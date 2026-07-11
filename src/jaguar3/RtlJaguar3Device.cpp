@@ -550,6 +550,13 @@ void RtlJaguar3Device::InitWrite(SelectedChannel channel) {
     SetAckResponder(*_cfg.rx.ack_responder); /* DEVOURER_ACK_RESPONDER */
   if (_cfg.tx.ampdu)
     SetAmpduMode(*_cfg.tx.ampdu); /* DEVOURER_TX_AMPDU_MODE */
+  /* 8822e OFDM-ref UPPER-field fix (the MCS4+/64-QAM TX fix) — applied HERE, as
+   * the last bring-up write, because the FW power-mode/coex H2C steps above
+   * reprogram 0x18e8/0x41e8 wholesale (index+upper) in firmware, clobbering an
+   * earlier apply. Bench-proven to recover MCS7 (0 -> clean, EVM -41 dB); gated
+   * OFF via DEVOURER_8822E_OFDM_REF_FIX_OFF. See apply_ofdm_ref_upper_8822e. */
+  if (_variant == jaguar3::ChipVariant::C8822E)
+    _radioManagement.apply_ofdm_ref_upper_8822e(/*skip_path_b=*/false);
   _logger->info("Jaguar3: ready for TX (monitor inject)");
 }
 

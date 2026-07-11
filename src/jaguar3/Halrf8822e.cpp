@@ -1084,6 +1084,26 @@ void Halrf8822e::phy_iq_calibrate(ChannelWidth_t bw, uint8_t channel) {
   _logger->info("Jaguar3(8822e): IQK done (times=" +
                 std::to_string(_iqk.iqk_times) + " fail_step=" + buf + ")");
 
+  /* DEBUG (DEVOURER_IQK_DUMP): verify the TX I/Q correction is actually ENABLED
+   * per path. Kernel success end-state = 0x1b70 BIT8==1 and 0x1b38 != bypass
+   * (0x40000000 post-fail / 0x20000000 pre-cal identity). A bypass/default here
+   * leaves an uncorrected TX image tone that spares QPSK but garbles 16/64-QAM. */
+  if (::getenv("DEVOURER_IQK_DUMP") != nullptr) {
+    uint32_t save_1b00 = _device.rtw_read32(0x1b00);
+    for (uint8_t p = 0; p < 2; ++p) {
+      bb_set(0x1b00, 0x00000006, p);
+      uint32_t txxy = _device.rtw_read32(0x1b38);
+      uint32_t enb = bb_get(0x1b70, 1u << 8);
+      const char *st = (txxy == 0x40000000) ? "BYPASS(fail)"
+                       : (txxy == 0x20000000) ? "IDENTITY(uncal)"
+                                              : "applied";
+      _logger->info("Jaguar3(8822e): IQK-DUMP path{} 0x1b38={:08x} "
+                    "apply_en(0x1b70.8)={} => {}",
+                    p, txxy, enb, st);
+    }
+    _device.rtw_write32(0x1b00, save_1b00);
+  }
+
   /* TX gain calibration — sets the 8822E TX gain table (the gross 5 GHz gain).
    * Runs after IQK on the tuned channel (halrf_init order: IQK then TXGAPK). */
   if (_skip_txgapk)
