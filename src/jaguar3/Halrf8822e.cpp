@@ -54,6 +54,30 @@ uint32_t Halrf8822e::rf_read(uint8_t path, uint16_t addr, uint32_t mask) {
 }
 void Halrf8822e::rf_write(uint8_t path, uint16_t addr, uint32_t mask,
                           uint32_t val) {
+  /* 8822e: RF reg 0x0 is NOT written through the direct 0x3c00/0x4c00 window
+   * like every other RF reg — it must go through the legacy 3-wire "FON" path
+   * 0x1808/0x4108 as a full-DWORD write with the addr in [27:20] (=0 here).
+   * Routing it through the direct window (as the rest of the RF regs use) makes
+   * the write a no-op on the gain-table index pointer, so txgapk_save_all reads
+   * the index-0 LUT entry for every gain index (all-zero on 5 GHz) and TXGAPK is
+   * skipped, leaving the 5 GHz PA un-linearized → MCS5-7 EVM floor. Port of the
+   * reg_addr==RF_0x0 branch of config_phydm_write_rf_reg_8822e. */
+  static const bool legacy_rf0 = ::getenv("DEVOURER_RF0_LEGACY") != nullptr;
+  if ((addr & 0xff) == 0x0 && !legacy_rf0) {
+    static constexpr uint16_t FON_WIN[2] = {0x1808, 0x4108};
+    uint32_t m = mask & RFREG_MASK;
+    uint32_t data;
+    if (m != RFREG_MASK) {
+      uint32_t orig = rf_read(path, 0x0, RFREG_MASK); /* read via 0x3c00 window */
+      data = (orig & ~m) | ((val << mask_shift(m)) & m);
+    } else {
+      data = val & RFREG_MASK;
+    }
+    /* data_and_addr = ((0 << 20) | data) & 0x0fffffff; full 32-bit BB write. */
+    _device.rtw_write32(FON_WIN[path & 1], data & 0x000fffff);
+    delay_us(1);
+    return;
+  }
   uint16_t direct = static_cast<uint16_t>(RF_WIN[path & 1] + ((addr & 0xff) << 2));
   bb_set(direct, mask & RFREG_MASK, val);
 }
