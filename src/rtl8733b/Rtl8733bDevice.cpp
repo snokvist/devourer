@@ -73,6 +73,21 @@ void Rtl8733bDevice::bring_up_to_phy() {
   _phy_ready = true;
   _logger->info("RTL8733B factory path reached PHY-ready (cut {})",
                 _chip.cut);
+  /* Every other generation applies tuning.disable_cca here (jaguar1/2/3,
+   * kestrel all call SetCcaMode during bring-up), so a caller setting
+   * DEVOURER_DIS_CCA=1 reasonably expects it to take effect. This backend has
+   * not located and measured the HALMAC 87xx carrier-sense gate, so it cannot
+   * honour the request — say so once, loudly, rather than dropping it in
+   * silence, which is the one way a refused knob can look like a granted one.
+   *
+   * Deliberately a warning and not the throw SetCcaMode(true) raises: the knob
+   * is on by default for the streamtx FPV downlink, and failing bring-up
+   * outright is a harsh answer to a request the caller may be making only via
+   * an inherited environment. The session runs with standard carrier-sense. */
+  if (_cfg.tuning.disable_cca)
+    _logger->warn(
+        "RTL8733B: DEVOURER_DIS_CCA / tuning.disable_cca is not implemented by "
+        "this backend — carrier-sense stays ENABLED for this session");
 }
 
 void Rtl8733bDevice::Init(Action_ParsedRadioPacket packetProcessor,
@@ -132,23 +147,44 @@ void Rtl8733bDevice::InitWrite(SelectedChannel channel) {
 bool Rtl8733bDevice::configure_tx_power(SelectedChannel channel) {
   _tssi_tracking = false;
   _tssi_cck = false;
+  /* Closed-loop TSSI is the TX-power control on a TSSI-offset PG unit, so it
+   * is not optional there: the flat fallback index below is a conservative
+   * bring-up value, and on-air it runs cold enough that HT rates do not
+   * survive the link (measured on the DUT: MCS7 undecodable by an RTL8812AU
+   * witness, 300/300 submitted, 0 captured). A unit whose EFUSE carries no
+   * TSSI calibration has nothing to drive the loop and takes the flat path. */
   if (_efuse.tx_power_mode != rtl8733b::TxPowerPgMode8733b::TssiOffset)
     return _phy.set_flat_tx_power(rtl8733b::kSafeTxAgcIndex8733b);
 
-  /* Start in the OFDM/HT thermal table. A first CCK submission switches the
-   * table through select_tssi_rate_table() before its descriptor reaches USB. */
+  /* Pick the thermal-compensation curve once, from the TX mode configured at
+   * this point, and leave it alone — the vendor's own setup keys the table on
+   * `phydm_get_tx_rate` at TSSI-setup time and never re-selects it at runtime.
+   * Re-selecting per frame is the opt-in DEVOURER_TSSI_RATE_TABLE path; the
+   * default keeps send_packet free of register I/O like every other
+   * generation. */
+  const bool cck_table = _tx_mode_default.has_value() &&
+                         _tx_mode_default->mode ==
+                             devourer::TxMode::Mode::Legacy &&
+                         rtl8733b::is_cck_rate_500kbps(
+                             _tx_mode_default->legacy_rate_500kbps);
   if (!_phy.prepare_tssi_bb(channel, _efuse) ||
-      !_phy.prepare_tssi_thermal(_efuse, false) ||
+      !_phy.prepare_tssi_thermal(_efuse, cck_table) ||
       !_phy.prepare_tssi_offsets(channel, _efuse) ||
       !_phy.enable_tssi_tracking(
           channel, _efuse, rtl8733b::kSafeTssiTargetQdbm8733b))
     return false;
   _tssi_tracking = true;
+  _tssi_cck = cck_table;
   return true;
 }
 
 bool Rtl8733bDevice::select_tssi_rate_table(bool cck) {
-  if (_efuse.tx_power_mode != rtl8733b::TxPowerPgMode8733b::TssiOffset)
+  /* Default: the table was chosen once in configure_tx_power and stays put, so
+   * the send path does no register I/O — the vendor behaves the same way.
+   * Both conditions must be checked: gating only on the EFUSE PG mode would
+   * return false here, which send_packet treats as fatal and stops the card. */
+  if (!_cfg.tuning.tssi_rate_table ||
+      _efuse.tx_power_mode != rtl8733b::TxPowerPgMode8733b::TssiOffset)
     return true;
   if (!_tssi_tracking)
     return false;

@@ -329,6 +329,27 @@ struct DeviceConfig {
      * MIX_MODE swing compensation (0xc94/0xe94 TXAGC + 0xc1c/0xe1c BB scale)
      * so on-air power holds flat as the PA heats over a sustained TX link. */
     bool thermal_track = true;
+    /* env: DEVOURER_TSSI_RATE_TABLE — RTL8733B per-rate TSSI thermal-table
+     * switching (default OFF; "1" enables). This is the *table* knob, not the
+     * TSSI loop: closed-loop TSSI itself stays on wherever the EFUSE is in
+     * TSSI-offset PG mode, because on those units it IS the TX-power control
+     * — a flat fallback index runs so cold that HT rates do not survive the
+     * link (measured: MCS7 undecodable by a witness at 300/300 submitted).
+     *
+     * The chip keeps two thermal-compensation curves, one for CCK and one for
+     * OFDM/HT. Off, the table is chosen once per channel set from the
+     * configured TX mode and left alone — which is exactly what the vendor
+     * driver does (`_halrf_tssi_set_tmeter_tbl_8733b` is only ever called from
+     * the full TSSI setup, keyed on `phydm_get_tx_rate` at that instant). On,
+     * the backend re-selects it whenever a frame crosses the CCK<->OFDM
+     * boundary, which costs ~84 ms / 136 USB register round trips *inside
+     * send_packet* (OpenIPC/devourer#389) and caps a mixed-rate stream at
+     * ~11 fps. No other generation does register I/O on the send path.
+     *
+     * Enable it only for a mixed CCK/OFDM stream that must hold calibrated
+     * power across a wide temperature swing; the compensation the switch buys
+     * is second-order, and at a thermal delta near zero the two curves agree. */
+    bool tssi_rate_table = false;
     /* env: DEVOURER_FASTRETUNE_FW — FastRetune firmware fast path (H2C 0x1D
      * SINGLE_CHANNELSWITCH_V2, the switch the vendor drivers gate behind
      * rtw_ch_switch_offload) on the Jaguar2 dies (8822B, 8821C) and the
