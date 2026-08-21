@@ -100,6 +100,22 @@ was a real failure on the bench:
   (153/161/169@20, 151/159/167@40, 155/171@80, 54/102/118@40, 58/106/122@80),
   explicit spur-free default elsewhere. `FastRetune` declines hops into or
   out of these combos (the lean hop can't reprogram the notch state).
+  The state is keyed on **(channel, bandwidth)**, so a *bandwidth* change
+  crosses the same boundary with the channel standing still: 153/161/169 are
+  spur combos at 20 MHz and spur-free at 5/10. `FastSetBandwidth` therefore
+  reprograms it — unlike the hop it can, because the channel is unchanged, so
+  it is the same `spur_eliminate_8822e(central, bw)` call with the same
+  arguments the full path would make, gated on the endpoints so a spur-free
+  channel pays nothing. Before that gate existed the lean toggle left a
+  20 MHz-tone notch punched into the 5/10 MHz passband on the way down, and
+  arrived on an unnotched spur channel on the way back up. Declining instead
+  was rejected: `FastSetBandwidth` is the TSF-slotted TDMA primitive
+  (`docs/scheduled-mac.md`), where falling back to the ~90 ms full path does
+  not merely cost time, it breaks the slot schedule. Decision logic pinned
+  headlessly in `tests/jaguar3_spur_bw_selftest.cpp` (`ctest -R
+  jaguar3_spur_bw`); the register evidence is arm 2 of
+  `tests/fast_bw_parity.sh` **run at ch 153** — at ch 36 the spur registers
+  are constant and the arm proves nothing. Not yet SDR-confirmed on air.
 - **CCK TX shaping filter** (2.4 GHz, per channel; ch14 special set) + per-band
   TX backoff/scaling.
 - 2.4 GHz RX needs the RF-write force-update brackets (`0x1830[29]`/

@@ -1100,6 +1100,22 @@ if(DEVOURER_JAGUAR2_8822B OR DEVOURER_JAGUAR2_8821C)
     add_test(NAME txpkt_pwr_quant COMMAND TxPktPwrSelftest)
 endif()
 
+# Headless guard for the 8822E spur-elimination state across a bandwidth
+# change: the vendor's 14-combo (channel, BANDWIDTH) table and the gate
+# fast_set_bandwidth uses to decide whether a same-channel width toggle has to
+# reprogram the NBI notch / CSI mask. Neither failure mode (a stale 20 MHz
+# notch inside a 5/10 MHz passband, or an unnotched spur channel after
+# 5/10 -> 20) is visible without an SDR, so the decision logic is pinned in
+# ctest. Needs the Jaguar3 HAL for RadioManagementJaguar3.
+if(DEVOURER_JAGUAR3_8822E)
+    add_executable(Jaguar3SpurBwSelftest
+        tests/jaguar3_spur_bw_selftest.cpp
+    )
+    target_link_libraries(Jaguar3SpurBwSelftest PRIVATE devourer)
+    target_include_directories(Jaguar3SpurBwSelftest PRIVATE src)
+    add_test(NAME jaguar3_spur_bw COMMAND Jaguar3SpurBwSelftest)
+endif()
+
 # Headless guard for the Jaguar3 per-packet power-bank planner (the
 # TxPktPwrBanks.h LRU/encode policy) + the descriptor bit positions of
 # TXPWR_OFSET_TYPE (8822C, incl. the bit30 ANTSEL_EN_V1 hazard) and the 8814A

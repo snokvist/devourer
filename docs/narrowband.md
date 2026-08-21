@@ -255,7 +255,13 @@ cached channel state, and falls back to the full `SetMonitorChannel` for a
 - **Jaguar3** (8822C/8822E): the narrowband re-clock is already a self-contained
   delta (`set_bandwidth_dividers`, incl. a 20 MHz-restore default and the
   8822e MAC-clock/TX-shaping), so the fast path is that delta + a BB reset.
-  ~0.8 ms (8822C).
+  ~0.8 ms (8822C). On the **8822E** the delta is not quite the whole story:
+  its spur-elimination state (NBI notch + CSI mask + packet detection) is keyed
+  on *(channel, bandwidth)*, and ch 153/161/169 are spur combos at 20 MHz and
+  spur-free at 5/10 — so on those three channels a width toggle alone crosses
+  the boundary and the fast path reprograms the notch before re-clocking
+  (`docs/8822e-quirks.md`). Everywhere else the gate is inert and the toggle
+  costs exactly the delta.
 
 Validation (`tests/fast_bw_parity.sh`): the fast path's re-clock registers come
 out **bit-for-bit identical** to the full narrowband path (Jaguar1/2 `0x8ac`
@@ -263,6 +269,17 @@ verified at 5/10/20 MHz), and a **cross-RX** test proves it on-air — with a
 narrowband TX partner, a fast-toggled receiver decodes the beacon ONLY in the
 narrowband window and not in either 20 MHz window (narrowband and 20 MHz are
 different ADC clock domains, so a receiver decodes exactly one at a time).
+
+Two limits of that parity arm, both now closed. It greped only the Jaguar1/2
+re-clock words (`0x8ac`/`0x8c4`/`0x8c8`), so on Jaguar3 it compared nothing —
+and the Jaguar3 fast path did not emit the canary at all, so a diff there
+re-read the *previous full-path* dump and reported a false green. The arm now
+asks for each generation's own set (J3 `0x9b0`/`0x9b4`, the 8822E MAC-clock
+half `0x24`/`0x55c`/`0x638`, and the 8822E spur registers), and
+`fast_set_bandwidth` emits the canary like the Jaguar1/2 paths always did. For
+the 8822E, run it at **ch 153**: at ch 36 the spur registers are constant, so
+that channel cannot see a stale-notch regression. The gate deciding when to
+reprogram is pinned headlessly in `ctest -R jaguar3_spur_bw`.
 
 The lever this unlocks: a receiver (or a burst-level TX scheme) can move between
 a robust narrowband link and a wide high-throughput one in well under a

@@ -80,12 +80,39 @@ public:
    * path is just that delta + a BB reset — no RF channel tune, no calibration.
    * Returns false if the radio was never tuned; the caller (which has already
    * checked that both endpoints are in {20, 5, 10}) falls back to the full
-   * set_channel_bwmode for a 40/80 MHz endpoint. */
+   * set_channel_bwmode for a 40/80 MHz endpoint. On the 8822E it additionally
+   * reprograms the bandwidth-keyed spur state when the toggle crosses a spur
+   * combo on the current channel (ch 153/161/169) — see the body. */
   bool fast_set_bandwidth(ChannelWidth_t new_bw) {
     if (_last_channel == 0)
       return false;
+    /* 8822E: the spur-elimination state (manual NBI notch, CSI mask, packet
+     * detection) is keyed on (central channel, BANDWIDTH) — 153/161/169 are
+     * spur combos at 20 MHz and spur-free at 5/10 — so a bandwidth toggle
+     * changes which case applies even though the channel does not. Without
+     * this, 20 -> 5/10 leaves a 20 MHz-tone notch punched into the narrowband
+     * passband, and 5/10 -> 20 arrives on a spur channel with no notch at all.
+     * This is the mirror of the fast_retune spur gate; here the full state is
+     * one self-contained BB write sequence keyed on the SAME channel, so the
+     * fast path can reprogram it (same call, same arguments the full path
+     * makes) instead of declining — FastSetBandwidth is the TSF-slotted TDMA
+     * primitive, where a fallback to the ~90 ms full path is not just slower
+     * but breaks the slot schedule. Gated on the endpoints so the common
+     * spur-free channel pays nothing. Central == primary for every width in
+     * the {20, 5, 10} set this path serves (central_and_pri only shifts the
+     * central for 40/80), so _last_channel is the central here. */
+    if (_variant == ChipVariant::C8822E &&
+        spur_state_changes_8822e(_last_channel, _last_bw, new_bw))
+      spur_eliminate_8822e(_last_channel, new_bw);
     set_bandwidth_dividers(new_bw);
     bb_reset_toggle(); /* restart the RX engine at the new sample clock */
+    _last_bw = new_bw;
+    /* The J1 parity lesson (see fast_retune): the fast path must emit the
+     * canary itself. Without it a full-vs-fast parity diff re-reads the
+     * PREVIOUS full-path dump and reports a false green — which is exactly
+     * what tests/fast_bw_parity.sh did on Jaguar3. */
+    if (_cfg.debug.dump_canary)
+      DumpCanary();
     return true;
   }
 
@@ -128,12 +155,29 @@ public:
   void apply_rate_diffs(uint8_t ref_a, uint8_t ref_b,
                         const devourer::TxRateDiffsQdb& diffs);
 
+  /* Is (central channel, bandwidth) one of the 14 combos whose synthesizer
+   * harmonic lands in-band, i.e. one phydm_spur_eliminate_8822e programs a
+   * notch/mask for? Every other combo takes the explicit spur-free default.
+   * Pure; public so the fast-path gates below and the headless guard in
+   * tests/jaguar3_spur_bw_selftest.cpp can both see it. */
+  static bool is_spur_combo_8822e(uint8_t ch, ChannelWidth_t bw);
+
+  /* Does a SAME-CHANNEL bandwidth toggle from `from` to `to` land on a
+   * different spur case than it left? The spur state is keyed on (channel,
+   * bandwidth), so a width change alone can cross the boundary — which is
+   * why fast_set_bandwidth has to reprogram it. Pure; the exact predicate
+   * fast_set_bandwidth uses, so the selftest guards the shipped gate rather
+   * than a copy of it. */
+  static bool spur_state_changes_8822e(uint8_t ch, ChannelWidth_t from,
+                                       ChannelWidth_t to) {
+    return is_spur_combo_8822e(ch, from) || is_spur_combo_8822e(ch, to);
+  }
+
 private:
   /* 8822E channel-switch helpers (straight phydm ports, 8822E-gated):
    * CCK TX shaping filter + spur elimination (manual NBI / CSI mask). */
   void cck_tx_shaping_8822e(uint8_t central);
   void spur_eliminate_8822e(uint8_t ch, ChannelWidth_t bw);
-  static bool is_spur_combo_8822e(uint8_t ch, ChannelWidth_t bw);
   void set_manual_nbi_8822e(bool en, uint32_t tone_idx);
   void set_nbi_wa_para_8822e(bool en, ChannelWidth_t bw);
   void set_csi_mask_8822e(uint32_t tone_idx, uint8_t weight);
@@ -191,6 +235,11 @@ private:
   Logger_t _logger;
   ChipVariant _variant;
   uint8_t _last_channel = 0; /* set by set_channel_bwmode; 0 = not yet tuned */
+  /* The bandwidth the radio is currently programmed at. Maintained by every
+   * path that changes it (set_channel_bwmode, fast_set_bandwidth) so the fast
+   * BW toggle can tell which spur state it is leaving — see the 8822E gate in
+   * fast_set_bandwidth. */
+  ChannelWidth_t _last_bw = CHANNEL_WIDTH_20;
   bool _warned_uncharacterized = false; /* one-shot extended-channel warning */
 
   /* fast_retune write-on-change caches. Invalidated whenever the full

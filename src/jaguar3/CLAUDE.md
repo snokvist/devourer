@@ -22,6 +22,23 @@ narrowband dividers, RF18 encoding), strategy interfaces `Jaguar3Calibration`
 - **5/10 MHz narrowband**: the re-clock lives in the `0x9b0`/`0x9b4`
   dividers (vs the `0x8ac` block the Jaguar1/2 chips share). 80 MHz works,
   incl. a 40-in-80 frame via TX-descriptor DATA_SC. See `docs/narrowband.md`.
+- **The 8822E's spur state is bandwidth-keyed, so `fast_set_bandwidth` owns
+  it.** `spur_eliminate_8822e` is keyed on *(central channel, bandwidth)*:
+  153/161/169 are spur combos at 20 MHz and spur-free at 5/10, so a
+  same-channel width toggle crosses the boundary that `fast_retune` declines
+  hops across. The lean path reprograms rather than declines — the channel is
+  unchanged, so it is the identical call with the identical arguments the full
+  path makes, and `FastSetBandwidth` is the TSF-slotted TDMA primitive where a
+  ~90 ms fallback breaks the slot schedule, not just its latency. Gated by
+  `spur_state_changes_8822e` so a spur-free channel pays nothing.
+  `_last_bw` exists to feed that gate; the invariant is that every path which
+  programs a bandwidth (`set_channel_bwmode`, `fast_set_bandwidth`) updates it.
+  Two blind spots went with the bug and are closed alongside it: the fast BW
+  path did not emit `DumpCanary` (so a full-vs-fast parity diff re-read the
+  previous full dump — a false green; Jaguar1/2 always emitted it, Jaguar3 was
+  the outlier), and the canary listed only 4 of the ~10 spur registers.
+  Headless guard: `ctest -R jaguar3_spur_bw`. Register evidence needs
+  `tests/fast_bw_parity.sh` **at ch 153** — ch 36 cannot see it.
 - halrf calibration: DACK/IQK/TXGAPK/thermal tracking.
 - **Firmware channel switch** (H2C 0x1D via `fastretune_fw`, both dies): the
   fw-switch H2C must ride `HalJaguar3::send_h2c_raw`'s HMEBOX box counter —

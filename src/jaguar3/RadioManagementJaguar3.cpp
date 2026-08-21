@@ -63,6 +63,7 @@ void RadioManagementJaguar3::set_channel_bwmode(uint8_t channel,
   }
 
   _last_channel = channel;
+  _last_bw = bwmode;
 
   /* --- bandwidth block (config_phydm_switch_bandwidth_8822c CH_20 / CH_40).
    * The 0x810/0x9b0[7:6]/0x9b4 clock+DFIR writes are the same for 20 and 40 MHz
@@ -430,15 +431,35 @@ void RadioManagementJaguar3::DumpCanary() {
    * AGC bound/tables (0x828/0x18ac/0x41ac), subtune (0x88c), small-BW/RF-BW/
    * pri-ch (0x9b0), clock dividers (0x9b4), SCO (0xc30), pilot smoothing
    * (0xcbc), CCK block regs (0x1a00/0x1a14/0x1a80/0x1a9c/0x1abc/0x1ae8/0x1aec),
-   * AGC 5G bound (0x1c80), 80 MHz decimation (0x1944/0x4044). MAC: BB-reset
+   * AGC 5G bound (0x1c80), 80 MHz decimation / NBI tone (0x1944/0x4044).
+   *
+   * The 8822E spur-elimination state (spur_eliminate_8822e) is channel AND
+   * bandwidth keyed, so it belongs in a channel/BW canary: auto/manual-NBI
+   * enables (0x818), NBI tone (0x1944/0x4044) and per-path NBI enable
+   * (0x1940/0x4040), the NBI workaround params (0x810/0x88c), NBI level
+   * (0x1d3c), CSI-mask enable (0xc0c) and packet detection (0xc24). Only
+   * 0x1944/0x4044/0x810/0x88c were listed before, so a full-vs-fast diff was
+   * blind to most of a stale notch. The CSI-mask table itself sits behind the
+   * 0x1d94/0x1ee8 indexed write port with no readable mirror, so its contents
+   * stay out; the enable bit and the NBI set are the observable half. None of
+   * these are driven by the runtime watchdog (PhydmRuntimeJaguar3 writes
+   * 0x1d70/0x1a2c/0x1d2c/0x1eb4/0x1ac8/0x1acc/0x1ad0/0x84c), so they are
+   * stable config rather than run-variant noise. Dumped on both dies: no
+   * 8822C code path writes any of them (0x818's two writers — cck_tx_shaping
+   * _8822e and config_channel_8822e — are both C8822E-gated), so on the C they
+   * sit at their BB-table value and a full-vs-fast diff sees a constant.
+   *
+   * MAC: BB-reset
    * word (0x0), AFE clk (0x24, 8822e NB), CCK check (0x454), DATA_SC (0x483),
    * us-ticks (0x55c/0x638), TRXPTCL (0x668). RF (via the BB direct window,
    * both paths): 0x18 channel, 0x1a RXBB (8822e), 0x3f RXBB (8822c), 0xdf.
    * Live counters (IGI 0x1d70, FA/CCA) deliberately excluded. */
   static const uint16_t bb_canary[] = {
-      0x808, 0x810, 0x828,  0x88c,  0x9b0,  0x9b4,  0xc30,  0xcbc,
+      0x808, 0x810, 0x818, 0x828,  0x88c,  0x9b0,  0x9b4,  0xc30,  0xcbc,
       0x1a00, 0x1a14, 0x1a80, 0x1a9c, 0x1abc, 0x1ae8, 0x1aec, 0x1c80,
       0x18ac, 0x41ac, 0x1944, 0x4044,
+      /* 8822E spur elimination (see above). */
+      0x1940, 0x4040, 0x1d3c, 0xc0c, 0xc24,
       /* TXAGC refs (runtime TX-power API): OFDM 0x18e8/0x41e8, CCK
        * 0x18a0/0x41a0, + the first per-rate diff dword. */
       0x18e8, 0x41e8, 0x18a0, 0x41a0, 0x3a00};
