@@ -112,6 +112,11 @@ public:
   bool read_efuse(EfuseInfo &out);
   bool initialize(const EfuseInfo &efuse);
   bool configure_monitor_rx(bool keep_corrupted);
+  /* REG_ACKTO (0x0640) only, in microseconds. The caller owns the
+   * 1..255 clamp DeviceConfig::tx::ack_timeout_us documents; this is the
+   * register plane, and the CCK companion 0x0639 is deliberately left at
+   * its vendor value, matching the register the Jaguar backends touch. */
+  uint8_t set_ack_timeout_us(uint8_t microseconds);
   void stop();
   MacState read_mac_state();
 

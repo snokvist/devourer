@@ -56,6 +56,8 @@ public:
   void SetTxMode(const devourer::TxMode &mode) override;
   void ClearTxMode() override;
   SelectedChannel GetSelectedChannel() override;
+  bool SetAckResponder(const devourer::MacAddr &mac) override;
+  void ClearAckResponder() override;
   void SetCcaMode(bool disabled) override;
   void Stop() override;
 
@@ -122,6 +124,13 @@ private:
   std::atomic<bool> _rx_active{false};
   std::atomic<uint8_t> _rx_configured_bw{0};
   std::atomic<uint64_t> _tx_submits{0};
+  /* Whether the hardware ACK responder is currently armed. Teardown has
+   * to disarm it (net_type at 0x0102 survives _mac.stop(), which clears
+   * only REG_CR's low half), but only when it was actually armed: the
+   * disarm is a read-modify-write, and spending a USB round-trip on every
+   * teardown to clear bits that are already zero is a cost the common
+   * path should not pay. Guarded by _reg_mu like the other state. */
+  bool _ack_armed = false;
   mutable std::recursive_mutex _reg_mu;
   std::optional<devourer::TxMode> _tx_mode_default;
 };

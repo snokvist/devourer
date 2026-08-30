@@ -175,12 +175,17 @@ struct AdapterCaps {
    * an earlier "broken" verdict was a harness artifact: the responder's arm
    * was never verified, so a silently dead responder read as on=0/off=0),
    * 8822B, 8812C/8822C, 8812E/8822E (the 8811A rides the 8812 die path and
-   * inherits its row). False-as-unmeasured (the
+   * inherits its row), 8733B (1736/1736 frames ACKed at retries_mean 0.00,
+   * retarget-proof and disarm-proof — tests/ack_txreport_matrix.sh run with
+   * the 8733B as the responder). False-as-unmeasured (the
    * vht_2g4_ok reading: unmeasured, not incapable): the 8821C — it shares
    * the recipe but no 8821CU/CE cell has run. FALSE on Kestrel:
    * SetAckResponder is not implemented on the AX generation.
    * tx_retry_limit_ok: DEVOURER_TX_RETRY_LIMIT drives hardware autonomous
-   * retransmission (measured 12/0/12 A/B: 8821AU, 8812BU, 8822CU; Kestrel
+   * retransmission (measured 12/0/12 A/B: 8821AU, 8812BU, 8822CU; the 8733B
+   * by airtime dose-response instead, 0/3/12 -> 0.93/3.93/12.27 airings per
+   * frame, because that die has no CCX path to judge its own frames
+   * (tests/rtl8733b_retry_limit_onair.sh); Kestrel
    * 8832CU witness-measured — the AX WD DATA_TXCNT_LMT field counts
    * ATTEMPTS, folded +1 to the N-retries contract, limits {0,2,8} -> modal
    * on-air copies {1,3,8-9}). FALSE on the 8814A die (the vendor

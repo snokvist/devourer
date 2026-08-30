@@ -636,6 +636,13 @@ void Halmac8733bMac::init_wmac() {
   _device.rtw_write32(kRegMar, 0xffffffff);
   _device.rtw_write32(kRegMar + 4, 0xffffffff);
   _device.rtw_write8(kRegBbpsfCtrl + 2, 0x84);
+  /* Vendor HALMAC values. 0x21 (33 us) is the bottom of the 33..128 us
+   * per-chip spread DeviceConfig::tx::ack_timeout_us exists to abolish, so
+   * Rtl8733bDevice overwrites REG_ACKTO from the config right after
+   * bring-up (set_ack_timeout_us) — the same shape Jaguar3 uses against
+   * halmac's per-bandwidth defaults. Left as-written here because this MAC
+   * plane is shared verbatim with rtl8733bprobe, which wants the vendor
+   * recipe and carries no DeviceConfig. */
   _device.rtw_write8(kRegAckTimeout, 0x21);
   _device.rtw_write8(kRegAckTimeoutCck, 0x6a);
   _device.rtw_write16(kRegEifs, 0x0040);
@@ -671,6 +678,14 @@ void Halmac8733bMac::init_wmac() {
       static_cast<uint8_t>(_device.rtw_read8(kRegSndPtclCtrl) | (1u << 6)));
   _device.rtw_write32(kRegWmacOption2, 0xb1810041);
   _device.rtw_write8(kRegWmacOption1, 0x18); // 0x98 with early-drop disabled
+}
+
+uint8_t Halmac8733bMac::set_ack_timeout_us(uint8_t microseconds) {
+  _device.rtw_write8(kRegAckTimeout, microseconds);
+  /* Read back and return what the register carries. The caller logs it: this
+   * knob was silently ignored here once (issue #2), and a value reported
+   * without a readback is the same shape of claim that bug was. */
+  return _device.rtw_read8(kRegAckTimeout);
 }
 
 void Halmac8733bMac::init_usb() {

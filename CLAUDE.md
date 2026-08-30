@@ -59,9 +59,10 @@ construction from the `SYS_CFG2` chip-id (Kestrel: PID-first):
   only what an independent witness decoded — legacy OFDM + HT MCS0-7, BCC,
   20/40 MHz on 2.4/5 GHz, plus long-preamble CCK on 2.4 GHz at 20 MHz, plus
   10 MHz narrowband (5 MHz refused — `src/rtl8733b/CLAUDE.md`).
-  Everything the backend has not ported (TSF/beacons, hardware ACK, A-MPDU,
+  Everything the backend has not ported (TSF/beacons, A-MPDU, CCX/`tx.report`,
   the flat-index and per-rate TX-power knobs) falls through to `IRtlDevice`'s
-  not-ported defaults rather than being faked, so read the base class before
+  not-ported defaults rather than being faked (hardware ACK/BlockAck IS ported
+  and measured, as is `tx.retry_limit` — `src/rtl8733b/CLAUDE.md`), so read the base class before
   assuming a cross-generation feature below applies here. `FastRetune` IS
   ported (intra-band, TSSI kept live — `src/rtl8733b/CLAUDE.md`). SGI, LDPC, STBC, VHT
   and HE are refused outright. Scope, one-unit validation record and the

@@ -7,6 +7,7 @@
 #include <utility>
 #include <vector>
 
+#include "AckResponder.h" /* hardware ACK/BlockAck responder recipe */
 #include "RateDefinitions.h"
 #include "RadiotapPeek.h" /* send_packets batch pre-parse */
 #include "RadiotapTxFlags.h"
@@ -76,6 +77,40 @@ void Rtl8733bDevice::bring_up_to_phy() {
   _phy_ready = true;
   _logger->info("RTL8733B factory path reached PHY-ready (cut {})",
                 _chip.cut);
+
+  /* ACK window (DEVOURER_ACK_TIMEOUT_US): the one library default every
+   * generation programs identically, replacing the vendor value init_wmac just
+   * wrote (0x21 = 33 us — the bottom of the 33..128 per-chip spread the single
+   * default exists to abolish). Same clamp and same register as jaguar1/2/3;
+   * see the DeviceConfig field doc for the range budget it buys.
+   *
+   * This was silently ignored until issue #2, which is the failure this
+   * backend refuses everywhere else (disable_cca, SetTxPowerIndexOverride): a
+   * config value that reads as applied while the radio runs something else.
+   * The window is load-bearing here now — both ends of a hardware-ARQ link are
+   * measured working on this die (SetAckResponder, tx.retry_limit).
+   *
+   * Sited in bring_up_to_phy for the same reason the disable_cca warning below
+   * is: it is where the MAC bring-up that wrote the vendor value has just run,
+   * once per bring-up, on both the RX and TX session shapes. */
+  const uint8_t ackto_want = static_cast<uint8_t>(
+      _cfg.tx.ack_timeout_us > 255   ? 255
+      : _cfg.tx.ack_timeout_us < 1 ? 1
+                                   : _cfg.tx.ack_timeout_us);
+  const uint8_t ackto_got = _mac.set_ack_timeout_us(ackto_want);
+  if (ackto_got != ackto_want)
+    _logger->warn("RTL8733B: ACK window did not latch — REG_ACKTO reads {} us, "
+                  "wanted {} us",
+                  ackto_got, ackto_want);
+  else
+    _logger->info("RTL8733B: ACK window {} us (REG_ACKTO 0x640, verified)",
+                  ackto_got);
+  /* DEVOURER_ACK_RESPONDER — opt-in only, never a default: it turns a passive
+   * monitor into an active SIFS-timed transmitter. Sited here with the other
+   * bring-up knobs so an RX-only session (Init) arms it too, which is the
+   * session shape a pure responder actually runs. */
+  if (_cfg.rx.ack_responder)
+    SetAckResponder(*_cfg.rx.ack_responder);
   /* Every other generation applies tuning.disable_cca during bring-up
    * (jaguar1/2/3, kestrel all call SetCcaMode there), so a caller setting
    * DEVOURER_DIS_CCA=1 reasonably expects it to take effect. This backend has
@@ -96,6 +131,22 @@ void Rtl8733bDevice::bring_up_to_phy() {
     _logger->warn(
         "RTL8733B: DEVOURER_DIS_CCA / tuning.disable_cca is not implemented by "
         "this backend — carrier-sense stays ENABLED for this session");
+  /* DEVOURER_TX_REPORT: the CCX per-frame TX-status path is not ported, and
+   * unlike the knobs above the reason is the firmware rather than a missing
+   * register — everything under this backend's control was verified correct on
+   * air and the chip still returned no C2H at all. The full bench narrative and
+   * the outstanding lead live in src/rtl8733b/CLAUDE.md "Hardware ARQ"; it is
+   * not repeated here.
+   *
+   * Warn rather than drop it silently: a consumer that sets this knob is
+   * asking for its per-frame delivery sensor, and would otherwise read the
+   * absence of tx.report events as a quiet link rather than an absent
+   * feature. */
+  if (_cfg.tx.report)
+    _logger->warn(
+        "RTL8733B: DEVOURER_TX_REPORT / tx.report is not implemented by this "
+        "backend — the firmware emits no CCX reports, so no tx.report events "
+        "will arrive (see src/rtl8733b/CLAUDE.md)");
 }
 
 void Rtl8733bDevice::Init(Action_ParsedRadioPacket packetProcessor,
@@ -755,6 +806,81 @@ size_t Rtl8733bDevice::build_tx_block(const uint8_t *packet, size_t length,
   return frame_offset + frame_len;
 }
 
+bool Rtl8733bDevice::SetAckResponder(const devourer::MacAddr &mac) {
+  std::lock_guard<std::recursive_mutex> lock(_reg_mu);
+  if (!_mac_ready) {
+    _logger->error("RTL8733B: ACK responder requires MAC bring-up first");
+    return false;
+  }
+  /* The AckResponder.h recipe is map-identical on this die, which is not an
+   * assumption: the vendor 8733BU tree's port-0 descriptor names exactly these
+   * three registers — net_type = REG_CR_8733B + 2 (0x0100 + 2 = 0x0102, shift
+   * 0), macaddr = REG_MACID_8733B (0x0610), bssid = REG_BSSID_8733B (0x0618)
+   * — the same addresses and the same MSR field the Jaguar backends use
+   * (hal/rtl8733b/rtl8733b_ops.c port_cfg[0], hal/halmac/halmac_reg_8733b.h).
+   *
+   * MAC bring-up leaves net_type at 0 (No Link) because init_mac writes only
+   * REG_CR's low half (0x0100-0x0101) — which is exactly why a monitor radio
+   * on this die never ACKs. Flipping the field is the whole gate. */
+  if ((mac.bytes[0] & 0x01u) != 0) {
+    /* A station cannot ACK-target a group address. Refuse rather than arm a
+     * responder that can never fire — the same footgun AckResponder.h records
+     * from the AP-mode work. */
+    _logger->error("RTL8733B: ACK responder needs a UNICAST MAC (I/G set in "
+                   "{:02x}) — not armed",
+                   mac.bytes[0]);
+    return false;
+  }
+  devourer::ack::enable(_device, mac.data());
+  /* Latch BEFORE the readback, not after it. The writes have already been
+   * issued at this point, so the hardware may be armed whatever the readback
+   * says; if the flag tracked the readback verdict instead, a mismatch would
+   * leave Stop() believing there was nothing to disarm while the chip went on
+   * auto-ACKing — the precise failure this flag exists to prevent. A redundant
+   * disarm costs one USB round-trip at teardown; a missed one leaves an
+   * unowned transmitter on the air. */
+  _ack_armed = true;
+  /* Read back before claiming it. This is the first port of the responder onto
+   * HALMAC 87xx, and this backend does not report a write it cannot verify
+   * (the same standard SetCcaMode and SetTxPowerOffsetQdb are held to). */
+  const uint8_t net_type = static_cast<uint8_t>(_device.rtw_read8(0x0102) & 0x03u);
+  const uint32_t id_lo = _device.rtw_read<uint32_t>(0x0610);
+  const uint16_t id_hi = _device.rtw_read16(0x0614);
+  const uint32_t want_lo = static_cast<uint32_t>(mac.bytes[0]) |
+                           (static_cast<uint32_t>(mac.bytes[1]) << 8) |
+                           (static_cast<uint32_t>(mac.bytes[2]) << 16) |
+                           (static_cast<uint32_t>(mac.bytes[3]) << 24);
+  const uint16_t want_hi =
+      static_cast<uint16_t>(mac.bytes[4] | (mac.bytes[5] << 8));
+  if (net_type != 0x03 || id_lo != want_lo || id_hi != want_hi) {
+    _logger->error("RTL8733B: ACK responder did not latch — net_type={} "
+                   "macid=0x{:04x}{:08x} (wanted 3 / 0x{:04x}{:08x})",
+                   net_type, id_hi, id_lo, want_hi, want_lo);
+    /* Best-effort undo, then leave _ack_armed set regardless: if this disable
+     * also failed we must not tell teardown the radio is quiet. */
+    try {
+      devourer::ack::disable(_device);
+    } catch (const std::exception &e) {
+      _logger->warn("RTL8733B: ACK responder rollback failed: {}", e.what());
+    }
+    return false;
+  }
+  _logger->info("RTL8733B: hardware ACK responder armed for "
+                "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} (net_type=AP)",
+                mac.bytes[0], mac.bytes[1], mac.bytes[2], mac.bytes[3],
+                mac.bytes[4], mac.bytes[5]);
+  return true;
+}
+
+void Rtl8733bDevice::ClearAckResponder() {
+  std::lock_guard<std::recursive_mutex> lock(_reg_mu);
+  if (!_mac_ready)
+    return;
+  devourer::ack::disable(_device);
+  _ack_armed = false;
+  _logger->info("RTL8733B: hardware ACK responder disarmed (net_type=NoLink)");
+}
+
 void Rtl8733bDevice::SetCcaMode(bool disabled) {
   if (!disabled) {
     /* `false` is the universal default — carrier-sense + EDCCA enabled — and
@@ -798,6 +924,27 @@ void Rtl8733bDevice::Stop() {
   }
   _phy_ready = false;
   if (_mac_ready) {
+    /* Disarm the ACK responder explicitly. _mac.stop() clears REG_CR's low
+     * half (0x0100-0x0101) but net_type lives at 0x0102 and would survive it,
+     * so a session that ends with teardown_power_down off would leave the chip
+     * auto-ACKing — an active SIFS-timed transmitter with no session owning
+     * it. The knob is opt-in precisely because it makes the radio transmit;
+     * it must not outlive the session that asked for it.
+     *
+     * Guarded like the TSSI rollback above and for the same reason: this is a
+     * read-modify-write, register reads throw on a disconnected device
+     * (UsbTransport rtw_read), and letting that escape here would abandon the
+     * REST of teardown — _mac.stop() and the card-disable sequence — which is
+     * worse than losing the disarm on a device that has already gone away. */
+    if (_ack_armed) {
+      try {
+        devourer::ack::disable(_device);
+      } catch (const std::exception &e) {
+        _logger->warn("RTL8733B: ACK responder disarm failed during shutdown: "
+                      "{}", e.what());
+      }
+      _ack_armed = false;
+    }
     _mac.stop();
     _mac_ready = false;
   }
@@ -851,6 +998,14 @@ devourer::AdapterCaps Rtl8733bDevice::GetAdapterCaps() {
    * 10 MHz is SDR- and cross-decode-qualified on both bands
    * (docs/rtl8733b.md "Narrowband status"). */
   caps.narrowband_ok = true;
+  /* Hardware ARQ (truth table at the AdapterCaps declarations): both knobs
+   * measured true on this die. The responder had to be proven before the TX
+   * side could be, because this die has no CCX path to judge its own frames —
+   * so the retry knob is witnessed from the air instead of from tx.report
+   * (tests/rtl8733b_retry_limit_onair.sh; bench narrative in
+   * src/rtl8733b/CLAUDE.md "Hardware ARQ"). */
+  caps.ack_responder_ok = true;
+  caps.tx_retry_limit_ok = true;
   caps.txpwr = GetTxPowerCaps();
   return caps;
 }
