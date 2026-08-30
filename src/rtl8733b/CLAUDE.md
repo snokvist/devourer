@@ -292,11 +292,14 @@ particular is witnessed by a monitor that can only ever LOSE airings, never
 invent them, so the measured ratio is a floor rather than a point estimate.
 
 `DeviceConfig::tx::ack_timeout_us` **is** honoured, and was not until that
-issue: `bring_up_to_phy` overwrites REG_ACKTO (0x0640) from the config with the
-same 1..255 clamp the Jaguars use, right after MAC bring-up wrote the vendor
-0x21 — 33 us, the bottom of the 33..128 per-chip spread that field's one
-default exists to abolish. The write is read back and logged, because a value
-reported without a readback is the same shape of claim the bug was; measured
+issue. The field's contract — range, clamp, default, register and the range
+budget it buys — is doc-commented at its declaration in `src/DeviceConfig.h`
+and is not restated here. What is specific to this backend: `init_wmac()` still
+writes the vendor `0x21`, so `bring_up_to_phy` overwrites it from the config
+afterwards (the vendor write stays because that MAC plane is shared verbatim
+with `rtl8733bprobe`, which carries no `DeviceConfig`), and the write is read
+back and logged rather than assumed — a value reported without a readback is
+the same shape of claim the original bug was. Measured
 `<unset>/128/33/200 -> 128/128/33/200`. The CCK companion 0x0639 keeps its
 vendor value, as on every other generation.
 

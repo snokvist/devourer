@@ -831,15 +831,18 @@ bool Rtl8733bDevice::SetAckResponder(const devourer::MacAddr &mac) {
                    mac.bytes[0]);
     return false;
   }
-  devourer::ack::enable(_device, mac.data());
-  /* Latch BEFORE the readback, not after it. The writes have already been
-   * issued at this point, so the hardware may be armed whatever the readback
-   * says; if the flag tracked the readback verdict instead, a mismatch would
-   * leave Stop() believing there was nothing to disarm while the chip went on
-   * auto-ACKing — the precise failure this flag exists to prevent. A redundant
-   * disarm costs one USB round-trip at teardown; a missed one leaves an
-   * unowned transmitter on the air. */
+  /* Latch BEFORE the first write, not after the call and not after the
+   * readback. ack::enable() is five register writes ending with the net_type
+   * field that actually arms the engine, and any of them can throw
+   * (UsbTransport rtw_read/rtw_write on a stalling device) — including after
+   * the arming write has already reached hardware. An exception here unwinds
+   * through bring_up_to_phy into Init()/InitWrite()'s catch, which calls
+   * Stop(); if the flag were set only on the success path, that teardown would
+   * believe there was nothing to disarm while the chip went on auto-ACKing.
+   * Same reasoning for a failed readback below. A redundant disarm costs one
+   * USB round-trip; a missed one leaves an unowned transmitter on the air. */
   _ack_armed = true;
+  devourer::ack::enable(_device, mac.data());
   /* Read back before claiming it. This is the first port of the responder onto
    * HALMAC 87xx, and this backend does not report a write it cannot verify
    * (the same standard SetCcaMode and SetTxPowerOffsetQdb are held to). */
