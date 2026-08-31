@@ -278,9 +278,8 @@ knob is told too, and so it fires exactly once per bring-up.
 
 ## Hardware ARQ
 
-All three knobs of the hardware-ARQ surface were opened by issue #2. Two are
-now measured true on this die; the third is refused loudly for a reason that
-took a bench to find.
+Two of the three hardware-ARQ knobs are measured true on this die; the third is
+refused loudly for a reason that took a bench to find.
 
 The counterparts for everything measured below, stated once here because the
 numbers that follow are uniformly favourable: **one physical unit and one peer
@@ -291,15 +290,14 @@ cells, and no vendor-driver A/B exists to compare against. The retry number in
 particular is witnessed by a monitor that can only ever LOSE airings, never
 invent them, so the measured ratio is a floor rather than a point estimate.
 
-`DeviceConfig::tx::ack_timeout_us` **is** honoured, and was not until that
-issue. The field's contract — range, clamp, default, register and the range
+`DeviceConfig::tx::ack_timeout_us` is honoured. The field's contract — range, clamp, default, register and the range
 budget it buys — is doc-commented at its declaration in `src/DeviceConfig.h`
 and is not restated here. What is specific to this backend: `init_wmac()` still
 writes the vendor `0x21`, so `bring_up_to_phy` overwrites it from the config
 afterwards (the vendor write stays because that MAC plane is shared verbatim
 with `rtl8733bprobe`, which carries no `DeviceConfig`), and the write is read
-back and logged rather than assumed — a value reported without a readback is
-the same shape of claim the original bug was. Measured
+back and logged rather than assumed: a knob reported without a readback cannot
+be told apart from one the radio never received. Measured
 `<unset>/128/33/200 -> 128/128/33/200`. The CCK companion 0x0639 keeps its
 vendor value, as on every other generation.
 
@@ -308,22 +306,36 @@ applies unchanged — not an assumption, the vendor's own port-0 descriptor name
 these three registers (`hal/rtl8733b/rtl8733b_ops.c` `port_cfg[0]`:
 net_type `REG_CR_8733B + 2` = 0x0102 shift 0, macaddr 0x0610, bssid 0x0618).
 MAC bring-up leaves net_type at No Link because `init_mac` writes only REG_CR's
-low half, which is exactly why a monitor radio here never ACKed. Teardown
-disarms it explicitly, because `_mac.stop()` clears only that same low half and
-net_type at 0x0102 would survive it: a session ending with
-`teardown_power_down` off would otherwise leave the chip auto-ACKing with no
-session owning it. Verified on air — after an armed session ends with
-power-down disabled, the peer's reports read ack_rate 0.00 with retries pinned
-at 12. The disarm is guarded like the TSSI rollback (register reads throw on a
-disconnected device, and losing the rest of teardown is worse than losing the
-disarm) and is skipped entirely when nothing was armed. The arm is
-read back before it is claimed, and refuses a group MAC outright (a station
-cannot ACK-target one — the I/G footgun, again). Measured against an RTL8812AU
-soliciting TX (`tests/ack_txreport_matrix.sh`, 8733B as RESPONDER): armed
-1736/1736 frames ACKed at retries_mean 0.00; re-armed on a **different** MAC,
-1736/1736 again (the address is arbitrary, not baked in); disarmed, 0.00 with
-retries pinned at the descriptor limit of 12. So this die can be the receiving
-end of a reliable-unicast link.
+low half, which is why a monitor radio here does not ACK.
+
+Three properties of the port worth knowing, none of them local inventions: the
+arm refuses a group MAC and is read back before it is reported, both through
+the shared `ack::is_unicast` / `ack::verify` beside `enable()` — the register
+map lives in one file, so no backend carries a copy that can drift from it. A
+config-driven arm that fails **fails the bring-up** rather than handing back a
+session that quietly answers nothing. And the disarm is unconditional inside
+`Halmac8733bMac::stop()`, not a flag-guarded special case at the device layer:
+`stop()` clears only REG_CR's low half, so net_type at 0x0102 survives it, and
+siting the clear there means no future path can reach `stop()` and leave an
+unowned SIFS-timed transmitter on the air. Verified on air — after an armed
+session ends with `teardown_power_down` off, the peer reads ack_rate 0.00 with
+retries pinned at 12.
+
+Measured against an RTL8812AU soliciting TX (`tests/ack_txreport_matrix.sh`,
+8733B as RESPONDER): armed 1736/1736 frames ACKed at retries_mean 0.00;
+re-armed on a **different** MAC, 1736/1736 again (the address is arbitrary, not
+baked in); disarmed, 0.00 with retries pinned at the descriptor limit of 12.
+
+**What ran is normal-ACK response to unicast singles, and the claim scopes to
+that.** `AckResponder.h` notes the same gate is also a hardware *BlockAck*
+responder on the generations where that was proven; it is NOT proven here.
+`tests/ampdu_ba_check.sh` was pointed at this die (8812CU aggregating TX, 8733B
+responder) and came back indeterminate — armed and disarmed both read 0%
+delivered at retries 0, so the control arm did not separate — which is the
+documented consequence of per-frame CCX accounting not surviving AGG_EN
+(`docs/aggregation.md`), not a verdict on this chip. A-MPDU is unported here
+anyway. So: normal-ACK response measured; BlockAck response untested, pending
+an A-MPDU-capable instrument that does not judge by `tx.report`.
 
 **`tx.retry_limit` drives real autonomous retransmission** — `tx_retry_limit_ok`
 is now true. It could not be measured the way the Jaguars were: that A/B reads
@@ -333,9 +345,13 @@ a passive monitor counting airings per submitted frame — and takes a
 dose-response rather than an on/off pair, because one pair could be ambient and
 a straight line through three levels cannot. Measured 0 -> 0.93, 3 -> 3.93,
 12 -> 12.27 airings/frame against an expected 1 + N, repeatable across a
-0/3/12/0/12 ladder. The ~0.07 shortfall is the `rx.txhit` sampling
-quantization the harness documents (the event fires on the first 10 hits then
-every 100th, so its `hits` field understates by up to 99), not loss.
+0/3/12/0/12 ladder. Two different things account for the shortfalls, and only the smaller one is an
+artefact: the `rx.txhit` readout quantizes to at most 99 airings (the event
+fires on the first 10 hits then every 100th), which is <=0.066/frame at 1500
+frames and covers the 0 and 3 arms entirely. It does NOT cover the 12 arm —
+12.27 against 13 is 0.73/frame, about 1095 airings, an order of magnitude past
+that bound. That residue is monitor loss (or genuinely fewer airings), which is
+why the ratio is reported as a floor and not a point estimate.
 
 **CCX / `tx.report` is NOT ported, and the reason is the firmware.** This is
 the one entry on the Not-ported list whose cause is known but not fixable from

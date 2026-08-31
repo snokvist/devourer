@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # rtl8733b_retry_limit_onair.sh — is DeviceConfig::tx::retry_limit a LIVE
-# actuator on the RTL8733B, or just an encoded descriptor field? (issue #2)
+# actuator on the RTL8733B, or just an encoded descriptor field?
 #
 # The 8733B has no CCX / tx.report path (the firmware emits no C2H reports —
 # src/rtl8733b/CLAUDE.md), so the TX side cannot be its own witness the way
@@ -19,7 +19,8 @@
 # counting EVENTS undercounts by 100x. The event's own `hits` field is the
 # cumulative truth, so we read the LAST hits value. That quantizes the total to
 # the largest multiple of 100 <= H, i.e. H is understated by up to 99 airings
-# (worst case ~6% on the retry=0 arm). Each arm therefore gets a FRESH witness
+# (at the FRAMES_MIN floor below, <=0.099 airings/frame). Each arm gets a FRESH
+# witness
 # so `hits` starts at zero — the counter is static for the process lifetime and
 # does not reset between arms.
 #
@@ -40,6 +41,21 @@ PWR_QDB=${PWR_QDB:-12}
 # RA must be UNICAST (so an ACK is expected) and unowned (so none ever comes).
 RA=${RA:-02:de:ad:be:ef:01}
 OUT=${OUT:-/tmp/rtl8733b_retry}
+
+# The readout is quantized to the last rx.txhit checkpoint (see COUNTING NOTE),
+# so the error is a fixed <=99 airings whatever FRAMES is — which only stays
+# negligible while FRAMES is large. At FRAMES=60 a healthy retry=0 arm airs ~55
+# times, the last checkpoint reads hits=10, and the arm scores 0.17 against a
+# 0.6 floor: a FAIL on working hardware. Refuse below a floor rather than
+# report that, for the same reason an arm that did not run is refused instead
+# of reported as zero.
+FRAMES_MIN=${FRAMES_MIN:-1000}
+if [ "$FRAMES" -lt "$FRAMES_MIN" ]; then
+  echo "ABORT: FRAMES=$FRAMES is below FRAMES_MIN=$FRAMES_MIN — the rx.txhit" >&2
+  echo "       readout quantizes to <=99 airings, which at this size is a" >&2
+  echo "       false FAIL on healthy hardware, not a measurement." >&2
+  exit 2
+fi
 
 KILL(){ sudo pkill -9 -x rxdemo 2>/dev/null; sudo pkill -9 -x txdemo 2>/dev/null; return 0; }
 trap KILL EXIT

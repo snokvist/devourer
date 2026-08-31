@@ -365,6 +365,18 @@ void RtlJaguar2Device::apply_replay_wseq() {
 }
 
 bool RtlJaguar2Device::SetAckResponder(const devourer::MacAddr &mac) {
+  if (!devourer::ack::is_unicast(mac.data())) {
+    /* A station cannot ACK-target a group address, so this arm could never
+     * fire. Refusing beats returning true for a responder that will read as
+     * silently dead — the shape AdapterCaps.h records from the 8821AU
+     * episode. Only the precondition is enforced here: adopting the shared
+     * readback verify() too wants a bench cell per die, since a family whose
+     * 0x0102 does not read back would start refusing healthy arms. */
+    _logger->error("{}: ACK responder needs a UNICAST MAC (I/G set in "
+                   "{:02x}) — not armed",
+                   "Jaguar2", mac.bytes[0]);
+    return false;
+  }
   /* Hardware ACK responder (src/AckResponder.h): port identity + net_type so
    * the MAC auto-ACKs unicast frames to `mac`. Same registers the proven
    * StartBeacon/AP path programs, minus the beacon machinery. */

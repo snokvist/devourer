@@ -258,8 +258,8 @@ nonzero limit for absolute numbers; 8821AU row re-measured ch6):
 | 8821AU | 62% | 0% | works (94% closed-loop at retry 8) |
 | 8812EU | 98% | 0% | works |
 | 8812CU | 69% | 0% | works |
-| 8733B | 100% (retry 12) | 0% | works (1736/1736, retarget- and disarm-proof) |
-| 8852CU (Kestrel) | 0% | 0% | not implemented (SetAckResponder is J1/2/3-only) |
+| 8733B | unmeasured | 0% | works (closed-loop 1736/1736 at retry 12; single-shot cell never run) |
+| 8852CU (Kestrel) | 0% | 0% | not implemented on the AX generation |
 
 Unmeasured for lack of plugged hardware: 8821CU / PCIe 8821CE (recipe-shared
 with the 8822B; their `AdapterCaps.ack_responder_ok` stays false-as-unmeasured

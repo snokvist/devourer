@@ -216,7 +216,8 @@ struct DeviceConfig {
     /* env: DEVOURER_TX_RETRY_LIMIT — per-frame hardware retry limit (0..63;
      * Kestrel ceiling 62 — its attempts-counting WD field folds +1). Maps to
      * the TX descriptor DATA_RETRY_LIMIT / RTS_DATA_RTY_LMT field on the
-     * 11ac generations and wd_info DATA_TXCNT_LMT on Kestrel. 0 = no retries
+     * 11ac generations and the RTL8733B, and wd_info DATA_TXCNT_LMT on
+     * Kestrel. 0 = no retries
      * (WFB default: FEC provides reliability, not MAC retries). On a busy
      * half-duplex link retries flood the air and blind the receiver.
      * Hardware-ARQ (SetAckResponder + unicast TA, docs/scheduled-mac.md)
@@ -234,8 +235,9 @@ struct DeviceConfig {
      * per-bandwidth vendor value is 117 µs), so it also replaces the
      * per-chip / per-bandwidth vendor defaults (which ranged 33..128 µs
      * and made hardware-ARQ range silently die-dependent). The register:
-     * REG_ACKTO 0x640 on the 11ac generations, R_AX_RSP_CHK_SIG 0xCC00
-     * byte0 on Kestrel; the CTS window (REG_CTS2TO 0x641) is separate and
+     * REG_ACKTO 0x640 on the 11ac generations and the RTL8733B (which
+     * overwrites its HALMAC vendor default at bring-up), R_AX_RSP_CHK_SIG
+     * 0xCC00 byte0 on Kestrel; the CTS window (REG_CTS2TO 0x641) is separate and
      * untouched. Sizing: ~6.7 µs x round-trip km + ~50 µs ACK flight and
      * detection margin; a longer window is NOT free — every retry of a
      * LOST frame waits the full window, measured (dead RA, retry 8, max
