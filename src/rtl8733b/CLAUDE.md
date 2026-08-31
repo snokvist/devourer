@@ -279,27 +279,26 @@ knob is told too, and so it fires exactly once per bring-up.
 ## Hardware ARQ
 
 Two of the three hardware-ARQ knobs are measured true on this die; the third is
-refused loudly for a reason that took a bench to find.
+refused loudly because the backend lacks the control path needed to complete
+its diagnosis safely.
 
-The counterparts for everything measured below, stated once here because the
-numbers that follow are uniformly favourable: **one physical unit and one peer
-generation** (the `f72b` RTL8731BU against an RTL8812AU), the same caveat every
-on-air claim in this subtree carries. Neither direction has been cross-checked
-against a second responder die, the second `b733` sample has not run these
-cells, and no vendor-driver A/B exists to compare against. The retry number in
-particular is witnessed by a monitor that can only ever LOSE airings, never
-invent them, so the measured ratio is a floor rather than a point estimate.
+The counterparts for everything measured below: **one physical RTL8733B
+unit**, the `f72b` RTL8731BU, an RTL8812AU peer, and an RTL8812CU passive
+witness. The second `b733` sample has not run these cells, no second responder
+die has been cross-checked, and no vendor-driver A/B exists. These are strong
+single-bench results, not population qualification. Witness copy counts are
+conservative observations because a passive monitor can miss airings.
 
-`DeviceConfig::tx::ack_timeout_us` is honoured. The field's contract — range, clamp, default, register and the range
-budget it buys — is doc-commented at its declaration in `src/DeviceConfig.h`
-and is not restated here. What is specific to this backend: `init_wmac()` still
-writes the vendor `0x21`, so `bring_up_to_phy` overwrites it from the config
-afterwards (the vendor write stays because that MAC plane is shared verbatim
-with `rtl8733bprobe`, which carries no `DeviceConfig`), and the write is read
-back and logged rather than assumed: a knob reported without a readback cannot
-be told apart from one the radio never received. Measured
-`<unset>/128/33/200 -> 128/128/33/200`. The CCK companion 0x0639 keeps its
-vendor value, as on every other generation.
+`DeviceConfig::tx::ack_timeout_us` is honoured. The field's contract — range,
+clamp, default, registers and range budget — is doc-commented at its
+declaration in `src/DeviceConfig.h`. What is specific to this backend:
+`init_wmac()` writes vendor defaults first, then `bring_up_to_phy` overwrites
+and verifies both REG_ACKTO 0x0640 (OFDM/HT) and REG_ACKTO_CCK 0x0639. A
+failure or mismatched readback aborts bring-up instead of reporting a partly
+applied range knob. Both registers read back 33 and 200 in direct runs. At 11M
+CCK to a dead RA, retry 8 and maximum duty, an 8-second run submitted 1513
+frames at 33 µs versus 1129 at 200 µs. That establishes the expected timing
+direction; it is not a precise calibration of the register's timebase.
 
 **`SetAckResponder` is ported and measured.** The `src/AckResponder.h` recipe
 applies unchanged — not an assumption, the vendor's own port-0 descriptor names
@@ -322,9 +321,18 @@ session ends with `teardown_power_down` off, the peer reads ack_rate 0.00 with
 retries pinned at 12.
 
 Measured against an RTL8812AU soliciting TX (`tests/ack_txreport_matrix.sh`,
-8733B as RESPONDER): armed 1736/1736 frames ACKed at retries_mean 0.00;
-re-armed on a **different** MAC, 1736/1736 again (the address is arbitrary, not
-baked in); disarmed, 0.00 with retries pinned at the descriptor limit of 12.
+8733B as RESPONDER): armed 1725/1725 reports ACKed at retries_mean 0.00;
+re-armed on a **different** MAC, 1728/1728 again (the address is arbitrary, not
+baked in); disarmed, 0/1723 successful reports with retries pinned at 12.
+
+The other direction is now measured independently rather than inferred.
+`tests/rtl8733b_arq_tx_onair.sh` puts the RTL8733B in the soliciting-TX role,
+the RTL8812AU in the responder role, and uses an RTL8812CU only as a passive
+payload-counter witness. At MCS3, responder on/off produced 1.032/12.948
+copies per observed frame with 99.7/100% coverage. At 11M CCK the result was
+1.002/11.908 with 95.8/92.3% coverage. This proves that the RTL8733B recognizes
+a real ACK and stops autonomous retry in these normal-ACK cells; it does not
+substitute for the unavailable per-frame delivery report.
 
 **What ran is normal-ACK response to unicast singles, and the claim scopes to
 that.** `AckResponder.h` notes the same gate is also a hardware *BlockAck*
@@ -342,22 +350,19 @@ is now true. It could not be measured the way the Jaguars were: that A/B reads
 the TX side's own CCX reports, and this die has none. `tests/rtl8733b_retry_limit_onair.sh`
 judges from the air instead — unicast to an unowned RA so no ACK ever returns,
 a passive monitor counting airings per submitted frame — and takes a
-dose-response rather than an on/off pair, because one pair could be ambient and
-a straight line through three levels cannot. Measured 0 -> 0.93, 3 -> 3.93,
-12 -> 12.27 airings/frame against an expected 1 + N, repeatable across a
-0/3/12/0/12 ladder. Two different things account for the shortfalls, and only the smaller one is an
-artefact: the `rx.txhit` readout quantizes to at most 99 airings (the event
-fires on the first 10 hits then every 100th), which is <=0.066/frame at 1500
-frames and covers the 0 and 3 arms entirely. It does NOT cover the 12 arm —
-12.27 against 13 is 0.73/frame, about 1095 airings, an order of magnitude past
-that bound. That residue is monitor loss (or genuinely fewer airings), which is
-why the ratio is reported as a floor and not a point estimate.
+dose-response rather than an on/off pair, because the multi-level response is
+stronger evidence than a single delta. The corrected harness uses a
+run-specific unicast SA, counts every payload-counter event, refuses fewer
+than three distinct levels or a missing zero baseline, and rejects partial
+runs. Measured 0 -> 1.00, 3 -> 4.00, 12 -> 12.32–12.33 copies/frame against
+expected 1 + N, repeatable across a 0/3/12/0/12 ladder. The retry-12 shortfall from the
+ideal 13 may be passive-monitor loss or genuinely fewer airings, so the ratio
+is reported as an observation, not an exact hardware count.
 
-**CCX / `tx.report` is NOT ported, and the reason is the firmware.** This is
-the one entry on the Not-ported list whose cause is known but not fixable from
-the descriptor side, so it is recorded in full to save the next person the
-bench time. Everything under this backend's control was verified correct on
-air: SPE_RPT is dword2[19] and SW_DEFINE dword6[11:0] via the generic halmac
+**CCX / `tx.report` is NOT ported, and its root cause is unresolved.** The
+descriptor and receive-side investigation narrows the problem but does not
+prove a firmware defect: SPE_RPT is dword2[19] and SW_DEFINE dword6[11:0] via
+the generic halmac
 NIC macros the 8733B maps straight onto (`hal/halmac/halmac_tx_desc_chip.h`
 maps `SET_TX_DESC_{SPE_RPT,SW_DEFINE}_8733B` onto the non-V2 pair, not the
 0x20/0x24 V2 placement), and a probe build confirmed the bit set in a live
@@ -369,14 +374,16 @@ fw-offload format `parse_ccx_halmac` already decodes (`C2H_EXTEND` 0xFF +
 sub_cmd 0x0F, `hal/rtl8733b/rtl8733b_cmd.c`). With an RX loop live and 3160
 frames received, the firmware returned **zero** C2H packets in any format —
 with and without a net_type armed, and with the peer both ACKing and silent.
-The outstanding lead is the halmac H2C queue plus a MEDIA_STATUS_RPT
-registering the descriptor MACID with the firmware; this backend has no H2C
-transport at all, which is the gap to close first. Until then the knob warns
-at bring-up rather than stamping descriptors that buy nothing — `tx.report`
-requested on this die is refused out loud, not silently dropped.
+The leading missing prerequisite is the halmac H2C queue plus a
+MEDIA_STATUS_RPT registering the descriptor MACID with the firmware; this
+backend has no H2C transport. Until that path is implemented and tested, the
+absence of reports cannot be assigned to firmware. The knob warns at bring-up
+rather than stamping descriptors that are not known to produce anything —
+`tx.report` requested on this die is refused out loud, not silently dropped.
 
-Consequence a consumer should plan around: an 8733BU can be **either end** of a
-hardware-ARQ link, but it cannot see per-frame delivery. `TxReport.state == 1`
+Consequence a consumer should plan around: the measured 8733BU can be **either
+end** of a normal-ACK hardware-ARQ link, but it cannot see per-frame delivery.
+`TxReport.state == 1`
 — the retry write-off that says a peer stopped ACKing — is unavailable here, so
 detecting a departed peer needs an application-level timeout.
 

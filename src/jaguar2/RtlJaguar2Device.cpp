@@ -380,7 +380,10 @@ bool RtlJaguar2Device::SetAckResponder(const devourer::MacAddr &mac) {
   /* Hardware ACK responder (src/AckResponder.h): port identity + net_type so
    * the MAC auto-ACKs unicast frames to `mac`. Same registers the proven
    * StartBeacon/AP path programs, minus the beacon machinery. */
-  devourer::ack::enable(_device, mac.data());
+  if (!devourer::ack::enable(_device, mac.data())) {
+    _logger->error("Jaguar2: ACK responder arm register write failed");
+    return false;
+  }
   _logger->info("Jaguar2: hardware ACK responder armed for "
                 "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
                 mac.bytes[0], mac.bytes[1], mac.bytes[2], mac.bytes[3],
@@ -389,7 +392,10 @@ bool RtlJaguar2Device::SetAckResponder(const devourer::MacAddr &mac) {
 }
 
 void RtlJaguar2Device::ClearAckResponder() {
-  devourer::ack::disable(_device);
+  if (!devourer::ack::disable(_device)) {
+    _logger->error("Jaguar2: ACK responder disarm register write failed");
+    throw std::runtime_error("Jaguar2: ACK responder disarm failed");
+  }
   _logger->info("Jaguar2: hardware ACK responder disarmed (net_type=NoLink)");
 }
 
@@ -470,8 +476,10 @@ void RtlJaguar2Device::Init(Action_ParsedRadioPacket packetProcessor,
     }
   }
 
-  if (_cfg.rx.ack_responder)
-    SetAckResponder(*_cfg.rx.ack_responder); /* DEVOURER_ACK_RESPONDER */
+  if (_cfg.rx.ack_responder &&
+      !SetAckResponder(*_cfg.rx.ack_responder)) /* DEVOURER_ACK_RESPONDER */
+    throw std::runtime_error(
+        "Jaguar2: configured ACK responder could not be armed");
   apply_replay_wseq();
 
   if (_cfg.debug.bb_dump) {
@@ -689,8 +697,10 @@ void RtlJaguar2Device::InitWrite(SelectedChannel channel) {
    * center frequency. DEVOURER_CW_TONE_GAIN=0..31 sets RF 0x00[4:0]. */
   if (_cfg.tx.cw_tone)
     StartCwTone(_cfg.tx.cw_tone_gain & 0x1F);
-  if (_cfg.rx.ack_responder)
-    SetAckResponder(*_cfg.rx.ack_responder); /* DEVOURER_ACK_RESPONDER */
+  if (_cfg.rx.ack_responder &&
+      !SetAckResponder(*_cfg.rx.ack_responder)) /* DEVOURER_ACK_RESPONDER */
+    throw std::runtime_error(
+        "Jaguar2: configured ACK responder could not be armed");
   if (_cfg.tx.ampdu)
     SetAmpduMode(*_cfg.tx.ampdu); /* DEVOURER_TX_AMPDU_MODE */
   apply_replay_wseq();

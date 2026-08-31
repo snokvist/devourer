@@ -134,8 +134,10 @@ void RtlJaguar3Device::Init(Action_ParsedRadioPacket packetProcessor,
     }
   }
 
-  if (_cfg.rx.ack_responder)
-    SetAckResponder(*_cfg.rx.ack_responder); /* DEVOURER_ACK_RESPONDER */
+  if (_cfg.rx.ack_responder &&
+      !SetAckResponder(*_cfg.rx.ack_responder)) /* DEVOURER_ACK_RESPONDER */
+    throw std::runtime_error(
+        "Jaguar3: configured ACK responder could not be armed");
   apply_replay_wseq(); /* DEVOURER_REPLAY_WSEQ — end of both bring-ups,
                         * like Jaguar2's. */
   if (_cfg.debug.bb_dump) {
@@ -906,8 +908,10 @@ void RtlJaguar3Device::InitWrite(SelectedChannel channel) {
                     _device.rtw_read32(a + 8), _device.rtw_read32(a + 12));
   }
   _coex_thread = std::thread([this] { coex_runtime_loop(); });
-  if (_cfg.rx.ack_responder)
-    SetAckResponder(*_cfg.rx.ack_responder); /* DEVOURER_ACK_RESPONDER */
+  if (_cfg.rx.ack_responder &&
+      !SetAckResponder(*_cfg.rx.ack_responder)) /* DEVOURER_ACK_RESPONDER */
+    throw std::runtime_error(
+        "Jaguar3: configured ACK responder could not be armed");
   if (_cfg.tx.ampdu)
     SetAmpduMode(*_cfg.tx.ampdu); /* DEVOURER_TX_AMPDU_MODE */
   _logger->info("Jaguar3: ready for TX (monitor inject)");
@@ -2167,7 +2171,10 @@ bool RtlJaguar3Device::SetAckResponder(const devourer::MacAddr &mac) {
    * StartBeacon/AP path programs, minus the beacon machinery. Serialized on
    * _reg_mu like every other register-touching control call. */
   std::lock_guard<std::mutex> lk(_reg_mu);
-  devourer::ack::enable(_device, mac.data());
+  if (!devourer::ack::enable(_device, mac.data())) {
+    _logger->error("Jaguar3: ACK responder arm register write failed");
+    return false;
+  }
   _logger->info("Jaguar3: hardware ACK responder armed for "
                 "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
                 mac.bytes[0], mac.bytes[1], mac.bytes[2], mac.bytes[3],
@@ -2177,7 +2184,10 @@ bool RtlJaguar3Device::SetAckResponder(const devourer::MacAddr &mac) {
 
 void RtlJaguar3Device::ClearAckResponder() {
   std::lock_guard<std::mutex> lk(_reg_mu);
-  devourer::ack::disable(_device);
+  if (!devourer::ack::disable(_device)) {
+    _logger->error("Jaguar3: ACK responder disarm register write failed");
+    throw std::runtime_error("Jaguar3: ACK responder disarm failed");
+  }
   _logger->info("Jaguar3: hardware ACK responder disarmed (net_type=NoLink)");
 }
 

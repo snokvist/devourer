@@ -12,12 +12,10 @@
  * responder for one MAC address while everything else about monitor mode
  * (promiscuous RX, injection) is unchanged.
  *
- * The SAME gate is a hardware BlockAck responder: the MAC's immediate-response
- * engine generates a SIFS-timed BlockAck for a received A-MPDU addressed to
- * its MACID, no ADDBA session state required (bench-proven,
- * tests/ampdu_ba_check.sh). So this one knob enables both reliable-unicast
- * ACK (for singles) and reliable-unicast A-MPDU (SetAmpduMode no_ack=false)
- * on the peer.
+ * On the adapter combinations exercised by tests/ampdu_ba_check.sh, the SAME
+ * gate also enables the hardware BlockAck responder. That result is not
+ * generation-neutral: RTL8733B is proven here only for normal ACKs to unicast
+ * singles; its BlockAck response remains untested.
  *
  * The registers are generation-neutral (same map on Jaguar1/2/3):
  *   0x0610..0x0615  REG_MACID   — the RA the ACK engine matches
@@ -40,23 +38,50 @@
 namespace devourer {
 namespace ack {
 
-inline void enable(RtlAdapter &dev, const uint8_t mac[6]) {
-  dev.rtw_write<uint32_t>(0x0610, (uint32_t)mac[0] | ((uint32_t)mac[1] << 8) |
-                                      ((uint32_t)mac[2] << 16) |
-                                      ((uint32_t)mac[3] << 24));
-  dev.rtw_write16(0x0614, (uint16_t)(mac[4] | (mac[5] << 8)));
-  dev.rtw_write<uint32_t>(0x0618, (uint32_t)mac[0] | ((uint32_t)mac[1] << 8) |
-                                      ((uint32_t)mac[2] << 16) |
-                                      ((uint32_t)mac[3] << 24));
-  dev.rtw_write16(0x061c, (uint16_t)(mac[4] | (mac[5] << 8)));
+inline bool enable(RtlAdapter &dev, const uint8_t mac[6]) {
   const uint8_t nt = dev.rtw_read8(0x0102);
-  dev.rtw_write8(0x0102, static_cast<uint8_t>((nt & ~0x03u) | 0x03u));
+  /* Close the gate before changing identity. Besides avoiding a transient
+   * responder for a half-written MAC during retargeting, this makes every
+   * failed identity write leave the radio passive. */
+  if (!dev.rtw_write8(0x0102, static_cast<uint8_t>(nt & ~0x03u)))
+    return false;
+  if (!dev.rtw_write<uint32_t>(
+          0x0610, (uint32_t)mac[0] | ((uint32_t)mac[1] << 8) |
+                      ((uint32_t)mac[2] << 16) |
+                      ((uint32_t)mac[3] << 24)) ||
+      !dev.rtw_write16(0x0614, (uint16_t)(mac[4] | (mac[5] << 8))) ||
+      !dev.rtw_write<uint32_t>(
+          0x0618, (uint32_t)mac[0] | ((uint32_t)mac[1] << 8) |
+                      ((uint32_t)mac[2] << 16) |
+                      ((uint32_t)mac[3] << 24)) ||
+      !dev.rtw_write16(0x061c, (uint16_t)(mac[4] | (mac[5] << 8))))
+    return false;
+  if (dev.rtw_write8(0x0102,
+                     static_cast<uint8_t>((nt & ~0x03u) | 0x03u)))
+    return true;
+  /* A failed status does not prove the gate write had no side effect. Make a
+   * best-effort close before reporting failure; RTL8733B additionally reads
+   * this back in its caller. */
+  (void)dev.rtw_write8(0x0102, static_cast<uint8_t>(nt & ~0x03u));
+  return false;
 }
 
 /* Disarm: net_type back to No Link — the gate, so the MACID may stay. */
-inline void disable(RtlAdapter &dev) {
+inline bool disable(RtlAdapter &dev) {
   const uint8_t nt = dev.rtw_read8(0x0102);
-  dev.rtw_write8(0x0102, static_cast<uint8_t>(nt & ~0x03u));
+  return dev.rtw_write8(0x0102, static_cast<uint8_t>(nt & ~0x03u));
+}
+
+inline bool is_disabled(RtlAdapter &dev) {
+  return (dev.rtw_read8(0x0102) & 0x03u) == 0;
+}
+
+inline bool disable_verified(RtlAdapter &dev) {
+  (void)disable(dev);
+  /* Readback is the safety result: a control transfer may report failure even
+   * though the write landed, while a successful transfer alone proves no
+   * state. The caller only needs to know whether the active gate is closed. */
+  return is_disabled(dev);
 }
 
 /* The MAC must be UNICAST: a station cannot ACK-target a group address, so an

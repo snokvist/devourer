@@ -202,7 +202,8 @@ CCX reports: responder ON = 100% delivered at mean 0.4 retries (67%
 first-try); OFF = 0% delivered, every frame pinned at the 12-retry limit. The
 retry distribution is the per-frame TX-side link-quality sensor.
 
-The same responder is a hardware **BlockAck** responder: the MAC's
+On the adapter combinations measured by `tests/ampdu_ba_check.sh`, the same
+responder is a hardware **BlockAck** responder: the MAC's
 immediate-response engine generates a SIFS-timed BlockAck for a received
 A-MPDU addressed to its MACID, on the same MACID + net_type gate. So
 reliable-unicast **ACKed A-MPDU** works end to end — the TX runs `SetAmpduMode`
@@ -212,7 +213,8 @@ aggregates deliver at 100% / mean 0.1 retries and ~27× the throughput of the
 responder-off case (where every aggregate re-airs to the retry limit). The
 `no_ack = true` default is the broadcast/FEC flavor (OpenIPC wfb — no
 responder, no re-air storm); `false` is the reliable-unicast flavor against a
-BA responder.
+BA responder. This BA result is not yet established for RTL8733B; that backend
+has only normal-ACK singles measured and keeps A-MPDU unported.
 
 Every MAC address in the loop must be **unicast** (I/G bit clear): the
 responder `mac` (an ACK/BlockAck cannot target a group address) and the TX

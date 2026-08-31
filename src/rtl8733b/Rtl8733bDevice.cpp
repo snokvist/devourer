@@ -7,7 +7,7 @@
 #include <utility>
 #include <vector>
 
-#include "AckResponder.h" /* hardware ACK/BlockAck responder recipe */
+#include "AckResponder.h" /* hardware ACK responder recipe */
 #include "RateDefinitions.h"
 #include "RadiotapPeek.h" /* send_packets batch pre-parse */
 #include "RadiotapTxFlags.h"
@@ -81,8 +81,9 @@ void Rtl8733bDevice::bring_up_to_phy() {
   /* ACK window (DEVOURER_ACK_TIMEOUT_US): the one library default every
    * generation programs identically, replacing the vendor value init_wmac just
    * wrote (0x21 = 33 us — the bottom of the 33..128 per-chip spread the single
-   * default exists to abolish). Same clamp and same register as jaguar1/2/3;
-   * see the DeviceConfig field doc for the range budget it buys.
+   * default exists to abolish). Same clamp as jaguar1/2/3, applied here to
+   * both the normal and CCK response-window registers; see the DeviceConfig
+   * field doc for the range budget it buys.
    *
    * Applied rather than left at the vendor value for the reason this backend
    * refuses knobs elsewhere (disable_cca, SetTxPowerIndexOverride): a config
@@ -98,14 +99,18 @@ void Rtl8733bDevice::bring_up_to_phy() {
       _cfg.tx.ack_timeout_us > 255   ? 255
       : _cfg.tx.ack_timeout_us < 1 ? 1
                                    : _cfg.tx.ack_timeout_us);
-  const uint8_t ackto_got = _mac.set_ack_timeout_us(ackto_want);
-  if (ackto_got != ackto_want)
-    _logger->warn("RTL8733B: ACK window did not latch — REG_ACKTO reads {} us, "
-                  "wanted {} us",
-                  ackto_got, ackto_want);
-  else
-    _logger->info("RTL8733B: ACK window {} us (REG_ACKTO 0x640, verified)",
-                  ackto_got);
+  const auto ackto = _mac.set_ack_timeout_us(ackto_want);
+  if (!ackto.writes_ok || ackto.non_cck != ackto_want ||
+      ackto.cck != ackto_want) {
+    _logger->error(
+        "RTL8733B: ACK window did not latch — REG_ACKTO={} us "
+        "REG_ACKTO_CCK={} us, wanted {} us",
+        ackto.non_cck, ackto.cck, ackto_want);
+    throw std::runtime_error("RTL8733B: configured ACK window did not latch");
+  }
+  _logger->info(
+      "RTL8733B: ACK window {} us (REG_ACKTO 0x640 + CCK 0x639, verified)",
+      ackto_want);
   /* DEVOURER_ACK_RESPONDER — opt-in only, never a default: it turns a passive
    * monitor into an active SIFS-timed transmitter. Sited here with the other
    * bring-up knobs so an RX-only session (Init) arms it too, which is the
@@ -141,12 +146,11 @@ void Rtl8733bDevice::bring_up_to_phy() {
     _logger->warn(
         "RTL8733B: DEVOURER_DIS_CCA / tuning.disable_cca is not implemented by "
         "this backend — carrier-sense stays ENABLED for this session");
-  /* DEVOURER_TX_REPORT: the CCX per-frame TX-status path is not ported, and
-   * unlike the knobs above the reason is the firmware rather than a missing
-   * register — everything under this backend's control was verified correct on
-   * air and the chip still returned no C2H at all. The full bench narrative and
-   * the outstanding lead live in src/rtl8733b/CLAUDE.md "Hardware ARQ"; it is
-   * not repeated here.
+  /* DEVOURER_TX_REPORT: the CCX per-frame TX-status path is not ported. The
+   * descriptor and receive-side pieces were checked, but this backend lacks
+   * the H2C/MEDIA_STATUS_RPT path needed to register the MACID, so the observed
+   * absence of C2H reports is not assigned to firmware. The full bench
+   * narrative lives in src/rtl8733b/CLAUDE.md "Hardware ARQ".
    *
    * Warn rather than drop it silently: a consumer that sets this knob is
    * asking for its per-frame delivery sensor, and would otherwise read the
@@ -155,8 +159,8 @@ void Rtl8733bDevice::bring_up_to_phy() {
   if (_cfg.tx.report)
     _logger->warn(
         "RTL8733B: DEVOURER_TX_REPORT / tx.report is not implemented by this "
-        "backend — the firmware emits no CCX reports, so no tx.report events "
-        "will arrive (see src/rtl8733b/CLAUDE.md)");
+        "backend — no CCX reports were observed, and the H2C/MACID "
+        "registration path is missing (see src/rtl8733b/CLAUDE.md)");
 }
 
 void Rtl8733bDevice::Init(Action_ParsedRadioPacket packetProcessor,
@@ -837,18 +841,37 @@ bool Rtl8733bDevice::SetAckResponder(const devourer::MacAddr &mac) {
                    mac.bytes[0]);
     return false;
   }
-  devourer::ack::enable(_device, mac.data());
-  /* Verify with the shared readback rather than a local copy of the map: this
-   * backend does not report a write it cannot confirm (the standard SetCcaMode
-   * and SetTxPowerOffsetQdb are held to). Teardown disarms unconditionally in
-   * Halmac8733bMac::stop(), so a half-landed arm cannot outlive the session
-   * whatever this returns. */
-  if (!devourer::ack::verify(_device, mac.data())) {
-    _logger->error("RTL8733B: ACK responder did not latch for "
-                   "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                   mac.bytes[0], mac.bytes[1], mac.bytes[2], mac.bytes[3],
-                   mac.bytes[4], mac.bytes[5]);
-    return false;
+  try {
+    if (!devourer::ack::enable(_device, mac.data())) {
+      if (!devourer::ack::disable_verified(_device))
+        throw std::runtime_error(
+            "RTL8733B: ACK responder arm failed and rollback did not latch");
+      _logger->error("RTL8733B: ACK responder register write failed — not armed");
+      return false;
+    }
+    /* Verify with the shared readback rather than a local copy of the map:
+     * this backend does not report a write it cannot confirm. A failed arm is
+     * rolled back and the NoLink gate is read back before false is returned. */
+    if (!devourer::ack::verify(_device, mac.data())) {
+      if (!devourer::ack::disable_verified(_device))
+        throw std::runtime_error(
+            "RTL8733B: ACK responder verify failed and rollback did not latch");
+      _logger->error("RTL8733B: ACK responder did not latch for "
+                     "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                     mac.bytes[0], mac.bytes[1], mac.bytes[2], mac.bytes[3],
+                     mac.bytes[4], mac.bytes[5]);
+      return false;
+    }
+  } catch (...) {
+    bool rolled_back = false;
+    try {
+      rolled_back = devourer::ack::disable_verified(_device);
+    } catch (...) {
+    }
+    if (!rolled_back)
+      _logger->error(
+          "RTL8733B: ACK responder arm failed with hardware state UNKNOWN");
+    throw;
   }
   _logger->info("RTL8733B: hardware ACK responder armed for "
                 "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} (net_type=AP)",
@@ -861,7 +884,10 @@ void Rtl8733bDevice::ClearAckResponder() {
   std::lock_guard<std::recursive_mutex> lock(_reg_mu);
   if (!_mac_ready)
     return;
-  devourer::ack::disable(_device);
+  if (!devourer::ack::disable_verified(_device)) {
+    _logger->error("RTL8733B: ACK responder disarm did not latch");
+    throw std::runtime_error("RTL8733B: ACK responder disarm failed");
+  }
   _logger->info("RTL8733B: hardware ACK responder disarmed (net_type=NoLink)");
 }
 

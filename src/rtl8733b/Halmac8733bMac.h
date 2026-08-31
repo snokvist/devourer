@@ -102,6 +102,12 @@ struct MacState {
   bool matches_normal_usb3out() const;
 };
 
+struct AckTimeoutState {
+  uint8_t non_cck = 0;
+  uint8_t cck = 0;
+  bool writes_ok = false;
+};
+
 /* RTL8733B HALMAC 87xx MAC/EFUSE plane: physical OTP, logical-map decode,
  * normal-mode queue/page allocation, protocol/EDCA/WMAC, USB RX-DMA, and TRX
  * lifecycle. The probe and production device deliberately share this path. */
@@ -112,11 +118,11 @@ public:
   bool read_efuse(EfuseInfo &out);
   bool initialize(const EfuseInfo &efuse);
   bool configure_monitor_rx(bool keep_corrupted);
-  /* REG_ACKTO (0x0640) only, in microseconds. The caller owns the
-   * 1..255 clamp DeviceConfig::tx::ack_timeout_us documents; this is the
-   * register plane, and the CCK companion 0x0639 is deliberately left at
-   * its vendor value, matching the register the Jaguar backends touch. */
-  uint8_t set_ack_timeout_us(uint8_t microseconds);
+  /* Program both response-window registers: REG_ACKTO (0x0640) for OFDM/HT
+   * and REG_ACKTO_CCK (0x0639) for CCK. Returns the actual readback plus the
+   * transport-write result so a configured value cannot green-initialize in
+   * only half of the advertised modulation surface. */
+  AckTimeoutState set_ack_timeout_us(uint8_t microseconds);
   void stop();
   MacState read_mac_state();
 

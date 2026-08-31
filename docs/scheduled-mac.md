@@ -173,12 +173,13 @@ scheduled MAC runs TX+RX anyway, so this is the relevant session shape.
 | Jaguar2 8812BU | 0.91 / 2.1 (run-to-run 0.12–0.91) | 0.64 / 5.3 | yes (12) | 0.86 | 0 |
 | Jaguar3 8822CU | 1.00 / 0.24 | 1.00 / 0.13 | yes (12) | 0.96 | 0 |
 
-The RTL8733B is deliberately absent from this table: it is the one die that
-runs closed-loop hardware ARQ with **no CCX report at all**, so none of these
-columns can be filled for it as the soliciting TX. Its retry knob is measured
-from the air instead (airings per submitted frame, 0/3/12 -> 0.93/3.93/12.27)
-and its responder side is measured with this same harness pointed the other
-way — `docs/rtl8733b.md` "Hardware ARQ".
+The RTL8733B is deliberately absent from this CCX table: no `tx.report` events
+arrive on that backend, so these columns cannot be filled for it. Independent
+airtime evidence does cover its soliciting side: a passive RTL8812CU witness
+measured 1.032 copies/frame with an RTL8812AU responder armed versus 12.948
+with it off at MCS3; at 11M CCK the corresponding values were 1.002/11.908.
+Its dead-peer retry dose response was 0/3/12 -> 1.00/4.00/12.32–12.33 copies/frame.
+All are one-RTL8733B bench results; details are in `docs/rtl8733b.md`.
 
 The OFF-phase pin is set by `DEVOURER_TX_RETRY_LIMIT` (the matrix runs 12,
 the value the descriptors used to hardcode) — the knob, not a descriptor
@@ -258,7 +259,7 @@ nonzero limit for absolute numbers; 8821AU row re-measured ch6):
 | 8821AU | 62% | 0% | works (94% closed-loop at retry 8) |
 | 8812EU | 98% | 0% | works |
 | 8812CU | 69% | 0% | works |
-| 8733B | unmeasured | 0% | works (closed-loop 1736/1736 at retry 12; single-shot cell never run) |
+| 8733B | unmeasured | 0% | works (closed-loop 1725/1725 at retry 12; single-shot cell never run) |
 | 8852CU (Kestrel) | 0% | 0% | not implemented on the AX generation |
 
 Unmeasured for lack of plugged hardware: 8821CU / PCIe 8821CE (recipe-shared
@@ -309,9 +310,10 @@ carry this table per die.
    stalled spsc-fat pool drained ~3 k frames in one receipt interval; the
    8192 default clears that bench worst case ~2.7×).
 2. **Closed-loop hardware ACK + autonomous retry is GO on Jaguar1, Jaguar3 and
-   the RTL8733B** (100% delivery, retries ≈ 0.2–0.3; the 8733B closes the loop
-   as responder at 1736/1736 but has no CCX report of its own, so its TX-side
-   retry evidence is airtime rather than `tx.report` — `docs/rtl8733b.md`)
+   the RTL8733B** (the CCX delivery/retry figures apply to the Jaguars; the
+   one-sample 8733B closes the loop as responder at 1725/1725 and as soliciting
+   TX collapses from 12.948 to 1.032 witnessed copies/frame at MCS3, but has no
+   per-frame report of its own — `docs/rtl8733b.md`)
    including retargeting an
    arbitrary UE MAC mid-session (re-arm `SetAckResponder`, change the
    descriptor RA — both fully dynamic). Requires a nonzero

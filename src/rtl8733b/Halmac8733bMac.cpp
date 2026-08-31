@@ -681,12 +681,14 @@ void Halmac8733bMac::init_wmac() {
   _device.rtw_write8(kRegWmacOption1, 0x18); // 0x98 with early-drop disabled
 }
 
-uint8_t Halmac8733bMac::set_ack_timeout_us(uint8_t microseconds) {
-  _device.rtw_write8(kRegAckTimeout, microseconds);
-  /* Read back and return what the register carries, so the caller can report
-   * the window the hardware actually holds: a value reported without a
-   * readback cannot be told apart from one the radio never received. */
-  return _device.rtw_read8(kRegAckTimeout);
+AckTimeoutState Halmac8733bMac::set_ack_timeout_us(uint8_t microseconds) {
+  const bool non_cck_ok = _device.rtw_write8(kRegAckTimeout, microseconds);
+  const bool cck_ok = _device.rtw_write8(kRegAckTimeoutCck, microseconds);
+  /* Read back both rate families. A successful control transfer alone does
+   * not prove that either register accepted the requested value. */
+  return {.non_cck = _device.rtw_read8(kRegAckTimeout),
+          .cck = _device.rtw_read8(kRegAckTimeoutCck),
+          .writes_ok = non_cck_ok && cck_ok};
 }
 
 void Halmac8733bMac::init_usb() {
@@ -813,7 +815,15 @@ void Halmac8733bMac::stop() {
    * unicast frames with SIFS-timed ACKs after the session that armed it is
    * gone. Unconditional and sited here so no caller can reach _mac.stop()
    * without it; a no-op on a session (or on rtl8733bprobe) that never armed. */
-  devourer::ack::disable(_device);
+  try {
+    if (!devourer::ack::disable_verified(_device))
+      _logger->warn("RTL8733B: ACK responder disarm did not latch during stop");
+  } catch (const std::exception &e) {
+    /* Teardown is best-effort after disconnect. Do not let the new safety
+     * clear prevent the remaining RCR/queue/CR shutdown steps from running. */
+    _logger->warn("RTL8733B: ACK responder disarm failed during stop: {}",
+                  e.what());
+  }
   _device.rtw_write32(kRegRcr, 0);
   _device.rtw_write8(
       kRegTxdmaPqMap,
