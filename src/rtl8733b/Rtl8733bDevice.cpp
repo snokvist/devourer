@@ -100,14 +100,18 @@ void Rtl8733bDevice::bring_up_to_phy() {
       : _cfg.tx.ack_timeout_us < 1 ? 1
                                    : _cfg.tx.ack_timeout_us);
   const auto ackto = _mac.set_ack_timeout_us(ackto_want);
-  if (!ackto.writes_ok || ackto.non_cck != ackto_want ||
-      ackto.cck != ackto_want) {
+  if (ackto.non_cck != ackto_want || ackto.cck != ackto_want) {
     _logger->error(
         "RTL8733B: ACK window did not latch — REG_ACKTO={} us "
         "REG_ACKTO_CCK={} us, wanted {} us",
         ackto.non_cck, ackto.cck, ackto_want);
     throw std::runtime_error("RTL8733B: configured ACK window did not latch");
   }
+  if (!ackto.writes_ok)
+    _logger->warn(
+        "RTL8733B: ACK-window write reported a transport failure, but both "
+        "register readbacks match {} us",
+        ackto_want);
   _logger->info(
       "RTL8733B: ACK window {} us (REG_ACKTO 0x640 + CCK 0x639, verified)",
       ackto_want);
@@ -841,37 +845,30 @@ bool Rtl8733bDevice::SetAckResponder(const devourer::MacAddr &mac) {
                    mac.bytes[0]);
     return false;
   }
-  try {
-    if (!devourer::ack::enable(_device, mac.data())) {
-      if (!devourer::ack::disable_verified(_device))
-        throw std::runtime_error(
-            "RTL8733B: ACK responder arm failed and rollback did not latch");
-      _logger->error("RTL8733B: ACK responder register write failed — not armed");
-      return false;
+  if (!devourer::ack::enable(_device, mac.data())) {
+    if (!devourer::ack::disable_verified(_device)) {
+      _logger->error(
+          "RTL8733B: ACK responder arm failed with hardware state UNKNOWN");
+    } else {
+      _logger->error(
+          "RTL8733B: ACK responder register write failed — not armed");
     }
-    /* Verify with the shared readback rather than a local copy of the map:
-     * this backend does not report a write it cannot confirm. A failed arm is
-     * rolled back and the NoLink gate is read back before false is returned. */
-    if (!devourer::ack::verify(_device, mac.data())) {
-      if (!devourer::ack::disable_verified(_device))
-        throw std::runtime_error(
-            "RTL8733B: ACK responder verify failed and rollback did not latch");
+    return false;
+  }
+  /* Verify with the shared readback rather than a local copy of the map:
+   * this backend does not report a write it cannot confirm. A failed arm is
+   * rolled back and the NoLink gate is read back before false is returned. */
+  if (!devourer::ack::verify(_device, mac.data())) {
+    if (!devourer::ack::disable_verified(_device)) {
+      _logger->error(
+          "RTL8733B: ACK responder verify failed with hardware state UNKNOWN");
+    } else {
       _logger->error("RTL8733B: ACK responder did not latch for "
                      "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
                      mac.bytes[0], mac.bytes[1], mac.bytes[2], mac.bytes[3],
                      mac.bytes[4], mac.bytes[5]);
-      return false;
     }
-  } catch (...) {
-    bool rolled_back = false;
-    try {
-      rolled_back = devourer::ack::disable_verified(_device);
-    } catch (...) {
-    }
-    if (!rolled_back)
-      _logger->error(
-          "RTL8733B: ACK responder arm failed with hardware state UNKNOWN");
-    throw;
+    return false;
   }
   _logger->info("RTL8733B: hardware ACK responder armed for "
                 "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} (net_type=AP)",
@@ -886,7 +883,7 @@ void Rtl8733bDevice::ClearAckResponder() {
     return;
   if (!devourer::ack::disable_verified(_device)) {
     _logger->error("RTL8733B: ACK responder disarm did not latch");
-    throw std::runtime_error("RTL8733B: ACK responder disarm failed");
+    return;
   }
   _logger->info("RTL8733B: hardware ACK responder disarmed (net_type=NoLink)");
 }

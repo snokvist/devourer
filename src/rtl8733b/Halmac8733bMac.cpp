@@ -815,15 +815,8 @@ void Halmac8733bMac::stop() {
    * unicast frames with SIFS-timed ACKs after the session that armed it is
    * gone. Unconditional and sited here so no caller can reach _mac.stop()
    * without it; a no-op on a session (or on rtl8733bprobe) that never armed. */
-  try {
-    if (!devourer::ack::disable_verified(_device))
-      _logger->warn("RTL8733B: ACK responder disarm did not latch during stop");
-  } catch (const std::exception &e) {
-    /* Teardown is best-effort after disconnect. Do not let the new safety
-     * clear prevent the remaining RCR/queue/CR shutdown steps from running. */
-    _logger->warn("RTL8733B: ACK responder disarm failed during stop: {}",
-                  e.what());
-  }
+  if (!devourer::ack::disable_verified(_device))
+    _logger->warn("RTL8733B: ACK responder disarm did not latch during stop");
   _device.rtw_write32(kRegRcr, 0);
   _device.rtw_write8(
       kRegTxdmaPqMap,

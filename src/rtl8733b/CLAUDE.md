@@ -325,7 +325,7 @@ Measured against an RTL8812AU soliciting TX (`tests/ack_txreport_matrix.sh`,
 re-armed on a **different** MAC, 1728/1728 again (the address is arbitrary, not
 baked in); disarmed, 0/1723 successful reports with retries pinned at 12.
 
-The other direction is now measured independently rather than inferred.
+Soliciting-TX ACK recognition is measured independently.
 `tests/rtl8733b_arq_tx_onair.sh` puts the RTL8733B in the soliciting-TX role,
 the RTL8812AU in the responder role, and uses an RTL8812CU only as a passive
 payload-counter witness. At MCS3, responder on/off produced 1.032/12.948
@@ -334,35 +334,31 @@ copies per observed frame with 99.7/100% coverage. At 11M CCK the result was
 a real ACK and stops autonomous retry in these normal-ACK cells; it does not
 substitute for the unavailable per-frame delivery report.
 
-**BlockAck response is now separately measured without CCX.** The original
-`tests/ampdu_ba_check.sh` attempt (8812CU aggregating TX, 8733B responder) was
-indeterminate because armed and disarmed both read 0% delivered/retries 0 —
-the documented failure of per-frame CCX accounting under AGG_EN
-(`docs/aggregation.md`), not a radio verdict. The replacement
-`tests/rtl8733b_blockack_onair.sh` uses a Jaguar2 `0bda:b812` TX, this
-RTL8733B as responder, and a Jaguar1 `0bda:8812` passive witness. At ch36/MCS3
-with retry limit 12, the fully initialized but unarmed control produced 1,605
-unique payloads at 12.720 copies/payload and zero matching BlockAck frames;
-armed produced 128,702 at 1.001 plus 14,402 addressed `0x94` BlockAcks, every
-one carrying a nonzero bitmap. Both arms were real A-MPDUs (`paggr`
-0.665/1.000, max burst 9). The control-frame event checks RA=the Jaguar2 TA
-and TA=the configured RTL8733B MAC, so ambient BlockAcks do not count. This
-establishes the RTL8733B responder on that measured combination only.
-RTL8733B A-MPDU **TX** remains unported and unmeasured.
+**BlockAck response is measured without CCX.** Per-frame CCX accounting is not
+a valid retry oracle under A-MPDU (`docs/aggregation.md`), so
+`tests/rtl8733b_blockack_onair.sh` uses a Jaguar2 `0bda:b812` TX, this RTL8733B
+as responder, and a Jaguar1 `0bda:8812` passive witness. At ch36/MCS3 with
+retry limit 12, the fully initialized but unarmed control produced 1,605 unique
+payloads at 12.720 copies/payload and zero matching BlockAck frames; armed
+produced 128,702 at 1.001 plus 14,402 addressed `0x94` BlockAcks, every one
+carrying a nonzero bitmap. Both arms were real A-MPDUs (`paggr` 0.665/1.000,
+max burst 9). The control-frame event checks RA=the Jaguar2 TA and TA=the
+configured RTL8733B MAC, so ambient BlockAcks do not count. This establishes
+the RTL8733B responder on that measured combination only. RTL8733B A-MPDU
+**TX** remains unported and unmeasured.
 
 **`tx.retry_limit` drives real autonomous retransmission** — `tx_retry_limit_ok`
-is now true. It could not be measured the way the Jaguars were: that A/B reads
-the TX side's own CCX reports, and this die has none. `tests/rtl8733b_retry_limit_onair.sh`
-judges from the air instead — unicast to an unowned RA so no ACK ever returns,
-a passive monitor counting airings per submitted frame — and takes a
-dose-response rather than an on/off pair, because the multi-level response is
-stronger evidence than a single delta. The corrected harness uses a
-run-specific unicast SA, counts every payload-counter event, refuses fewer
-than three distinct levels or a missing zero baseline, and rejects partial
-runs. Measured 0 -> 1.00, 3 -> 4.00, 12 -> 12.32–12.33 copies/frame against
-expected 1 + N, repeatable across a 0/3/12/0/12 ladder. The retry-12 shortfall from the
-ideal 13 may be passive-monitor loss or genuinely fewer airings, so the ratio
-is reported as an observation, not an exact hardware count.
+is true. `tests/rtl8733b_retry_limit_onair.sh` judges from the air because this
+die has no TX-side CCX reports: unicast to an unowned RA ensures no ACK ever
+returns, while a passive monitor counts clean airings per submitted frame. A
+dose-response rather than an on/off pair gives multi-level evidence. The
+harness uses a run-specific unicast SA, counts every clean payload-counter
+event, refuses fewer than three distinct levels or a missing zero baseline,
+and rejects partial runs. Measured 0 -> 1.00, 3 -> 4.00, 12 -> 12.32–12.33
+copies/frame against expected 1 + N, repeatable across a 0/3/12/0/12 ladder.
+The retry-12 shortfall from the ideal 13 may be passive-monitor loss or
+genuinely fewer airings, so the ratio is reported as an observation, not an
+exact hardware count.
 
 **CCX / `tx.report` is NOT ported, and its root cause is unresolved.** The
 descriptor and receive-side investigation narrows the problem but does not

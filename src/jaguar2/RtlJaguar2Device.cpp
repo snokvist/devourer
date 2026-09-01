@@ -381,17 +381,12 @@ bool RtlJaguar2Device::SetAckResponder(const devourer::MacAddr &mac) {
    * the MAC auto-ACKs unicast frames to `mac`. Same registers the proven
    * StartBeacon/AP path programs, minus the beacon machinery. */
   if (!devourer::ack::enable(_device, mac.data())) {
-    bool rolled_back = false;
-    try {
-      rolled_back = devourer::ack::disable_verified(_device);
-    } catch (...) {
-    }
-    if (!rolled_back) {
+    if (!devourer::ack::disable_verified(_device)) {
       _logger->error("Jaguar2: ACK responder arm failed and rollback did "
                      "not latch; hardware state is unknown");
-      throw std::runtime_error("Jaguar2: ACK responder arm rollback failed");
+    } else {
+      _logger->error("Jaguar2: ACK responder arm register write failed");
     }
-    _logger->error("Jaguar2: ACK responder arm register write failed");
     return false;
   }
   _logger->info("Jaguar2: hardware ACK responder armed for "
@@ -404,7 +399,7 @@ bool RtlJaguar2Device::SetAckResponder(const devourer::MacAddr &mac) {
 void RtlJaguar2Device::ClearAckResponder() {
   if (!devourer::ack::disable_verified(_device)) {
     _logger->error("Jaguar2: ACK responder disarm did not latch");
-    throw std::runtime_error("Jaguar2: ACK responder disarm failed");
+    return;
   }
   _logger->info("Jaguar2: hardware ACK responder disarmed (net_type=NoLink)");
 }

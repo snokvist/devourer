@@ -120,8 +120,8 @@ public:
   bool configure_monitor_rx(bool keep_corrupted);
   /* Program both response-window registers: REG_ACKTO (0x0640) for OFDM/HT
    * and REG_ACKTO_CCK (0x0639) for CCK. Returns the actual readback plus the
-   * transport-write result so a configured value cannot green-initialize in
-   * only half of the advertised modulation surface. */
+   * transport-write result for diagnostics; readback is authoritative because
+   * a failed transfer status does not prove that a write missed hardware. */
   AckTimeoutState set_ack_timeout_us(uint8_t microseconds);
   void stop();
   MacState read_mac_state();

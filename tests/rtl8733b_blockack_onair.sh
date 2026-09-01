@@ -54,7 +54,9 @@ if [ "$TX_VID:$TX_PID" = "$RESP_VID:$RESP_PID" ] ||
   exit 2
 fi
 
-ESC_BUILD=$(printf '%s' "$BUILD" | sed 's/[][\.*^$/]/\\&/g')
+# pkill/pgrep use EREs. Escape every ERE metacharacter so a build directory
+# containing characters such as '+', '?', '(' or '|' remains an exact prefix.
+ESC_BUILD=$(printf '%s' "$BUILD" | sed 's#[][\\.^$*+?(){}|/]#\\&#g')
 cleanup() {
   sudo pkill -9 -f "^$ESC_BUILD/rxdemo" 2>/dev/null
   sudo pkill -9 -f "^$ESC_BUILD/txdemo" 2>/dev/null

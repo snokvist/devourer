@@ -81,7 +81,9 @@ if ! [[ "$FRAMES" =~ ^[0-9]+$ ]] || [ "$FRAMES" -lt "$FRAMES_MIN" ]; then
 fi
 
 # Kill only this tree's demos; do not terminate unrelated bench sessions.
-ESC_BUILD=$(printf '%s' "$BUILD" | sed 's/[][\.*^$/]/\\&/g')
+# pkill uses an ERE. Escape every ERE metacharacter so a build directory
+# containing characters such as '+', '?', '(' or '|' remains an exact prefix.
+ESC_BUILD=$(printf '%s' "$BUILD" | sed 's#[][\\.^$*+?(){}|/]#\\&#g')
 KILL() {
   sudo pkill -9 -f "^$ESC_BUILD/rxdemo" 2>/dev/null
   sudo pkill -9 -f "^$ESC_BUILD/txdemo" 2>/dev/null
@@ -126,7 +128,22 @@ for arm in "${arm_values[@]}"; do
   sleep 3
   sent=$(grep '"ev":"tx.stats"' "$OUT/tx_$tag.jsonl" | tail -1 |
          sed -n 's/.*"submitted":\([0-9]*\).*/\1/p'); sent=${sent:-0}
-  hits=$(grep -c '"ev":"rx.seq"' "$OUT/wit_$tag.jsonl" || true)
+  hits=$(python3 - "$OUT/wit_$tag.jsonl" <<'PY'
+import json, sys
+
+hits = 0
+for line in open(sys.argv[1], errors="replace"):
+    if not line.startswith('{"ev":"rx.seq"'):
+        continue
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    if not event.get("crc"):
+        hits += 1
+print(hits)
+PY
+  )
   KILL
   # A cell that did not run is NOT a measurement of zero. An arm whose DUT
   # never opened (sent=0) or whose witness heard nothing at all (hits=0) is a

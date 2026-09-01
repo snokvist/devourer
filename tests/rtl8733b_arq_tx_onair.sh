@@ -24,13 +24,15 @@ if [ -z "${TX_SA:-}" ]; then
 fi
 
 if ! [[ "$FRAMES" =~ ^[0-9]+$ && "$RETRY_LIMIT" =~ ^[0-9]+$ ]] ||
-   [ "$FRAMES" -lt 1000 ] || [ "$RETRY_LIMIT" -lt 3 ] ||
+   [ "$FRAMES" -lt 1000 ] || [ "$RETRY_LIMIT" -lt 5 ] ||
    [ "$RETRY_LIMIT" -gt 63 ]; then
-  echo "ABORT: require FRAMES>=1000 and RETRY_LIMIT=3..63" >&2
+  echo "ABORT: require FRAMES>=1000 and RETRY_LIMIT=5..63" >&2
   exit 2
 fi
 
-ESC_BUILD=$(printf '%s' "$BUILD" | sed 's/[][\.*^$/]/\\&/g')
+# pkill/pgrep use EREs. Escape every ERE metacharacter so a build directory
+# containing characters such as '+', '?', '(' or '|' remains an exact prefix.
+ESC_BUILD=$(printf '%s' "$BUILD" | sed 's#[][\\.^$*+?(){}|/]#\\&#g')
 cleanup() {
   sudo pkill -9 -f "^$ESC_BUILD/rxdemo" 2>/dev/null
   sudo pkill -9 -f "^$ESC_BUILD/txdemo" 2>/dev/null
