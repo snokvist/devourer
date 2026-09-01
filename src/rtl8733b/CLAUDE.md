@@ -334,16 +334,21 @@ copies per observed frame with 99.7/100% coverage. At 11M CCK the result was
 a real ACK and stops autonomous retry in these normal-ACK cells; it does not
 substitute for the unavailable per-frame delivery report.
 
-**What ran is normal-ACK response to unicast singles, and the claim scopes to
-that.** `AckResponder.h` notes the same gate is also a hardware *BlockAck*
-responder on the generations where that was proven; it is NOT proven here.
-`tests/ampdu_ba_check.sh` was pointed at this die (8812CU aggregating TX, 8733B
-responder) and came back indeterminate — armed and disarmed both read 0%
-delivered at retries 0, so the control arm did not separate — which is the
-documented consequence of per-frame CCX accounting not surviving AGG_EN
-(`docs/aggregation.md`), not a verdict on this chip. A-MPDU is unported here
-anyway. So: normal-ACK response measured; BlockAck response untested, pending
-an A-MPDU-capable instrument that does not judge by `tx.report`.
+**BlockAck response is now separately measured without CCX.** The original
+`tests/ampdu_ba_check.sh` attempt (8812CU aggregating TX, 8733B responder) was
+indeterminate because armed and disarmed both read 0% delivered/retries 0 —
+the documented failure of per-frame CCX accounting under AGG_EN
+(`docs/aggregation.md`), not a radio verdict. The replacement
+`tests/rtl8733b_blockack_onair.sh` uses a Jaguar2 `0bda:b812` TX, this
+RTL8733B as responder, and a Jaguar1 `0bda:8812` passive witness. At ch36/MCS3
+with retry limit 12, the fully initialized but unarmed control produced 1,605
+unique payloads at 12.720 copies/payload and zero matching BlockAck frames;
+armed produced 128,702 at 1.001 plus 14,402 addressed `0x94` BlockAcks, every
+one carrying a nonzero bitmap. Both arms were real A-MPDUs (`paggr`
+0.665/1.000, max burst 9). The control-frame event checks RA=the Jaguar2 TA
+and TA=the configured RTL8733B MAC, so ambient BlockAcks do not count. This
+establishes the RTL8733B responder on that measured combination only.
+RTL8733B A-MPDU **TX** remains unported and unmeasured.
 
 **`tx.retry_limit` drives real autonomous retransmission** — `tx_retry_limit_ok`
 is now true. It could not be measured the way the Jaguars were: that A/B reads

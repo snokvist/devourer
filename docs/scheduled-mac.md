@@ -179,7 +179,12 @@ airtime evidence does cover its soliciting side: a passive RTL8812CU witness
 measured 1.032 copies/frame with an RTL8812AU responder armed versus 12.948
 with it off at MCS3; at 11M CCK the corresponding values were 1.002/11.908.
 Its dead-peer retry dose response was 0/3/12 -> 1.00/4.00/12.32–12.33 copies/frame.
-All are one-RTL8733B bench results; details are in `docs/rtl8733b.md`.
+The same unit's BlockAck responder was judged without CCX: a Jaguar2
+aggregating TX plus Jaguar1 passive witness measured armed/active-unarmed
+1.001/12.720 copies per payload, with A-MPDU structure present in both arms;
+the armed/active-unarmed control-frame counts were 14402/0 addressed
+BlockAcks (`tests/rtl8733b_blockack_onair.sh`). All are one-RTL8733B bench
+results; details are in `docs/rtl8733b.md`.
 
 The OFF-phase pin is set by `DEVOURER_TX_RETRY_LIMIT` (the matrix runs 12,
 the value the descriptors used to hardcode) — the knob, not a descriptor

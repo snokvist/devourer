@@ -13,11 +13,13 @@
  * (promiscuous RX, injection) is unchanged.
  *
  * On the adapter combinations exercised by tests/ampdu_ba_check.sh, the SAME
- * gate also enables the hardware BlockAck responder. That result is not
- * generation-neutral: RTL8733B is proven here only for normal ACKs to unicast
- * singles; its BlockAck response remains untested.
+ * gate also enables the hardware BlockAck responder. RTL8733B has its own
+ * air-side proof in tests/rtl8733b_blockack_onair.sh: a Jaguar2 TX forms real
+ * A-MPDUs and an independent Jaguar1 witness observes retry copies collapse
+ * only while the RTL8733B responder is armed.
  *
- * The registers are generation-neutral (same map on Jaguar1/2/3):
+ * The registers are generation-neutral (same map on Jaguar1/2/3 and
+ * RTL8733B):
  *   0x0610..0x0615  REG_MACID   — the RA the ACK engine matches
  *   0x0618..0x061d  REG_BSSID   — port identity companion (the proven AP
  *                                 recipe programs both)
