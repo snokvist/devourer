@@ -2172,6 +2172,16 @@ bool RtlJaguar3Device::SetAckResponder(const devourer::MacAddr &mac) {
    * _reg_mu like every other register-touching control call. */
   std::lock_guard<std::mutex> lk(_reg_mu);
   if (!devourer::ack::enable(_device, mac.data())) {
+    bool rolled_back = false;
+    try {
+      rolled_back = devourer::ack::disable_verified(_device);
+    } catch (...) {
+    }
+    if (!rolled_back) {
+      _logger->error("Jaguar3: ACK responder arm failed and rollback did "
+                     "not latch; hardware state is unknown");
+      throw std::runtime_error("Jaguar3: ACK responder arm rollback failed");
+    }
     _logger->error("Jaguar3: ACK responder arm register write failed");
     return false;
   }
@@ -2184,8 +2194,8 @@ bool RtlJaguar3Device::SetAckResponder(const devourer::MacAddr &mac) {
 
 void RtlJaguar3Device::ClearAckResponder() {
   std::lock_guard<std::mutex> lk(_reg_mu);
-  if (!devourer::ack::disable(_device)) {
-    _logger->error("Jaguar3: ACK responder disarm register write failed");
+  if (!devourer::ack::disable_verified(_device)) {
+    _logger->error("Jaguar3: ACK responder disarm did not latch");
     throw std::runtime_error("Jaguar3: ACK responder disarm failed");
   }
   _logger->info("Jaguar3: hardware ACK responder disarmed (net_type=NoLink)");

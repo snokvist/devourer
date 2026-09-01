@@ -192,6 +192,13 @@ run_phase() {
     cleanup
     exit 1
   fi
+  if grep -qE 'ACK responder disarm (did not latch|failed)|ACK responder disarm register write failed' \
+       "$OUT/resp_$phase.err" 2>/dev/null; then
+    echo "ABORT: phase=$phase responder disarm was not verified" >&2
+    tail -8 "$OUT/resp_$phase.err" >&2
+    cleanup
+    exit 1
+  fi
   cleanup
 
   sent=$(grep '"ev":"tx.stats"' "$OUT/tx_$phase.jsonl" | tail -1 |
@@ -251,6 +258,9 @@ total = len(events)
 nonzero_bitmaps = sum(ba.get("bitmap", "0" * 16) != "0" * 16
                       for ba in blockacks)
 compressed = sum(bool(int(ba.get("ctrl", 0)) & 0x4) for ba in blockacks)
+compressed_nonzero = sum(bool(int(ba.get("ctrl", 0)) & 0x4) and
+                         ba.get("bitmap", "0" * 16) != "0" * 16
+                         for ba in blockacks)
 print(json.dumps({"ev": "rtl8733b.blockack", "phase": phase,
                   "sent": sent, "observed_frames": len(copies),
                   "copies": total,
@@ -260,7 +270,8 @@ print(json.dumps({"ev": "rtl8733b.blockack", "phase": phase,
                   "max_burst": max(bursts),
                   "blockacks": len(blockacks),
                   "compressed_blockacks": compressed,
-                  "nonzero_bitmaps": nonzero_bitmaps}))
+                  "nonzero_bitmaps": nonzero_bitmaps,
+                  "compressed_nonzero_bitmaps": compressed_nonzero}))
 PY
   then
     exit 1
@@ -286,6 +297,7 @@ closure = (on_c <= 1.25 and
 control = (on["blockacks"] >= 100 and
            on["compressed_blockacks"] >= 100 and
            on["nonzero_bitmaps"] >= 100 and
+           on["compressed_nonzero_bitmaps"] >= 100 and
            off["blockacks"] == 0)
 ok = structure and closure and control
 print(json.dumps({"ev": "rtl8733b.blockack.verdict", "ok": ok,
@@ -300,6 +312,7 @@ print(json.dumps({"ev": "rtl8733b.blockack.verdict", "ok": ok,
                   "off_blockacks": off["blockacks"],
                   "on_compressed_blockacks": on["compressed_blockacks"],
                   "on_nonzero_bitmaps": on["nonzero_bitmaps"],
+                  "on_compressed_nonzero_bitmaps": on["compressed_nonzero_bitmaps"],
                   "on_observed": on["observed_frames"],
                   "off_observed": off["observed_frames"]}))
 raise SystemExit(0 if ok else 1)

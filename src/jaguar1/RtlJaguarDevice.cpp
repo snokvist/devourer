@@ -771,6 +771,16 @@ bool RtlJaguarDevice::SetAckResponder(const devourer::MacAddr &mac) {
   /* Hardware ACK responder (src/AckResponder.h) — same register recipe as
    * the HalMAC generations (0x610/0x618/0x102 are map-identical here). */
   if (!devourer::ack::enable(_device, mac.data())) {
+    bool rolled_back = false;
+    try {
+      rolled_back = devourer::ack::disable_verified(_device);
+    } catch (...) {
+    }
+    if (!rolled_back) {
+      _logger->error("Jaguar1: ACK responder arm failed and rollback did "
+                     "not latch; hardware state is unknown");
+      throw std::runtime_error("Jaguar1: ACK responder arm rollback failed");
+    }
     _logger->error("Jaguar1: ACK responder arm register write failed");
     return false;
   }
@@ -782,8 +792,8 @@ bool RtlJaguarDevice::SetAckResponder(const devourer::MacAddr &mac) {
 }
 
 void RtlJaguarDevice::ClearAckResponder() {
-  if (!devourer::ack::disable(_device)) {
-    _logger->error("Jaguar1: ACK responder disarm register write failed");
+  if (!devourer::ack::disable_verified(_device)) {
+    _logger->error("Jaguar1: ACK responder disarm did not latch");
     throw std::runtime_error("Jaguar1: ACK responder disarm failed");
   }
   _logger->info("Jaguar1: hardware ACK responder disarmed (net_type=NoLink)");

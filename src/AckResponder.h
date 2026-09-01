@@ -45,8 +45,13 @@ inline bool enable(RtlAdapter &dev, const uint8_t mac[6]) {
   /* Close the gate before changing identity. Besides avoiding a transient
    * responder for a half-written MAC during retargeting, this makes every
    * failed identity write leave the radio passive. */
-  if (!dev.rtw_write8(0x0102, static_cast<uint8_t>(nt & ~0x03u)))
+  if (!dev.rtw_write8(0x0102, static_cast<uint8_t>(nt & ~0x03u))) {
+    /* The transfer status is not state readback. Retry the safety clear using
+     * the value read before the failed transfer; callers verify it before
+     * reporting a failed arm as passive. */
+    (void)dev.rtw_write8(0x0102, static_cast<uint8_t>(nt & ~0x03u));
     return false;
+  }
   if (!dev.rtw_write<uint32_t>(
           0x0610, (uint32_t)mac[0] | ((uint32_t)mac[1] << 8) |
                       ((uint32_t)mac[2] << 16) |

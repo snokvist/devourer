@@ -40,6 +40,18 @@ trap cleanup EXIT
 mkdir -p "$OUT"
 RESULTS="$OUT/results.jsonl"; : >"$RESULTS"
 
+stop_receivers() {
+  sudo pkill -INT -f "^$ESC_BUILD/rxdemo" 2>/dev/null || true
+  for _ in 1 2 3 4 5; do
+    if ! pgrep -f "^$ESC_BUILD/rxdemo" >/dev/null; then
+      return 0
+    fi
+    sleep 1
+  done
+  sudo pkill -9 -f "^$ESC_BUILD/rxdemo" 2>/dev/null || true
+  return 1
+}
+
 wait_rx() {
   local err="$1" waited=0
   until grep -qE 'async ring of .* URBs submitted|Listening air' "$err"; do
@@ -92,7 +104,20 @@ run_phase() {
     DEVOURER_TX_PWR_OFFSET_QDB=12 DEVOURER_LOG_LEVEL=warn \
     timeout -s INT 90 "$BUILD/txdemo" \
     >"$OUT/tx_$phase.jsonl" 2>"$OUT/tx_$phase.err" || true
-  sleep 2; cleanup
+  sleep 2
+  if ! stop_receivers; then
+    echo "ABORT: phase=$phase receivers did not stop gracefully" >&2
+    cleanup
+    exit 1
+  fi
+  if grep -qE 'ACK responder disarm (did not latch|failed)|ACK responder disarm register write failed' \
+       "$OUT/resp_$phase.err" 2>/dev/null; then
+    echo "ABORT: phase=$phase responder disarm was not verified" >&2
+    tail -8 "$OUT/resp_$phase.err" >&2
+    cleanup
+    exit 1
+  fi
+  cleanup
 
   sent=$(grep '"ev":"tx.stats"' "$OUT/tx_$phase.jsonl" | tail -1 |
          sed -n 's/.*"submitted":\([0-9]*\).*/\1/p')
