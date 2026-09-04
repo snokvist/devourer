@@ -322,15 +322,11 @@ unowned SIFS-timed transmitter on the air. After an armed session ends with
 CR writes take the MAC down two lines later and the silence is unavoidable
 either way.
 
-Measured against an RTL8812AU soliciting TX (`tests/ack_txreport_matrix.sh`,
-8733B as RESPONDER): armed 1725/1725 reports ACKed at retries_mean 0.00;
-re-armed on a **different** MAC, 1728/1728 again (the address is arbitrary, not
-baked in); and 0/1723 successful reports with retries pinned at 12 in the OFF
-cell. That cell is **never-armed, not disarmed**: `run_phase()` starts no
-responder process at all when the responder MAC is empty. A real disarm was
-later measured NOT to stop this die — clearing net_type leaves a port whose
-MACID is still programmed answering, which is why `ClearAckResponder` also
-retargets the identity.
+Responder capability and its measured limits live in `src/AdapterCaps.h`
+(`ack_responder_ok`); the arm/disarm recipe and why this die needs a retarget
+live in `src/AckResponder.h` and `Rtl8733bDevice::ClearAckResponder`. Read
+those rather than a copy here. The harness is
+`tests/ack_txreport_matrix.sh` with the 8733B as RESPONDER.
 
 Soliciting-TX ACK recognition is measured independently.
 `tests/rtl8733b_arq_tx_onair.sh` puts the RTL8733B in the soliciting-TX role,

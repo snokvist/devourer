@@ -24,7 +24,10 @@
  *  - the CALLER's choice of restore address. Nothing here instantiates
  *    Rtl8733bDevice, so a regression that handed retarget() a zeroed buffer
  *    would still pass; the invariant that stops that (_mac_ready implies
- *    EFUSE mac_valid()) lives in ClearAckResponder and initialize(). */
+ *    EFUSE mac_valid()) lives in ClearAckResponder and initialize().
+ *  - the degenerate case where the armed address IS the restore address, in
+ *    which no retarget can move the match. SetAckResponder refuses that arm
+ *    up front; the refusal is device-layer and untested here. */
 #include <cstdint>
 #include <cstdio>
 #include <map>

@@ -847,6 +847,20 @@ bool Rtl8733bDevice::SetAckResponder(const devourer::MacAddr &mac) {
                    mac.bytes[0]);
     return false;
   }
+  /* Refused on this die, and only on this die: ClearAckResponder disarms by
+   * retargeting the identity BACK to _efuse.mac, so a responder armed to that
+   * very address could not be moved off it. The port would keep answering
+   * while the disarm reported success — the exact silent-live-responder
+   * failure this backend's disarm exists to prevent. Refusing the arm is the
+   * honest end of the trade: the alternative is an ACK responder that cannot
+   * be switched off without a re-init. Other generations disarm through the
+   * net_type gate alone and carry no such restriction. */
+  if (std::memcmp(mac.data(), _efuse.mac.data(), _efuse.mac.size()) == 0) {
+    _logger->error("RTL8733B: ACK responder cannot be armed to the adapter's "
+                   "OWN MAC — the disarm restores that address, so it could "
+                   "not be turned off again without a re-init");
+    return false;
+  }
   if (!devourer::ack::enable(_device, mac.data())) {
     if (!devourer::ack::disable_verified(_device)) {
       _logger->error(
