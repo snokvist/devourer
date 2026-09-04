@@ -316,14 +316,21 @@ session that quietly answers nothing. And the disarm is unconditional inside
 `Halmac8733bMac::stop()`, not a flag-guarded special case at the device layer:
 `stop()` clears only REG_CR's low half, so net_type at 0x0102 survives it, and
 siting the clear there means no future path can reach `stop()` and leave an
-unowned SIFS-timed transmitter on the air. Verified on air — after an armed
-session ends with `teardown_power_down` off, the peer reads ack_rate 0.00 with
-retries pinned at 12.
+unowned SIFS-timed transmitter on the air. After an armed session ends with
+`teardown_power_down` off, the peer reads ack_rate 0.00 with retries pinned at
+12 — but that does NOT validate the net_type clear, because `stop()`'s RCR and
+CR writes take the MAC down two lines later and the silence is unavoidable
+either way.
 
 Measured against an RTL8812AU soliciting TX (`tests/ack_txreport_matrix.sh`,
 8733B as RESPONDER): armed 1725/1725 reports ACKed at retries_mean 0.00;
 re-armed on a **different** MAC, 1728/1728 again (the address is arbitrary, not
-baked in); disarmed, 0/1723 successful reports with retries pinned at 12.
+baked in); and 0/1723 successful reports with retries pinned at 12 in the OFF
+cell. That cell is **never-armed, not disarmed**: `run_phase()` starts no
+responder process at all when the responder MAC is empty. A real disarm was
+later measured NOT to stop this die — clearing net_type leaves a port whose
+MACID is still programmed answering, which is why `ClearAckResponder` also
+retargets the identity.
 
 Soliciting-TX ACK recognition is measured independently.
 `tests/rtl8733b_arq_tx_onair.sh` puts the RTL8733B in the soliciting-TX role,

@@ -786,6 +786,18 @@ target_link_libraries(TxQuiesceSelftest PRIVATE devourer PkgConfig::libusb)
 
 add_test(NAME tx_quiesce_seam COMMAND TxQuiesceSelftest)
 
+# Headless guard for the ACK-responder recipe (src/AckResponder.h): the arm,
+# the gate-only disarm staying gate-only, and the retarget seam. The on-air
+# harnesses cannot cover the disarm at all -- every cell in
+# ack_responder_check.sh and ack_txreport_matrix.sh is a FRESH PROCESS, so
+# their responder-off arm starts from a chip that was never armed.
+add_executable(AckResponderSelftest
+    tests/ack_responder_selftest.cpp
+)
+target_link_libraries(AckResponderSelftest PRIVATE devourer PkgConfig::libusb)
+
+add_test(NAME ack_responder_recipe COMMAND AckResponderSelftest)
+
 # Headless guard for the windowed RX-receipt primitives (src/cell/RxReceipt.h):
 # TLV round-trip, ring eviction, late accounting, ledger merge idempotence,
 # strict-parse rejections. The on-air halves are tests/receipt_verify.py over

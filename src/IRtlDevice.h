@@ -223,7 +223,9 @@ public:
    * transmitter is opt-in only — never a default. Returns false when
    * unsupported or when arm/verification fails; false is not proof of passive
    * state, so implementations log if rollback cannot be verified. Clear is a
-   * non-throwing best effort to return net_type to No Link. */
+   * non-throwing best effort to return net_type to No Link — and, on a die
+   * where the gate alone does not stop the engine, to move the port identity
+   * off `mac` as well (see Rtl8733bDevice::ClearAckResponder). */
   virtual bool SetAckResponder(const devourer::MacAddr &mac) {
     (void)mac;
     return false;

@@ -4,7 +4,14 @@
  *
  * The Realtek MAC auto-ACKs (SIFS-timed, zero host involvement) any unicast
  * frame whose RA matches the port-0 MACID, PROVIDED the port has a network
- * type. devourer's monitor bring-up leaves net_type = 0 (No Link), which is
+ * type. That proviso is what ARMS the engine on every generation tested. It is
+ * NOT reliable in reverse: on the RTL8733B a port whose MACID is still
+ * programmed keeps answering after net_type reads back 0 (measured — see
+ * retarget() and Rtl8733bDevice::ClearAckResponder). Closing the gate is the
+ * portable disarm; where it is not enough, the die must also move the
+ * identity off the responder address (retarget()).
+ *
+ * devourer's monitor bring-up leaves net_type = 0 (No Link), which is
  * why a monitor radio never ACKs; the AP-mode work proved the gate — with
  * MACID + net_type programmed, a real station's auth/assoc arrive at retry=0
  * (docs/ap-mode.md). This header is that recipe minus the beacon machinery:
@@ -83,6 +90,55 @@ inline bool enable(RtlAdapter &dev, const uint8_t mac[6]) noexcept {
 inline bool disable(RtlAdapter &dev) {
   const uint8_t nt = dev.rtw_read8(0x0102);
   return dev.rtw_write8(0x0102, static_cast<uint8_t>(nt & ~0x03u));
+}
+
+/* Point the ACK-match identity somewhere harmless WITHOUT touching the gate.
+ *
+ * For dies where closing net_type does not stop the engine. Measured on an
+ * RTL8733B against a peer soliciting unicast QoS-Data: after a disable() whose
+ * gate write read back as 0, the port still answered on the armed MAC, and only
+ * re-initialising the chip stopped it — a responder reporting passive while
+ * still transmitting.
+ *
+ * `mac` is a RESTORE address, normally the adapter's own (what MAC bring-up
+ * programmed). It is deliberately NOT zero: many Realtek MAC TX paths refuse to
+ * schedule a frame when the MAC ID is zero — the T1 canary bug that programming
+ * REG_MACID was introduced to fix (src/jaguar1/HalModule.cpp,
+ * EepromManager.h) — and a radio being disarmed may still be injecting. Zero
+ * would also not remove the match, only move it: 00:00:00:00:00:00 has the I/G
+ * bit clear, so is_unicast() accepts it and a peer could solicit it.
+ *
+ * Gate untouched on purpose: this is the identity half, so a caller can compose
+ * it with disable() in whichever order its die needs, and no generation gets a
+ * behaviour change it was not measured for. */
+inline bool retarget(RtlAdapter &dev, const uint8_t mac[6]) noexcept {
+  try {
+    /* Sequenced into locals rather than `&&`: both halves must be ATTEMPTED.
+     * Under short-circuit a failed low write would skip the high one — and by
+     * this file's own doctrine (see enable(): "The transfer status is not
+     * state readback") that low write may still have landed, leaving a
+     * half-updated address with the high half never even tried. */
+    const bool lo = dev.rtw_write<uint32_t>(
+        0x0610, (uint32_t)mac[0] | ((uint32_t)mac[1] << 8) |
+                    ((uint32_t)mac[2] << 16) | ((uint32_t)mac[3] << 24));
+    const bool hi = dev.rtw_write16(0x0614, (uint16_t)(mac[4] | (mac[5] << 8)));
+    return lo && hi;
+  } catch (...) {
+    return false;
+  }
+}
+
+/* Did a retarget land? The MACID half only — the gate is disable()'s business. */
+inline bool retargeted(RtlAdapter &dev, const uint8_t mac[6]) noexcept {
+  try {
+    const uint32_t want_lo =
+        (uint32_t)mac[0] | ((uint32_t)mac[1] << 8) |
+        ((uint32_t)mac[2] << 16) | ((uint32_t)mac[3] << 24);
+    return dev.rtw_read<uint32_t>(0x0610) == want_lo &&
+           dev.rtw_read16(0x0614) == (uint16_t)(mac[4] | (mac[5] << 8));
+  } catch (...) {
+    return false;
+  }
 }
 
 inline bool is_disabled(RtlAdapter &dev) {
