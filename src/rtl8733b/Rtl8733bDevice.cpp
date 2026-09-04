@@ -855,7 +855,7 @@ bool Rtl8733bDevice::SetAckResponder(const devourer::MacAddr &mac) {
    * honest end of the trade: the alternative is an ACK responder that cannot
    * be switched off without a re-init. Other generations disarm through the
    * net_type gate alone and carry no such restriction. */
-  if (std::memcmp(mac.data(), _efuse.mac.data(), _efuse.mac.size()) == 0) {
+  if (!devourer::ack::disarmable_by_retarget(mac.data(), _efuse.mac.data())) {
     _logger->error("RTL8733B: ACK responder cannot be armed to the adapter's "
                    "OWN MAC — the disarm restores that address, so it could "
                    "not be turned off again without a re-init");

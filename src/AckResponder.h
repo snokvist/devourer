@@ -41,6 +41,7 @@
  * same footgun broke AP association (docs/ap-mode.md). */
 
 #include <cstdint>
+#include <cstring>
 
 #include "RtlAdapter.h"
 
@@ -90,6 +91,21 @@ inline bool enable(RtlAdapter &dev, const uint8_t mac[6]) noexcept {
 inline bool disable(RtlAdapter &dev) {
   const uint8_t nt = dev.rtw_read8(0x0102);
   return dev.rtw_write8(0x0102, static_cast<uint8_t>(nt & ~0x03u));
+}
+
+/* Can a responder armed on `responder` be disarmed by retargeting the identity
+ * to `restore`? Only if the two differ. Where they are the same address the
+ * retarget writes the value already there: both register writes and the
+ * readback succeed, nothing moves, and a caller that trusts the return value
+ * reports a disarm that did not happen — on a die that ignores the gate, that
+ * is a responder still transmitting behind a success log.
+ *
+ * A predicate rather than a check inside retarget(), because retarget() cannot
+ * know what the port was armed to; the caller owns both addresses and is the
+ * only place the question can be asked. */
+inline bool disarmable_by_retarget(const uint8_t responder[6],
+                                   const uint8_t restore[6]) {
+  return std::memcmp(responder, restore, 6) != 0;
 }
 
 /* Point the ACK-match identity somewhere harmless WITHOUT touching the gate.

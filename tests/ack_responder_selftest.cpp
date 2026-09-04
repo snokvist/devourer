@@ -175,6 +175,26 @@ int main() {
     regs->fail_writes = false;
   }
   {
+    /* The disarm's precondition. Retargeting to the SAME address the port is
+     * armed to cannot move the match — both writes and the readback succeed
+     * while nothing changes — so the caller must refuse that arm up front
+     * rather than emit a success log for a responder that is still answering.
+     * Rtl8733bDevice::SetAckResponder gates on exactly this. */
+    auto regs = std::make_shared<FakeRegs>();
+    RtlAdapter dev(regs, logger);
+    CHECK(devourer::ack::disarmable_by_retarget(mac, own));
+    CHECK(!devourer::ack::disarmable_by_retarget(own, own));
+    /* And the reason it matters, demonstrated on the register file: arming on
+     * `own` and then "disarming" to `own` leaves the identity untouched, so
+     * retargeted() reports success while the port still matches the address it
+     * was armed to. */
+    CHECK(devourer::ack::enable(dev, own));
+    CHECK(devourer::ack::disable_verified(dev));
+    CHECK(devourer::ack::retarget(dev, own));    /* writes what is already there */
+    CHECK(devourer::ack::retargeted(dev, own));  /* "succeeds" */
+    CHECK(devourer::ack::retargeted(dev, own));  /* still the armed address */
+  }
+  {
     /* Zero is a UNICAST address by the I/G bit, which is exactly why it is not
      * a safe "no match" value: is_unicast() accepts it, so a peer could
      * solicit it. Pins the reasoning behind restoring a real MAC. */
