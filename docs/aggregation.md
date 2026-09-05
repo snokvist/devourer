@@ -191,8 +191,11 @@ numbers above came from.
 `DEVOURER_ACK_RESPONDER=<unicast mac>`, all generations; `src/AckResponder.h`)
 arms the MAC's autonomous ACK engine while monitor RX/injection continue
 unchanged: port identity (MACID/BSSID 0x610/0x618 = `mac`) + net_type (0x102
-[1:0] = AP). The identity+net_type pair is the whole gate — no beacon
-machinery, no ADDBA session state, no CAM entry.
+[1:0] = AP). No beacon machinery, no ADDBA session state, no CAM entry.
+Which half of that pair is actually the gate is per-die: on the generations
+the AP-mode work covered, net_type is; on the RTL8733B it is inert and the
+engine matches MACID alone, so a disarm there must move the identity
+(`src/AckResponder.h` retarget(), `src/AdapterCaps.h`).
 
 With a responder armed, a peer TXing unicast QoS-Data (normal ack-policy) to
 `mac` runs a full hardware ARQ loop — SIFS-timed ACKs from the responder,

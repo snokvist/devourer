@@ -326,7 +326,15 @@ Responder capability and its measured limits live in `src/AdapterCaps.h`
 (`ack_responder_ok`); the arm/disarm recipe and why this die needs a retarget
 live in `src/AckResponder.h` and `Rtl8733bDevice::ClearAckResponder`. Read
 those rather than a copy here. The harness is
-`tests/ack_txreport_matrix.sh` with the 8733B as RESPONDER.
+`tests/ack_txreport_matrix.sh` with the 8733B as RESPONDER; its `disarmed`
+phase is the only cell that measures a DISARM (it arms, then disarms mid-run
+via `DEVOURER_ACK_DISARM_AFTER_MS`), because every other phase is a fresh
+process and its `off` cell never arms at all.
+
+Note for anyone treating a monitor session on this die as passive: it is not.
+net_type is inert here and the engine matches MACID, so a never-armed session
+auto-ACKs unicast frames addressed to its own EFUSE MAC. A disarm can move the
+identity; nothing short of taking the MAC down makes the port silent.
 
 Soliciting-TX ACK recognition is measured independently.
 `tests/rtl8733b_arq_tx_onair.sh` puts the RTL8733B in the soliciting-TX role,

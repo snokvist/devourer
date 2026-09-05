@@ -40,15 +40,22 @@ trap cleanup EXIT
 mkdir -p "$OUT"
 VERDICTS="$OUT/verdicts.jsonl"; : >"$VERDICTS"
 
-run_phase() { # $1 cell $2 phase $3 tx vid $4 tx pid $5 RA mac $6 responder mac (""=off) $7 expect
+run_phase() { # $1 cell $2 phase $3 tx vid $4 tx pid $5 RA mac $6 responder mac (""=off) $7 expect $8 disarm-after-ms
   local cell="$1" phase="$2" vid="$3" pid="$4" ra="$5" resp="$6" expect="$7"
+  local disarm_ms="${8:-}"
   local tag="${cell}_${phase}"
   cleanup; sleep 1
   if [ -n "$resp" ]; then
+    # $8 arms, then disarms mid-session from a side thread. Without it no cell
+    # here can exercise a DISARM at all: every phase is a fresh process, so the
+    # off phase starts from a chip that was never armed, which is a different
+    # state (and on the RTL8733B an identical one — see AdapterCaps.h).
     sudo env DEVOURER_VID=$RESP_VID DEVOURER_PID=$RESP_PID DEVOURER_CHANNEL=$CH \
         DEVOURER_ACK_RESPONDER=$resp DEVOURER_LOG_LEVEL=info \
+        ${disarm_ms:+DEVOURER_ACK_DISARM_AFTER_MS=$disarm_ms} \
         ./build/rxdemo >"$OUT/resp_$tag.jsonl" 2>"$OUT/resp_$tag.err" &
     sleep 6   # responder bring-up
+    [ -n "$disarm_ms" ] && sleep $(( disarm_ms / 1000 + 2 ))  # let the disarm land
   fi
   sudo env DEVOURER_VID=$vid DEVOURER_PID=$pid DEVOURER_CHANNEL=$CH \
       DEVOURER_TX_QOS_DATA=1 DEVOURER_TX_RA=$ra DEVOURER_TX_SA=$TX_SA \
@@ -79,6 +86,11 @@ for cell in $CELLS; do
   run_phase "$name" on       "$vid" "$pid" "$MAC1" "$MAC1" on
   run_phase "$name" retarget "$vid" "$pid" "$MAC2" "$MAC2" on
   run_phase "$name" off      "$vid" "$pid" "$MAC1" ""      off
+  # The only cell that measures a DISARM rather than a never-armed chip: arm on
+  # MAC1, disarm 2 s in, then solicit MAC1. `off` above cannot substitute — it
+  # never arms, so it cannot tell a working disarm from a chip that was always
+  # passive. Expect `off` on a die whose disarm moves the identity.
+  run_phase "$name" disarmed "$vid" "$pid" "$MAC1" "$MAC1" off 2000
 done
 
 echo

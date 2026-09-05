@@ -241,7 +241,7 @@ station): **8814AU** closes the loop at retries ~0.1 (the bench responder of
 choice); **8812AU** works but degraded (97% delivery at ~7 mean retries —
 its SIFS ACKs only land intermittently); **8821AU works** (61–64% single-shot
 across three reps, **94% at retry 8** with a healthy retry histogram,
-disarm-proof-verified: 0% with the responder powered down); the 8812BU
+arm-verified (the off cell is never-armed, so it establishes no disarm): 0% with the responder powered down); the 8812BU
 responder was separately proven (`tests/ack_responder_check.sh`).
 
 A cell whose responder never armed reads exactly like a broken chip — on=0%

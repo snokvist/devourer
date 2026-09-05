@@ -2153,12 +2153,47 @@ int main(int argc, char **argv) {
   uint8_t rx_band = 0;
   if (const char *b = std::getenv("DEVOURER_BAND"))
     rx_band = static_cast<uint8_t>(std::atoi(b));
+  /* DEVOURER_ACK_DISARM_AFTER_MS=<n>: disarm the hardware ACK responder <n> ms
+   * after bring-up, from a side thread, while RX keeps running.
+   *
+   * Exists so the DISARM is reachable from the tree at all. Every on-air cell
+   * in tests/ack_responder_check.sh and tests/ack_txreport_matrix.sh is a fresh
+   * process, so their responder-off arm starts from a chip that was never
+   * armed: nothing could previously arm and then disarm inside one session,
+   * which is the only shape in which a disarm can be measured or regress.
+   * tests/ack_txreport_matrix.sh's `disarmed` phase drives this.
+   *
+   * Init() below runs the RX loop and does not return, hence the thread. The
+   * call is register I/O concurrent with a live RX loop: the RTL8733B guards
+   * its register plane with a recursive mutex, and this knob is only meaningful
+   * where a responder was armed, but it is a measurement aid and not something
+   * to lean on in a shipping path. Ignored without DEVOURER_ACK_RESPONDER. */
+  std::thread ack_disarm_thread;
+  if (const char *d = std::getenv("DEVOURER_ACK_DISARM_AFTER_MS")) {
+    const long ms = std::atol(d);
+    const bool armed = std::getenv("DEVOURER_ACK_RESPONDER") != nullptr;
+    if (ms >= 0 && armed) {
+      ack_disarm_thread = std::thread([rtlDevice, ms, logger]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+        logger->info("DEVOURER_ACK_DISARM_AFTER_MS: disarming ACK responder "
+                     "after {} ms",
+                     ms);
+        rtlDevice->ClearAckResponder();
+      });
+    } else if (!armed) {
+      logger->warn("DEVOURER_ACK_DISARM_AFTER_MS ignored: no "
+                   "DEVOURER_ACK_RESPONDER was armed");
+    }
+  }
+
   rtlDevice->Init(packetProcessor, SelectedChannel{
                                        .Channel = static_cast<uint8_t>(channel),
                                        .ChannelOffset = ch_offset,
                                        .ChannelWidth = width,
                                        .Band = rx_band,
                                    });
+  if (ack_disarm_thread.joinable())
+    ack_disarm_thread.join();
 
   stop_background_emitters.Run();
   if (la_thread.joinable())
