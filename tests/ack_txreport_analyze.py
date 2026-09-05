@@ -13,8 +13,9 @@
 # a different unicast RA (SetAckResponder re-armed) -> expect ON behavior.
 #
 # Usage: python3 ack_txreport_analyze.py <tx.jsonl> --sent N --cell NAME \
-#            --expect on|off [--expect-retries PIN]
+#            --expect on|off [--expect-retries PIN] [--min-coverage FRACTION]
 #        (off-phase verdict pins at PIN, default 12)
+#        (minimum report coverage defaults to 0.80)
 #        python3 ack_txreport_analyze.py --selftest
 import json, sys
 
@@ -32,7 +33,8 @@ def load(path):
             out.append(r)
     return out
 
-def analyze(reports, sent, cell="", expect=None, expect_retries=12):
+def analyze(reports, sent, cell="", expect=None, expect_retries=12,
+            min_coverage=0.80):
     n = len(reports)
     v = {"ev": "ackrep.verdict", "cell": cell, "sent": sent, "reports": n}
     if n == 0:
@@ -46,6 +48,7 @@ def analyze(reports, sent, cell="", expect=None, expect_retries=12):
     v["retries_mean"] = round(sum(rts) / n, 2)
     v["retries_max"] = max(rts)
     v["report_coverage"] = round(n / sent, 3) if sent else None
+    v["coverage_ok"] = bool(sent and n / sent >= min_coverage)
     # HalMAC per-frame correlation: the descriptor stamps a rotating 8-bit tag;
     # count sequence gaps in the echo (mod 256) + the fw's own missed counter.
     tags = [r["tag"] for r in reports if "tag" in r]
@@ -56,12 +59,15 @@ def analyze(reports, sent, cell="", expect=None, expect_retries=12):
         v["tag_gaps"] = gaps
         v["fw_missed"] = sum(r.get("missed", 0) for r in reports)
     if expect == "on":
-        v["capability_ok"] = bool(v["ack_rate"] >= 0.9 and v["retries_mean"] < 2)
+        v["capability_ok"] = bool(v["coverage_ok"] and
+                                  v["ack_rate"] >= 0.9 and
+                                  v["retries_mean"] < 2)
     elif expect == "off":
         # Nobody ACKs: delivery must FAIL and retries pin at the configured
         # limit (--expect-retries, DEVOURER_TX_RETRY_LIMIT) — this proves the
         # no-ACK outcome is visible, not that the link is bad.
-        v["capability_ok"] = bool(v["ack_rate"] <= 0.1 and
+        v["capability_ok"] = bool(v["coverage_ok"] and
+                                  v["ack_rate"] <= 0.1 and
                                   v["retries_max"] >= expect_retries)
     else:
         v["capability_ok"] = None
@@ -99,9 +105,18 @@ def selftest():
     check(v["tag_gaps"] == 9, "tag gaps count lost reports (got %s)" % v["tag_gaps"])
     # J1 (no tag field) still verdicts on coverage alone.
     j1 = [{"ev": "tx.report", "ok": True, "state": 0, "retries": 1}
-          for _ in range(90)]
+            for _ in range(90)]
     v = analyze(j1, 100, "j1", expect="on")
-    check(v["capability_ok"] and "tag_gaps" not in v, "8812 format (no tag) ok")
+    check(v["capability_ok"] and "tag_gaps" not in v,
+          "8812 format (no tag) ok")
+    sparse_on = on[:1]
+    v = analyze(sparse_on, 100, "sparse-on", expect="on")
+    check(not v["capability_ok"] and not v["coverage_ok"],
+          "matching ON reports with insufficient coverage fail")
+    sparse_off = off[:1]
+    v = analyze(sparse_off, 100, "sparse-off", expect="off")
+    check(not v["capability_ok"] and not v["coverage_ok"],
+          "matching OFF reports with insufficient coverage fail")
     print("ack_txreport_analyze selftest:",
           "%d FAILURE(S)" % fails if fails else "all passed")
     return 1 if fails else 0
@@ -112,6 +127,7 @@ def main():
     args = sys.argv[1:]
     sent, cell, expect = 0, "", None
     expect_retries = 12
+    min_coverage = 0.80
     if "--sent" in args:
         i = args.index("--sent"); sent = int(args[i + 1]); del args[i:i + 2]
     if "--cell" in args:
@@ -121,7 +137,13 @@ def main():
     if "--expect-retries" in args:
         i = args.index("--expect-retries")
         expect_retries = int(args[i + 1]); del args[i:i + 2]
-    v = analyze(load(args[0]), sent, cell, expect, expect_retries)
+    if "--min-coverage" in args:
+        i = args.index("--min-coverage")
+        min_coverage = float(args[i + 1]); del args[i:i + 2]
+    if not 0 < min_coverage <= 1:
+        raise SystemExit("--min-coverage must be in (0, 1]")
+    v = analyze(load(args[0]), sent, cell, expect, expect_retries,
+                min_coverage)
     print(json.dumps(v))
     sys.exit(0 if v.get("capability_ok") else 1)
 

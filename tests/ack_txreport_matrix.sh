@@ -35,6 +35,7 @@ TX_SA=${TX_SA:-02:aa:bb:cc:dd:01}   # unicast TA (the ACK RA I/G footgun)
 RETRY_LIMIT=${RETRY_LIMIT:-12}      # descriptor retry pin for the off phase
 DISARM_MS=${DISARM_MS:-2000}        # RTL8733B post-bring-up disarm delay
 MIN_SENT=${MIN_SENT:-100}           # reject dead/too-short transmitter cells
+MIN_REPORT_COVERAGE=${MIN_REPORT_COVERAGE:-0.80} # reject sparse CCX samples
 READY_TIMEOUT=${READY_TIMEOUT:-25}  # bounded responder log/liveness wait
 OUT=${OUT:-/tmp/ack_txreport}
 CELLS=${CELLS:-"j1-8812au:0x0bda:0x8812 j2-8812bu:0x2357:0x012d j3-8822cu:0x0bda:0xc812"}
@@ -148,7 +149,8 @@ run_phase() { # $1 cell $2 phase $3 tx vid $4 tx pid $5 RA mac $6 responder mac 
   echo "-- $tag: sent=$sent reports=$(grep -c '"ev":"tx.report"' "$OUT/tx_$tag.jsonl" || true)"
   if ! python3 tests/ack_txreport_analyze.py "$OUT/tx_$tag.jsonl" \
        --sent "$sent" --cell "$tag" --expect "$expect" \
-       --expect-retries "$RETRY_LIMIT" | tee -a "$VERDICTS"; then
+       --expect-retries "$RETRY_LIMIT" \
+       --min-coverage "$MIN_REPORT_COVERAGE" | tee -a "$VERDICTS"; then
     echo "ABORT: analyzer rejected $tag" >&2
     exit 1
   fi

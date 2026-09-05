@@ -157,7 +157,9 @@ re-armed to a different MAC2, TX to MAC2 → proves RA and responder MAC are
 arbitrary), **off** (no responder → expect 0% ok, retries pinned at the
 descriptor limit set by `DEVOURER_TX_RETRY_LIMIT` — this matrix runs it at
 12 — so the no-ACK outcome must be *visible*, per frame).
-`report_coverage` = reports / frames sent (`tx.stats.submitted`); HalMAC adds
+`report_coverage` = reports / frames sent (`tx.stats.submitted`); a verdict
+requires at least 0.80 by default (`MIN_REPORT_COVERAGE`), so a handful of
+matching reports cannot make a mostly unobserved cell pass. HalMAC adds
 SW_DEFINE tag-echo gap counting.
 
 When the configured responder is an RTL8733B (`0bda:f72b` or `0bda:b733`),
