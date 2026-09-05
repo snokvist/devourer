@@ -16,6 +16,7 @@
 #            --expect on|off [--expect-retries PIN] [--min-coverage FRACTION]
 #        (off-phase verdict pins at PIN, default 12)
 #        (minimum report coverage defaults to 0.80)
+#        (minimum off-phase retry-pin fraction defaults to 0.90)
 #        python3 ack_txreport_analyze.py --selftest
 import json, sys
 
@@ -34,7 +35,7 @@ def load(path):
     return out
 
 def analyze(reports, sent, cell="", expect=None, expect_retries=12,
-            min_coverage=0.80):
+            min_coverage=0.80, min_retry_pin_rate=0.90):
     n = len(reports)
     v = {"ev": "ackrep.verdict", "cell": cell, "sent": sent, "reports": n}
     if n == 0:
@@ -66,9 +67,11 @@ def analyze(reports, sent, cell="", expect=None, expect_retries=12,
         # Nobody ACKs: delivery must FAIL and retries pin at the configured
         # limit (--expect-retries, DEVOURER_TX_RETRY_LIMIT) — this proves the
         # no-ACK outcome is visible, not that the link is bad.
+        v["retry_pin_rate"] = round(
+            sum(r >= expect_retries for r in rts) / n, 3)
         v["capability_ok"] = bool(v["coverage_ok"] and
                                   v["ack_rate"] <= 0.1 and
-                                  v["retries_max"] >= expect_retries)
+                                  v["retry_pin_rate"] >= min_retry_pin_rate)
     else:
         v["capability_ok"] = None
     return v
@@ -117,6 +120,11 @@ def selftest():
     v = analyze(sparse_off, 100, "sparse-off", expect="off")
     check(not v["capability_ok"] and not v["coverage_ok"],
           "matching OFF reports with insufficient coverage fail")
+    one_pinned = [dict(r, retries=0) for r in off]
+    one_pinned[-1]["retries"] = 12
+    v = analyze(one_pinned, 100, "one-pinned", expect="off")
+    check(not v["capability_ok"] and v["retry_pin_rate"] == 0.01,
+          "one pinned outlier cannot pass an otherwise unpinned OFF cell")
     print("ack_txreport_analyze selftest:",
           "%d FAILURE(S)" % fails if fails else "all passed")
     return 1 if fails else 0
@@ -128,6 +136,7 @@ def main():
     sent, cell, expect = 0, "", None
     expect_retries = 12
     min_coverage = 0.80
+    min_retry_pin_rate = 0.90
     if "--sent" in args:
         i = args.index("--sent"); sent = int(args[i + 1]); del args[i:i + 2]
     if "--cell" in args:
@@ -140,10 +149,15 @@ def main():
     if "--min-coverage" in args:
         i = args.index("--min-coverage")
         min_coverage = float(args[i + 1]); del args[i:i + 2]
+    if "--min-retry-pin-rate" in args:
+        i = args.index("--min-retry-pin-rate")
+        min_retry_pin_rate = float(args[i + 1]); del args[i:i + 2]
     if not 0 < min_coverage <= 1:
         raise SystemExit("--min-coverage must be in (0, 1]")
+    if not 0 < min_retry_pin_rate <= 1:
+        raise SystemExit("--min-retry-pin-rate must be in (0, 1]")
     v = analyze(load(args[0]), sent, cell, expect, expect_retries,
-                min_coverage)
+                min_coverage, min_retry_pin_rate)
     print(json.dumps(v))
     sys.exit(0 if v.get("capability_ok") else 1)
 

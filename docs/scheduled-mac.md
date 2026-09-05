@@ -160,7 +160,9 @@ descriptor limit set by `DEVOURER_TX_RETRY_LIMIT` — this matrix runs it at
 `report_coverage` = reports / frames sent (`tx.stats.submitted`); a verdict
 requires at least 0.80 by default (`MIN_REPORT_COVERAGE`), so a handful of
 matching reports cannot make a mostly unobserved cell pass. HalMAC adds
-SW_DEFINE tag-echo gap counting.
+SW_DEFINE tag-echo gap counting. An off verdict also requires at least 90% of
+reported frames at the configured retry limit (`MIN_RETRY_PIN_RATE`); one
+pinned outlier cannot stand in for the claimed retry-pinned distribution.
 
 When the configured responder is an RTL8733B (`0bda:f72b` or `0bda:b733`),
 the harness adds a fourth **disarmed** phase: arm MAC1, start a timer only

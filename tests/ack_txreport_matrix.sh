@@ -36,9 +36,24 @@ RETRY_LIMIT=${RETRY_LIMIT:-12}      # descriptor retry pin for the off phase
 DISARM_MS=${DISARM_MS:-2000}        # RTL8733B post-bring-up disarm delay
 MIN_SENT=${MIN_SENT:-100}           # reject dead/too-short transmitter cells
 MIN_REPORT_COVERAGE=${MIN_REPORT_COVERAGE:-0.80} # reject sparse CCX samples
+MIN_RETRY_PIN_RATE=${MIN_RETRY_PIN_RATE:-0.90} # OFF must be broadly pinned
 READY_TIMEOUT=${READY_TIMEOUT:-25}  # bounded responder log/liveness wait
 OUT=${OUT:-/tmp/ack_txreport}
 CELLS=${CELLS:-"j1-8812au:0x0bda:0x8812 j2-8812bu:0x2357:0x012d j3-8822cu:0x0bda:0xc812"}
+
+fraction_re='^(0\.[0-9]*[1-9][0-9]*|1(\.0+)?)$'
+if ! [[ "$SECS" =~ ^[1-9][0-9]*$ && "$GAP_US" =~ ^[0-9]+$ &&
+        "$RETRY_LIMIT" =~ ^[0-9]+$ && "$DISARM_MS" =~ ^[0-9]+$ &&
+        "$MIN_SENT" =~ ^[1-9][0-9]*$ &&
+        "$READY_TIMEOUT" =~ ^[1-9][0-9]*$ &&
+        "$MIN_REPORT_COVERAGE" =~ $fraction_re &&
+        "$MIN_RETRY_PIN_RATE" =~ $fraction_re ]] ||
+   [ "$RETRY_LIMIT" -gt 63 ]; then
+  echo "ABORT: invalid numeric matrix setting (SECS/MIN_SENT/READY_TIMEOUT " \
+       "must be positive integers; GAP_US/DISARM_MS non-negative integers; " \
+       "RETRY_LIMIT 0..63; coverage/pin-rate fractions in (0,1])" >&2
+  exit 2
+fi
 
 cleanup(){ sudo pkill -9 -x rxdemo 2>/dev/null; sudo pkill -9 -x txdemo 2>/dev/null; return 0; }
 trap cleanup EXIT
@@ -150,7 +165,8 @@ run_phase() { # $1 cell $2 phase $3 tx vid $4 tx pid $5 RA mac $6 responder mac 
   if ! python3 tests/ack_txreport_analyze.py "$OUT/tx_$tag.jsonl" \
        --sent "$sent" --cell "$tag" --expect "$expect" \
        --expect-retries "$RETRY_LIMIT" \
-       --min-coverage "$MIN_REPORT_COVERAGE" | tee -a "$VERDICTS"; then
+       --min-coverage "$MIN_REPORT_COVERAGE" \
+       --min-retry-pin-rate "$MIN_RETRY_PIN_RATE" | tee -a "$VERDICTS"; then
     echo "ABORT: analyzer rejected $tag" >&2
     exit 1
   fi
