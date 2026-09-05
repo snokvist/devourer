@@ -58,6 +58,8 @@ public:
   SelectedChannel GetSelectedChannel() override;
   bool SetAckResponder(const devourer::MacAddr &mac) override;
   void ClearAckResponder() override;
+  /* Shared by ClearAckResponder and SetAckResponder rollback. */
+  bool disarm_ack_responder();
   void SetCcaMode(bool disabled) override;
   void Stop() override;
 

@@ -847,22 +847,11 @@ bool Rtl8733bDevice::SetAckResponder(const devourer::MacAddr &mac) {
                    mac.bytes[0]);
     return false;
   }
-  /* Refused on this die, and only on this die: ClearAckResponder disarms by
-   * retargeting the identity BACK to _efuse.mac, so a responder armed to that
-   * very address could not be moved off it. The port would keep answering
-   * while the disarm reported success — the exact silent-live-responder
-   * failure this backend's disarm exists to prevent. Refusing the arm is the
-   * honest end of the trade: the alternative is an ACK responder that cannot
-   * be switched off without a re-init. Other generations disarm through the
-   * net_type gate alone and carry no such restriction. */
-  if (!devourer::ack::disarmable_by_retarget(mac.data(), _efuse.mac.data())) {
-    _logger->error("RTL8733B: ACK responder cannot be armed to the adapter's "
-                   "OWN MAC — the disarm restores that address, so it could "
-                   "not be turned off again without a re-init");
-    return false;
-  }
   if (!devourer::ack::enable(_device, mac.data())) {
-    if (!devourer::ack::disable_verified(_device)) {
+    /* enable() writes MACID before its final gate write, so a failure here can
+     * leave the identity ON the responder address — a live responder on this
+     * die. Roll back through the same disarm ClearAckResponder uses. */
+    if (!disarm_ack_responder()) {
       _logger->error(
           "RTL8733B: ACK responder arm failed with hardware state UNKNOWN");
     } else {
@@ -875,7 +864,7 @@ bool Rtl8733bDevice::SetAckResponder(const devourer::MacAddr &mac) {
    * this backend does not report a write it cannot confirm. A failed arm is
    * rolled back and the NoLink gate is read back before false is returned. */
   if (!devourer::ack::verify(_device, mac.data())) {
-    if (!devourer::ack::disable_verified(_device)) {
+    if (!disarm_ack_responder()) {
       _logger->error(
           "RTL8733B: ACK responder verify failed with hardware state UNKNOWN");
     } else {
@@ -893,62 +882,51 @@ bool Rtl8733bDevice::SetAckResponder(const devourer::MacAddr &mac) {
   return true;
 }
 
+/* The disarm, shared by ClearAckResponder and SetAckResponder's rollback.
+ *
+ * BOTH halves are attempted and neither gates the other. The gate write is
+ * kept for the generations where it means something and because leaving
+ * net_type set would be untidy, but on this die it changes nothing: measured,
+ * a never-armed port answers on its own MAC at 85.2 % / 82.5 % against 0.0 %
+ * for an address nobody holds, and an armed one at 83.3 % — so the engine
+ * matches MACID and 0x0102[1:0] is inert. The identity half is therefore the
+ * one that decides anything, and it must not be skipped because a transport
+ * read for the half that decides nothing happened to throw.
+ *
+ * Restores the adapter's own MAC — what initialize()'s program_mac wrote — not
+ * zero: many Realtek MAC TX paths refuse to schedule a frame when the MAC ID
+ * is zero (the T1 canary bug REG_MACID programming exists to fix,
+ * src/jaguar1/HalModule.cpp), and a radio being disarmed live may still be
+ * injecting. _efuse.mac is always valid here: initialize() refuses to bring the
+ * MAC up without mac_valid(), and _mac_ready is set only after that succeeded.
+ *
+ * This returns the port to the state a never-armed session ships in. It does
+ * NOT make it silent — on this die nothing can, short of taking the MAC down —
+ * and the log says so. */
+bool Rtl8733bDevice::disarm_ack_responder() {
+  const bool gate = devourer::ack::disable_verified(_device);
+  if (!gate)
+    _logger->error("RTL8733B: ACK responder gate did not latch closed — "
+                   "continuing to the identity, which is what this die "
+                   "actually matches on");
+  const bool id = devourer::ack::retarget(_device, _efuse.mac.data()) &&
+                  devourer::ack::macid_is(_device, _efuse.mac.data());
+  if (!id) {
+    _logger->error("RTL8733B: ACK responder MACID could not be restored — the "
+                   "port may still answer for the responder address");
+    return false;
+  }
+  _logger->info("RTL8733B: hardware ACK responder disarmed (MACID back to the "
+                "adapter's own address; this port answers for that address "
+                "either way on this die)");
+  return gate;
+}
+
 void Rtl8733bDevice::ClearAckResponder() {
   std::lock_guard<std::recursive_mutex> lock(_reg_mu);
   if (!_mac_ready)
     return;
-  if (!devourer::ack::disable_verified(_device)) {
-    _logger->error("RTL8733B: ACK responder disarm did not latch");
-    return;
-  }
-  /* Closing the gate is not enough on this die. Measured against a peer
-   * soliciting unicast QoS-Data at ~32 frames/s, scoring the SOLICITING side's
-   * CCX tx.report (this backend emits none of its own):
-   *
-   *   fresh process, never armed   100.00 % unanswered (969/969)
-   *   armed                          0.42 %
-   *   disarmed, gate only            0.53 %   <-- still answering
-   *   fresh process, never armed   100.00 % unanswered (reversibility control)
-   *
-   * is_disabled() read 0x0102[1:0] back as 0 on every one of those disarms and
-   * nothing was logged, so the gate write landed and the engine ignored it.
-   * Only re-initialising the chip stopped it. Retarget the identity too.
-   *
-   * Restore the adapter's own MAC — what initialize()'s program_mac wrote —
-   * rather than zero: many Realtek MAC TX paths refuse to schedule a frame when
-   * the MAC ID is zero (the T1 canary bug that programming REG_MACID exists to
-   * fix, src/jaguar1/HalModule.cpp), and a radio being disarmed live may still
-   * be injecting. Zero would not even remove the match, only move it to an
-   * address whose I/G bit is clear, which is_unicast() accepts.
-   *
-   * _efuse.mac is always valid here: initialize() REFUSES to bring the MAC up
-   * without mac_valid() (rejects all-zero, all-0xFF and I/G-set), and
-   * _mac_ready — checked above — is set only after that succeeded. So this
-   * cannot write zeros back and cannot re-create the T1 state.
-   *
-   * What this restores is precisely the register state a NEVER-ARMED monitor
-   * session already ships in: program_mac writes this same MACID at init and
-   * net_type stays 0. So the disarm returns the port to the status quo ante
-   * rather than to silence — on a die that ignores the gate, a port matching
-   * its own MAC may still answer a frame addressed to it, exactly as an
-   * unarmed monitor radio would. This cannot create an exposure monitor mode
-   * does not already have, and devourer never advertises that address.
-   *
-   * enable() also writes BSSID (0x0618/0x061c); this does not restore it,
-   * because program_mac never wrote it and there is nothing to restore to.
-   * The on-air result — 100 % unanswered after this disarm, with the BSSID
-   * residue standing — is the evidence that the engine does not match on it. */
-  if (!devourer::ack::retarget(_device, _efuse.mac.data())) {
-    _logger->error("RTL8733B: ACK responder disarmed the gate but could not "
-                   "restore the MACID — the port may still answer");
-    return;
-  }
-  if (!devourer::ack::retargeted(_device, _efuse.mac.data())) {
-    _logger->error("RTL8733B: ACK responder MACID restore did not read back");
-    return;
-  }
-  _logger->info("RTL8733B: hardware ACK responder disarmed (net_type=NoLink, "
-                "MACID restored)");
+  (void)disarm_ack_responder();
 }
 
 void Rtl8733bDevice::SetCcaMode(bool disabled) {

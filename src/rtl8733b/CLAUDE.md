@@ -318,9 +318,9 @@ session that quietly answers nothing. And the disarm is unconditional inside
 siting the clear there means no future path can reach `stop()` and leave an
 unowned SIFS-timed transmitter on the air. After an armed session ends with
 `teardown_power_down` off, the peer reads ack_rate 0.00 with retries pinned at
-12 — but that does NOT validate the net_type clear, because `stop()`'s RCR and
-CR writes take the MAC down two lines later and the silence is unavoidable
-either way.
+12 — that silence comes from `stop()`'s RCR and CR writes taking the MAC down,
+not from the net_type clear, which is inert on this die (`src/AckResponder.h`
+retarget(), `Rtl8733bDevice::disarm_ack_responder`).
 
 Responder capability and its measured limits live in `src/AdapterCaps.h`
 (`ack_responder_ok`); the arm/disarm recipe and why this die needs a retarget

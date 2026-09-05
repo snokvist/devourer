@@ -224,8 +224,11 @@ public:
    * unsupported or when arm/verification fails; false is not proof of passive
    * state, so implementations log if rollback cannot be verified. Clear is a
    * non-throwing best effort to return net_type to No Link — and, on a die
-   * where the gate alone does not stop the engine, to move the port identity
-   * off `mac` as well (see Rtl8733bDevice::ClearAckResponder). */
+   * whose engine does not consult net_type, to move the port identity off
+   * `mac` as well, which is the only thing that changes its behaviour there
+   * (see Rtl8733bDevice::disarm_ack_responder). Clear does not promise
+   * silence: a die that matches MACID alone answers for whatever address is
+   * left programmed, including the one MAC bring-up wrote. */
   virtual bool SetAckResponder(const devourer::MacAddr &mac) {
     (void)mac;
     return false;

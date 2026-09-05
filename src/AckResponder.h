@@ -48,6 +48,32 @@
 namespace devourer {
 namespace ack {
 
+/* The MACID pair, composed in ONE place. enable(), verify() and retarget()
+ * previously each carried their own copy of this packing, in a header whose
+ * verify() comment promises to keep the register map in one file: an
+ * endianness or width fix applied to one copy would leave the others reading
+ * the old layout while still reporting success. */
+inline uint32_t macid_lo(const uint8_t mac[6]) {
+  return (uint32_t)mac[0] | ((uint32_t)mac[1] << 8) | ((uint32_t)mac[2] << 16) |
+         ((uint32_t)mac[3] << 24);
+}
+inline uint16_t macid_hi(const uint8_t mac[6]) {
+  return (uint16_t)(mac[4] | (mac[5] << 8));
+}
+
+/* Is the ACK-match identity currently `mac`? The engine matches MACID, so this
+ * is the question "would this port answer for `mac`" — on the RTL8733B that is
+ * the WHOLE question (see retarget()). Throws nothing; a transport failure
+ * reads as "not this address". */
+inline bool macid_is(RtlAdapter &dev, const uint8_t mac[6]) noexcept {
+  try {
+    return dev.rtw_read<uint32_t>(0x0610) == macid_lo(mac) &&
+           dev.rtw_read16(0x0614) == macid_hi(mac);
+  } catch (...) {
+    return false;
+  }
+}
+
 inline bool enable(RtlAdapter &dev, const uint8_t mac[6]) noexcept {
   try {
     const uint8_t nt = dev.rtw_read8(0x0102);
@@ -61,16 +87,10 @@ inline bool enable(RtlAdapter &dev, const uint8_t mac[6]) noexcept {
       (void)dev.rtw_write8(0x0102, static_cast<uint8_t>(nt & ~0x03u));
       return false;
     }
-    if (!dev.rtw_write<uint32_t>(
-            0x0610, (uint32_t)mac[0] | ((uint32_t)mac[1] << 8) |
-                        ((uint32_t)mac[2] << 16) |
-                        ((uint32_t)mac[3] << 24)) ||
-        !dev.rtw_write16(0x0614, (uint16_t)(mac[4] | (mac[5] << 8))) ||
-        !dev.rtw_write<uint32_t>(
-            0x0618, (uint32_t)mac[0] | ((uint32_t)mac[1] << 8) |
-                        ((uint32_t)mac[2] << 16) |
-                        ((uint32_t)mac[3] << 24)) ||
-        !dev.rtw_write16(0x061c, (uint16_t)(mac[4] | (mac[5] << 8))))
+    if (!dev.rtw_write<uint32_t>(0x0610, macid_lo(mac)) ||
+        !dev.rtw_write16(0x0614, macid_hi(mac)) ||
+        !dev.rtw_write<uint32_t>(0x0618, macid_lo(mac)) ||
+        !dev.rtw_write16(0x061c, macid_hi(mac)))
       return false;
     if (dev.rtw_write8(0x0102,
                        static_cast<uint8_t>((nt & ~0x03u) | 0x03u)))
@@ -93,39 +113,39 @@ inline bool disable(RtlAdapter &dev) {
   return dev.rtw_write8(0x0102, static_cast<uint8_t>(nt & ~0x03u));
 }
 
-/* Can a responder armed on `responder` be disarmed by retargeting the identity
- * to `restore`? Only if the two differ. Where they are the same address the
- * retarget writes the value already there: both register writes and the
- * readback succeed, nothing moves, and a caller that trusts the return value
- * reports a disarm that did not happen — on a die that ignores the gate, that
- * is a responder still transmitting behind a success log.
+/* Point the ACK-match identity at another address WITHOUT touching the gate.
  *
- * A predicate rather than a check inside retarget(), because retarget() cannot
- * know what the port was armed to; the caller owns both addresses and is the
- * only place the question can be asked. */
-inline bool disarmable_by_retarget(const uint8_t responder[6],
-                                   const uint8_t restore[6]) {
-  return std::memcmp(responder, restore, 6) != 0;
-}
-
-/* Point the ACK-match identity somewhere harmless WITHOUT touching the gate.
+ * On the RTL8733B this is the ONLY thing that changes whether the port answers.
+ * net_type is inert there — measured, three cells, single-shot ACK rate at
+ * MCS3 with a Jaguar1 soliciting:
  *
- * For dies where closing net_type does not stop the engine. Measured on an
- * RTL8733B against a peer soliciting unicast QoS-Data: after a disable() whose
- * gate write read back as 0, the port still answered on the armed MAC, and only
- * re-initialising the chip stopped it — a responder reporting passive while
- * still transmitting.
+ *   never-armed port, peer solicits the adapter's own EFUSE MAC   85.2 %, 82.5 %
+ *   never-armed port, peer solicits an address nobody holds        0.0 %  (control)
+ *   port armed to X, peer solicits X                              83.3 %
  *
- * `mac` is a RESTORE address, normally the adapter's own (what MAC bring-up
- * programmed). It is deliberately NOT zero: many Realtek MAC TX paths refuse to
- * schedule a frame when the MAC ID is zero — the T1 canary bug that programming
- * REG_MACID was introduced to fix (src/jaguar1/HalModule.cpp,
- * EepromManager.h) — and a radio being disarmed may still be injecting. Zero
- * would also not remove the match, only move it: 00:00:00:00:00:00 has the I/G
- * bit clear, so is_unicast() accepts it and a peer could solicit it.
+ * A never-armed monitor answers on its own MAC at the same rate as a
+ * deliberately armed responder. So on this die the engine matches MACID and
+ * nothing else: MAC bring-up's program_mac is what makes it answer, arming
+ * merely repoints it, and 0x0102[1:0] does not gate it in either direction.
+ * (The gate IS real on the generations the AP-mode work covered; this is a
+ * per-die exception, not a correction to the recipe.)
  *
- * Gate untouched on purpose: this is the identity half, so a caller can compose
- * it with disable() in whichever order its die needs, and no generation gets a
+ * Consequences worth stating plainly, because they are easy to get backwards:
+ * every never-armed RTL8733B monitor session already auto-ACKs unicast frames
+ * addressed to its own EFUSE MAC — a pre-existing property of that die under
+ * this library, not something an arm creates. And a disarm cannot make the port
+ * silent; it can only take it off the responder address and put it back on the
+ * one it shipped with.
+ *
+ * `mac` is that restore address, normally the adapter's own. Deliberately NOT
+ * zero: many Realtek MAC TX paths refuse to schedule a frame when the MAC ID is
+ * zero — the T1 canary bug that programming REG_MACID was introduced to fix
+ * (src/jaguar1/HalModule.cpp, EepromManager.h) — and a radio being disarmed may
+ * still be injecting. Zero would not remove the match either, only move it:
+ * 00:00:00:00:00:00 has the I/G bit clear, so is_unicast() accepts it.
+ *
+ * Gate untouched on purpose: this is the identity half, so a caller composes it
+ * with disable() in whichever order its die needs, and no generation gets a
  * behaviour change it was not measured for. */
 inline bool retarget(RtlAdapter &dev, const uint8_t mac[6]) noexcept {
   try {
@@ -134,24 +154,9 @@ inline bool retarget(RtlAdapter &dev, const uint8_t mac[6]) noexcept {
      * this file's own doctrine (see enable(): "The transfer status is not
      * state readback") that low write may still have landed, leaving a
      * half-updated address with the high half never even tried. */
-    const bool lo = dev.rtw_write<uint32_t>(
-        0x0610, (uint32_t)mac[0] | ((uint32_t)mac[1] << 8) |
-                    ((uint32_t)mac[2] << 16) | ((uint32_t)mac[3] << 24));
-    const bool hi = dev.rtw_write16(0x0614, (uint16_t)(mac[4] | (mac[5] << 8)));
+    const bool lo = dev.rtw_write<uint32_t>(0x0610, macid_lo(mac));
+    const bool hi = dev.rtw_write16(0x0614, macid_hi(mac));
     return lo && hi;
-  } catch (...) {
-    return false;
-  }
-}
-
-/* Did a retarget land? The MACID half only — the gate is disable()'s business. */
-inline bool retargeted(RtlAdapter &dev, const uint8_t mac[6]) noexcept {
-  try {
-    const uint32_t want_lo =
-        (uint32_t)mac[0] | ((uint32_t)mac[1] << 8) |
-        ((uint32_t)mac[2] << 16) | ((uint32_t)mac[3] << 24);
-    return dev.rtw_read<uint32_t>(0x0610) == want_lo &&
-           dev.rtw_read16(0x0614) == (uint16_t)(mac[4] | (mac[5] << 8));
   } catch (...) {
     return false;
   }
@@ -189,13 +194,7 @@ inline bool is_unicast(const uint8_t mac[6]) { return (mac[0] & 0x01u) == 0; }
  * honest without asserting on one that does not. */
 inline bool verify(RtlAdapter &dev, const uint8_t mac[6]) noexcept {
   try {
-    const uint32_t want_lo =
-        (uint32_t)mac[0] | ((uint32_t)mac[1] << 8) |
-        ((uint32_t)mac[2] << 16) | ((uint32_t)mac[3] << 24);
-    const uint16_t want_hi = (uint16_t)(mac[4] | (mac[5] << 8));
-    return (dev.rtw_read8(0x0102) & 0x03u) == 0x03u &&
-           dev.rtw_read<uint32_t>(0x0610) == want_lo &&
-           dev.rtw_read16(0x0614) == want_hi;
+    return (dev.rtw_read8(0x0102) & 0x03u) == 0x03u && macid_is(dev, mac);
   } catch (...) {
     return false;
   }

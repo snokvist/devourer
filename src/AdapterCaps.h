@@ -171,19 +171,27 @@ struct AdapterCaps {
    * ack_responder_ok: SetAckResponder measurably closes a hardware-ARQ loop
    * as the RESPONDER (SIFS ACKs that a soliciting TX's CCX reports confirm).
    * Measured true: 8812A (works, degraded — intermittent SIFS ACKs), 8814A,
-   * 8821A (61–64% single-shot MCS3, 94% at retry 8, disarm-proof-verified —
-   * an earlier "broken" verdict was a harness artifact: the responder's arm
-   * was never verified, so a silently dead responder read as on=0/off=0),
+   * 8821A (61–64% single-shot MCS3, 94% at retry 8 — an earlier "broken"
+   * verdict was a harness artifact: the responder's arm was never verified,
+   * so a silently dead responder read as on=0/off=0),
    * 8822B, 8812C/8822C, 8812E/8822E (the 8811A rides the 8812 die path and
    * inherits its row), 8733B (1725/1725 frames ACKed at retries_mean 0.00,
    * and retarget-proof: re-armed on a different MAC, 1728/1728 —
-   * tests/ack_txreport_matrix.sh run with the 8733B as the responder). That
-   * matrix does NOT establish disarm on any die, and an earlier revision of
-   * this row said "disarm-proof" on its strength: run_phase() passes an empty
-   * responder MAC for the off cell, so it starts no responder process at all.
-   * That cell is NEVER-ARMED, not disarmed — the same fresh-process fallacy as
-   * the 8821AU line above, and on the 8733B a real disarm was later measured
-   * NOT to stop the engine (Rtl8733bDevice::ClearAckResponder).
+   * tests/ack_txreport_matrix.sh run with the 8733B as the responder).
+   *
+   * That matrix establishes ARMING only. Its off cell is never-armed rather
+   * than disarmed — run_phase() passes an empty responder MAC, so it starts no
+   * responder process at all — so no row here says anything about disarm, on
+   * any die, however the cell is labelled.
+   *
+   * On the 8733B the net_type gate is INERT and the engine matches MACID
+   * alone: at single-shot ACK rate a never-armed port answers on its own EFUSE
+   * MAC at 85.2%/82.5% against 0.0% for an address nobody holds, and 83.3%
+   * when deliberately armed. Two consequences: every never-armed monitor
+   * session on that die already auto-ACKs unicast to its own MAC, and a disarm
+   * there can only move the identity, never silence the port
+   * (Rtl8733bDevice::disarm_ack_responder). Not known to hold on any other
+   * generation — the AP-mode work proved the gate where it was measured.
    * False-as-unmeasured (the
    * vht_2g4_ok reading: unmeasured, not incapable): the 8821C — it shares
    * the recipe but no 8821CU/CE cell has run. FALSE on Kestrel:

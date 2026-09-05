@@ -1,35 +1,29 @@
 /* Headless guard for the ACK-responder recipe (src/AckResponder.h): the arm,
- * the gate-only disarm, and the retarget seam a die needs when the gate alone
- * does not stop its ACK engine.
+ * the gate-only disarm staying gate-only, and the retarget that the RTL8733B
+ * disarm is built on.
  *
- * Why retarget() exists. On the RTL8733B a port whose MACID is still
- * programmed keeps auto-ACKing after net_type reads back 0, so
- * Rtl8733bDevice::ClearAckResponder composes disable() with a retarget to the
- * adapter's own MAC. The restore address is deliberately NOT zero: many
- * Realtek MAC TX paths refuse to schedule a frame when the MAC ID is zero
- * (src/jaguar1/HalModule.cpp), and zero would not remove the match anyway —
- * 00:00:00:00:00:00 has the I/G bit clear, so is_unicast() accepts it. Both
- * properties are pinned below.
+ * Why retarget() exists. On the RTL8733B the net_type gate is INERT: measured
+ * at single-shot ACK rate, a never-armed port answers on its own EFUSE MAC at
+ * 85.2 % / 82.5 % (0.0 % for an address nobody holds; 83.3 % when deliberately
+ * armed), so the engine matches MACID and 0x0102[1:0] decides nothing. The
+ * identity is therefore the only thing a disarm can move, and
+ * Rtl8733bDevice::disarm_ack_responder moves it back to the adapter's own MAC.
  *
- * tests/ack_responder_check.sh cannot cover this and never could: every cell
- * in its matrix is a FRESH PROCESS, so its responder-off arm always starts
- * from a chip that was never armed. The behaviour only appears when one
- * process arms and then disarms — which is what this test does against a
- * modelled register file.
+ * The restore address is deliberately NOT zero: many Realtek MAC TX paths
+ * refuse to schedule a frame when the MAC ID is zero (src/jaguar1/HalModule.cpp),
+ * and zero would not remove the match anyway — 00:00:00:00:00:00 has the I/G
+ * bit clear, so is_unicast() accepts it. Both properties are pinned below.
  *
- * What it does NOT cover, and cannot:
- *  - whether a retarget stops a given die on air. That is silicon behaviour,
- *    verified on hardware (RTL8733B: 100 % unanswered before an arm, 0.63 %
- *    armed, 100 % again after the composed disarm, 1.15 % re-armed).
- *  - the CALLER's choice of restore address. Nothing here instantiates
- *    Rtl8733bDevice, so a regression that handed retarget() a zeroed buffer
- *    would still pass; the invariant that stops that (_mac_ready implies
- *    EFUSE mac_valid()) lives in ClearAckResponder and initialize().
- *  - the degenerate case where the armed address IS the restore address, in
- *    which no retarget can move the match. SetAckResponder refuses that arm
- *    up front; the refusal is device-layer and untested here. */
+ * The on-air harnesses cannot cover any of this: every cell in
+ * ack_responder_check.sh and ack_txreport_matrix.sh is a FRESH PROCESS, so
+ * their responder-off arm always starts from a chip that was never armed.
+ *
+ * What this does NOT cover: silicon behaviour, and the device-layer composition
+ * in Rtl8733bDevice (nothing here instantiates it). Those are verified on
+ * hardware. */
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <map>
 #include <memory>
 
@@ -48,10 +42,10 @@ static int failures = 0;
 
 namespace {
 
-/* A byte-addressed register file. Only the three fields the recipe touches
- * matter, but modelling the whole space keeps the test honest about WHERE it
- * writes: an implementation that hit the wrong offset would read back zero
- * here rather than quietly passing. */
+/* A byte-addressed register file. Only the fields the recipe touches matter,
+ * but modelling the whole space keeps the test honest about WHERE it writes:
+ * an implementation that hit the wrong offset would read back zero here rather
+ * than quietly passing. */
 class FakeRegs final : public devourer::IRtlTransport {
 public:
   std::map<uint16_t, uint8_t> mem;
@@ -93,22 +87,19 @@ public:
 constexpr uint16_t kNetType = 0x0102;
 constexpr uint16_t kMacId = 0x0610;
 
-bool macid_clear(FakeRegs &r) {
-  return r.read32(kMacId) == 0 && r.read16(kMacId + 4) == 0;
-}
-
 }  // namespace
 
 int main() {
   auto logger = std::make_shared<Logger>();
   const uint8_t mac[6] = {0x02, 0x12, 0x34, 0x56, 0x78, 0x9a};
   /* Stands in for the adapter's own EFUSE MAC — what MAC bring-up programmed
-   * and what the disarm restores. Distinct from the responder MAC, which is
-   * the whole point. */
+   * and what the disarm restores. Distinct from the responder MAC. */
   const uint8_t own[6] = {0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0x01};
 
   {
-    /* Arm: MACID programmed, gate open, verify() agrees. */
+    /* Arm: MACID programmed, gate open, verify() agrees. The raw register
+     * values are asserted independently of the readback helpers, so a
+     * self-consistent endianness change in both would still be caught. */
     auto regs = std::make_shared<FakeRegs>();
     RtlAdapter dev(regs, logger);
     CHECK(devourer::ack::enable(dev, mac));
@@ -116,18 +107,33 @@ int main() {
     CHECK(regs->read16(kMacId + 4) == 0x9a78u);
     CHECK((regs->read8(kNetType) & 0x03u) == 0x03u);
     CHECK(devourer::ack::verify(dev, mac));
+    CHECK(devourer::ack::macid_is(dev, mac));
     CHECK(!devourer::ack::is_disabled(dev));
   }
   {
+    /* One packing, one register map: verify() and macid_is() must agree with
+     * the bytes actually in the file. This is the property the helpers exist
+     * for — a width or endianness fix that reached only one of them would
+     * break here rather than silently diverge (they used to be four copies). */
+    auto regs = std::make_shared<FakeRegs>();
+    RtlAdapter dev(regs, logger);
+    CHECK(devourer::ack::enable(dev, mac));
+    CHECK(regs->read32(kMacId) == devourer::ack::macid_lo(mac));
+    CHECK(regs->read16(kMacId + 4) == devourer::ack::macid_hi(mac));
+    CHECK(devourer::ack::macid_is(dev, mac));
+    CHECK(!devourer::ack::macid_is(dev, own));
+  }
+  {
     /* The portable disarm is gate-only and MUST stay that way: it is what the
-     * three unmeasured generations still use, and zeroing or moving their
-     * MACID is a change none of them has a bench cell for. */
+     * other generations use, and moving their MACID is a change none of them
+     * has a bench cell for. */
     auto regs = std::make_shared<FakeRegs>();
     RtlAdapter dev(regs, logger);
     CHECK(devourer::ack::enable(dev, mac));
     CHECK(devourer::ack::disable_verified(dev));
     CHECK((regs->read8(kNetType) & 0x03u) == 0);
     CHECK(regs->read32(kMacId) == 0x56341202u); /* identity left standing */
+    CHECK(devourer::ack::macid_is(dev, mac));
     CHECK(!devourer::ack::verify(dev, mac));    /* gate shut, so not armed */
   }
   {
@@ -138,17 +144,27 @@ int main() {
     CHECK(devourer::ack::enable(dev, mac));
     CHECK(devourer::ack::disable_verified(dev));
     CHECK(devourer::ack::retarget(dev, own));
-    CHECK(devourer::ack::retargeted(dev, own));
-    CHECK(!devourer::ack::retargeted(dev, mac)); /* no longer the responder */
+    CHECK(devourer::ack::macid_is(dev, own));
+    CHECK(!devourer::ack::macid_is(dev, mac)); /* no longer the responder */
     CHECK((regs->read8(kNetType) & 0x03u) == 0);
-    /* NOT zero — the T1 state that stops MAC TX scheduling. */
-    CHECK(regs->read32(kMacId) != 0 || regs->read16(kMacId + 4) != 0);
     CHECK(regs->read32(kMacId) == 0xccbbaa02u);
     CHECK(regs->read16(kMacId + 4) == 0x01ddu);
+    /* NOT zero — the T1 state that stops MAC TX scheduling. */
+    CHECK(regs->read32(kMacId) != 0 || regs->read16(kMacId + 4) != 0);
   }
   {
-    /* Re-arm after a composed disarm restores the responder identity: the
-     * live toggle loop must work in both directions without a re-init. */
+    /* retarget() does not touch the gate: composition is the caller's, so a
+     * die that wants the identity moved without reopening anything gets that. */
+    auto regs = std::make_shared<FakeRegs>();
+    RtlAdapter dev(regs, logger);
+    CHECK(devourer::ack::enable(dev, mac));
+    const uint8_t before = regs->read8(kNetType);
+    CHECK(devourer::ack::retarget(dev, own));
+    CHECK(regs->read8(kNetType) == before);
+  }
+  {
+    /* Re-arm after a composed disarm restores the responder identity: the live
+     * toggle loop must work in both directions without a re-init. */
     auto regs = std::make_shared<FakeRegs>();
     RtlAdapter dev(regs, logger);
     CHECK(devourer::ack::enable(dev, mac));
@@ -164,7 +180,7 @@ int main() {
      * operations without identifying addresses, and its strength depends on
      * FakeRegs::write8 returning BEFORE it stores (so write16/write32
      * short-circuit to one call each): making the fake attempt both bytes
-     * would make this assertion tautological. */
+     * would turn this into a tautology. */
     auto regs = std::make_shared<FakeRegs>();
     RtlAdapter dev(regs, logger);
     CHECK(devourer::ack::enable(dev, mac));
@@ -173,26 +189,6 @@ int main() {
     CHECK(!devourer::ack::retarget(dev, own));
     CHECK(regs->write_calls - before == 2); /* both halves attempted */
     regs->fail_writes = false;
-  }
-  {
-    /* The disarm's precondition. Retargeting to the SAME address the port is
-     * armed to cannot move the match — both writes and the readback succeed
-     * while nothing changes — so the caller must refuse that arm up front
-     * rather than emit a success log for a responder that is still answering.
-     * Rtl8733bDevice::SetAckResponder gates on exactly this. */
-    auto regs = std::make_shared<FakeRegs>();
-    RtlAdapter dev(regs, logger);
-    CHECK(devourer::ack::disarmable_by_retarget(mac, own));
-    CHECK(!devourer::ack::disarmable_by_retarget(own, own));
-    /* And the reason it matters, demonstrated on the register file: arming on
-     * `own` and then "disarming" to `own` leaves the identity untouched, so
-     * retargeted() reports success while the port still matches the address it
-     * was armed to. */
-    CHECK(devourer::ack::enable(dev, own));
-    CHECK(devourer::ack::disable_verified(dev));
-    CHECK(devourer::ack::retarget(dev, own));    /* writes what is already there */
-    CHECK(devourer::ack::retargeted(dev, own));  /* "succeeds" */
-    CHECK(devourer::ack::retargeted(dev, own));  /* still the armed address */
   }
   {
     /* Zero is a UNICAST address by the I/G bit, which is exactly why it is not
