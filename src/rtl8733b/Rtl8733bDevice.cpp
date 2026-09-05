@@ -200,7 +200,7 @@ void Rtl8733bDevice::Init(Action_ParsedRadioPacket packetProcessor,
               const auto quantum =
                   std::chrono::duration_cast<std::chrono::steady_clock::duration>(
                       std::chrono::milliseconds(25));
-              std::this_thread::sleep_for(std::min(left, quantum));
+              std::this_thread::sleep_for(left < quantum ? left : quantum);
             }
             if (stop.stop_requested())
               return;

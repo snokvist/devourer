@@ -1465,7 +1465,7 @@ int main(int argc, char **argv) {
       errno = 0;
       const unsigned long long ms = std::strtoull(d, &end, 10);
       if (errno != 0 || end == d || *end != '\0' || d[0] == '-' ||
-          ms > std::numeric_limits<uint32_t>::max()) {
+          ms > (std::numeric_limits<uint32_t>::max)()) {
         logger->error("DEVOURER_ACK_DISARM_AFTER_MS='{}' is not a valid "
                       "non-negative 32-bit millisecond delay",
                       d);
