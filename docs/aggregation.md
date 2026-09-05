@@ -233,6 +233,8 @@ canonical TX SA `57:42:75:05:d6:00` is a group address, so txdemo's QoS shape
 takes `DEVOURER_TX_SA` to override it — a group TA yields retry-limit-pinned
 reports even with the responder perfectly armed.
 
-Arming a responder turns a passive monitor into an active transmitter, so it
-is opt-in. The hardware ARQ (ACK, BlockAck, autonomous retransmission) is
-complete; devourer layers no software ARQ policy above the reports.
+Arming retargets hardware responses to a caller-supplied address, so it is
+opt-in. That does not prove the never-armed state is passive: notably,
+RTL8733B already answers for its initialization MAC. The hardware ARQ (ACK,
+BlockAck, autonomous retransmission) is complete; devourer layers no software
+ARQ policy above the reports.

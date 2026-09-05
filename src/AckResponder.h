@@ -2,22 +2,19 @@
 
 /* AckResponder — the hardware ACK engine as a first-class monitor-mode knob.
  *
- * The Realtek MAC auto-ACKs (SIFS-timed, zero host involvement) any unicast
- * frame whose RA matches the port-0 MACID, PROVIDED the port has a network
- * type. That proviso is what ARMS the engine on every generation tested. It is
- * NOT reliable in reverse: on the RTL8733B a port whose MACID is still
- * programmed keeps answering after net_type reads back 0 (measured — see
- * retarget() and Rtl8733bDevice::ClearAckResponder). Closing the gate is the
- * portable disarm; where it is not enough, the die must also move the
- * identity off the responder address (retarget()).
+ * The Realtek MAC's immediate-response engine is SIFS-timed with zero host
+ * involvement. The shared recipe programs the port-0 MACID/BSSID and requests
+ * AP net_type. On the Jaguar generations covered by the AP-mode measurements,
+ * net_type participates in gating the engine. RTL8733B is different: it
+ * matches MACID while net_type reads NoLink, so MAC bring-up already permits
+ * responses to the adapter's own address and SetAckResponder retargets that
+ * match to the requested address. See the measured truth table in
+ * AdapterCaps.h and Rtl8733bDevice::ClearAckResponder.
  *
- * devourer's monitor bring-up leaves net_type = 0 (No Link), which is
- * why a monitor radio never ACKs; the AP-mode work proved the gate — with
- * MACID + net_type programmed, a real station's auth/assoc arrive at retry=0
- * (docs/ap-mode.md). This header is that recipe minus the beacon machinery:
- * program the port identity, flip the net type, and the chip becomes an ACK
- * responder for one MAC address while everything else about monitor mode
- * (promiscuous RX, injection) is unchanged.
+ * This header carries that register recipe minus the beacon machinery. Which
+ * half controls a live disarm is a measured per-die property: use the shared
+ * gate-only clear only where net_type is sufficient; otherwise the backend
+ * must also move the identity off the responder address with retarget().
  *
  * On the adapter combinations exercised by tests/ampdu_ba_check.sh, the SAME
  * gate also enables the hardware BlockAck responder. RTL8733B has its own
@@ -31,8 +28,8 @@
  *   0x0618..0x061d  REG_BSSID   — port identity companion (the proven AP
  *                                 recipe programs both)
  *   0x0102[1:0]     MSR/net_type (REG_CR+2) — 0 NoLink / 1 Ad-hoc / 2 Infra /
- *                                 3 AP; any nonzero arms the responder. We
- *                                 use AP (3), the bench-proven value.
+ *                                 3 AP. We request AP (3); whether the field
+ *                                 gates responses is die-specific.
  *
  * Turning a passive monitor into an ACTIVE transmitter is a behavioral
  * change — hence opt-in only (DeviceConfig rx.ack_responder / the
@@ -107,7 +104,8 @@ inline bool enable(RtlAdapter &dev, const uint8_t mac[6]) noexcept {
   }
 }
 
-/* Disarm: net_type back to No Link — the gate, so the MACID may stay. */
+/* Shared gate-only clear for dies where net_type controls the responder.
+ * RTL8733B callers must additionally retarget MACID. */
 inline bool disable(RtlAdapter &dev) {
   const uint8_t nt = dev.rtw_read8(0x0102);
   return dev.rtw_write8(0x0102, static_cast<uint8_t>(nt & ~0x03u));
@@ -183,15 +181,15 @@ inline bool disable_verified(RtlAdapter &dev) noexcept {
  * the precondition is a property of the recipe, not of any one die. */
 inline bool is_unicast(const uint8_t mac[6]) { return (mac[0] & 0x01u) == 0; }
 
-/* Did the arm actually land? Reads back the gate (net_type) and the RA the ACK
+/* Did the requested arm recipe land? Reads back net_type and the RA the ACK
  * engine matches (MACID), composed exactly as enable() writes them — keeping
  * the register map in ONE file, so a change to enable() cannot silently
  * diverge from a copy of it somewhere else.
  *
  * NB the BSSID companion at 0x0618 is written but not checked: the ACK engine
  * matches on MACID, and 0x0618 is programmed only because the proven AP recipe
- * programs both. Verifying the two fields that gate the behaviour keeps this
- * honest without asserting on one that does not. */
+ * programs both. Verifying the two behavior-relevant programmed fields keeps
+ * this honest without asserting that both are gates on every die. */
 inline bool verify(RtlAdapter &dev, const uint8_t mac[6]) noexcept {
   try {
     return (dev.rtw_read8(0x0102) & 0x03u) == 0x03u && macid_is(dev, mac);

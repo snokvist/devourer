@@ -2,11 +2,9 @@
  * the gate-only disarm staying gate-only, and the retarget that the RTL8733B
  * disarm is built on.
  *
- * Why retarget() exists. On the RTL8733B the net_type gate is INERT: measured
- * at single-shot ACK rate, a never-armed port answers on its own EFUSE MAC at
- * 85.2 % / 82.5 % (0.0 % for an address nobody holds; 83.3 % when deliberately
- * armed), so the engine matches MACID and 0x0102[1:0] decides nothing. The
- * identity is therefore the only thing a disarm can move, and
+ * Why retarget() exists. On the RTL8733B the net_type field is inert and the
+ * engine matches MACID; the measured truth table is owned by AdapterCaps.h.
+ * The identity is therefore the only thing a disarm can move, and
  * Rtl8733bDevice::disarm_ack_responder moves it back to the adapter's own MAC.
  *
  * The restore address is deliberately NOT zero: many Realtek MAC TX paths
@@ -14,13 +12,10 @@
  * and zero would not remove the match anyway — 00:00:00:00:00:00 has the I/G
  * bit clear, so is_unicast() accepts it. Both properties are pinned below.
  *
- * The on-air harnesses cannot cover any of this: every cell in
- * ack_responder_check.sh and ack_txreport_matrix.sh is a FRESH PROCESS, so
- * their responder-off arm always starts from a chip that was never armed.
- *
- * What this does NOT cover: silicon behaviour, and the device-layer composition
- * in Rtl8733bDevice (nothing here instantiates it). Those are verified on
- * hardware. */
+ * This test does NOT cover silicon behaviour or the device-layer composition
+ * in Rtl8733bDevice (nothing here instantiates it). Those are covered on
+ * hardware by ack_txreport_matrix.sh's RTL8733B-only `disarmed` phase; its
+ * legacy `off` phase is still only a never-armed control. */
 #include <cstdint>
 #include <cstdio>
 #include <functional>

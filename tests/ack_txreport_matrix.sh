@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ack_txreport_matrix.sh — M0 contract 3: the unicast-ACK + TxReport capability
-# matrix. For each TX generation, three phases against a fixed hardware-ACK
-# responder (SetAckResponder on a second adapter):
+# matrix. For each TX generation, three generic phases against a fixed
+# hardware-ACK responder (SetAckResponder on a second adapter):
 #   on       — responder armed with MAC1, TX injects unicast QoS-Data to MAC1:
 #              expect tx.report ok~1, retries~0 (hardware ACK closes the loop).
 #   retarget — responder re-armed with a DIFFERENT unicast MAC2, TX targets
@@ -11,6 +11,7 @@
 #              descriptor limit set by DEVOURER_TX_RETRY_LIMIT (this matrix
 #              pins 12 so the hardware-ARQ capability stays visible) — the
 #              no-ACK outcome is VISIBLE per frame.
+# An RTL8733B responder adds a fourth, same-process `disarmed` phase.
 # Every phase also measures report_coverage (reports / frames sent) and, on
 # HalMAC (J2/J3), SW_DEFINE tag-echo gaps + the firmware missed counter.
 #
@@ -22,7 +23,7 @@
 #   bash tests/ack_txreport_matrix.sh
 #   CELLS="j3-8822cu:0x0bda:0xc812" SECS=10 bash tests/ack_txreport_matrix.sh
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 
 # 8814AU responder. NOT the 8821AU: bench-measured, an armed 8821AU never
 # closed the loop (TX retries stayed pinned) while the 8814AU ACKs ~100%.
@@ -32,6 +33,9 @@ MAC1=${MAC1:-02:12:34:56:78:9a}
 MAC2=${MAC2:-02:12:34:56:78:9b}
 TX_SA=${TX_SA:-02:aa:bb:cc:dd:01}   # unicast TA (the ACK RA I/G footgun)
 RETRY_LIMIT=${RETRY_LIMIT:-12}      # descriptor retry pin for the off phase
+DISARM_MS=${DISARM_MS:-2000}        # RTL8733B post-bring-up disarm delay
+MIN_SENT=${MIN_SENT:-100}           # reject dead/too-short transmitter cells
+READY_TIMEOUT=${READY_TIMEOUT:-25}  # bounded responder log/liveness wait
 OUT=${OUT:-/tmp/ack_txreport}
 CELLS=${CELLS:-"j1-8812au:0x0bda:0x8812 j2-8812bu:0x2357:0x012d j3-8822cu:0x0bda:0xc812"}
 
@@ -40,9 +44,40 @@ trap cleanup EXIT
 mkdir -p "$OUT"
 VERDICTS="$OUT/verdicts.jsonl"; : >"$VERDICTS"
 
+wait_for_log() { # $1 pid $2 log $3 regex $4 label
+  local pid="$1" log="$2" pattern="$3" label="$4" waited=0
+  until grep -qE "$pattern" "$log"; do
+    if ! sudo kill -0 "$pid" 2>/dev/null; then
+      echo "ABORT: $label process exited" >&2
+      tail -8 "$log" >&2
+      exit 1
+    fi
+    if [ "$waited" -ge "$READY_TIMEOUT" ]; then
+      echo "ABORT: timed out waiting for $label" >&2
+      tail -8 "$log" >&2
+      exit 1
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+}
+
+stop_responder() { # $1 saved sudo/rxdemo process pid
+  local pid="$1"
+  sudo pkill -INT -x rxdemo 2>/dev/null || true
+  for _ in 1 2 3 4 5; do
+    if ! sudo kill -0 "$pid" 2>/dev/null; then
+      return 0
+    fi
+    sleep 1
+  done
+  sudo pkill -9 -x rxdemo 2>/dev/null || true
+  return 1
+}
+
 run_phase() { # $1 cell $2 phase $3 tx vid $4 tx pid $5 RA mac $6 responder mac (""=off) $7 expect $8 disarm-after-ms
   local cell="$1" phase="$2" vid="$3" pid="$4" ra="$5" resp="$6" expect="$7"
-  local disarm_ms="${8:-}"
+  local disarm_ms="${8:-}" resp_pid="" tx_rc=0
   local tag="${cell}_${phase}"
   cleanup; sleep 1
   if [ -n "$resp" ]; then
@@ -50,33 +85,73 @@ run_phase() { # $1 cell $2 phase $3 tx vid $4 tx pid $5 RA mac $6 responder mac 
     # here can exercise a DISARM at all: every phase is a fresh process, so the
     # off phase starts from a chip that was never armed, which is a different
     # state (and on the RTL8733B an identical one — see AdapterCaps.h).
-    sudo env DEVOURER_VID=$RESP_VID DEVOURER_PID=$RESP_PID DEVOURER_CHANNEL=$CH \
-        DEVOURER_ACK_RESPONDER=$resp DEVOURER_LOG_LEVEL=info \
+    # Redirects intentionally belong to the invoking user, not root.
+    # shellcheck disable=SC2024
+    sudo env DEVOURER_VID="$RESP_VID" DEVOURER_PID="$RESP_PID" DEVOURER_CHANNEL="$CH" \
+        DEVOURER_ACK_RESPONDER="$resp" DEVOURER_LOG_LEVEL=info \
         ${disarm_ms:+DEVOURER_ACK_DISARM_AFTER_MS=$disarm_ms} \
         ./build/rxdemo >"$OUT/resp_$tag.jsonl" 2>"$OUT/resp_$tag.err" &
-    sleep 6   # responder bring-up
-    [ -n "$disarm_ms" ] && sleep $(( disarm_ms / 1000 + 2 ))  # let the disarm land
+    resp_pid=$!
+    wait_for_log "$resp_pid" "$OUT/resp_$tag.err" \
+      "hardware ACK responder armed for $resp" "$tag responder arm"
+    wait_for_log "$resp_pid" "$OUT/resp_$tag.err" \
+      'async ring of .* URBs submitted' "$tag responder RX readiness"
+    if [ -n "$disarm_ms" ]; then
+      wait_for_log "$resp_pid" "$OUT/resp_$tag.err" \
+        'hardware ACK responder disarmed \(MACID back to' \
+        "$tag responder disarm"
+    fi
+    if grep -qE 'ACK responder (gate did not latch|MACID could not|.*UNKNOWN)' \
+         "$OUT/resp_$tag.err"; then
+      echo "ABORT: $tag responder state was not verified" >&2
+      tail -8 "$OUT/resp_$tag.err" >&2
+      exit 1
+    fi
   fi
-  sudo env DEVOURER_VID=$vid DEVOURER_PID=$pid DEVOURER_CHANNEL=$CH \
-      DEVOURER_TX_QOS_DATA=1 DEVOURER_TX_RA=$ra DEVOURER_TX_SA=$TX_SA \
+  # shellcheck disable=SC2024
+  sudo env DEVOURER_VID="$vid" DEVOURER_PID="$pid" DEVOURER_CHANNEL="$CH" \
+      DEVOURER_TX_QOS_DATA=1 DEVOURER_TX_RA="$ra" DEVOURER_TX_SA="$TX_SA" \
       DEVOURER_TX_RATE=MCS3 DEVOURER_TX_PAYLOAD_BYTES=200 \
-      DEVOURER_TX_GAP_US=$GAP_US DEVOURER_TX_REPORT=1 \
-      DEVOURER_TX_RETRY_LIMIT=$RETRY_LIMIT \
+      DEVOURER_TX_GAP_US="$GAP_US" DEVOURER_TX_REPORT=1 \
+      DEVOURER_TX_RETRY_LIMIT="$RETRY_LIMIT" \
       DEVOURER_TX_WITH_RX=thread DEVOURER_LOG_LEVEL=warn \
-      timeout -s INT $SECS ./build/txdemo \
-      >"$OUT/tx_$tag.jsonl" 2>"$OUT/tx_$tag.err" || true
+      timeout -s INT "$SECS" ./build/txdemo \
+      >"$OUT/tx_$tag.jsonl" 2>"$OUT/tx_$tag.err" || tx_rc=$?
+  if [ "$tx_rc" -ne 124 ]; then
+    echo "ABORT: transmitter exited early in $tag (status=$tx_rc)" >&2
+    tail -8 "$OUT/tx_$tag.err" >&2
+    exit 1
+  fi
+  if [ -n "$resp_pid" ] && ! sudo kill -0 "$resp_pid" 2>/dev/null; then
+    echo "ABORT: responder exited during TX in $tag" >&2
+    tail -8 "$OUT/resp_$tag.err" >&2
+    exit 1
+  fi
+  if [ -n "$resp_pid" ] && ! stop_responder "$resp_pid"; then
+    echo "ABORT: responder did not stop cleanly in $tag" >&2
+    exit 1
+  fi
+  sudo pkill -9 -x txdemo 2>/dev/null || true
   sleep 1
-  cleanup; sleep 1
   # Frames sent = the last tx.stats 'submitted' counter (GetTxStats, emitted
   # every 500 frames) — the per-send stderr lines differ per generation.
   local sent
   sent=$(grep '"ev":"tx.stats"' "$OUT/tx_$tag.jsonl" | tail -1 |
          sed -n 's/.*"submitted":\([0-9]*\).*/\1/p')
   sent=${sent:-0}
+  if [ "$sent" -lt "$MIN_SENT" ]; then
+    echo "ABORT: transmitter submitted only $sent frames in $tag " \
+         "(require $MIN_SENT)" >&2
+    tail -8 "$OUT/tx_$tag.err" >&2
+    exit 1
+  fi
   echo "-- $tag: sent=$sent reports=$(grep -c '"ev":"tx.report"' "$OUT/tx_$tag.jsonl" || true)"
-  python3 tests/ack_txreport_analyze.py "$OUT/tx_$tag.jsonl" \
-      --sent "$sent" --cell "$tag" --expect "$expect" \
-      --expect-retries "$RETRY_LIMIT" | tee -a "$VERDICTS" || true
+  if ! python3 tests/ack_txreport_analyze.py "$OUT/tx_$tag.jsonl" \
+       --sent "$sent" --cell "$tag" --expect "$expect" \
+       --expect-retries "$RETRY_LIMIT" | tee -a "$VERDICTS"; then
+    echo "ABORT: analyzer rejected $tag" >&2
+    exit 1
+  fi
 }
 
 for cell in $CELLS; do
@@ -86,11 +161,18 @@ for cell in $CELLS; do
   run_phase "$name" on       "$vid" "$pid" "$MAC1" "$MAC1" on
   run_phase "$name" retarget "$vid" "$pid" "$MAC2" "$MAC2" on
   run_phase "$name" off      "$vid" "$pid" "$MAC1" ""      off
-  # The only cell that measures a DISARM rather than a never-armed chip: arm on
-  # MAC1, disarm 2 s in, then solicit MAC1. `off` above cannot substitute — it
-  # never arms, so it cannot tell a working disarm from a chip that was always
-  # passive. Expect `off` on a die whose disarm moves the identity.
-  run_phase "$name" disarmed "$vid" "$pid" "$MAC1" "$MAC1" off 2000
+  # The RTL8733B-only cell that measures a DISARM rather than a never-armed
+  # chip: arm on MAC1, start the timer after verified bring-up, disarm, then
+  # solicit MAC1. The hook is intentionally not generic: Jaguar1/2/3 have no
+  # init-wide synchronization, and their disarm semantics need separate cells.
+  case "${RESP_VID,,}:${RESP_PID,,}" in
+    0x0bda:0xf72b|0x0bda:0xb733)
+      run_phase "$name" disarmed "$vid" "$pid" "$MAC1" "$MAC1" off "$DISARM_MS"
+      ;;
+    *)
+      echo "-- ${name}_disarmed: SKIP (RTL8733B responder required)"
+      ;;
+  esac
 done
 
 echo

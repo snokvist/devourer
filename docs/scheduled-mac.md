@@ -160,6 +160,13 @@ descriptor limit set by `DEVOURER_TX_RETRY_LIMIT` — this matrix runs it at
 `report_coverage` = reports / frames sent (`tx.stats.submitted`); HalMAC adds
 SW_DEFINE tag-echo gap counting.
 
+When the configured responder is an RTL8733B (`0bda:f72b` or `0bda:b733`),
+the harness adds a fourth **disarmed** phase: arm MAC1, start a timer only
+after the backend has completed bring-up and arming, clear it in the same live
+process, then solicit MAC1 and expect the off verdict. That phase is
+deliberately skipped for the default Jaguar1 responder; its disarm semantics
+require separate backend-specific evidence.
+
 TX sessions run `DEVOURER_TX_WITH_RX=thread`: CCX reports arrive on the C2H
 RX path, so J1/J2 TX-only sessions never see them (measured: J2 TX-only = 0
 reports; only J3 drains C2H off its coex runtime without an RX loop). A

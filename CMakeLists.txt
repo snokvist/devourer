@@ -787,10 +787,10 @@ target_link_libraries(TxQuiesceSelftest PRIVATE devourer PkgConfig::libusb)
 add_test(NAME tx_quiesce_seam COMMAND TxQuiesceSelftest)
 
 # Headless guard for the ACK-responder recipe (src/AckResponder.h): the arm,
-# the gate-only disarm staying gate-only, and the retarget seam. The on-air
-# harnesses cannot cover the disarm at all -- every cell in
-# ack_responder_check.sh and ack_txreport_matrix.sh is a FRESH PROCESS, so
-# their responder-off arm starts from a chip that was never armed.
+# the gate-only clear staying gate-only, and the retarget seam. This test does
+# not model silicon or instantiate Rtl8733bDevice; those are covered by the
+# RTL8733B-only `disarmed` phase in ack_txreport_matrix.sh. Its legacy `off`
+# phase remains a never-armed control.
 add_executable(AckResponderSelftest
     tests/ack_responder_selftest.cpp
 )

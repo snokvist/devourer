@@ -58,6 +58,12 @@ public:
   SelectedChannel GetSelectedChannel() override;
   bool SetAckResponder(const devourer::MacAddr &mac) override;
   void ClearAckResponder() override;
+  /* rxdemo's RTL8733B-only live-disarm measurement hook. The delay starts
+   * after Init has completed the locked bring-up (including a configured
+   * SetAckResponder), never from process start. */
+  void ScheduleAckResponderDisarmForTest(uint32_t delay_ms) {
+    _ack_disarm_after_ms = delay_ms;
+  }
   /* Shared by ClearAckResponder and SetAckResponder rollback. */
   bool disarm_ack_responder();
   void SetCcaMode(bool disabled) override;
@@ -128,6 +134,7 @@ private:
   std::atomic<uint64_t> _tx_submits{0};
   mutable std::recursive_mutex _reg_mu;
   std::optional<devourer::TxMode> _tx_mode_default;
+  std::optional<uint32_t> _ack_disarm_after_ms;
 };
 
 #endif /* RTL8733B_DEVICE_H */

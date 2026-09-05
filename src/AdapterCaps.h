@@ -179,10 +179,10 @@ struct AdapterCaps {
    * and retarget-proof: re-armed on a different MAC, 1728/1728 —
    * tests/ack_txreport_matrix.sh run with the 8733B as the responder).
    *
-   * That matrix establishes ARMING only. Its off cell is never-armed rather
-   * than disarmed — run_phase() passes an empty responder MAC, so it starts no
-   * responder process at all — so no row here says anything about disarm, on
-   * any die, however the cell is labelled.
+   * The `on`, `retarget`, and legacy `off` rows establish arming, retargeting,
+   * and a never-armed control. Only the RTL8733B-scoped `disarmed` row arms and
+   * clears within one process; it supports the RTL8733B live-disarm claim only
+   * and establishes nothing about disarm on other dies.
    *
    * On the 8733B the net_type gate is INERT and the engine matches MACID
    * alone: at single-shot ACK rate a never-armed port answers on its own EFUSE

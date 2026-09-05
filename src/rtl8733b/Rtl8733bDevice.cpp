@@ -1,9 +1,11 @@
 #include "Rtl8733bDevice.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <span>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -179,6 +181,35 @@ void Rtl8733bDevice::Init(Action_ParsedRadioPacket packetProcessor,
       _rx_configured_bw = channel.ChannelWidth == CHANNEL_WIDTH_40 ? 1 : 0;
       if (!_mac.configure_monitor_rx(_cfg.rx.keep_corrupted))
         throw std::runtime_error("RTL8733B monitor RX configuration failed");
+    }
+    /* Measurement-only live disarm. Constructed only after bring-up has
+     * completed under _reg_mu, so even a zero delay cannot clear a cold port
+     * and then be undone by SetAckResponder later in Init. jthread's stop
+     * request bounds normal/exceptional shutdown even for a very long delay. */
+    std::jthread ack_disarm_thread;
+    if (_ack_disarm_after_ms) {
+      const uint32_t delay_ms = *_ack_disarm_after_ms;
+      _ack_disarm_after_ms.reset();
+      ack_disarm_thread = std::jthread(
+          [this, delay_ms](std::stop_token stop) {
+            const auto deadline = std::chrono::steady_clock::now() +
+                                  std::chrono::milliseconds(delay_ms);
+            while (!stop.stop_requested() &&
+                   std::chrono::steady_clock::now() < deadline) {
+              const auto left = deadline - std::chrono::steady_clock::now();
+              const auto quantum =
+                  std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                      std::chrono::milliseconds(25));
+              std::this_thread::sleep_for(std::min(left, quantum));
+            }
+            if (stop.stop_requested())
+              return;
+            _logger->info(
+                "DEVOURER_ACK_DISARM_AFTER_MS: disarming RTL8733B ACK "
+                "responder {} ms after completed bring-up",
+                delay_ms);
+            ClearAckResponder();
+          });
     }
     StartRxLoop(std::move(packetProcessor));
   } catch (...) {
@@ -836,11 +867,10 @@ bool Rtl8733bDevice::SetAckResponder(const devourer::MacAddr &mac) {
    * 0), macaddr = REG_MACID_8733B (0x0610), bssid = REG_BSSID_8733B (0x0618)
    * (hal/rtl8733b/rtl8733b_ops.c port_cfg[0], hal/halmac/halmac_reg_8733b.h).
    *
-   * MAC bring-up leaves net_type at 0 (No Link) because init_mac writes only
-   * REG_CR's low half (0x0100-0x0101) — which is why a monitor radio on this
-   * die does not ACK. Flipping the field is what ARMS the engine — it is NOT
-   * what stops it: see ClearAckResponder below, where clearing net_type was
-   * measured to leave this die still answering. */
+   * MAC bring-up leaves net_type at 0 (No Link) but programs the adapter MAC
+   * into MACID. NoLink does not silence this die: the port already answers for
+   * that identity. SetAckResponder applies the shared register recipe while
+   * retargeting MACID; ClearAckResponder must move MACID back. */
   if (!devourer::ack::is_unicast(mac.data())) {
     _logger->error("RTL8733B: ACK responder needs a UNICAST MAC (I/G set in "
                    "{:02x}) — not armed",
@@ -909,17 +939,27 @@ bool Rtl8733bDevice::disarm_ack_responder() {
     _logger->error("RTL8733B: ACK responder gate did not latch closed — "
                    "continuing to the identity, which is what this die "
                    "actually matches on");
-  const bool id = devourer::ack::retarget(_device, _efuse.mac.data()) &&
-                  devourer::ack::macid_is(_device, _efuse.mac.data());
+  const bool transfer = devourer::ack::retarget(_device, _efuse.mac.data());
+  /* A failed transfer status does not prove the write had no effect. Always
+   * perform the authoritative identity readback rather than short-circuiting
+   * it on `transfer`. */
+  const bool id = devourer::ack::macid_is(_device, _efuse.mac.data());
   if (!id) {
     _logger->error("RTL8733B: ACK responder MACID could not be restored — the "
                    "port may still answer for the responder address");
     return false;
   }
+  if (!transfer)
+    _logger->warn("RTL8733B: ACK responder MACID write reported a transport "
+                  "failure, but identity readback confirms the adapter's "
+                  "own address");
   _logger->info("RTL8733B: hardware ACK responder disarmed (MACID back to the "
                 "adapter's own address; this port answers for that address "
                 "either way on this die)");
-  return gate;
+  /* Identity is the measured disarm result on this die. A failed/inert gate
+   * readback is diagnosed above but must not turn a verified identity move
+   * into the contradictory caller result "hardware state UNKNOWN". */
+  return true;
 }
 
 void Rtl8733bDevice::ClearAckResponder() {

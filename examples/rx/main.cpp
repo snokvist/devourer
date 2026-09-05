@@ -1,10 +1,12 @@
 #include <atomic>
 #include <cassert>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -36,6 +38,9 @@
 #endif
 #if defined(DEVOURER_HAVE_JAGUAR3)
 #include "jaguar3/RtlJaguar3Device.h"
+#endif
+#if defined(DEVOURER_HAVE_8733B)
+#include "rtl8733b/Rtl8733bDevice.h"
 #endif
 #include "RtlAdapter.h"
 #include "SignalStop.h"
@@ -1442,6 +1447,48 @@ int main(int argc, char **argv) {
       .f("stage", "demo.create_device")
       .f("ms", ms_since_start());
   devourer::emit_adapter_caps(*g_ev, rtlDevice);
+  /* RTL8733B-only measurement hook. Scheduling belongs to the concrete
+   * backend so the delay starts after its verified arm/bring-up rather than
+   * racing Init from a generic side thread. Refuse other generations: a green
+   * run that cleared a cold port before Init armed it is false evidence. */
+  if (const char *d = std::getenv("DEVOURER_ACK_DISARM_AFTER_MS")) {
+    const char *responder = std::getenv("DEVOURER_ACK_RESPONDER");
+    if (responder == nullptr) {
+      logger->warn("DEVOURER_ACK_DISARM_AFTER_MS ignored: no "
+                   "DEVOURER_ACK_RESPONDER was configured");
+    } else if (!devourer::parse_mac(responder)) {
+      logger->error("DEVOURER_ACK_DISARM_AFTER_MS requires a valid "
+                    "DEVOURER_ACK_RESPONDER MAC");
+      return 1;
+    } else {
+      char *end = nullptr;
+      errno = 0;
+      const unsigned long long ms = std::strtoull(d, &end, 10);
+      if (errno != 0 || end == d || *end != '\0' || d[0] == '-' ||
+          ms > std::numeric_limits<uint32_t>::max()) {
+        logger->error("DEVOURER_ACK_DISARM_AFTER_MS='{}' is not a valid "
+                      "non-negative 32-bit millisecond delay",
+                      d);
+        return 1;
+      }
+#if defined(DEVOURER_HAVE_8733B)
+      auto *rtl8733b = dynamic_cast<Rtl8733bDevice *>(rtlDevice);
+      if (rtl8733b == nullptr) {
+        logger->error("DEVOURER_ACK_DISARM_AFTER_MS is RTL8733B-only: "
+                      "refusing a race-prone measurement on {}",
+                      devourer::generation_name(
+                          rtlDevice->GetAdapterCaps().generation));
+        return 1;
+      }
+      rtl8733b->ScheduleAckResponderDisarmForTest(
+          static_cast<uint32_t>(ms));
+#else
+      logger->error("DEVOURER_ACK_DISARM_AFTER_MS requires an RTL8733B-enabled "
+                    "build");
+      return 1;
+#endif
+    }
+  }
   /* The BB-debug-port / queue-depth research helpers are Jaguar1-only, so
    * they live on RtlJaguarDevice rather than the IRtlDevice interface. The
    * whole block compiles out when Jaguar1 support isn't built; when it is, the
@@ -2153,48 +2200,12 @@ int main(int argc, char **argv) {
   uint8_t rx_band = 0;
   if (const char *b = std::getenv("DEVOURER_BAND"))
     rx_band = static_cast<uint8_t>(std::atoi(b));
-  /* DEVOURER_ACK_DISARM_AFTER_MS=<n>: disarm the hardware ACK responder <n> ms
-   * after bring-up, from a side thread, while RX keeps running.
-   *
-   * Exists so the DISARM is reachable from the tree at all. Every on-air cell
-   * in tests/ack_responder_check.sh and tests/ack_txreport_matrix.sh is a fresh
-   * process, so their responder-off arm starts from a chip that was never
-   * armed: nothing could previously arm and then disarm inside one session,
-   * which is the only shape in which a disarm can be measured or regress.
-   * tests/ack_txreport_matrix.sh's `disarmed` phase drives this.
-   *
-   * Init() below runs the RX loop and does not return, hence the thread. The
-   * call is register I/O concurrent with a live RX loop: the RTL8733B guards
-   * its register plane with a recursive mutex, and this knob is only meaningful
-   * where a responder was armed, but it is a measurement aid and not something
-   * to lean on in a shipping path. Ignored without DEVOURER_ACK_RESPONDER. */
-  std::thread ack_disarm_thread;
-  if (const char *d = std::getenv("DEVOURER_ACK_DISARM_AFTER_MS")) {
-    const long ms = std::atol(d);
-    const bool armed = std::getenv("DEVOURER_ACK_RESPONDER") != nullptr;
-    if (ms >= 0 && armed) {
-      ack_disarm_thread = std::thread([rtlDevice, ms, logger]() {
-        std::this_thread::sleep_for(std::chrono::milliseconds(ms));
-        logger->info("DEVOURER_ACK_DISARM_AFTER_MS: disarming ACK responder "
-                     "after {} ms",
-                     ms);
-        rtlDevice->ClearAckResponder();
-      });
-    } else if (!armed) {
-      logger->warn("DEVOURER_ACK_DISARM_AFTER_MS ignored: no "
-                   "DEVOURER_ACK_RESPONDER was armed");
-    }
-  }
-
   rtlDevice->Init(packetProcessor, SelectedChannel{
                                        .Channel = static_cast<uint8_t>(channel),
                                        .ChannelOffset = ch_offset,
                                        .ChannelWidth = width,
                                        .Band = rx_band,
                                    });
-  if (ack_disarm_thread.joinable())
-    ack_disarm_thread.join();
-
   stop_background_emitters.Run();
   if (la_thread.joinable())
     la_thread.join();
