@@ -96,6 +96,9 @@ int mt_rx_parse(struct mt7612u_dev *d, uint8_t *buf, int n,
 		                         (c < 2 ? d->cal.rssi_offset[c] : 0) -
 		                         d->cal.lna_gain);
 
+	for (int i = 0; i < 4; i++)
+		info->bbp[i] = get_le32(rxwi + 16 + 4 * i);
+
 	if (rxinfo & MT_RXINFO_L2PAD)
 		pad = 2;
 

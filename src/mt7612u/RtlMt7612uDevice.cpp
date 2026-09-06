@@ -10,6 +10,7 @@
 #include <filesystem>
 
 #include "RxPacket.h"
+#include "RxQuality.h"
 #include "SignalStop.h"
 #include "Mt7612uMapping.h"
 
@@ -163,6 +164,16 @@ void RtlMt7612uDevice::on_rx(const void *frame, size_t len,
       const_cast<uint8_t *>(static_cast<const uint8_t *>(frame)), len);
 
   _rx_frames.fetch_add(1, std::memory_order_relaxed);
+  if (info->rssi[0]) {
+    _rssi_sum.fetch_add(static_cast<uint64_t>(info->rssi[0] + 128),
+                        std::memory_order_relaxed);
+    _rssi_n.fetch_add(1, std::memory_order_relaxed);
+    int prev = _rssi_max.load(std::memory_order_relaxed);
+    while (info->rssi[0] > prev &&
+           !_rssi_max.compare_exchange_weak(prev, info->rssi[0],
+                                            std::memory_order_relaxed)) {
+    }
+  }
   _rx_processor(packet);
 }
 
@@ -194,6 +205,9 @@ void RtlMt7612uDevice::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
      * reason. */
     if (mt7612u_set_monitor_rx(_dev, _cfg.rx.keep_corrupted ? 1 : 0) != 0)
       _logger->warn("MT7612U monitor RX filter not applied");
+    /* Arms the channel timers and zeroes the MIB counters that GetRxQuality
+     * drains. Without it ch_busy never counts. */
+    mt7612u_link_stats_start(_dev);
     _rx_active = true;
   }
 
@@ -537,6 +551,52 @@ devourer::TxStats RtlMt7612uDevice::GetTxStats() {
   s.submitted = st.tx_submitted;
   s.failed = st.tx_err;
   return s;
+}
+
+/*
+ * Window RX quality.
+ *
+ * What this part can and cannot fill in is worth being explicit about,
+ * because the empty fields are not laziness:
+ *
+ *  - No SNR and no EVM. The RX descriptor carries RSSI and nothing else. Its
+ *    `bbp_rxinfo[4]` - which mt76 declares in mt76x02_mac.h and never reads -
+ *    measured as two words of zero plus a duplicate of the same two RSSI
+ *    values across a 30 dB transmit sweep. There is no per-frame quality
+ *    metric on this MAC to report, so `evm_valid` stays false and the SNR
+ *    fields stay zero rather than carrying a plausible-looking fiction.
+ *  - `fa_ofdm` is real: MT_RX_STAT_1's false-CCA count, which is energy that
+ *    started a receive and never became a frame. mt76's own AGC loop treats
+ *    >800 per interval as interfered and <10 as clean
+ *    (mt76x02_phy.c:178-182), so the number has a calibrated meaning.
+ *  - The MIB counters are read-and-clear in hardware, which suits the drained
+ *    -window contract here exactly.
+ */
+devourer::RxQuality RtlMt7612uDevice::GetRxQuality() {
+  std::lock_guard<std::recursive_mutex> lock(_mu);
+  devourer::RxQuality q{};
+
+  if (!_dev)
+    return q;
+
+  struct mt7612u_link_stats st {};
+  if (mt7612u_link_stats(_dev, &st) == 0) {
+    q.energy_valid = true;
+    q.fa_ofdm = st.rx_false_cca;
+    q.cca_ofdm = st.ch_busy;
+  }
+
+  const uint64_t n = _rssi_n.exchange(0, std::memory_order_relaxed);
+  const uint64_t sum = _rssi_sum.exchange(0, std::memory_order_relaxed);
+  const int peak = _rssi_max.exchange(-127, std::memory_order_relaxed);
+
+  q.frames = static_cast<uint32_t>(n);
+  if (n) {
+    q.valid = true;
+    q.rssi_mean_dbm = static_cast<int>(sum / n) - 128;
+    q.rssi_max_dbm = peak;
+  }
+  return q;
 }
 
 void RtlMt7612uDevice::SetCcaMode(bool disabled) {

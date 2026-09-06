@@ -91,6 +91,7 @@ public:
 
   bool GetPermanentMacAddress(uint8_t out[6]) override;
   devourer::TxStats GetTxStats() override;
+  devourer::RxQuality GetRxQuality() override;
 
   void SetCcaMode(bool disabled) override;
   void Stop() override;
@@ -118,6 +119,11 @@ private:
   std::atomic<bool> _rx_stop{false};
   std::atomic<bool> _rx_active{false};
   std::atomic<uint64_t> _rx_frames{0};
+  /* RSSI window for GetRxQuality, drained on read like every other backend's.
+   * Written only by the libusb event thread, read only under _mu. */
+  std::atomic<uint64_t> _rssi_sum{0};
+  std::atomic<uint64_t> _rssi_n{0};
+  std::atomic<int> _rssi_max{-127};
 
   devourer::AmpduMode _ampdu{};
   struct mt7612u_tx_rate _tx_default {};

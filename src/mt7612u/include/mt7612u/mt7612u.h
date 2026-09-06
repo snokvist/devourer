@@ -69,6 +69,12 @@ struct mt7612u_rx_info {
 	uint8_t  n_chains;
 	uint16_t mpdu_len;
 	uint16_t seq;
+	/* RXWI bytes 16-31, the `bbp_rxinfo[4]` that mt76 declares in
+	 * mt76x02_mac.h and never reads. Raw and unparsed: exposed because
+	 * whatever the baseband puts here is the only per-frame quality
+	 * signal this MAC offers beyond RSSI, and it cannot be identified
+	 * without looking at it. Do not build on the layout until it is. */
+	uint32_t bbp[4];
 };
 
 struct mt7612u_dev;
@@ -197,6 +203,49 @@ struct mt7612u_stats {
 	uint64_t rx_invalid;
 };
 void mt7612u_get_stats(struct mt7612u_dev *dev, struct mt7612u_stats *out);
+
+/*
+ * Per-interval link statistics from the MAC's MIB counters.
+ *
+ * These are the rich part of this MAC's link reporting, and none of it is per
+ * frame: the RX descriptor carries RSSI and nothing else - its
+ * `bbp_rxinfo[4]`, which mt76 declares and never reads, turns out to be two
+ * words of zero plus a duplicate of the same two RSSI values, so there is no
+ * per-frame SNR or EVM to surface.
+ *
+ * Every counter below is READ-AND-CLEAR in hardware. Each call therefore
+ * returns the interval since the previous call, not a running total, and two
+ * readers would steal each other's counts. mt7612u_link_stats_start() enables
+ * the channel timers and zeroes everything; call it once, then poll.
+ */
+struct mt7612u_link_stats {
+	uint32_t interval_us;    /* host-measured, for turning counts into rates */
+
+	/* Channel occupancy, in the MAC's own clock units. busy counts TX, RX,
+	 * NAV and EIFS as busy, which is the definition mt76 configures. */
+	uint32_t ch_busy, ch_idle;
+
+	/* Receive error classes. false_cca is the interference signal: energy
+	 * that started a receive and did not become a frame. */
+	uint16_t rx_crc_err, rx_phy_err, rx_false_cca, rx_plcp_err;
+	uint16_t rx_dup_err, rx_overflow;
+
+	/* A-MPDU length histogram: agg_cnt[n] is the number of aggregates that
+	 * carried n+1 MPDUs, up to 32. */
+	uint16_t agg_cnt[32];
+
+	int8_t   temp_c;         /* die temperature, degrees C; INT8_MIN if unread */
+};
+
+/*
+ * Enable the channel timers and clear every counter. Safe to call again to
+ * re-zero. Returns 0 on success.
+ */
+int mt7612u_link_stats_start(struct mt7612u_dev *dev);
+
+/* Read and clear. Returns 0 on success; fills the interval since the previous
+ * call to this function or to _start(). */
+int mt7612u_link_stats(struct mt7612u_dev *dev, struct mt7612u_link_stats *out);
 
 /* TSF, the hardware microsecond clock. Two register reads. */
 uint64_t mt7612u_read_tsf(struct mt7612u_dev *dev);

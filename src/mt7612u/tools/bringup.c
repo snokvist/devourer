@@ -1067,6 +1067,213 @@ static int gate_ack(uint8_t chan, int secs, int arm)
 
 
 /*
+ * The MAC's MIB counters, sampled once a second.
+ *
+ * This is where this part's link reporting actually lives. The RX descriptor
+ * carries RSSI and nothing else - `bbp_rxinfo[4]`, which mt76 declares and
+ * never reads, is two words of zero plus a duplicate of the same two RSSI
+ * values - so there is no per-frame SNR or EVM. What there is instead is
+ * per-interval: channel occupancy, four classes of receive error, a false-CCA
+ * count that is the interference signal, and the A-MPDU length histogram.
+ *
+ * Read-and-clear, so each line is the second that just passed.
+ */
+static unsigned long linkstat_drained;
+
+static int gate_linkstat(uint8_t chan, int secs, int with_rx)
+{
+	struct mt7612u_link_stats st;
+
+	if (mt_eeprom_init(&dev)) return 1;
+	if (mt_init_hardware(&dev, NULL)) return 1;
+	if (mt_set_channel(&dev, chan, MT7612U_BW_20)) return 1;
+	/* The receiver has to be ON for any of the RX error classes or the
+	 * busy timer to count anything, and the ring has to be draining before
+	 * the receiver is enabled. Getting this wrong reads as "the counters
+	 * are dead" rather than as a harness bug. */
+	if (with_rx) {
+		if (mt7612u_rx_start(&dev, drain_cb, &linkstat_drained)) return 1;
+	}
+	if (mt_mac_start(&dev, with_rx)) return 1;
+	if (with_rx) mt7612u_set_monitor_rx(&dev, 0);
+	mt7612u_link_stats_start(&dev);
+
+	printf("ch%u, receiver %s, %d samples of 1 s (read-and-clear)\n\n",
+	       chan, with_rx ? "ON" : "off", secs);
+	printf("  %5s %9s %9s %6s  %5s %5s %8s %5s %5s %5s  %4s\n",
+	       "s", "busy", "idle", "busy%", "crc", "phy", "falseCCA", "plcp", "dup", "ovf",
+	       "temp");
+	for (int i = 0; i < secs; i++) {
+		double busy_pct;
+
+		mt_usleep(1000000);
+		if (mt7612u_link_stats(&dev, &st)) return 1;
+		busy_pct = (st.ch_busy + st.ch_idle)
+		         ? 100.0 * st.ch_busy / (double)(st.ch_busy + st.ch_idle) : 0.0;
+		printf("  %5d %9u %9u %5.1f%%  %5u %5u %8u %5u %5u %5u  %4d\n",
+		       i, st.ch_busy, st.ch_idle, busy_pct,
+		       st.rx_crc_err, st.rx_phy_err, st.rx_false_cca,
+		       st.rx_plcp_err, st.rx_dup_err, st.rx_overflow, st.temp_c);
+	}
+
+	{
+		int any = 0;
+
+		for (int i = 0; i < 32; i++) if (st.agg_cnt[i]) any = 1;
+		printf("\n  A-MPDU length histogram (last second): %s",
+		       any ? "" : "all zero - nothing aggregated\n");
+		if (any) {
+			for (int i = 0; i < 32; i++)
+				if (st.agg_cnt[i]) printf("[%d]=%u ", i + 1, st.agg_cnt[i]);
+			printf("\n");
+		}
+	}
+	if (with_rx) {
+		mt7612u_rx_stop(&dev);
+		printf("  %lu frames reached the ring over the run\n", linkstat_drained);
+	}
+	mt_mac_stop(&dev);
+	return 0;
+}
+
+/* --- MT7612U -> MT7612U link, and what the baseband reports per frame ---
+ *
+ * Two adapters, one transmitting at a swept TX power and one receiving. It
+ * answers three separate questions at once, which is why the sweep is a
+ * power sweep and not a fixed level:
+ *
+ *  1. Does this port's TX and RX work against each other end to end?
+ *  2. Does mt7612u_set_txpower() move *radiated* power? Everything so far
+ *     compared registers against the kernel's, which is not the same claim.
+ *  3. RXWI bytes 16-31 are `bbp_rxinfo[4]`, which mt76 declares and never
+ *     reads, and mt76x02 has no SNR or EVM anywhere. If any of those bytes
+ *     is a link-quality metric it must move with the transmitter's power;
+ *     if none of them does, they are not one.
+ *
+ * The receiver is NOT an independent instrument - it runs this same decode
+ * path - so this measures the link and the descriptor, not our correctness.
+ */
+static int gate_linktx(uint8_t chan, int count)
+{
+	static const uint8_t src[6] = { 0x02, 0x4d, 0x54, 0x76, 0x12, 0x01 };
+	static const int powers[] = { 0, 4, 8, 12, 16, 20, 24, 30 };
+	struct mt7612u_tx_rate r = { .phy = MT7612U_PHY_HT, .mcs = 2, .nss = 1,
+	                             .bw = MT7612U_BW_20, .no_ack = 1 };
+	uint8_t f[64];
+
+	if (mt_eeprom_init(&dev)) return 1;
+	if (mt_init_hardware(&dev, NULL)) return 1;
+	if (mt_set_channel(&dev, chan, MT7612U_BW_20)) return 1;
+	if (mt_mac_start(&dev, 0)) return 1;
+
+	memset(f, 0, sizeof f);
+	f[0] = 0x08;
+	memset(f + 4, 0xff, 6);
+	memcpy(f + 10, src, 6);
+	memcpy(f + 16, src, 6);
+	memcpy(f + 24, "MT7612U-HAL ", 12);
+
+	printf("TX on ch%u, HT MCS2 1SS 20 MHz, %d frames per power step\n",
+	       chan, count);
+	for (unsigned i = 0; i < sizeof powers / sizeof powers[0]; i++) {
+		long sent = 0;
+
+		if (mt7612u_set_txpower(&dev, powers[i])) {
+			printf("  %2d dBm  REFUSED\n", powers[i]);
+			continue;
+		}
+		f[36] = (uint8_t)powers[i];
+		for (int n = 0; n < count; n++) {
+			f[22] = (uint8_t)((n & 0xf) << 4);
+			f[23] = (uint8_t)(n >> 4);
+			f[37] = (uint8_t)n;
+			if (mt7612u_tx(&dev, f, 44, &r) == 0) sent++;
+			mt_usleep(1200);
+		}
+		printf("  %2d dBm  sent %ld/%d\n", powers[i], sent, count);
+		mt_usleep(120000);
+	}
+	mt_mac_stop(&dev);
+	return 0;
+}
+
+struct link_bucket { unsigned long n; long rssi_sum[2]; uint32_t bbp_or[4], bbp_and[4];
+                     long bbp_sum[4]; uint32_t bbp_first[4]; };
+static struct link_bucket g_link[32];
+static int g_link_pw[32];
+static int g_link_n;
+
+static void linkrx_cb(void *user, const void *frame, size_t len,
+                      const struct mt7612u_rx_info *info)
+{
+	const uint8_t *f = frame;
+	int slot = -1, pw;
+
+	(void)user;
+	if (len < 40) return;
+	if (memcmp(f + 10, "\x02\x4d\x54\x76\x12\x01", 6)) return;
+	if (memcmp(f + 24, "MT7612U-HAL ", 12)) return;
+	pw = f[36];
+	for (int i = 0; i < g_link_n; i++)
+		if (g_link_pw[i] == pw) { slot = i; break; }
+	if (slot < 0) {
+		if (g_link_n >= 32) return;
+		slot = g_link_n++;
+		g_link_pw[slot] = pw;
+		for (int i = 0; i < 4; i++) {
+			g_link[slot].bbp_and[i] = 0xffffffffu;
+			g_link[slot].bbp_first[i] = info->bbp[i];
+		}
+	}
+	g_link[slot].n++;
+	for (int c = 0; c < 2; c++) g_link[slot].rssi_sum[c] += info->rssi[c];
+	for (int i = 0; i < 4; i++) {
+		g_link[slot].bbp_or[i]  |= info->bbp[i];
+		g_link[slot].bbp_and[i] &= info->bbp[i];
+		g_link[slot].bbp_sum[i] += (long)(info->bbp[i] & 0xff);
+	}
+}
+
+static int gate_linkrx(uint8_t chan, int secs)
+{
+	double t0;
+
+	if (mt_eeprom_init(&dev)) return 1;
+	if (mt_init_hardware(&dev, NULL)) return 1;
+	if (mt_set_channel(&dev, chan, MT7612U_BW_20)) return 1;
+	if (mt7612u_rx_start(&dev, linkrx_cb, NULL)) return 1;
+	if (mt_mac_start(&dev, 1)) return 1;
+	mt7612u_set_monitor_rx(&dev, 0);
+
+	printf("RX on ch%u for %d s, filtering our own magic\n", chan, secs);
+	t0 = now_ms();
+	while (now_ms() - t0 < secs * 1000.0)
+		mt_usleep(100000);
+	mt7612u_rx_stop(&dev);
+	mt_mac_stop(&dev);
+
+	printf("\n  %-8s %6s  %-13s   %s\n", "tx dBm", "recv", "rssi dBm", "RXWI bbp_rxinfo[0..3]  (or / and / mean byte0)");
+	for (int i = 0; i < g_link_n; i++) {
+		struct link_bucket *b = &g_link[i];
+
+		printf("  %-8d %6lu  %5.1f %5.1f   ", g_link_pw[i], b->n,
+		       b->rssi_sum[0] / (double)b->n, b->rssi_sum[1] / (double)b->n);
+		for (int k = 0; k < 4; k++)
+			printf("%08x ", b->bbp_first[k]);
+		printf("\n           %25s or  ", "");
+		for (int k = 0; k < 4; k++) printf("%08x ", b->bbp_or[k]);
+		printf("\n           %25s and ", "");
+		for (int k = 0; k < 4; k++) printf("%08x ", b->bbp_and[k]);
+		printf("\n           %25s b0mean ", "");
+		for (int k = 0; k < 4; k++) printf("%8.1f ", b->bbp_sum[k] / (double)b->n);
+		printf("\n");
+	}
+	printf("\nA byte that tracks tx power monotonically is a level metric; one\n"
+	       "that is constant across a 30 dB sweep is not a quality metric.\n");
+	return g_link_n ? 0 : 1;
+}
+
+/*
  * Does STBC actually put the stream on both antennas, and does the second
  * chain radiate without it?
  *
@@ -1542,6 +1749,16 @@ int main(int argc, char **argv)
 		              argc > 4 ? atoi(argv[4]) : 0);
 	} else if (!strcmp(cmd, "caps")) {
 		rc = gate_caps(argc > 2 ? (uint8_t)atoi(argv[2]) : 149);
+	} else if (!strcmp(cmd, "linkstat")) {
+		rc = gate_linkstat(argc > 2 ? (uint8_t)atoi(argv[2]) : 149,
+		                   argc > 3 ? atoi(argv[3]) : 10,
+		                   argc > 4 ? atoi(argv[4]) : 0);
+	} else if (!strcmp(cmd, "linktx")) {
+		rc = gate_linktx(argc > 2 ? (uint8_t)atoi(argv[2]) : 149,
+		                 argc > 3 ? atoi(argv[3]) : 400);
+	} else if (!strcmp(cmd, "linkrx")) {
+		rc = gate_linkrx(argc > 2 ? (uint8_t)atoi(argv[2]) : 149,
+		                 argc > 3 ? atoi(argv[3]) : 30);
 	} else if (!strcmp(cmd, "diversity")) {
 		rc = gate_diversity(argc > 2 ? (uint8_t)atoi(argv[2]) : 149,
 		                    argc > 3 ? atoi(argv[3]) : 600);

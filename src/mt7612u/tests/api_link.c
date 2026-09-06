@@ -32,6 +32,8 @@ static void *const api[] = {
 	(void *)mt7612u_set_ack_responder,
 	(void *)mt7612u_clear_ack_responder,
 	(void *)mt7612u_get_stats,
+	(void *)mt7612u_link_stats_start,
+	(void *)mt7612u_link_stats,
 	(void *)mt7612u_read_tsf,
 	(void *)mt7612u_write_tsf,
 	(void *)mt7612u_get_caps,

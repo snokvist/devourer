@@ -5,6 +5,7 @@
  * See PLAN.md: trimming this sequence is a post-Gate-E activity, because a
  * 95%-correct init answers every register read and still radiates nothing.
  */
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include "internal.h"
@@ -486,5 +487,83 @@ int mt7612u_set_monitor_rx(struct mt7612u_dev *d, int keep_corrupted)
 	if (!keep_corrupted)
 		filtr |= MT_RX_FILTR_CFG_CRC_ERR;
 	mt_wr(d, MT_RX_FILTR_CFG, filtr);
+	return 0;
+}
+
+/* --- MIB link statistics --------------------------------------------------
+ *
+ * Every counter here is read-and-clear in hardware: mt76x02_mac_reset_counters()
+ * zeroes them by reading, and mt76x02_mac_cc_reset() documents the channel
+ * timers the same way. So there is nothing to difference - each read *is* the
+ * interval - and two pollers would steal each other's counts.
+ */
+static uint64_t stats_now_us(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)(ts.tv_nsec / 1000);
+}
+
+static uint64_t g_stats_last_us;
+
+int mt7612u_link_stats_start(struct mt7612u_dev *d)
+{
+	struct mt7612u_link_stats discard;
+
+	if (!d) return -1;
+	/* Exactly mt76x02_mac_cc_reset()'s configuration: TX, RX, NAV and EIFS
+	 * all count as busy, which is what makes ch_busy an airtime figure
+	 * rather than a receive-only one. */
+	mt_wr(d, MT_CH_TIME_CFG,
+	      MT_CH_TIME_CFG_TIMER_EN | MT_CH_TIME_CFG_TX_AS_BUSY |
+	      MT_CH_TIME_CFG_RX_AS_BUSY | MT_CH_TIME_CFG_NAV_AS_BUSY |
+	      MT_CH_TIME_CFG_EIFS_AS_BUSY | MT_CH_CCA_RC_EN |
+	      FIELD_PREP(MT_CH_TIME_CFG_CH_TIMER_CLR, 1));
+	/* One read to clear everything, so the first real sample is clean. */
+	mt7612u_link_stats(d, &discard);
+	return 0;
+}
+
+int mt7612u_link_stats(struct mt7612u_dev *d, struct mt7612u_link_stats *out)
+{
+	uint64_t now = stats_now_us();
+	uint32_t v;
+
+	if (!d || !out) return -1;
+	memset(out, 0, sizeof *out);
+	out->interval_us = g_stats_last_us ? (uint32_t)(now - g_stats_last_us) : 0;
+	g_stats_last_us = now;
+
+	out->ch_busy = mt_rr(d, MT_CH_BUSY);
+	out->ch_idle = mt_rr(d, MT_CH_IDLE);
+
+	v = mt_rr(d, MT_RX_STAT_0);
+	out->rx_crc_err = (uint16_t)FIELD_GET(MT_RX_STAT_0_CRC_ERRORS, v);
+	out->rx_phy_err = (uint16_t)FIELD_GET(MT_RX_STAT_0_PHY_ERRORS, v);
+	v = mt_rr(d, MT_RX_STAT_1);
+	out->rx_false_cca = (uint16_t)FIELD_GET(MT_RX_STAT_1_CCA_ERRORS, v);
+	out->rx_plcp_err = (uint16_t)FIELD_GET(MT_RX_STAT_1_PLCP_ERRORS, v);
+	v = mt_rr(d, MT_RX_STAT_2);
+	out->rx_dup_err = (uint16_t)FIELD_GET(MT_RX_STAT_2_DUP_ERRORS, v);
+	out->rx_overflow = (uint16_t)FIELD_GET(MT_RX_STAT_2_OVERFLOW_ERRORS, v);
+
+	for (int i = 0; i < 16; i++) {
+		v = mt_rr(d, MT_TX_AGG_CNT(i));
+		out->agg_cnt[i * 2]     = (uint16_t)(v & 0xffff);
+		out->agg_cnt[i * 2 + 1] = (uint16_t)(v >> 16);
+	}
+
+	/* The temperature sensor needs the MCU to sample it first. Its raw
+	 * value is relative to a per-part 25 C reference in the EEPROM, which
+	 * this port does not read, so the raw code is reported as-is rather
+	 * than converted to a wrong number of degrees. */
+	out->temp_c = INT8_MIN;
+	if (!mt_mcu_calibrate(d, MCU_CAL_TEMP_SENSOR, 0)) {
+		uint32_t t;
+
+		if (!mt_rr_chk(d, MT_TEMP_SENSOR, &t))
+			out->temp_c = (int8_t)FIELD_GET(MT_TEMP_SENSOR_VAL, t);
+	}
 	return 0;
 }
