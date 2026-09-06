@@ -64,6 +64,44 @@ static int legacy_rate_index(uint8_t r500, enum mt7612u_phy *phy)
 }
 
 /*
+ * Radiotap VHT bandwidth code -> the width the frame is actually sent at.
+ *
+ * The code names a channel width *and* the sub-channel within it: 2 is
+ * "40 (20L)", a 20 MHz frame in the lower half of a 40 MHz channel, not a
+ * 40 MHz frame. Treating 1-3 as 40 and >=4 as 80 airs a requested 20-in-40
+ * at 40 MHz and a requested 20-in-80 at 80.
+ *
+ * This project's own ieee80211_radiotap.h names the equivalent HT codes
+ * IEEE80211_RADIOTAP_MCS_BW_20L (2) and _20U (3), and the HT branch below
+ * already reads them that way - the VHT branch used to disagree with it.
+ */
+static enum mt7612u_bw vht_bandwidth(uint8_t code)
+{
+	static const uint8_t width[] = {
+		MT7612U_BW_20,  /*  0  20        */
+		MT7612U_BW_40,  /*  1  40        */
+		MT7612U_BW_20,  /*  2  40 (20L)  */
+		MT7612U_BW_20,  /*  3  40 (20U)  */
+		MT7612U_BW_80,  /*  4  80        */
+		MT7612U_BW_40,  /*  5  80 (40L)  */
+		MT7612U_BW_40,  /*  6  80 (40U)  */
+		MT7612U_BW_20,  /*  7  80 (20LL) */
+		MT7612U_BW_20,  /*  8  80 (20LU) */
+		MT7612U_BW_20,  /*  9  80 (20UL) */
+		MT7612U_BW_20,  /* 10  80 (20UU) */
+	};
+
+	if (code < sizeof width / sizeof width[0])
+		return (enum mt7612u_bw)width[code];
+	/* 11 and above are 160 MHz and its sub-channels. This part has no
+	 * 160 MHz encoding in the rate word, and narrowing silently would be
+	 * worse than saying so. */
+	LOG("radiotap VHT bandwidth code %u is 160 MHz or a sub-channel of it; "
+	    "unsupported, sending at 20 MHz", code);
+	return MT7612U_BW_20;
+}
+
+/*
  * Parse a radiotap header into a tx_rate. Returns the header length, or 0 if
  * the buffer is not a usable radiotap header.
  */
@@ -157,8 +195,7 @@ int mt_radiotap_parse(const uint8_t *buf, size_t len, struct mt7612u_tx_rate *r)
 
 				if (flags & 0x04)   r->sgi = 1;
 				if (coding & 0x01)  r->ldpc = 1;
-				r->bw = bwc == 0 ? MT7612U_BW_20
-				      : (bwc <= 3 ? MT7612U_BW_40 : MT7612U_BW_80);
+				r->bw = vht_bandwidth(bwc);
 				break;
 			}
 			default:

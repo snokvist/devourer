@@ -149,10 +149,55 @@ static void test_rx_l2pad(void)
 	}
 }
 
+/*
+ * Radiotap VHT bandwidth: the code names a width *and* a sub-channel within
+ * it, so "40 (20L)" is a 20 MHz frame. Mapping 1-3 to 40 and >=4 to 80 aired
+ * a requested 20-in-40 at 40 MHz.
+ */
+static void test_vht_bandwidth(void)
+{
+	/* code -> expected width, from the radiotap VHT bandwidth table */
+	static const struct { uint8_t code; enum mt7612u_bw bw; const char *what; } cases[] = {
+		{  0, MT7612U_BW_20, "20"        }, {  1, MT7612U_BW_40, "40"        },
+		{  2, MT7612U_BW_20, "40 (20L)"  }, {  3, MT7612U_BW_20, "40 (20U)"  },
+		{  4, MT7612U_BW_80, "80"        }, {  5, MT7612U_BW_40, "80 (40L)"  },
+		{  6, MT7612U_BW_40, "80 (40U)"  }, {  7, MT7612U_BW_20, "80 (20LL)" },
+		{  8, MT7612U_BW_20, "80 (20LU)" }, {  9, MT7612U_BW_20, "80 (20UL)" },
+		{ 10, MT7612U_BW_20, "80 (20UU)" },
+	};
+	/* radiotap: present = VHT(21) only; then 12 bytes of VHT at offset 8,
+	 * 2-byte aligned. known = BANDWIDTH, bandwidth byte at VHT+3. */
+	uint8_t buf[8 + 12 + 32];
+	struct mt7612u_tx_rate r;
+
+	printf("radiotap VHT bandwidth:\n");
+	for (unsigned i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+		memset(buf, 0, sizeof buf);
+		buf[2] = 20;                    /* radiotap length */
+		buf[4] = 0x00; buf[5] = 0x00;
+		buf[6] = 0x20; buf[7] = 0x00;   /* present bit 21 = VHT */
+		buf[8] = 0x40;                  /* known: BANDWIDTH */
+		buf[11] = cases[i].code;        /* VHT+3 = bandwidth */
+		buf[12] = 0x10;                 /* mcs_nss: MCS1 NSS0 -> nss 1 */
+
+		if (mt_radiotap_parse(buf, sizeof buf, &r) != 20) {
+			printf("  FAIL code %u: header not parsed\n", cases[i].code);
+			fails++;
+			continue;
+		}
+		if (r.bw != cases[i].bw) {
+			printf("  FAIL code %2u %-10s want bw %d got %d\n",
+			       cases[i].code, cases[i].what, (int)cases[i].bw, (int)r.bw);
+			fails++;
+		}
+	}
+}
+
 int main(void)
 {
 	test_hdrlen();
 	test_rx_l2pad();
+	test_vht_bandwidth();
 	printf("frame_shape: %s\n", fails ? "FAIL" : "PASS");
 	return fails ? 1 : 0;
 }
