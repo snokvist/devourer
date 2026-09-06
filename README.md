@@ -109,6 +109,7 @@ Bandwidth cells are devourer's measured on-air TX throughput (Mbps, HT MCS7,
 | **RTL8832BU** (11ax)          | 2T2R              | —             | —             | —                | —          | Wi-Fi-only SKU of the 8852B die; rides the 8852BU code path. Not benchmarked. 5/10 MHz capable; HE ER SU + DCM extended range |
 | **RTL8832CU** (11ax)          | 2T2R + BT         | 40            | 33            | 32               | 32          | TP-Link Archer TX50UH (`35bc:0101`); Wi-Fi 6E tri-band (2.4/5/6 GHz). 5/10 and 160 MHz capable; HE ER SU + DCM extended range. Host-push injection over USB 2.0 (~50% duty ceiling); [6G TX+RX validated](tests/kestrel_8832cu_6g_txrx.sh) |
 | **RTL8852CU** (11ax)          | 2T2R + BT         | —             | —             | —                | —          | "8852" branding of the same 8852C die; rides the 8832CU code path. Not benchmarked. 5/10 and 160 MHz capable; HE ER SU + DCM extended range |
+| **MT7612U** (11ac)            | 2T2R              | —             | —             | —                | —          | **MediaTek, not Realtek** — the one non-Realtek backend, opt-in via `DEVOURER_MT7612U` (OFF by default). `0e8d:7612`/`0e8d:7662`. Not benchmarked in this column's units (the figures in [docs/mt7612u.md](docs/mt7612u.md) are goodput, not occupancy × PHY rate). 20/40/80 MHz; above 20 it is 5 GHz-only except 2.4 GHz ch4-11, and 5/10 MHz is absent (`MT_RATE_BW` has no encoding for it). Needs `mt7662.bin` + `mt7662_rom_patch.bin` from linux-firmware |
 
 `†` = works on-air but the reading varies run-to-run (bracketed = best clean
 reading).
@@ -196,7 +197,8 @@ All chips compile in by default; per-chip CMake options (`DEVOURER_JAGUAR1`,
 `DEVOURER_8814`, `DEVOURER_JAGUAR2_8822B`, `DEVOURER_JAGUAR2_8821C`,
 `DEVOURER_JAGUAR3_8822C`, `DEVOURER_JAGUAR3_8822E`, `DEVOURER_8733B`,
 `DEVOURER_KESTREL_8852B`, `DEVOURER_KESTREL_8852C`) drop unneeded firmware and
-tables — an 8812AU-only
+tables. `DEVOURER_MT7612U` is the exception in both directions: it is **off**
+by default, and it adds a backend rather than dropping one — an 8812AU-only
 `rxdemo` is ~1.6 MB against ~6.3 MB with everything on, and dropping just the
 two Wi-Fi 6 dies takes it to ~4.2 MB (their verbatim-vendored halbb/halrf plane
 is the single largest contributor). `DEVOURER_PCIE` (default OFF, Linux-only)

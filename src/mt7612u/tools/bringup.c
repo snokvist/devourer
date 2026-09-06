@@ -1556,7 +1556,8 @@ static int gate_diversity(uint8_t chan, int count)
  * arm that only ever asks for things that work cannot tell a working encoder
  * from one that sets every bit it is handed.
  */
-static int gate_coding(uint8_t chan, int count, int bw40)
+/* bw is the MT7612U_BW_* enum: 0 = 20, 1 = 40, 2 = 80. */
+static int gate_coding(uint8_t chan, int count, int bw)
 {
 	static const uint8_t src[6] = { 0x02, 0x4d, 0x54, 0x76, 0x12, 0x01 };
 	static const struct { enum mt7612u_phy phy; uint8_t mcs, nss; int base; }
@@ -1571,13 +1572,16 @@ static int gate_coding(uint8_t chan, int count, int bw40)
 	};
 	uint8_t f[64];
 	int arms = 0;
+	uint8_t hw_chan = chan;
 
 	if (mt_eeprom_init(&dev)) return 1;
 	if (mt_init_hardware(&dev, NULL)) return 1;
-	if (mt_set_channel(&dev, chan, bw40 ? MT7612U_BW_40 : MT7612U_BW_20)) return 1;
+	if (mt_set_channel(&dev, chan, (enum mt7612u_bw)bw)) return 1;
 	if (mt_mac_start(&dev, 0)) return 1;
 
-	printf("ch%u at %d MHz, %d frames per arm\n\n", chan, bw40 ? 40 : 20, count);
+	mt_chan_group(chan, (uint8_t)bw, &hw_chan, NULL, NULL);
+	printf("ch%u (hw centre %u) at %d MHz, %d frames per arm\n\n",
+	       chan, hw_chan, 20 << bw, count);
 	printf("  %-16s %-10s %-9s %s\n", "rate", "asked", "rate word", "expect on air");
 
 	memset(f, 0, sizeof f);
@@ -1588,11 +1592,18 @@ static int gate_coding(uint8_t chan, int count, int bw40)
 	memcpy(f + 24, "MT7612U-HAL ", 12);
 
 	for (unsigned i = 0; i < sizeof rates / sizeof rates[0]; i++) {
+		/* 802.11n has no 80 MHz, so an HT arm at that width would emit a
+		 * rate word that names no real format. gate_sweep and gate_vht
+		 * skip the same pairing. */
+		if (bw == MT7612U_BW_80 && rates[i].phy != MT7612U_PHY_VHT) {
+			printf("  %-16s skipped: 802.11n has no 80 MHz\n", "HT");
+			continue;
+		}
 		for (int coding = 0; coding < 8; coding++) {
 			struct mt7612u_tx_rate r = {
 				.phy = rates[i].phy, .mcs = rates[i].mcs,
 				.nss = rates[i].nss,
-				.bw = bw40 ? MT7612U_BW_40 : MT7612U_BW_20,
+				.bw = (uint8_t)bw,
 				.sgi = (coding & 4) ? 1u : 0u,
 				.ldpc = (coding & 1) ? 1u : 0u,
 				.stbc = (coding & 2) ? 1u : 0u,
@@ -1653,19 +1664,25 @@ static int gate_coding(uint8_t chan, int count, int bw40)
  * VHT MCS9 is not legal at 20 MHz for one or two streams, so it is skipped
  * there and included at 40.
  */
-static int gate_sweep(uint8_t chan, int count, int bw40)
+/* bw is the MT7612U_BW_* enum: 0 = 20, 1 = 40, 2 = 80. */
+static int gate_sweep(uint8_t chan, int count, int bw)
 {
 	static const uint8_t src[6] = { 0x02, 0x4d, 0x54, 0x76, 0x12, 0x01 };
 	uint8_t f[64];
 	int arms = 0;
+	uint8_t hw_chan = chan;
 
 	if (mt_eeprom_init(&dev)) return 1;
 	if (mt_init_hardware(&dev, NULL)) return 1;
-	if (mt_set_channel(&dev, chan, bw40 ? MT7612U_BW_40 : MT7612U_BW_20)) return 1;
+	if (mt_set_channel(&dev, chan, (enum mt7612u_bw)bw)) return 1;
 	if (mt_mac_start(&dev, 0)) return 1;
 
-	printf("ch%u at %d MHz, chainmask 0x%04x, %d frames per rate\n\n",
-	       chan, bw40 ? 40 : 20, dev.chainmask, count);
+	/* Report the centre the hardware actually tuned, not the control
+	 * channel: at 80 MHz they differ by up to 6, and a witness listening on
+	 * the control channel with the wrong centre hears nothing. */
+	mt_chan_group(chan, (uint8_t)bw, &hw_chan, NULL, NULL);
+	printf("ch%u (hw centre %u) at %d MHz, chainmask 0x%04x, %d frames per rate\n\n",
+	       chan, hw_chan, 20 << bw, dev.chainmask, count);
 	printf("  %-18s %-9s %s\n", "rate", "rate word", "expected DESC_RATE");
 
 	memset(f, 0, sizeof f);
@@ -1676,12 +1693,21 @@ static int gate_sweep(uint8_t chan, int count, int bw40)
 	memcpy(f + 24, "MT7612U-HAL ", 12);
 
 	for (int phase = 0; phase < 2; phase++) {
-		int last_mcs = phase == 0 ? 15 : (bw40 ? 9 : 8);
+		/* HT has no 80 MHz: 802.11n stops at 40, and 80 is a VHT-only
+		 * width. A rate word naming PHY=HT with BW=80 is not a wide HT
+		 * frame, it is an unspecified one, so the HT ladder is skipped
+		 * rather than swept at a width it cannot mean. */
+		int last_mcs = phase == 0 ? 15 : (bw ? 9 : 8);
+
+		if (phase == 0 && bw == MT7612U_BW_80) {
+			printf("  (HT ladder skipped: 802.11n has no 80 MHz)\n");
+			continue;
+		}
 
 		for (int mcs = 0; mcs <= last_mcs; mcs++) {
 			for (int nss = 1; nss <= 2; nss++) {
 				struct mt7612u_tx_rate r = {
-					.bw = bw40 ? MT7612U_BW_40 : MT7612U_BW_20,
+					.bw = (uint8_t)bw,
 					.no_ack = 1,
 				};
 				char what[32];
@@ -1724,8 +1750,10 @@ static int gate_sweep(uint8_t chan, int count, int bw40)
 	}
 
 	mt_mac_stop(&dev);
-	printf("\n%d rates swept. Each frame carries its own expected DESC_RATE\n"
-	       "at payload offset 12; the witness compares the two.\n", arms);
+	printf("\n%d rates swept at %d MHz. Each frame carries its own expected\n"
+	       "DESC_RATE at payload offset 12; the witness compares the two.\n"
+	       "The witness must be listening at the same width - a 20 MHz\n"
+	       "receiver decodes none of a 40 or 80 MHz frame.\n", arms, 20 << bw);
 	return 0;
 }
 
@@ -1743,7 +1771,8 @@ static int gate_sweep(uint8_t chan, int count, int bw40)
  * VHT MCS9 is not a legal rate at 20 MHz for one or two streams, so it only
  * appears in the 40 MHz arms.
  */
-static int gate_vht(uint8_t chan, int count, int bw40)
+/* bw is the MT7612U_BW_* enum: 0 = 20, 1 = 40, 2 = 80. */
+static int gate_vht(uint8_t chan, int count, int bw)
 {
 	static const uint8_t src[6] = { 0x02, 0x4d, 0x54, 0x76, 0x12, 0x01 };
 	static const struct {
@@ -1762,16 +1791,19 @@ static int gate_vht(uint8_t chan, int count, int bw40)
 		{ 'Z', MT7612U_PHY_VHT, 9,  2, 1, "VHT  MCS9  2SS", 63 },
 	};
 	uint8_t f[64];
+	uint8_t hw_chan = chan;
 
 	if (mt_eeprom_init(&dev)) return 1;
 	if (mt_init_hardware(&dev, NULL)) return 1;
-	if (mt_set_channel(&dev, chan, bw40 ? MT7612U_BW_40 : MT7612U_BW_20)) return 1;
+	if (mt_set_channel(&dev, chan, (enum mt7612u_bw)bw)) return 1;
 	if (mt_mac_start(&dev, 0)) return 1;
 
+	mt_chan_group(chan, (uint8_t)bw, &hw_chan, NULL, NULL);
 	printf("chainmask 0x%04x -> %d spatial streams, txwi[17]=0x%02x\n",
 	       dev.chainmask, (dev.chainmask & 0xf) > 1 ? 2 : 1,
 	       ((dev.chainmask & 0xf) > 1) ? 0x13 : 0);
-	printf("ch%u at %d MHz, %d frames per arm\n\n", chan, bw40 ? 40 : 20, count);
+	printf("ch%u (hw centre %u) at %d MHz, %d frames per arm\n\n",
+	       chan, hw_chan, 20 << bw, count);
 	printf("  tag  %-16s rate word  expected witness DESC_RATE\n", "arm");
 
 	memset(f, 0, sizeof f);
@@ -1784,11 +1816,14 @@ static int gate_vht(uint8_t chan, int count, int bw40)
 	for (unsigned a = 0; a < sizeof arms / sizeof arms[0]; a++) {
 		struct mt7612u_tx_rate r = { .phy = arms[a].phy, .mcs = arms[a].mcs,
 		                             .nss = arms[a].nss,
-		                             .bw = bw40 ? MT7612U_BW_40 : MT7612U_BW_20,
+		                             .bw = (uint8_t)bw,
 		                             .no_ack = 1 };
 		long sent = 0;
 
-		if (arms[a].wide_only && !bw40) continue;
+		/* MCS9 has no 20 MHz encoding at 1 or 2 streams. */
+		if (arms[a].wide_only && bw == MT7612U_BW_20) continue;
+		/* HT is a 20/40-only PHY: 80 MHz is VHT-defined. */
+		if (arms[a].phy != MT7612U_PHY_VHT && bw == MT7612U_BW_80) continue;
 
 		printf("  %c    %-16s 0x%04x     %d\n", arms[a].tag, arms[a].what,
 		       mt_tx_rate_word(&r), arms[a].expect);
@@ -1907,6 +1942,20 @@ int main(int argc, char **argv)
 {
 	const char *err = NULL, *cmd = argc > 1 ? argv[1] : "regs";
 	int rc;
+	/* The width argument that sweep/coding/vht share in argv[4]. Validated
+	 * here rather than inside them, because they format it as `20 << bw`,
+	 * which for a negative or large argv value is undefined rather than
+	 * merely wrong. Other gates give argv[4] a different meaning, so the
+	 * check is scoped to the three that read it as a width. */
+	int want_bw = argc > 4 ? atoi(argv[4]) : 0;
+
+	if ((!strcmp(cmd, "sweep") || !strcmp(cmd, "coding") ||
+	     !strcmp(cmd, "vht")) &&
+	    (want_bw < MT7612U_BW_20 || want_bw > MT7612U_BW_80)) {
+		fprintf(stderr, "bad bandwidth '%s': 0 = 20 MHz, 1 = 40, 2 = 80\n",
+		        argv[4]);
+		return 2;
+	}
 
 	signal(SIGINT, on_signal);
 	signal(SIGTERM, on_signal);
@@ -1944,16 +1993,13 @@ int main(int argc, char **argv)
 		                    argc > 3 ? atoi(argv[3]) : 600);
 	} else if (!strcmp(cmd, "coding")) {
 		rc = gate_coding(argc > 2 ? (uint8_t)atoi(argv[2]) : 149,
-		                 argc > 3 ? atoi(argv[3]) : 100,
-		                 argc > 4 ? atoi(argv[4]) : 0);
+		                 argc > 3 ? atoi(argv[3]) : 100, want_bw);
 	} else if (!strcmp(cmd, "sweep")) {
 		rc = gate_sweep(argc > 2 ? (uint8_t)atoi(argv[2]) : 149,
-		                argc > 3 ? atoi(argv[3]) : 120,
-		                argc > 4 ? atoi(argv[4]) : 0);
+		                argc > 3 ? atoi(argv[3]) : 120, want_bw);
 	} else if (!strcmp(cmd, "vht")) {
 		rc = gate_vht(argc > 2 ? (uint8_t)atoi(argv[2]) : 149,
-		              argc > 3 ? atoi(argv[3]) : 300,
-		              argc > 4 ? atoi(argv[4]) : 0);
+		              argc > 3 ? atoi(argv[3]) : 300, want_bw);
 	} else if (!strcmp(cmd, "ampdu")) {
 		rc = gate_ampdu(argc > 2 ? (uint8_t)atoi(argv[2]) : 149,
 		                argc > 3 ? atoi(argv[3]) : 400);
@@ -1992,6 +2038,8 @@ int main(int argc, char **argv)
 	} else {
 		fprintf(stderr, "unknown subcommand '%s'\n", cmd);
 		fprintf(stderr, "usage: bringup [regs|fw|init|chan|tx|rx|hop|gateg] [chan] [count] [phy 0=CCK 1=OFDM 2=HT 4=VHT] [mcs]\n");
+		fprintf(stderr, "       bringup [sweep|coding|vht] [chan] [count] [bw 0=20 1=40 2=80]\n");
+		fprintf(stderr, "       the witness must listen at the same width (DEVOURER_BW=40|80)\n");
 		rc = 2;
 	}
 

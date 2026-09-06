@@ -73,16 +73,18 @@ int main() {
     expect("20 MHz -> BW_20", bw == MT7612U_BW_20);
     expect("40 MHz accepted", width_to_bw(CHANNEL_WIDTH_40, bw, why));
     expect("40 MHz -> BW_40", bw == MT7612U_BW_40);
+    expect("80 MHz accepted", width_to_bw(CHANNEL_WIDTH_80, bw, why));
+    expect("80 MHz -> BW_80", bw == MT7612U_BW_80);
 
     /* Refusals must not write `out` — a caller that ignores the bool would
      * otherwise transmit at whatever the last accepted width left behind. */
     bw = MT7612U_BW_20;
-    expect("80 MHz refused", !width_to_bw(CHANNEL_WIDTH_80, bw, why));
-    expect("80 MHz leaves bw untouched", bw == MT7612U_BW_20);
-    expect("80 MHz gives a reason", why && why[0]);
     expect("5 MHz refused", !width_to_bw(CHANNEL_WIDTH_5, bw, why));
+    expect("5 MHz leaves bw untouched", bw == MT7612U_BW_20);
+    expect("5 MHz gives a reason", why && why[0]);
     expect("10 MHz refused", !width_to_bw(CHANNEL_WIDTH_10, bw, why));
     expect("160 MHz refused", !width_to_bw(CHANNEL_WIDTH_160, bw, why));
+    expect("160 MHz leaves bw untouched", bw == MT7612U_BW_20);
   }
 
   if (g_fail == 0)

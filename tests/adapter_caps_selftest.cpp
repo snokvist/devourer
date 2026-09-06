@@ -38,6 +38,15 @@ int main() {
   expect("RTL8733B bw = 10/20/40 (5 MHz refused on this die)",
          bw_mask_for_generation(ChipGeneration::Rtl8733b) ==
              (kBw10 | kBw20 | kBw40));
+  /* MT7612U: 11ac widths only. MT_RATE_BW is a two-bit field with three
+   * defined values, so 5/10 MHz has no encoding in the rate word — without
+   * its own arm this generation falls through to the 5/10-capable default,
+   * i.e. it advertises widths the backend refuses. */
+  expect("Mediatek bw = 20/40/80, no narrowband",
+         bw_mask_for_generation(ChipGeneration::Mediatek) == ac);
+  expect("Mediatek bw excludes 5/10",
+         (bw_mask_for_generation(ChipGeneration::Mediatek) &
+          (kBw5 | kBw10)) == 0);
   /* Kestrel (11ax) does 20/40/80 + 160 MHz (RTL8852C, validated on-air at
    * 6 GHz). */
   expect("Kestrel bw = 20/40/80/160",
@@ -57,6 +66,9 @@ int main() {
   expect("gen name unknown",
          std::string_view(generation_name(ChipGeneration::Unknown)) ==
              "unknown");
+  expect("gen name mediatek",
+         std::string_view(generation_name(ChipGeneration::Mediatek)) ==
+             "mediatek");
 
   /* --- RTL8733B identity gates --- */
   expect("RTL8733B chip id accepted", rtl8733b::is_chip_id(0x16));

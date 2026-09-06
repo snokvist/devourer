@@ -274,13 +274,19 @@ SelectedChannel RtlMt7612uDevice::GetSelectedChannel() {
 
 /* --- TX ------------------------------------------------------------------ */
 
+/* Both send paths take _mu because the TX width clamp in mt_tx_build() reads
+ * the tuned channel and width, which SetMonitorChannel writes under this same
+ * lock. Without it a retune concurrent with a burst can have a frame read a
+ * half-updated width. */
 bool RtlMt7612uDevice::send_packet(const uint8_t *packet, size_t length) {
+  std::lock_guard<std::recursive_mutex> lock(_mu);
   if (!_dev)
     return false;
   return mt7612u_send_packet(_dev, packet, length) == 0;
 }
 
 size_t RtlMt7612uDevice::send_packets(const TxPacketView *pkts, size_t count) {
+  std::lock_guard<std::recursive_mutex> lock(_mu);
   if (!_dev || !pkts)
     return 0;
   /* TxPacketView and mt7612u_tx_view are the same two fields in the same
@@ -303,9 +309,10 @@ devourer::TxCaps RtlMt7612uDevice::GetTxCaps() {
   c.stbc_ok = true;
   c.ldpc_ok = true;
   c.sgi_ok = true;
-  /* 40, not 80: the rate word encodes 80 but the channel-width maths is not
-   * ported, so a caller must not be told it can ask for it. */
-  c.bw_max_mhz = 40;
+  /* 80 is the silicon's limit and now the port's. Not every channel can
+   * carry it — SetMonitorChannel refuses a control channel that is off the
+   * 80 MHz grid rather than tuning near it. */
+  c.bw_max_mhz = 80;
   return c;
 }
 
@@ -337,7 +344,11 @@ devourer::AdapterCaps RtlMt7612uDevice::GetAdapterCaps() {
   c.rx_chains = 2;
   c.tx = GetTxCaps();
   c.txpwr = GetTxPowerCaps();
-  c.bw_mask = devourer::kBw20 | devourer::kBw40;
+  /* Must agree with GetTxCaps().bw_max_mhz above — these two travel together
+   * in one adapter.caps event, and a consumer gating on the mask would never
+   * ask for a width the ceiling advertises. 5/10 MHz stay out: MT_RATE_BW has
+   * no encoding for them. */
+  c.bw_mask = devourer::kBw20 | devourer::kBw40 | devourer::kBw80;
   c.tune_5g = {true, 5180, 5825};
   c.tune_2g4 = {true, 2412, 2484};
   c.characterized_5g = c.tune_5g;
@@ -467,11 +478,25 @@ void RtlMt7612uDevice::SetTxMode(const devourer::TxMode &mode) {
     return;
   }
 
-  r.bw = mode.bw_mhz >= 40 ? MT7612U_BW_40 : MT7612U_BW_20;
-  if (mode.bw_mhz > 40)
-    _logger->warn("MT7612U: {} MHz requested, narrowing to 40 (80 MHz width "
-                  "maths not ported)",
+  if (mode.bw_mhz >= 80 && r.phy != MT7612U_PHY_VHT) {
+    /* 802.11n has no 80 MHz: it is a VHT-defined width. A rate word naming
+     * PHY=HT with BW=80 is not a wide HT frame, it is an unspecified one, so
+     * narrow rather than emit it. The bringup gates refuse the same pairing. */
+    r.bw = MT7612U_BW_40;
+    _logger->warn("MT7612U: {} MHz asked for a non-VHT rate; 802.11n has no "
+                  "80 MHz, narrowing to 40",
                   mode.bw_mhz);
+  } else if (mode.bw_mhz >= 80) {
+    r.bw = MT7612U_BW_80;
+    if (mode.bw_mhz > 80)
+      _logger->warn("MT7612U: {} MHz requested, narrowing to 80 (802.11ac "
+                    "silicon; MT_RATE_BW has no wider encoding)",
+                    mode.bw_mhz);
+  } else if (mode.bw_mhz >= 40) {
+    r.bw = MT7612U_BW_40;
+  } else {
+    r.bw = MT7612U_BW_20;
+  }
   r.sgi = mode.sgi;
   r.ldpc = mode.ldpc;
   r.stbc = mode.stbc;

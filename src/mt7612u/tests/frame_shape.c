@@ -235,11 +235,147 @@ static void test_invalid_phy(void)
 	}
 }
 
+/*
+ * Channel grouping. The hardware tunes the *centre* of a widened channel, so
+ * at 80 MHz control channel 36 tunes 42. Getting this wrong is silent: every
+ * register write succeeds and the part transmits, just not where it was asked
+ * to. Only a correctly tuned receiver or a spectrum analyser would show it,
+ * which is why it is pinned here instead.
+ */
+static void test_chan_group(void)
+{
+	static const struct {
+		uint8_t chan, bw, hw, idx, group;
+	} ok[] = {
+		/* 20 MHz: the control channel is the hardware channel. */
+		{  36, MT7612U_BW_20,  36, 0, 0 },
+		{ 149, MT7612U_BW_20, 149, 0, 0 },
+		{   1, MT7612U_BW_20,   1, 0, 0 },   /* 2.4 GHz is fine at 20 */
+
+		/* 40 MHz: centre is control +/- 2, and which side alternates. */
+		{  36, MT7612U_BW_40,  38, 1, 0 },
+		{  40, MT7612U_BW_40,  38, 3, 1 },
+		{ 149, MT7612U_BW_40, 151, 1, 0 },
+		{ 161, MT7612U_BW_40, 159, 3, 1 },
+
+		/* 80 MHz: all four control channels of a group tune one centre,
+		 * and ch_group_index says which quarter the control channel is. */
+		{  36, MT7612U_BW_80,  42, 0, 0 },
+		{  40, MT7612U_BW_80,  42, 1, 1 },
+		{  44, MT7612U_BW_80,  42, 2, 2 },
+		{  48, MT7612U_BW_80,  42, 3, 3 },
+		{  52, MT7612U_BW_80,  58, 0, 0 },
+		{  64, MT7612U_BW_80,  58, 3, 3 },
+		{ 100, MT7612U_BW_80, 106, 0, 0 },
+		{ 112, MT7612U_BW_80, 106, 3, 3 },
+		{ 116, MT7612U_BW_80, 122, 0, 0 },
+		{ 128, MT7612U_BW_80, 122, 3, 3 },
+		{ 132, MT7612U_BW_80, 138, 0, 0 },
+		{ 144, MT7612U_BW_80, 138, 3, 3 },
+		/* U-NII-3 is the case a naive centre formula gets wrong: the
+		 * group starts at 149, not 148, so every channel in it carries
+		 * a +1 that the integer divide has to absorb. */
+		{ 149, MT7612U_BW_80, 155, 0, 0 },
+		{ 153, MT7612U_BW_80, 155, 1, 1 },
+		{ 157, MT7612U_BW_80, 155, 2, 2 },
+		{ 161, MT7612U_BW_80, 155, 3, 3 },
+		/* 2.4 GHz 40 MHz reaches centres 6-9, i.e. control 4-11. */
+		{   4, MT7612U_BW_40,   6, 1, 0 },
+		{   6, MT7612U_BW_40,   8, 1, 0 },
+		{   8, MT7612U_BW_40,   6, 3, 1 },
+		{  11, MT7612U_BW_40,   9, 3, 1 },
+	};
+	static const struct { uint8_t chan, bw; const char *why; } refused[] = {
+		/* 5.35-5.47 GHz: the arithmetic yields centres 74 and 90, which
+		 * are not allocated. Tuning them is what the grid check stops. */
+		{  68, MT7612U_BW_80, "centre 74 is not allocated" },
+		{  96, MT7612U_BW_80, "centre 90 is not allocated" },
+		/* Off-grid control channels. 38 is a legal 40 MHz *centre*, so a
+		 * caller could pass it by mistake; at 80 MHz it names no group. */
+		{  38, MT7612U_BW_80, "not a control channel of any 80 group" },
+		{  42, MT7612U_BW_80, "42 is a centre, not a control channel" },
+		{  34, MT7612U_BW_80, "below the 5 GHz 80 MHz grid" },
+		/* The 165/169/173/177 group centres on 171 = 5855 MHz and spans
+		 * to 5895, past the 5825 this driver's caps declare. mt76's own
+		 * channel list has it; we refuse until the band is widened. */
+		{ 165, MT7612U_BW_80, "centre 171 is outside the declared band" },
+		{ 177, MT7612U_BW_80, "centre 171 is outside the declared band" },
+		/* 40 MHz gets the same grid check as 80. Without it these tune
+		 * silently: 254 wraps a uint8_t to centre 0, and 165 centres on
+		 * 167 = 5835 MHz, outside the declared band. */
+		{ 254, MT7612U_BW_40, "uint8_t wrap: would centre on 0" },
+		{ 255, MT7612U_BW_40, "uint8_t wrap: would centre on 1" },
+		{ 165, MT7612U_BW_40, "centre 167 is outside the declared band" },
+		{  15, MT7612U_BW_40, "not on the 5 GHz 40 MHz grid" },
+		{  35, MT7612U_BW_40, "not on the 5 GHz 40 MHz grid" },
+		/* 2.4 GHz: 1-3 would need a secondary at or below channel 0,
+		 * 12-13 one above 13. Both are what the old wrap produced. */
+		{   1, MT7612U_BW_40, "would centre on 255 after the wrap" },
+		{   2, MT7612U_BW_40, "would centre on 0 after the wrap" },
+		{  13, MT7612U_BW_40, "would need channel 15" },
+		{   6, MT7612U_BW_80, "no 80 MHz in 2.4 GHz at all" },
+		{  14, MT7612U_BW_80, "no 80 MHz in 2.4 GHz at all" },
+	};
+	unsigned i;
+
+	printf("mt_chan_group:\n");
+	for (i = 0; i < sizeof ok / sizeof ok[0]; i++) {
+		uint8_t hw = 0xff, idx = 0xff, group = 0xff;
+
+		if (mt_chan_group(ok[i].chan, ok[i].bw, &hw, &idx, &group)) {
+			printf("  FAIL ch %3u bw %u refused, should be accepted\n",
+			       ok[i].chan, ok[i].bw);
+			fails++;
+			continue;
+		}
+		if (hw != ok[i].hw || idx != ok[i].idx || group != ok[i].group) {
+			printf("  FAIL ch %3u bw %u: want hw %u idx %u group %u, "
+			       "got hw %u idx %u group %u\n",
+			       ok[i].chan, ok[i].bw, ok[i].hw, ok[i].idx,
+			       ok[i].group, hw, idx, group);
+			fails++;
+		}
+	}
+
+	for (i = 0; i < sizeof refused / sizeof refused[0]; i++) {
+		uint8_t hw = 0x5a, idx = 0x5a, group = 0x5a;
+
+		if (!mt_chan_group(refused[i].chan, refused[i].bw, &hw, &idx, &group)) {
+			printf("  FAIL ch %3u bw %u accepted (%s), tuned hw %u\n",
+			       refused[i].chan, refused[i].bw, refused[i].why, hw);
+			fails++;
+			continue;
+		}
+		/* A refusal must not write the outputs: a caller that checks the
+		 * return but reuses the buffer would otherwise tune whatever the
+		 * last accepted call left behind. */
+		if (hw != 0x5a || idx != 0x5a || group != 0x5a) {
+			printf("  FAIL ch %3u bw %u refused but wrote its outputs\n",
+			       refused[i].chan, refused[i].bw);
+			fails++;
+		}
+	}
+
+	/* Negative control: the 80 MHz centre must not be the control channel.
+	 * If this ever passes, the maths has degenerated to a pass-through and
+	 * every positive case above would still look right at 20 MHz. */
+	{
+		uint8_t hw = 0;
+
+		if (!mt_chan_group(36, MT7612U_BW_80, &hw, NULL, NULL) && hw == 36) {
+			printf("  FAIL negative control: 80 MHz returned the control "
+			       "channel, so this test could not detect a missing centre\n");
+			fails++;
+		}
+	}
+}
+
 int main(void)
 {
 	test_hdrlen();
 	test_invalid_phy();
 	test_rx_l2pad();
+	test_chan_group();
 	test_vht_bandwidth();
 	printf("frame_shape: %s\n", fails ? "FAIL" : "PASS");
 	return fails ? 1 : 0;

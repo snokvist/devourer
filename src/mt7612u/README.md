@@ -86,6 +86,20 @@ gateg  per-frame rate control               ack    ACK responder (needs a stimul
 rtap   send_packet / send_packets           hop    channel-switch cost
 ```
 
+`sweep`, `coding` and `vht` take a width as their fourth argument, in the
+`MT7612U_BW_*` numbering — `0` = 20, `1` = 40, `2` = 80 MHz:
+
+```sh
+./bringup sweep 149 120 2      # VHT ladder at 80 MHz, control channel 149
+```
+
+The witness has to listen at the same width (`DEVOURER_BW=40|80` for
+devourer's own `rxdemo`). A 20 MHz receiver decodes *none* of an 80 MHz
+frame — which makes it a good negative control and a misleading oracle.
+
+At 80 MHz the HT ladder is skipped: 802.11n has no 80 MHz, so a rate word
+naming `PHY=HT` with `BW=80` is not a wide HT frame, it is an unspecified one.
+
 ## Provenance
 
 Register sequences and descriptor layouts are derived from `openwrt/mt76`

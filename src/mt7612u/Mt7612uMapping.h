@@ -55,10 +55,12 @@ inline uint16_t desc_rate(const struct mt7612u_rx_info &info) {
   return 0;
 }
 
-/* SelectedChannel width -> the two widths this port implements. Anything
- * wider or narrower is refused rather than silently narrowed: 80 MHz is
- * silicon-capable but the width maths is not ported, and 5/10 MHz has no
- * encoding in the rate word at all. */
+/* SelectedChannel width -> the three widths this port implements. Anything
+ * wider or narrower is refused rather than silently narrowed: 5/10 MHz has no
+ * encoding in the rate word at all, and 160 MHz is beyond the silicon. Note
+ * that a width being accepted here does not mean every channel can carry it —
+ * mt7612u_set_channel() refuses a control channel that is off the grid for
+ * the requested width. */
 inline bool width_to_bw(ChannelWidth_t w, enum mt7612u_bw &out,
                         const char *&why) {
   switch (w) {
@@ -69,8 +71,8 @@ inline bool width_to_bw(ChannelWidth_t w, enum mt7612u_bw &out,
     out = MT7612U_BW_40;
     return true;
   case CHANNEL_WIDTH_80:
-    why = "80 MHz: silicon-capable, width maths not ported";
-    return false;
+    out = MT7612U_BW_80;
+    return true;
   case CHANNEL_WIDTH_5:
   case CHANNEL_WIDTH_10:
     why = "5/10 MHz narrowband: MT_RATE_BW has no encoding for it";

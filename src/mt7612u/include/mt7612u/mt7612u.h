@@ -132,10 +132,18 @@ void mt7612u_close(struct mt7612u_dev *dev);
 void mt7612u_keep_detached(struct mt7612u_dev *dev, int keep);
 
 /*
- * Channel + width. `chan` is an 802.11 channel number. Issues
+ * Channel + width. `chan` is always the *control* channel, at every width,
+ * and is an 802.11 channel number rather than a frequency. Issues
  * CMD_SWITCH_CHANNEL_OP and the firmware calibration burst, so it is not
- * cheap - it is a setup call, not a per-frame one. Only 20 and 40 MHz are
- * implemented; 80 MHz is silicon-capable but the width maths is not ported.
+ * cheap - it is a setup call, not a per-frame one.
+ *
+ * 20, 40 and 80 MHz are implemented. The hardware tunes the *centre* of a
+ * widened channel, derived here from the control channel: at 80 MHz, channel
+ * 36 tunes centre 42. A control channel that cannot carry the requested
+ * width is refused rather than tuned near - that covers an off-grid channel,
+ * one whose widened span would leave the band `mt7612u_caps` declares, and
+ * 40 MHz in 2.4 GHz outside channels 4-11, where a bare channel number
+ * cannot say which side the secondary sits on.
  */
 int mt7612u_set_channel(struct mt7612u_dev *dev, uint8_t chan, enum mt7612u_bw bw);
 

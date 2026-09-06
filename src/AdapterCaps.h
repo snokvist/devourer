@@ -86,8 +86,13 @@ inline uint8_t bw_mask_for_generation(ChipGeneration g) {
   /* RTL8733B: 10 MHz qualified (SDR OBW + two-way cross-decode with a
    * Jaguar3 peer, both bands); 5 MHz is refused — its BB small-BW mode airs
    * no packets on this die (docs/rtl8733b.md "Narrowband status"). */
+  /* MT7612U (11ac, 2T2R): 20/40/80, no narrowband — MT_RATE_BW is a two-bit
+   * field with three defined values, so 5/10 MHz has no encoding in the rate
+   * word at all. Without an arm here it would fall through to the
+   * 5/10-capable default, i.e. wrong in the permissive direction. */
   return g == ChipGeneration::Rtl8733b ? (kBw10 | kBw20 | kBw40)
          : g == ChipGeneration::Jaguar1  ? ac
+         : g == ChipGeneration::Mediatek ? ac
          : g == ChipGeneration::Unknown ? 0
                                         : (ac | kBw5 | kBw10);
 }
