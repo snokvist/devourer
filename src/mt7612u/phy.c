@@ -311,6 +311,59 @@ int8_t mt_tx_get_txpwr_adj(struct mt7612u_dev *d, int8_t txpwr, int8_t max_adj)
 	return (int8_t)(v < -16 ? 8 : (v + 32) / 2);
 }
 
+/*
+ * The 40 MHz centre channel, or -1 if this control channel cannot carry
+ * 40 MHz. mt76x2u_phy_set_channel()'s 40 MHz case, plus the validation it does
+ * not need: mt76 gets the segment centre from cfg80211's chandef, so an
+ * off-grid channel never reaches it. This API takes a bare channel number and
+ * derives the centre from the standard pairing - 36/44/149/157 take the upper
+ * half, 40/48/153/161 the lower - which means a channel that is not on the
+ * grid still produces *a* number, and the caller transmits 40 MHz wide
+ * somewhere it did not ask for. Every register write succeeds, so nothing
+ * says so.
+ *
+ * Two cases made that reachable through the public API:
+ *
+ *   - the arithmetic ran in uint8_t, so control channel 254 computed 256 and
+ *     truncated to 0, handing the MCU channel index 0 with the 5 GHz register
+ *     set loaded. 255 gave 1.
+ *   - in 2.4 GHz the pairing only ever reaches centres 6-9. Channel 1 computed
+ *     -1, i.e. 255 after truncation; 12 and 13 would need a secondary above
+ *     channel 13.
+ *
+ * Validating the centre against the ones that exist catches all of it at once,
+ * including both wraps - no wrapped value aliases onto a legal centre. The
+ * 5 GHz ceiling is channel 159 rather than 175 because centres 167 and 175
+ * span past the band mt7612u_caps declares (5825 MHz); widen the declared band
+ * first if they are wanted.
+ */
+int mt_chan40_centre(uint8_t chan, uint8_t *bw_index, uint8_t *ch_group)
+{
+	static const uint8_t centre_5g[] = {
+		38, 46, 54, 62, 102, 110, 118, 126, 134, 142, 151, 159,
+	};
+	static const uint8_t centre_2g[] = { 6, 7, 8, 9 };
+	const uint8_t *ok = chan > 14 ? centre_5g : centre_2g;
+	size_t n_ok = chan > 14 ? sizeof centre_5g / sizeof centre_5g[0]
+	                        : sizeof centre_2g / sizeof centre_2g[0];
+	int group = ((chan / 4) & 1) ? 0 : 1;
+	int idx = group ? 3 : 1;
+	/* int, not uint8_t: this is the expression that wrapped. */
+	int centre = chan + 2 - group * 4;
+	size_t i;
+
+	for (i = 0; i < n_ok; i++) {
+		if (centre != ok[i])
+			continue;
+		if (bw_index) *bw_index = (uint8_t)idx;
+		if (ch_group) *ch_group = (uint8_t)group;
+		return centre;
+	}
+	ERR("channel %u cannot carry 40 MHz: it would centre on %d, which is "
+	    "not a usable 40 MHz centre channel in this band", chan, centre);
+	return -1;
+}
+
 /* fast=1 skips the firmware calibration burst, which is what a retune would do
  * if the chip tolerates it. Measured cost of each path: see BRINGUP-RESULTS. */
 int mt_set_channel_ex(struct mt7612u_dev *d, uint8_t chan, uint8_t bw, int fast)
@@ -333,14 +386,11 @@ int mt_set_channel_ex(struct mt7612u_dev *d, uint8_t chan, uint8_t bw, int fast)
 	uint8_t bw_index = 0, ch_group_index = 0, hw_chan = chan;
 
 	if (bw == MT7612U_BW_40) {
-		/* mt76x2u_phy_set_channel()'s 40 MHz case. Which side the
-		 * secondary sits on follows the standard pairing: 36/44/149/157
-		 * take the upper half, 40/48/153/161 the lower. */
-		int sec_above = (chan / 4) & 1;
+		int centre = mt_chan40_centre(chan, &bw_index, &ch_group_index);
 
-		if (sec_above) { bw_index = 1; ch_group_index = 0; }
-		else           { bw_index = 3; ch_group_index = 1; }
-		hw_chan = (uint8_t)(chan + 2 - ch_group_index * 4);
+		if (centre < 0)
+			return -1;
+		hw_chan = (uint8_t)centre;
 	} else if (bw != MT7612U_BW_20) {
 		ERR("only 20 and 40 MHz are implemented");
 		return -1;

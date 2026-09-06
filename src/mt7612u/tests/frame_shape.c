@@ -193,11 +193,83 @@ static void test_vht_bandwidth(void)
 	}
 }
 
+/*
+ * The 40 MHz centre channel. The hardware tunes the centre, not the control
+ * channel, and an off-grid control channel still produces *a* number: every
+ * register write succeeds and the part transmits 40 MHz wide somewhere the
+ * caller did not ask for. Two cases were reachable through the public API -
+ * control channel 254 computed 256 and truncated to 0, and 2.4 GHz channel 1
+ * computed -1, i.e. 255.
+ */
+static void test_chan40_centre(void)
+{
+	static const struct { uint8_t chan; int centre; uint8_t idx, group; } ok[] = {
+		{  36,  38, 1, 0 }, {  40,  38, 3, 1 },
+		{  44,  46, 1, 0 }, {  48,  46, 3, 1 },
+		{ 149, 151, 1, 0 }, { 153, 151, 3, 1 },
+		{ 157, 159, 1, 0 }, { 161, 159, 3, 1 },
+		{ 100, 102, 1, 0 }, { 128, 126, 3, 1 },
+		/* 2.4 GHz reaches centres 6-9, i.e. control channels 4-11. */
+		{   4,   6, 1, 0 }, {   6,   8, 1, 0 },
+		{   8,   6, 3, 1 }, {  11,   9, 3, 1 },
+	};
+	static const struct { uint8_t chan; const char *why; } refused[] = {
+		{ 254, "computes 256, which truncated to channel 0" },
+		{ 255, "computes 257, which truncated to channel 1" },
+		{   1, "computes -1, which truncated to channel 255" },
+		{   2, "computes 0" },
+		{  13, "would need a secondary above channel 13" },
+		{ 165, "centre 167 is outside the declared band" },
+		{ 177, "centre 175 is outside the declared band" },
+		{  15, "not on the 5 GHz 40 MHz grid" },
+		{  35, "not on the 5 GHz 40 MHz grid" },
+	};
+	unsigned i;
+
+	printf("mt_chan40_centre:\n");
+	for (i = 0; i < sizeof ok / sizeof ok[0]; i++) {
+		uint8_t idx = 0xff, group = 0xff;
+		int got = mt_chan40_centre(ok[i].chan, &idx, &group);
+
+		if (got != ok[i].centre || idx != ok[i].idx || group != ok[i].group) {
+			printf("  FAIL ch %3u: want centre %d idx %u group %u, "
+			       "got %d idx %u group %u\n", ok[i].chan, ok[i].centre,
+			       ok[i].idx, ok[i].group, got, idx, group);
+			fails++;
+		}
+	}
+	for (i = 0; i < sizeof refused / sizeof refused[0]; i++) {
+		uint8_t idx = 0x5a, group = 0x5a;
+
+		if (mt_chan40_centre(refused[i].chan, &idx, &group) >= 0) {
+			printf("  FAIL ch %3u accepted (%s)\n",
+			       refused[i].chan, refused[i].why);
+			fails++;
+			continue;
+		}
+		/* A refusal must not write the outputs: a caller that checks the
+		 * return but reuses the buffer would tune what was left behind. */
+		if (idx != 0x5a || group != 0x5a) {
+			printf("  FAIL ch %3u refused but wrote its outputs\n",
+			       refused[i].chan);
+			fails++;
+		}
+	}
+	/* Negative control: the centre must differ from the control channel. If
+	 * this passes, the maths degenerated to a pass-through and every case
+	 * above would still look right. */
+	if (mt_chan40_centre(36, NULL, NULL) == 36) {
+		printf("  FAIL negative control: 40 MHz returned the control channel\n");
+		fails++;
+	}
+}
+
 int main(void)
 {
 	test_hdrlen();
 	test_rx_l2pad();
 	test_vht_bandwidth();
+	test_chan40_centre();
 	printf("frame_shape: %s\n", fails ? "FAIL" : "PASS");
 	return fails ? 1 : 0;
 }

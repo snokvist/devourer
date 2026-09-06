@@ -211,6 +211,7 @@ int8_t mt_tx_get_txpwr_adj(struct mt7612u_dev *d, int8_t txpwr, int8_t max_adj);
 void mt_phy_set_txdac(struct mt7612u_dev *d);
 int  mt_set_channel(struct mt7612u_dev *d, uint8_t chan, uint8_t bw);
 int  mt_set_channel_ex(struct mt7612u_dev *d, uint8_t chan, uint8_t bw, int fast);
+int  mt_chan40_centre(uint8_t chan, uint8_t *bw_index, uint8_t *ch_group);
 
 #define LOG(...)  do { fprintf(stderr, "[mt7612u] " __VA_ARGS__); fputc('\n', stderr); } while (0)
 #define ERR(...)  do { fprintf(stderr, "[mt7612u] ERROR " __VA_ARGS__); fputc('\n', stderr); } while (0)
