@@ -1112,6 +1112,17 @@ static int gate_ack(uint8_t chan, int secs, int arm)
 		printf("responder NOT armed (control arm)\n");
 	}
 
+	/* Validate before the cast: `secs` is signed and came from argv, and
+	 * (unsigned)(-1) * 1000000 is roughly 49 days with the receiver left
+	 * running - an RX path enabled and undrained for that long is the wedge
+	 * this port documents as replug-only. */
+	if (secs <= 0 || secs > 3600) {
+		printf("GATE ack: FAIL - listen duration %d out of range (1..3600 s)\n",
+		       secs);
+		mt7612u_rx_stop(&dev);
+		mt_mac_stop(&dev);
+		return 1;
+	}
 	printf("listening %d s ...\n", secs);
 	/* wait_ms, not mt_usleep: it honours SIGINT, where the old cast-to-
 	 * unsigned sleep both ignored the signal and turned a negative argument
