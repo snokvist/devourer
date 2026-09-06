@@ -7,11 +7,15 @@
 #include <stdlib.h>
 #include <time.h>
 #include <sys/resource.h>
+#include <pthread.h>
+#include <signal.h>
+#include <unistd.h>
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
 #include <sys/resource.h>
 #include "../internal.h"
+
 
 static struct mt7612u_dev dev;
 
@@ -20,6 +24,81 @@ static double now_ms(void)
 	struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
 	return t.tv_sec * 1000.0 + t.tv_nsec / 1e6;
 }
+
+/* --- watchdog and interruptible waits -------------------------------------
+ *
+ * A gate that hangs on this part hangs hard: the thread blocks inside a USB
+ * ioctl in uninterruptible sleep, where SIGKILL does not reach it. Ctrl-C
+ * does nothing and the process cannot be cleared until whatever else is
+ * touching the device lets go.
+ *
+ * Three defences, in order of how much they can actually save:
+ *
+ *  1. The exclusive per-adapter lock in usb.c refuses a second opener. That
+ *     removes the cause; everything below only limits the damage.
+ *  2. Signals set a flag that every wait loop here polls, so an interrupt
+ *     unwinds through the normal teardown instead of leaving the MAC running
+ *     and the RX ring armed.
+ *  3. A watchdog thread with a deadline. If the main thread is stuck, the
+ *     watchdog still runs: it says where, and calls _exit() so the process at
+ *     least stops consuming the device from userspace. If the stuck thread is
+ *     in D state even that cannot reap it immediately - which is the honest
+ *     limit of what a userspace watchdog can promise.
+ */
+static volatile sig_atomic_t g_stop;
+static volatile sig_atomic_t g_wd_deadline_s;
+static const char *volatile g_wd_where = "startup";
+
+static void on_signal(int sig) { (void)sig; g_stop = 1; }
+
+/* Interruptible sleep: returns 1 if the caller should keep going. */
+static int wait_ms(double ms)
+{
+	double t0 = now_ms();
+
+	while (now_ms() - t0 < ms) {
+		if (g_stop) return 0;
+		mt_usleep(50000);
+	}
+	return !g_stop;
+}
+
+static void *watchdog_thread(void *arg)
+{
+	int limit = *(int *)arg;
+	double t0 = now_ms();
+
+	while (!g_stop) {
+		mt_usleep(250000);
+		if (g_wd_deadline_s && now_ms() - t0 > limit * 1000.0) {
+			fprintf(stderr,
+			        "\n[watchdog] no progress for %d s while in '%s'.\n"
+			        "[watchdog] The device is probably held by something else "
+			        "(kernel mt76x2u, or another bringup).\n"
+			        "[watchdog] Forcing exit; if this process stays in D state "
+			        "it is blocked in a USB ioctl and\n"
+			        "[watchdog] only removing the other consumer will clear it: "
+			        "sudo modprobe -r mt76x2u\n", limit, g_wd_where);
+			fflush(stderr);
+			_exit(3);
+		}
+	}
+	return NULL;
+}
+
+static void watchdog_start(int seconds)
+{
+	static int limit;
+	static pthread_t th;
+
+	limit = seconds;
+	g_wd_deadline_s = 1;
+	signal(SIGINT, on_signal);
+	signal(SIGTERM, on_signal);
+	if (pthread_create(&th, NULL, watchdog_thread, &limit) == 0)
+		pthread_detach(th);
+}
+
 
 static int gate_regs(void)
 {
@@ -611,15 +690,18 @@ static int gate_arx(uint8_t chan, int secs)
 		printf("GATE arx: FAIL - rx_start failed\n"); return 1;
 	}
 	t0 = now_ms();
-	while (now_ms() - t0 < secs * 1000.0)
-		mt_usleep(100000);
+	wait_ms(secs * 1000.0);
 	{
 		struct mt_async_stats st;
+		/* Actual elapsed, not the requested duration: an interrupt now
+		 * unwinds through here, and dividing by the request would report
+		 * a rate the run never achieved. */
+		double el = (now_ms() - t0) / 1000.0;
 
 		mt_async_stats(&dev, &st);
-		printf("async RX on ch%u for %d s: %lu frames (%.0f/s), rx_err=%llu "
+		printf("async RX on ch%u for %.1f s: %lu frames (%.0f/s), rx_err=%llu "
 		       "rx_invalid=%llu\n",
-		       chan, secs, ctx.n, ctx.n / (double)secs,
+		       chan, el, ctx.n, ctx.n / (el > 0 ? el : 1),
 		       (unsigned long long)st.rx_err,
 		       (unsigned long long)st.rx_invalid);
 	}
@@ -1067,6 +1149,94 @@ static int gate_ack(uint8_t chan, int secs, int arm)
 
 
 /*
+ * Every RXWI byte against ambient traffic, bucketed by received level.
+ *
+ * The power sweep answered "does this byte track our transmitter". This asks
+ * the two questions that one could not: does a byte vary with received level
+ * across a much wider span than our own saturated link covers, and does a
+ * byte that looks constant differ between a clean channel and an interfered
+ * one. A noise floor would be flat within a channel and move between them.
+ */
+static struct { unsigned long n; long sum[20]; long mn[20], mx[20]; } g_rxb[6];
+static const int g_rxb_edge[6] = { -100, -80, -70, -60, -50, 0 };
+
+static void rxbytes_cb(void *user, const void *frame, size_t len,
+                       const struct mt7612u_rx_info *info)
+{
+    uint8_t bytes[20];
+    int band = 0;
+
+    (void)user; (void)frame;
+    if (len < 16) return;
+    for (int i = 0; i < 6; i++)
+        if (info->rssi[0] <= g_rxb_edge[i]) { band = i; break; }
+
+    for (int i = 0; i < 4; i++) bytes[i] = (uint8_t)info->rssi[i];
+    for (int w = 0; w < 4; w++)
+        for (int b = 0; b < 4; b++)
+            bytes[4 + w * 4 + b] = (uint8_t)(info->bbp[w] >> (8 * b));
+
+    if (!g_rxb[band].n)
+        for (int i = 0; i < 20; i++) { g_rxb[band].mn[i] = 999; g_rxb[band].mx[i] = -999; }
+    g_rxb[band].n++;
+    for (int i = 0; i < 20; i++) {
+        long v = bytes[i];
+
+        g_rxb[band].sum[i] += v;
+        if (v < g_rxb[band].mn[i]) g_rxb[band].mn[i] = v;
+        if (v > g_rxb[band].mx[i]) g_rxb[band].mx[i] = v;
+    }
+}
+
+static int gate_rxbytes(uint8_t chan, int secs)
+{
+    static const char *nm[20] = {
+        "rssi[0]", "rssi[1]", "rssi[2]", "rssi[3]",
+        "bbp0.b0", "bbp0.b1", "bbp0.b2", "bbp0.b3",
+        "bbp1.b0", "bbp1.b1", "bbp1.b2", "bbp1.b3",
+        "bbp2.b0", "bbp2.b1", "bbp2.b2", "bbp2.b3",
+        "bbp3.b0", "bbp3.b1", "bbp3.b2", "bbp3.b3",
+    };
+    struct mt7612u_link_stats st;
+
+    memset(g_rxb, 0, sizeof g_rxb);
+    if (mt_eeprom_init(&dev)) return 1;
+    if (mt_init_hardware(&dev, NULL)) return 1;
+    if (mt_set_channel(&dev, chan, MT7612U_BW_20)) return 1;
+    if (mt7612u_rx_start(&dev, rxbytes_cb, NULL)) return 1;
+    if (mt_mac_start(&dev, 1)) return 1;
+    mt7612u_set_monitor_rx(&dev, 0);
+    mt7612u_link_stats_start(&dev);
+
+    wait_ms(secs * 1000.0);
+    mt7612u_link_stats(&dev, &st);
+    mt7612u_rx_stop(&dev);
+    mt_mac_stop(&dev);
+
+    printf("ch%u, %d s ambient. false CCA this interval: %u (mt76 calls >800 "
+           "interfered, <10 clean)\n\n", chan, secs, st.rx_false_cca);
+    printf("  %-8s", "byte");
+    for (int b = 0; b < 6; b++) if (g_rxb[b].n) printf("  <=%-4d", g_rxb_edge[b]);
+    printf("   min  max\n");
+    for (int i = 0; i < 20; i++) {
+        long mn = 999, mx = -999;
+
+        printf("  %-8s", nm[i]);
+        for (int b = 0; b < 6; b++) {
+            if (!g_rxb[b].n) continue;
+            printf(" %7.1f", g_rxb[b].sum[i] / (double)g_rxb[b].n);
+            if (g_rxb[b].mn[i] < mn) mn = g_rxb[b].mn[i];
+            if (g_rxb[b].mx[i] > mx) mx = g_rxb[b].mx[i];
+        }
+        printf("  %4ld %4ld\n", mn, mx);
+    }
+    printf("\n  frames per band:");
+    for (int b = 0; b < 6; b++) if (g_rxb[b].n) printf(" %lu", g_rxb[b].n);
+    printf("\n");
+    return 0;
+}
+
+/*
  * The MAC's MIB counters, sampled once a second.
  *
  * This is where this part's link reporting actually lives. The RX descriptor
@@ -1106,7 +1276,7 @@ static int gate_linkstat(uint8_t chan, int secs, int with_rx)
 	for (int i = 0; i < secs; i++) {
 		double busy_pct;
 
-		mt_usleep(1000000);
+		if (!wait_ms(1000.0)) break;
 		if (mt7612u_link_stats(&dev, &st)) return 1;
 		busy_pct = (st.ch_busy + st.ch_idle)
 		         ? 100.0 * st.ch_busy / (double)(st.ch_busy + st.ch_idle) : 0.0;
@@ -1197,8 +1367,12 @@ static int gate_linktx(uint8_t chan, int count)
 	return 0;
 }
 
-struct link_bucket { unsigned long n; long rssi_sum[2]; uint32_t bbp_or[4], bbp_and[4];
-                     long bbp_sum[4]; uint32_t bbp_first[4]; };
+/* Every byte the RXWI offers past the two RSSI values mt76 reads, averaged.
+ * 4 rssi bytes (mt76 uses only [0] and [1]; [2] and [3] are read by nobody,
+ * and on the legacy Ralink RXWI those slots were SNR0/SNR1) plus the 16 bytes
+ * of bbp_rxinfo. Signed and unsigned means both, because an SNR would be a
+ * small positive number and an RSSI a negative one. */
+struct link_bucket { unsigned long n; long b_sum[20]; long b_min[20], b_max[20]; };
 static struct link_bucket g_link[32];
 static int g_link_pw[32];
 static int g_link_n;
@@ -1208,6 +1382,7 @@ static void linkrx_cb(void *user, const void *frame, size_t len,
 {
 	const uint8_t *f = frame;
 	int slot = -1, pw;
+	uint8_t bytes[20];
 
 	(void)user;
 	if (len < 40) return;
@@ -1220,23 +1395,29 @@ static void linkrx_cb(void *user, const void *frame, size_t len,
 		if (g_link_n >= 32) return;
 		slot = g_link_n++;
 		g_link_pw[slot] = pw;
-		for (int i = 0; i < 4; i++) {
-			g_link[slot].bbp_and[i] = 0xffffffffu;
-			g_link[slot].bbp_first[i] = info->bbp[i];
+		for (int i = 0; i < 20; i++) {
+			g_link[slot].b_min[i] = 999;
+			g_link[slot].b_max[i] = -999;
 		}
 	}
+
+	for (int i = 0; i < 4; i++) bytes[i] = (uint8_t)info->rssi[i];
+	for (int w = 0; w < 4; w++)
+		for (int b = 0; b < 4; b++)
+			bytes[4 + w * 4 + b] = (uint8_t)(info->bbp[w] >> (8 * b));
+
 	g_link[slot].n++;
-	for (int c = 0; c < 2; c++) g_link[slot].rssi_sum[c] += info->rssi[c];
-	for (int i = 0; i < 4; i++) {
-		g_link[slot].bbp_or[i]  |= info->bbp[i];
-		g_link[slot].bbp_and[i] &= info->bbp[i];
-		g_link[slot].bbp_sum[i] += (long)(info->bbp[i] & 0xff);
+	for (int i = 0; i < 20; i++) {
+		long v = bytes[i];
+
+		g_link[slot].b_sum[i] += v;
+		if (v < g_link[slot].b_min[i]) g_link[slot].b_min[i] = v;
+		if (v > g_link[slot].b_max[i]) g_link[slot].b_max[i] = v;
 	}
 }
 
 static int gate_linkrx(uint8_t chan, int secs)
 {
-	double t0;
 
 	if (mt_eeprom_init(&dev)) return 1;
 	if (mt_init_hardware(&dev, NULL)) return 1;
@@ -1246,30 +1427,47 @@ static int gate_linkrx(uint8_t chan, int secs)
 	mt7612u_set_monitor_rx(&dev, 0);
 
 	printf("RX on ch%u for %d s, filtering our own magic\n", chan, secs);
-	t0 = now_ms();
-	while (now_ms() - t0 < secs * 1000.0)
-		mt_usleep(100000);
+	wait_ms(secs * 1000.0);
 	mt7612u_rx_stop(&dev);
 	mt_mac_stop(&dev);
 
-	printf("\n  %-8s %6s  %-13s   %s\n", "tx dBm", "recv", "rssi dBm", "RXWI bbp_rxinfo[0..3]  (or / and / mean byte0)");
-	for (int i = 0; i < g_link_n; i++) {
-		struct link_bucket *b = &g_link[i];
+	{
+		static const char *nm[20] = {
+			"rssi[0]", "rssi[1]", "rssi[2]", "rssi[3]",
+			"bbp0.b0", "bbp0.b1", "bbp0.b2", "bbp0.b3",
+			"bbp1.b0", "bbp1.b1", "bbp1.b2", "bbp1.b3",
+			"bbp2.b0", "bbp2.b1", "bbp2.b2", "bbp2.b3",
+			"bbp3.b0", "bbp3.b1", "bbp3.b2", "bbp3.b3",
+		};
 
-		printf("  %-8d %6lu  %5.1f %5.1f   ", g_link_pw[i], b->n,
-		       b->rssi_sum[0] / (double)b->n, b->rssi_sum[1] / (double)b->n);
-		for (int k = 0; k < 4; k++)
-			printf("%08x ", b->bbp_first[k]);
-		printf("\n           %25s or  ", "");
-		for (int k = 0; k < 4; k++) printf("%08x ", b->bbp_or[k]);
-		printf("\n           %25s and ", "");
-		for (int k = 0; k < 4; k++) printf("%08x ", b->bbp_and[k]);
-		printf("\n           %25s b0mean ", "");
-		for (int k = 0; k < 4; k++) printf("%8.1f ", b->bbp_sum[k] / (double)b->n);
+		printf("\nmean of every candidate byte, per requested tx power\n");
+		printf("  %-8s", "byte");
+		for (int i = 0; i < g_link_n; i++) printf(" %7d", g_link_pw[i]);
+		printf("   span  as int8\n");
+		for (int b = 0; b < 20; b++) {
+			double lo = 1e9, hi = -1e9;
+
+			printf("  %-8s", nm[b]);
+			for (int i = 0; i < g_link_n; i++) {
+				double m = g_link[i].b_sum[b] / (double)g_link[i].n;
+
+				if (m < lo) lo = m;
+				if (m > hi) hi = m;
+				printf(" %7.1f", m);
+			}
+			printf("  %5.1f  %6.1f\n", hi - lo,
+			       g_link[0].b_sum[b] / (double)g_link[0].n > 127
+			         ? g_link[0].b_sum[b] / (double)g_link[0].n - 256
+			         : g_link[0].b_sum[b] / (double)g_link[0].n);
+		}
+		printf("\n  frames per level:");
+		for (int i = 0; i < g_link_n; i++) printf(" %lu", g_link[i].n);
 		printf("\n");
 	}
-	printf("\nA byte that tracks tx power monotonically is a level metric; one\n"
-	       "that is constant across a 30 dB sweep is not a quality metric.\n");
+	printf("\nA byte whose span is ~0 across a 30 dB sweep carries no level or\n"
+	       "quality information. One that tracks and stays a small positive\n"
+	       "number is an SNR candidate; one that tracks and reads negative as\n"
+	       "int8 is another copy of RSSI.\n");
 	return g_link_n ? 0 : 1;
 }
 
@@ -1733,10 +1931,15 @@ int main(int argc, char **argv)
 	const char *err = NULL, *cmd = argc > 1 ? argv[1] : "regs";
 	int rc;
 
+	/* Generous: the slowest legitimate gate is a full sweep at 40 MHz. The
+	 * watchdog exists to break a hang, not to police a slow measurement. */
+	watchdog_start(600);
+	g_wd_where = "mt_open";
 	if (mt_open(&dev, &err)) {
 		fprintf(stderr, "open failed: %s\n", err ? err : "?");
 		return 1;
 	}
+	g_wd_where = cmd;
 
 	if (!strcmp(cmd, "regs")) {
 		rc = gate_regs();
@@ -1749,6 +1952,9 @@ int main(int argc, char **argv)
 		              argc > 4 ? atoi(argv[4]) : 0);
 	} else if (!strcmp(cmd, "caps")) {
 		rc = gate_caps(argc > 2 ? (uint8_t)atoi(argv[2]) : 149);
+	} else if (!strcmp(cmd, "rxbytes")) {
+		rc = gate_rxbytes(argc > 2 ? (uint8_t)atoi(argv[2]) : 1,
+		                  argc > 3 ? atoi(argv[3]) : 15);
 	} else if (!strcmp(cmd, "linkstat")) {
 		rc = gate_linkstat(argc > 2 ? (uint8_t)atoi(argv[2]) : 149,
 		                   argc > 3 ? atoi(argv[3]) : 10,

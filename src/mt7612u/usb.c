@@ -4,9 +4,13 @@
  * plumbing; the wire encoding is identical (verified against usbmon, see
  * ../../INVESTIGATION.md §11).
  */
+#include <errno.h>
+#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <time.h>
+#include <unistd.h>
 #include "internal.h"
 
 #define REQ_IN   (LIBUSB_ENDPOINT_IN  | LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_RECIPIENT_DEVICE)
@@ -22,6 +26,9 @@ void mt_usleep(unsigned us)
 	struct timespec ts = { .tv_sec = us / 1000000, .tv_nsec = (us % 1000000) * 1000 };
 	nanosleep(&ts, NULL);
 }
+
+/* Held for the process lifetime; flock releases it on any exit. */
+static int g_lock_fd = -1;
 
 static uint64_t now_us(void)
 {
@@ -225,6 +232,37 @@ int mt_adopt(struct mt7612u_dev *d, libusb_device_handle *h,
  * happened to hand over. MT7612U_DEV takes a "bus-port" as lsusb and sysfs
  * spell it ("2-1"), or a bare index into the matches in enumeration order.
  */
+/*
+ * Exclusive per-adapter lock.
+ *
+ * Two processes on one MT7612U is not a race that resolves badly - it is the
+ * one failure this driver cannot recover from. The loser blocks inside a USB
+ * ioctl in uninterruptible sleep, where SIGKILL does not reach it, and the
+ * only way out is unbinding whatever else is touching the device. So the
+ * second opener is refused here rather than allowed to wedge the first.
+ *
+ * flock() on a per-bus-port file: released automatically when the process
+ * dies however it dies, which matters precisely because these processes
+ * sometimes die badly.
+ */
+static int lock_adapter(const char *id, const char **err)
+{
+	static char path[128];
+	int fd;
+
+	snprintf(path, sizeof path, "/tmp/.mt7612u-%s.lock", id);
+	fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0666);
+	if (fd < 0)
+		return -1;   /* no lock dir: proceed unlocked rather than refuse */
+	if (flock(fd, LOCK_EX | LOCK_NB) == 0)
+		return fd;
+	close(fd);
+	if (errno == EWOULDBLOCK && err)
+		*err = "another process already has this MT7612U "
+		       "(a second opener would wedge it beyond SIGKILL)";
+	return -2;
+}
+
 static libusb_device_handle *open_selected(libusb_context *ctx, const char **err)
 {
 	const char *sel = getenv("MT7612U_DEV");
@@ -267,8 +305,17 @@ static libusb_device_handle *open_selected(libusb_context *ctx, const char **err
 			LOG("MT7612U at %s  <- selected by MT7612U_DEV index %d", id, matches);
 		}
 
-		if (!h && libusb_open(list[i], &h))
-			h = NULL;
+		if (!h) {
+			int lk = lock_adapter(id, err);
+
+			if (lk == -2) {          /* held by someone else */
+				libusb_free_device_list(list, 1);
+				return NULL;
+			}
+			g_lock_fd = lk;
+			if (libusb_open(list[i], &h))
+				h = NULL;
+		}
 		matches++;
 		if (h && sel && *sel)
 			break;
@@ -366,6 +413,7 @@ void mt_close(struct mt7612u_dev *d)
 	}
 	if (d->ctx && d->owns_handle) libusb_exit(d->ctx);
 	d->ctx = NULL;
+	if (g_lock_fd >= 0) { close(g_lock_fd); g_lock_fd = -1; }
 }
 
 /* Block write, as mt76u_copy(): one MULTI_WRITE per batch, wValue 0.
