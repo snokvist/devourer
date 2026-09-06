@@ -115,8 +115,11 @@ int mt7612u_tx(struct mt7612u_dev *dev, const void *frame, size_t len,
                const struct mt7612u_tx_rate *rate);
 
 /*
- * RX callback, invoked from the libusb event thread. frame excludes the RXWI.
- * Must not block and must not call back into the device.
+ * RX callback, invoked from the libusb event thread. `frame`/`len` are the
+ * 802.11 MPDU with the RXWI removed and **without the trailing FCS** - the
+ * MAC strips it, and the four bytes that follow the MPDU in the DMA buffer
+ * are the FCE info trailer, not a checksum (measured: CRC-32 matched them on
+ * 0 of 4263 frames). Must not block and must not call back into the device.
  */
 typedef void (*mt7612u_rx_cb)(void *user, const void *frame, size_t len,
                               const struct mt7612u_rx_info *info);
