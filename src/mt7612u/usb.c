@@ -233,34 +233,80 @@ int mt_adopt(struct mt7612u_dev *d, libusb_device_handle *h,
  * spell it ("2-1"), or a bare index into the matches in enumeration order.
  */
 /*
- * Exclusive per-adapter lock.
+ * Exclusive per-adapter lock - the same lock devourer's own UsbDeviceLock
+ * takes, deliberately byte-identical in key and path so the two contend.
  *
- * Two processes on one MT7612U is not a race that resolves badly - it is the
- * one failure this driver cannot recover from. The loser blocks inside a USB
- * ioctl in uninterruptible sleep, where SIGKILL does not reach it, and the
- * only way out is unbinding whatever else is touching the device. So the
- * second opener is refused here rather than allowed to wedge the first.
+ * Two consumers on one MT7612U is not a race that resolves badly, it is the
+ * one failure neither driver recovers from: the loser blocks inside a USB
+ * ioctl in uninterruptible sleep, where SIGKILL does not reach it.
+ * src/UsbDeviceLock.h describes the same symptom in the same words, which is
+ * why this mirrors it rather than inventing a second scheme.
  *
- * flock() on a per-bus-port file: released automatically when the process
- * dies however it dies, which matters precisely because these processes
- * sometimes die badly.
+ * That mirroring is the whole point. A lock file of our own would make
+ * `bringup` and `rxdemo` invisible to each other and reproduce the wedge
+ * across the two tools, which is exactly the case this is meant to stop:
+ *   key   bus + USB port path, e.g. "3-1.4", with UsbDeviceLock's
+ *         "-a<address>" fallback when the backend reports no port path
+ *   path  $TMPDIR (default /tmp) + "/devourer-usb-" + key + ".lock"
+ *   flags O_CREAT|O_RDWR|O_NOFOLLOW, 0666, then flock(LOCK_EX|LOCK_NB)
+ *
+ * Fail-open vs fail-closed follows UsbDeviceLock too: genuine contention
+ * refuses, while an infrastructure failure (read-only tmpdir) warns and
+ * proceeds, so a quirky environment never bricks an otherwise-working open.
+ *
+ * flock is released by the kernel on process death however it arrives, so
+ * there are no stale locks to clean up - which matters precisely because
+ * these processes sometimes die badly.
  */
-static int lock_adapter(const char *id, const char **err)
+static void adapter_key(libusb_device *dev, char *out, size_t n)
 {
-	static char path[128];
+	uint8_t ports[8];
+	int np = libusb_get_port_numbers(dev, ports, sizeof ports);
+	int off = snprintf(out, n, "%u", libusb_get_bus_number(dev));
+
+	if (np <= 0) {
+		snprintf(out + off, n - (size_t)off, "-a%u",
+		         libusb_get_device_address(dev));
+		return;
+	}
+	for (int i = 0; i < np && off > 0 && (size_t)off < n; i++)
+		off += snprintf(out + off, n - (size_t)off, "%s%u",
+		                i ? "." : "-", ports[i]);
+}
+
+/* Returns a held fd, -1 to proceed unlocked (infrastructure failure), or
+ * -2 when another process holds the adapter and the caller must refuse. */
+static int lock_adapter(libusb_device *dev, const char **err)
+{
+	const char *dir = getenv("TMPDIR");
+	char key[64], path[256];
 	int fd;
 
-	snprintf(path, sizeof path, "/tmp/.mt7612u-%s.lock", id);
-	fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0666);
-	if (fd < 0)
-		return -1;   /* no lock dir: proceed unlocked rather than refuse */
+	if (!dir || !*dir) dir = "/tmp";
+	adapter_key(dev, key, sizeof key);
+	snprintf(path, sizeof path, "%s/devourer-usb-%s.lock", dir, key);
+
+	/* O_NOFOLLOW: the path is world-writable and predictable, so a symlink
+	 * planted there must not redirect the open. UsbDeviceLock does the same. */
+	fd = open(path, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0666);
+	if (fd < 0) {
+		LOG("warning: cannot open lock file %s (%s) - proceeding without "
+		    "exclusivity", path, strerror(errno));
+		return -1;
+	}
 	if (flock(fd, LOCK_EX | LOCK_NB) == 0)
 		return fd;
 	close(fd);
-	if (errno == EWOULDBLOCK && err)
-		*err = "another process already has this MT7612U "
-		       "(a second opener would wedge it beyond SIGKILL)";
-	return -2;
+	if (errno == EWOULDBLOCK || errno == EAGAIN) {
+		if (err)
+			*err = "adapter is already open in another process "
+			       "(devourer or bringup); a second opener would wedge it "
+			       "beyond SIGKILL";
+		return -2;
+	}
+	LOG("warning: cannot lock %s (%s) - proceeding without exclusivity",
+	    path, strerror(errno));
+	return -1;
 }
 
 static libusb_device_handle *open_selected(libusb_context *ctx, const char **err)
@@ -306,7 +352,7 @@ static libusb_device_handle *open_selected(libusb_context *ctx, const char **err
 		}
 
 		if (!h) {
-			int lk = lock_adapter(id, err);
+			int lk = lock_adapter(list[i], err);
 
 			if (lk == -2) {          /* held by someone else */
 				libusb_free_device_list(list, 1);

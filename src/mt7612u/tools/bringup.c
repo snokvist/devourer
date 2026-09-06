@@ -7,7 +7,6 @@
 #include <stdlib.h>
 #include <time.h>
 #include <sys/resource.h>
-#include <pthread.h>
 #include <signal.h>
 #include <unistd.h>
 #include <string.h>
@@ -25,29 +24,24 @@ static double now_ms(void)
 	return t.tv_sec * 1000.0 + t.tv_nsec / 1e6;
 }
 
-/* --- watchdog and interruptible waits -------------------------------------
+/* --- interruptible waits --------------------------------------------------
  *
  * A gate that hangs on this part hangs hard: the thread blocks inside a USB
- * ioctl in uninterruptible sleep, where SIGKILL does not reach it. Ctrl-C
- * does nothing and the process cannot be cleared until whatever else is
- * touching the device lets go.
+ * ioctl in uninterruptible sleep, where SIGKILL does not reach it and Ctrl-C
+ * does nothing.
  *
- * Three defences, in order of how much they can actually save:
+ * The defence against that is the exclusive per-adapter lock in usb.c, which
+ * refuses a second opener and so removes the cause. A watchdog thread lived
+ * here for one commit and was removed: _exit() cannot reap a thread already
+ * blocked in an uninterruptible ioctl, so against the failure that motivated
+ * it the watchdog could only print a message and then fail to exit. Keeping
+ * it would have been complexity that reads like protection without being any.
  *
- *  1. The exclusive per-adapter lock in usb.c refuses a second opener. That
- *     removes the cause; everything below only limits the damage.
- *  2. Signals set a flag that every wait loop here polls, so an interrupt
- *     unwinds through the normal teardown instead of leaving the MAC running
- *     and the RX ring armed.
- *  3. A watchdog thread with a deadline. If the main thread is stuck, the
- *     watchdog still runs: it says where, and calls _exit() so the process at
- *     least stops consuming the device from userspace. If the stuck thread is
- *     in D state even that cannot reap it immediately - which is the honest
- *     limit of what a userspace watchdog can promise.
+ * What is kept is the part that does work: signals set a flag every wait loop
+ * polls, so an interrupt unwinds through the normal teardown - MAC stopped,
+ * RX ring torn down, lock released - instead of leaving the receiver running.
  */
 static volatile sig_atomic_t g_stop;
-static volatile sig_atomic_t g_wd_deadline_s;
-static const char *volatile g_wd_where = "startup";
 
 static void on_signal(int sig) { (void)sig; g_stop = 1; }
 
@@ -61,42 +55,6 @@ static int wait_ms(double ms)
 		mt_usleep(50000);
 	}
 	return !g_stop;
-}
-
-static void *watchdog_thread(void *arg)
-{
-	int limit = *(int *)arg;
-	double t0 = now_ms();
-
-	while (!g_stop) {
-		mt_usleep(250000);
-		if (g_wd_deadline_s && now_ms() - t0 > limit * 1000.0) {
-			fprintf(stderr,
-			        "\n[watchdog] no progress for %d s while in '%s'.\n"
-			        "[watchdog] The device is probably held by something else "
-			        "(kernel mt76x2u, or another bringup).\n"
-			        "[watchdog] Forcing exit; if this process stays in D state "
-			        "it is blocked in a USB ioctl and\n"
-			        "[watchdog] only removing the other consumer will clear it: "
-			        "sudo modprobe -r mt76x2u\n", limit, g_wd_where);
-			fflush(stderr);
-			_exit(3);
-		}
-	}
-	return NULL;
-}
-
-static void watchdog_start(int seconds)
-{
-	static int limit;
-	static pthread_t th;
-
-	limit = seconds;
-	g_wd_deadline_s = 1;
-	signal(SIGINT, on_signal);
-	signal(SIGTERM, on_signal);
-	if (pthread_create(&th, NULL, watchdog_thread, &limit) == 0)
-		pthread_detach(th);
 }
 
 
@@ -1950,15 +1908,12 @@ int main(int argc, char **argv)
 	const char *err = NULL, *cmd = argc > 1 ? argv[1] : "regs";
 	int rc;
 
-	/* Generous: the slowest legitimate gate is a full sweep at 40 MHz. The
-	 * watchdog exists to break a hang, not to police a slow measurement. */
-	watchdog_start(600);
-	g_wd_where = "mt_open";
+	signal(SIGINT, on_signal);
+	signal(SIGTERM, on_signal);
 	if (mt_open(&dev, &err)) {
 		fprintf(stderr, "open failed: %s\n", err ? err : "?");
 		return 1;
 	}
-	g_wd_where = cmd;
 
 	if (!strcmp(cmd, "regs")) {
 		rc = gate_regs();
