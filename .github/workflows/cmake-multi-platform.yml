@@ -186,11 +186,28 @@ jobs:
             flags: "-DDEVOURER_JAGUAR1=OFF -DDEVOURER_8814=OFF -DDEVOURER_JAGUAR2_8822B=OFF -DDEVOURER_JAGUAR2_8821C=OFF -DDEVOURER_JAGUAR3_8822C=OFF -DDEVOURER_JAGUAR3_8822E=OFF -DDEVOURER_8733B=OFF -DDEVOURER_KESTREL_8852B=OFF"
           - name: rtl8733b-only
             flags: "-DDEVOURER_JAGUAR1=OFF -DDEVOURER_8814=OFF -DDEVOURER_JAGUAR2_8822B=OFF -DDEVOURER_JAGUAR2_8821C=OFF -DDEVOURER_JAGUAR3_8822C=OFF -DDEVOURER_JAGUAR3_8822E=OFF -DDEVOURER_KESTREL_8852B=OFF -DDEVOURER_KESTREL_8852C=OFF"
+          # MT7612U is the only chip option defaulting OFF, so no other job in
+          # this file compiles src/mt7612u/ at all — the DEVOURER_HAVE_MT7612U
+          # guards in WiFiDriver.cpp are never exercised in the ON direction.
+          # With every Realtek chip off, this is also the only cell that proves
+          # the MediaTek backend links on its own rather than borrowing a symbol
+          # from a Realtek HAL that happened to be compiled in.
+          - name: mt7612u-only
+            flags: "-DDEVOURER_MT7612U=ON -DDEVOURER_JAGUAR1=OFF -DDEVOURER_8814=OFF -DDEVOURER_JAGUAR2_8822B=OFF -DDEVOURER_JAGUAR2_8821C=OFF -DDEVOURER_JAGUAR3_8822C=OFF -DDEVOURER_JAGUAR3_8822E=OFF -DDEVOURER_8733B=OFF -DDEVOURER_KESTREL_8852B=OFF -DDEVOURER_KESTREL_8852C=OFF"
     steps:
       - uses: actions/checkout@v4
 
       - name: Install dependency libraries
         run: sudo apt install libusb-1.0-0-dev
+
+      # mt7612u_tables_check verifies the generated initvals.h against the
+      # pinned mt76 tree, and CMake only registers it when that tree exists.
+      # Fetch just this one submodule (there are ten, all large vendor trees,
+      # so `submodules: recursive` on the checkout would be wasteful) — without
+      # it the cell would build but silently carry no table check.
+      - name: Fetch the pinned mt76 reference
+        if: matrix.name == 'mt7612u-only'
+        run: git submodule update --init --depth 1 reference/mt76
 
       - name: Configure (${{ matrix.name }})
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.flags }} -S ${{ github.workspace }}
@@ -245,7 +262,7 @@ jobs:
           if cmake -B build-none -DDEVOURER_JAGUAR1=OFF -DDEVOURER_8814=OFF \
                 -DDEVOURER_JAGUAR3_8822C=OFF -DDEVOURER_JAGUAR3_8822E=OFF \
                 -DDEVOURER_JAGUAR2_8822B=OFF -DDEVOURER_JAGUAR2_8821C=OFF \
-                -DDEVOURER_8733B=OFF \
+                -DDEVOURER_8733B=OFF -DDEVOURER_MT7612U=OFF \
                 -DDEVOURER_KESTREL_8852B=OFF -DDEVOURER_KESTREL_8852C=OFF \
                 -S "${{ github.workspace }}" 2>err.log; then
             echo "ERROR: configure should have failed (no chip selected)"; cat err.log; exit 1
