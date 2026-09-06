@@ -157,8 +157,19 @@ re-armed to a different MAC2, TX to MAC2 → proves RA and responder MAC are
 arbitrary), **off** (no responder → expect 0% ok, retries pinned at the
 descriptor limit set by `DEVOURER_TX_RETRY_LIMIT` — this matrix runs it at
 12 — so the no-ACK outcome must be *visible*, per frame).
-`report_coverage` = reports / frames sent (`tx.stats.submitted`); HalMAC adds
-SW_DEFINE tag-echo gap counting.
+`report_coverage` = reports / frames sent (`tx.stats.submitted`); a verdict
+requires at least 0.80 by default (`MIN_REPORT_COVERAGE`), so a handful of
+matching reports cannot make a mostly unobserved cell pass. HalMAC adds
+SW_DEFINE tag-echo gap counting. An off verdict also requires at least 90% of
+reported frames at the configured retry limit (`MIN_RETRY_PIN_RATE`); one
+pinned outlier cannot stand in for the claimed retry-pinned distribution.
+
+When the configured responder is an RTL8733B (`0bda:f72b` or `0bda:b733`),
+the harness adds a fourth **disarmed** phase: arm MAC1, start a timer only
+after the backend has completed bring-up and arming, clear it in the same live
+process, then solicit MAC1 and expect the off verdict. That phase is
+deliberately skipped for the default Jaguar1 responder; its disarm semantics
+require separate backend-specific evidence.
 
 TX sessions run `DEVOURER_TX_WITH_RX=thread`: CCX reports arrive on the C2H
 RX path, so J1/J2 TX-only sessions never see them (measured: J2 TX-only = 0
@@ -241,7 +252,7 @@ station): **8814AU** closes the loop at retries ~0.1 (the bench responder of
 choice); **8812AU** works but degraded (97% delivery at ~7 mean retries —
 its SIFS ACKs only land intermittently); **8821AU works** (61–64% single-shot
 across three reps, **94% at retry 8** with a healthy retry histogram,
-disarm-proof-verified: 0% with the responder powered down); the 8812BU
+arm-verified (the off cell is never-armed, so it establishes no disarm): 0% with the responder powered down); the 8812BU
 responder was separately proven (`tests/ack_responder_check.sh`).
 
 A cell whose responder never armed reads exactly like a broken chip — on=0%

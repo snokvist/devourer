@@ -186,7 +186,9 @@ struct DeviceConfig {
      * responder at the end of bring-up (src/AckResponder.h): the MAC
      * auto-ACKs unicast frames addressed to this MAC while monitor RX and
      * injection continue unchanged. Runtime equivalent: SetAckResponder /
-     * ClearAckResponder. OPT-IN: makes a passive monitor transmit. */
+     * ClearAckResponder. Retargeting hardware responses to a caller-supplied
+     * address is opt-in; some dies, notably RTL8733B, may already answer for
+     * the initialization MAC before this option is set. */
     std::optional<MacAddr> ack_responder;
   } rx;
 

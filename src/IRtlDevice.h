@@ -219,11 +219,17 @@ public:
    * monitor RX/injection continue unchanged. The reliable-unicast enabler:
    * a peer TXing to `mac` with normal ack-policy gets hardware
    * retransmissions until the ACK (its tx.report shows retries~0). `mac`
-   * must be unicast (I/G clear). Turning a passive monitor into an active
-   * transmitter is opt-in only — never a default. Returns false when
-   * unsupported or when arm/verification fails; false is not proof of passive
-   * state, so implementations log if rollback cannot be verified. Clear is a
-   * non-throwing best effort to return net_type to No Link. */
+   * must be unicast (I/G clear). Retargeting hardware ACK behavior to a
+   * caller-supplied address is opt-in only. Some implementations, notably
+   * RTL8733B, may already respond for the initialization MAC. Returns false
+   * when unsupported or when arm/verification fails; false is not proof of
+   * passive state, so implementations log if rollback cannot be verified.
+   * Clear is a non-throwing best effort to return net_type to No Link — and,
+   * on a die whose engine does not consult net_type, to move the port identity
+   * off `mac` as well, which is the only thing that changes its behaviour
+   * there (see Rtl8733bDevice::disarm_ack_responder). Clear does not promise
+   * silence: a die that matches MACID alone answers for whatever address is
+   * left programmed, including the one MAC bring-up wrote. */
   virtual bool SetAckResponder(const devourer::MacAddr &mac) {
     (void)mac;
     return false;

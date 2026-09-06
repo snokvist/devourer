@@ -786,6 +786,18 @@ target_link_libraries(TxQuiesceSelftest PRIVATE devourer PkgConfig::libusb)
 
 add_test(NAME tx_quiesce_seam COMMAND TxQuiesceSelftest)
 
+# Headless guard for the ACK-responder recipe (src/AckResponder.h): the arm,
+# the gate-only clear staying gate-only, and the retarget seam. This test does
+# not model silicon or instantiate Rtl8733bDevice; those are covered by the
+# RTL8733B-only `disarmed` phase in ack_txreport_matrix.sh. Its legacy `off`
+# phase remains a never-armed control.
+add_executable(AckResponderSelftest
+    tests/ack_responder_selftest.cpp
+)
+target_link_libraries(AckResponderSelftest PRIVATE devourer PkgConfig::libusb)
+
+add_test(NAME ack_responder_recipe COMMAND AckResponderSelftest)
+
 # Headless guard for the windowed RX-receipt primitives (src/cell/RxReceipt.h):
 # TLV round-trip, ring eviction, late accounting, ledger merge idempotence,
 # strict-parse rejections. The on-air halves are tests/receipt_verify.py over
