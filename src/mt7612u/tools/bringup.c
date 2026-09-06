@@ -1214,7 +1214,26 @@ static int gate_rxbytes(uint8_t chan, int secs)
     mt_mac_stop(&dev);
 
     printf("ch%u, %d s ambient. false CCA this interval: %u (mt76 calls >800 "
-           "interfered, <10 clean)\n\n", chan, secs, st.rx_false_cca);
+           "interfered, <10 clean)\n", chan, secs, st.rx_false_cca);
+    {
+        unsigned long tot = 0, nv = 0;
+        long rs = 0, ns = 0, ss = 0;
+
+        for (int b = 0; b < 6; b++) {
+            if (!g_rxb[b].n) continue;
+            tot += g_rxb[b].n;
+            rs += g_rxb[b].sum[0];
+            ns += g_rxb[b].sum[2];
+        }
+        if (tot) {
+            double r = rs / (double)tot - 256, n = ns / (double)tot - 256;
+
+            (void)nv; (void)ss;
+            printf("  mean rssi %.1f dBm, noise %.1f dBm  ->  SNR %.1f dB%s\n\n",
+                   r, n, r - n,
+                   n < -100 ? "   (noise below thermal: no valid estimate)" : "");
+        }
+    }
     printf("  %-8s", "byte");
     for (int b = 0; b < 6; b++) if (g_rxb[b].n) printf("  <=%-4d", g_rxb_edge[b]);
     printf("   min  max\n");

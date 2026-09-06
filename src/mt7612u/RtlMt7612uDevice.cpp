@@ -174,6 +174,16 @@ void RtlMt7612uDevice::on_rx(const void *frame, size_t len,
                                             std::memory_order_relaxed)) {
     }
   }
+  if (info->noise_valid) {
+    _snr_sum.fetch_add(info->snr_db, std::memory_order_relaxed);
+    _noise_sum.fetch_add(info->noise, std::memory_order_relaxed);
+    _snr_n.fetch_add(1, std::memory_order_relaxed);
+    int lo = _snr_min.load(std::memory_order_relaxed);
+    while (info->snr_db < lo &&
+           !_snr_min.compare_exchange_weak(lo, info->snr_db,
+                                           std::memory_order_relaxed)) {
+    }
+  }
   _rx_processor(packet);
 }
 
@@ -559,12 +569,17 @@ devourer::TxStats RtlMt7612uDevice::GetTxStats() {
  * What this part can and cannot fill in is worth being explicit about,
  * because the empty fields are not laziness:
  *
- *  - No SNR and no EVM. The RX descriptor carries RSSI and nothing else. Its
- *    `bbp_rxinfo[4]` - which mt76 declares in mt76x02_mac.h and never reads -
+ *  - SNR and the noise floor ARE available, from RXWI byte 14 - the
+ *    `rssi[2]` slot mt76 declares and never reads. Established by
+ *    measurement: it is signal-independent (flat across a 43 dB span on
+ *    ch36) and orders with the MAC's own false-CCA count across channels.
+ *    A reading below -100 dBm is under the thermal floor of a 20 MHz
+ *    channel and is treated as no estimate, which is what a quiet channel
+ *    carrying only a very strong local transmitter produces.
+ *  - No EVM. `bbp_rxinfo[4]`, the other thing mt76 declares and never reads,
  *    measured as two words of zero plus a duplicate of the same two RSSI
- *    values across a 30 dB transmit sweep. There is no per-frame quality
- *    metric on this MAC to report, so `evm_valid` stays false and the SNR
- *    fields stay zero rather than carrying a plausible-looking fiction.
+ *    values across a 30 dB transmit sweep, so `evm_valid` stays false
+ *    rather than carrying a plausible-looking fiction.
  *  - `fa_ofdm` is real: MT_RX_STAT_1's false-CCA count, which is energy that
  *    started a receive and never became a frame. mt76's own AGC loop treats
  *    >800 per interval as interfered and <10 as clean
@@ -595,6 +610,19 @@ devourer::RxQuality RtlMt7612uDevice::GetRxQuality() {
     q.valid = true;
     q.rssi_mean_dbm = static_cast<int>(sum / n) - 128;
     q.rssi_max_dbm = peak;
+  }
+
+  const uint64_t sn = _snr_n.exchange(0, std::memory_order_relaxed);
+  const int64_t ssum = _snr_sum.exchange(0, std::memory_order_relaxed);
+  const int64_t nsum = _noise_sum.exchange(0, std::memory_order_relaxed);
+  const int smin = _snr_min.exchange(127, std::memory_order_relaxed);
+  if (sn) {
+    q.snr_mean_db = static_cast<double>(ssum) / static_cast<double>(sn);
+    q.snr_min_db = smin;
+    q.noise_floor_dbm = static_cast<double>(nsum) / static_cast<double>(sn);
+    q.nf_valid = true;
+    q.abs_noise_floor_dbm = static_cast<int8_t>(q.noise_floor_dbm);
+    q.abs_nf_valid = true;
   }
   return q;
 }

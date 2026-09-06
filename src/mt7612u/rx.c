@@ -99,6 +99,15 @@ int mt_rx_parse(struct mt7612u_dev *d, uint8_t *buf, int n,
 	for (int i = 0; i < 4; i++)
 		info->bbp[i] = get_le32(rxwi + 16 + 4 * i);
 
+	/* RXWI byte 14 is a noise floor - see the header for how that was
+	 * established. Below -100 dBm is under the thermal floor of a 20 MHz
+	 * channel, so it is reported as no estimate rather than as a very quiet
+	 * channel. */
+	info->noise = info->rssi[2];
+	info->noise_valid = info->noise > -100 && info->noise < -30;
+	info->snr_db = info->noise_valid
+	             ? (int8_t)(info->rssi[0] - info->noise) : 0;
+
 	if (rxinfo & MT_RXINFO_L2PAD)
 		pad = 2;
 

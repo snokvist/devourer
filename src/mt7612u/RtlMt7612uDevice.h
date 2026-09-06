@@ -124,6 +124,10 @@ private:
   std::atomic<uint64_t> _rssi_sum{0};
   std::atomic<uint64_t> _rssi_n{0};
   std::atomic<int> _rssi_max{-127};
+  std::atomic<int64_t> _snr_sum{0};
+  std::atomic<uint64_t> _snr_n{0};
+  std::atomic<int> _snr_min{127};
+  std::atomic<int64_t> _noise_sum{0};
 
   devourer::AmpduMode _ampdu{};
   struct mt7612u_tx_rate _tx_default {};

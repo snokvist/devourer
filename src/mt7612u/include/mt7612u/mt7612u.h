@@ -66,6 +66,29 @@ struct mt7612u_rx_info {
 	unsigned crc_err : 1;
 	unsigned ampdu   : 1;
 	int8_t   rssi[4];      /* per chain, already EEPROM-corrected */
+	/*
+	 * Noise floor in dBm, from RXWI byte 14 - the `rssi[2]` slot that mt76
+	 * declares and never reads (mt76x02_mac_process_rx uses only [0] and
+	 * [1]). Identified by measurement, not by documentation:
+	 *
+	 *  - It is signal-independent. On ch36 it read -92, -94, -92, -91, -91
+	 *    dBm across five bands whose signal spanned 43 dB.
+	 *  - It orders with how noisy the channel is, against the MAC's own
+	 *    false-CCA count: ch36 (689 false CCA) -92 dBm, ch1 (28567) -88,
+	 *    ch6 (27313) -85, ch11 (17256) -81.
+	 *
+	 * `snr_db` below is simply rssi[0] - noise.
+	 *
+	 * CAVEAT, unresolved: on a quiet 5 GHz channel carrying only our own
+	 * very strong transmitter this reads a fixed -116 dBm, which is below
+	 * the thermal floor of a 20 MHz channel and so cannot be a real
+	 * measurement. Treat a reading below about -100 dBm as "no valid
+	 * estimate" rather than as an extraordinarily quiet channel; noise_valid
+	 * says so.
+	 */
+	int8_t   noise;
+	int8_t   snr_db;       /* rssi[0] - noise; 0 when !noise_valid */
+	unsigned noise_valid : 1;
 	uint8_t  n_chains;
 	uint16_t mpdu_len;
 	uint16_t seq;
