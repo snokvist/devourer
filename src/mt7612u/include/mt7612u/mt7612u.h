@@ -79,6 +79,24 @@ struct mt7612u_dev;
  * system default. Returns NULL on failure; err (optional) receives a message.
  */
 struct mt7612u_dev *mt7612u_open(const char *fw_dir, const char **err);
+
+/*
+ * Same, but adopting a libusb handle the caller already opened, reset and
+ * claimed interface 0 on. Neither the handle nor the context is closed by
+ * mt7612u_close() - the caller keeps ownership of both, and of any exclusive
+ * lock it took over them.
+ *
+ * Adopting rather than reopening matters: reopening would race whatever lock
+ * the caller holds, and libusb_reset_device() here would invalidate the
+ * caller's own handle.
+ *
+ * `h` is `libusb_device_handle *` and `ctx` is `libusb_context *`, spelled
+ * void * so this header does not force libusb on a consumer that only wants
+ * the descriptor types above.
+ */
+struct mt7612u_dev *mt7612u_open_handle(void *h, void *ctx, const char *fw_dir,
+                                        const char **err);
+
 void mt7612u_close(struct mt7612u_dev *dev);
 
 /* Reattaches the kernel driver on close unless this is set. */
@@ -127,6 +145,18 @@ int mt7612u_rx_start(struct mt7612u_dev *dev, mt7612u_rx_cb cb, void *user);
 int mt7612u_rx_stop(struct mt7612u_dev *dev);
 
 /*
+ * Put the receive filter into monitor mode: pass everything the PHY decodes,
+ * dropping only PHY errors and (unless keep_corrupted) frames that failed FCS.
+ *
+ * This is NOT the default. mt7612u_start() leaves the filter mt76's managed
+ * -mode value, which drops control frames and anything not addressed to this
+ * station - on ambient 2.4 GHz traffic that is the difference between seeing
+ * the whole mix and seeing almost nothing but beacons. Call this after
+ * mt7612u_start(), which rewrites the register.
+ */
+int mt7612u_set_monitor_rx(struct mt7612u_dev *dev, int keep_corrupted);
+
+/*
  * Radiotap-framed inject, matching devourer's send_packet() contract: one
  * buffer holding a radiotap header followed by the 802.11 MPDU, with the
  * per-frame rate carried in the header.
@@ -152,6 +182,21 @@ size_t mt7612u_send_packets(struct mt7612u_dev *dev,
  */
 int  mt7612u_set_ack_responder(struct mt7612u_dev *dev, const uint8_t mac[6]);
 void mt7612u_clear_ack_responder(struct mt7612u_dev *dev);
+
+/*
+ * TX/RX counters from the async rings. Zeroed when no ring is running, and
+ * taken under the ring's own lock - reading the fields directly would race
+ * the libusb event thread.
+ */
+struct mt7612u_stats {
+	uint64_t tx_submitted, tx_done, tx_err, rx_frames, rx_err;
+	/* Frames dropped because the rate word named no valid PHY. MT_RATE_PHY
+	 * is three bits, so 5-7 are representable and mean nothing; mt76 drops
+	 * them too. Nonzero here means the RX path is seeing garbage, not that
+	 * the radio is slow. */
+	uint64_t rx_invalid;
+};
+void mt7612u_get_stats(struct mt7612u_dev *dev, struct mt7612u_stats *out);
 
 /* TSF, the hardware microsecond clock. Two register reads. */
 uint64_t mt7612u_read_tsf(struct mt7612u_dev *dev);

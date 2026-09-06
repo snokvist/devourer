@@ -285,6 +285,7 @@ void mt_async_stats(struct mt7612u_dev *d, struct mt_async_stats *out)
 	out->tx_err       = a->tx_err;
 	out->rx_frames    = a->rx_frames;
 	out->rx_err       = a->rx_err;
+	out->rx_invalid   = a->rx_invalid;
 	pthread_mutex_unlock(&a->lock);
 }
 
@@ -298,4 +299,31 @@ int mt7612u_rx_stop(struct mt7612u_dev *d)
 {
 	mt_async_stop(d);
 	return 0;
+}
+
+/* A frame whose rate word named no valid PHY. Counted under the ring's lock
+ * when one is running; on the synchronous bring-up path there is no ring and
+ * nothing to count into, which is fine - that path prints every frame. */
+void mt_async_note_invalid(struct mt7612u_dev *d)
+{
+	struct mt_async *a = d->a;
+
+	if (!a) return;
+	pthread_mutex_lock(&a->lock);
+	a->rx_invalid++;
+	pthread_mutex_unlock(&a->lock);
+}
+
+/* Public form of the snapshot above. */
+void mt7612u_get_stats(struct mt7612u_dev *d, struct mt7612u_stats *out)
+{
+	struct mt_async_stats st;
+
+	mt_async_stats(d, &st);
+	out->tx_submitted = st.tx_submitted;
+	out->tx_done      = st.tx_done;
+	out->tx_err       = st.tx_err;
+	out->rx_frames    = st.rx_frames;
+	out->rx_err       = st.rx_err;
+	out->rx_invalid   = st.rx_invalid;
 }

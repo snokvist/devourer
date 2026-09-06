@@ -392,15 +392,10 @@ int mt_init_hardware(struct mt7612u_dev *d, const char *fw_dir)
 
 /* --- the public lifecycle, as declared in include/mt7612u/mt7612u.h --- */
 
-struct mt7612u_dev *mt7612u_open(const char *fw_dir, const char **err)
+/* EEPROM + full bring-up, once the transport is up either way. */
+static struct mt7612u_dev *bring_up(struct mt7612u_dev *d, const char *fw_dir,
+                                    const char **err)
 {
-	struct mt7612u_dev *d = calloc(1, sizeof *d);
-
-	if (!d) {
-		if (err) *err = "out of memory";
-		return NULL;
-	}
-	if (mt_open(d, err)) { free(d); return NULL; }
 	if (mt_eeprom_init(d)) {
 		if (err) *err = "EEPROM image did not validate";
 		goto fail;
@@ -415,6 +410,34 @@ fail:
 	mt_close(d);
 	free(d);
 	return NULL;
+}
+
+struct mt7612u_dev *mt7612u_open(const char *fw_dir, const char **err)
+{
+	struct mt7612u_dev *d = calloc(1, sizeof *d);
+
+	if (!d) {
+		if (err) *err = "out of memory";
+		return NULL;
+	}
+	if (mt_open(d, err)) { free(d); return NULL; }
+	return bring_up(d, fw_dir, err);
+}
+
+struct mt7612u_dev *mt7612u_open_handle(void *h, void *ctx, const char *fw_dir,
+                                        const char **err)
+{
+	struct mt7612u_dev *d = calloc(1, sizeof *d);
+
+	if (!d) {
+		if (err) *err = "out of memory";
+		return NULL;
+	}
+	if (mt_adopt(d, (libusb_device_handle *)h, (libusb_context *)ctx, err)) {
+		free(d);
+		return NULL;
+	}
+	return bring_up(d, fw_dir, err);
 }
 
 void mt7612u_close(struct mt7612u_dev *d)
@@ -442,4 +465,26 @@ int mt7612u_stop(struct mt7612u_dev *d)
 {
 	if (!d) return -1;
 	return mt_mac_stop(d);
+}
+
+/*
+ * Monitor receive filter.
+ *
+ * mt_mac_start() leaves MT_RX_FILTR_CFG at 0x00015f97, which is what mt76
+ * programs for a managed station: control frames, other-BSS frames and
+ * frames not addressed here are all dropped. A monitor consumer wants the
+ * opposite, so this clears everything except the two error classes.
+ *
+ * DUP deliberately stays clear: duplicate suppression would hide the
+ * retransmissions an ACK-responder test counts.
+ */
+int mt7612u_set_monitor_rx(struct mt7612u_dev *d, int keep_corrupted)
+{
+	uint32_t filtr = MT_RX_FILTR_CFG_PHY_ERR;
+
+	if (!d) return -1;
+	if (!keep_corrupted)
+		filtr |= MT_RX_FILTR_CFG_CRC_ERR;
+	mt_wr(d, MT_RX_FILTR_CFG, filtr);
+	return 0;
 }

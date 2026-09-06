@@ -617,9 +617,11 @@ static int gate_arx(uint8_t chan, int secs)
 		struct mt_async_stats st;
 
 		mt_async_stats(&dev, &st);
-		printf("async RX on ch%u for %d s: %lu frames (%.0f/s), rx_err=%llu\n",
+		printf("async RX on ch%u for %d s: %lu frames (%.0f/s), rx_err=%llu "
+		       "rx_invalid=%llu\n",
 		       chan, secs, ctx.n, ctx.n / (double)secs,
-		       (unsigned long long)st.rx_err);
+		       (unsigned long long)st.rx_err,
+		       (unsigned long long)st.rx_invalid);
 	}
 	for (int i = 0; i < 5; i++)
 		if (ctx.by_phy[i]) printf("  %-6s %lu\n", phy_name[i], ctx.by_phy[i]);

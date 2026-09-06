@@ -10,6 +10,10 @@
 #include "RtlAdapter.h"
 #include "UsbDeviceLock.h"
 #include "UsbTransport.h" /* REALTEK_USB_VENQT_READ / USB_TIMEOUT for read_chip_id */
+#include "mt7612u/Mt7612uUsbIds.h"
+#if defined(DEVOURER_HAVE_MT7612U)
+#include "mt7612u/RtlMt7612uDevice.h"
+#endif
 #if defined(DEVOURER_HAVE_PCIE)
 #include "PcieTransport.h"
 #endif
@@ -138,6 +142,30 @@ WiFiDriver::CreateRtlDevice(libusb_device_handle *dev_handle,
     if (libusb_get_device_descriptor(dev, &desc) == 0)
       vid = desc.idVendor;
   }
+
+  /* MediaTek gates on VID:PID for a stronger version of Kestrel's reason: on
+   * MT7612U the SYS_CFG2 read below is not merely ambiguous, it is the wrong
+   * protocol. 0x00FC is a Realtek register address issued with a Realtek
+   * vendor request; MediaTek's register window is reached with
+   * MT_VEND_MULTI_READ and the address split across wValue/wIndex, so the
+   * byte that read returns on this silicon means nothing and must not be
+   * allowed to pick a backend. The MediaTek VID is disjoint from every
+   * Realtek one here, which makes the gate unambiguous; MT_ASIC_VERSION is
+   * read inside the backend as confirmation. */
+  if (mt7612u::is_usb_id(vid, pid)) {
+#if defined(DEVOURER_HAVE_MT7612U)
+    _logger->info("Creating RtlMt7612uDevice ({:04x}:{:04x})", vid, pid);
+    return std::make_unique<RtlMt7612uDevice>(dev_handle, ctx,
+                                              std::move(usb_lock), _logger,
+                                              cfg);
+#else
+    _logger->error("MediaTek chip ({:04x}:{:04x}) detected but MT7612U support "
+                   "not compiled in (DEVOURER_MT7612U=OFF)",
+                   vid, pid);
+    return nullptr;
+#endif
+  }
+
   if (auto kvariant = kestrel::variant_for_usb_id(vid, pid)) {
 #if defined(DEVOURER_HAVE_KESTREL)
     const bool is_8852b = *kvariant == kestrel::ChipVariant::C8852B;

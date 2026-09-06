@@ -32,6 +32,12 @@ option(DEVOURER_8733B         "RTL8731BU / RTL8733BU USB support"               
 # src/kestrel/CLAUDE.md).
 option(DEVOURER_KESTREL_8852B "RTL8852BU / 8832BU (Kestrel 11ax, G6)"           ON)
 option(DEVOURER_KESTREL_8852C "RTL8852CU / 8832CU (Kestrel 11ax, G6)"           ON)
+# MediaTek MT7612U — the first non-Realtek silicon here, derived from mainline
+# mt76 (reference/mt76, BSD-3-Clause-Clear) rather than a vendor drop. Fixed-
+# rate raw injection and monitor RX; measurements and limits in
+# docs/mt7612u.md. OFF by default: it is new, single-sample silicon and
+# nothing else in the tree depends on it.
+option(DEVOURER_MT7612U       "MediaTek MT7612U / MT7662U USB support"          OFF)
 # PCIe transport (vfio-pci). Linux-only. The transport implements the HalMAC-
 # generation (Jaguar2/3) 88xx buffer-descriptor DMA rings; the RTL8821CE is
 # the only chip with a PCIe bring-up implemented + hardware-validated so far,
@@ -84,12 +90,13 @@ else()
 endif()
 if(NOT DEVOURER_JAGUAR1 AND NOT DEVOURER_JAGUAR2 AND NOT DEVOURER_JAGUAR3
    AND NOT DEVOURER_8733B
-   AND NOT DEVOURER_KESTREL)
+   AND NOT DEVOURER_KESTREL
+   AND NOT DEVOURER_MT7612U)
     message(FATAL_ERROR
         "No chip support selected. Enable at least one of DEVOURER_JAGUAR1 / "
         "DEVOURER_JAGUAR2_8822B / DEVOURER_JAGUAR2_8821C / DEVOURER_JAGUAR3_8822C "
         "/ DEVOURER_JAGUAR3_8822E / DEVOURER_8733B / DEVOURER_KESTREL_8852B "
-        "/ DEVOURER_KESTREL_8852C.")
+        "/ DEVOURER_KESTREL_8852C / DEVOURER_MT7612U.")
 endif()
 if(DEVOURER_PCIE)
     if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -404,6 +411,35 @@ if(DEVOURER_8733B)
         hal/hal8733b_fw.c hal/hal8733b_fw.h
         hal/hal8733b_tables.c hal/hal8733b_tables.h)
     target_compile_definitions(devourer PUBLIC DEVOURER_HAVE_8733B=1)
+endif()
+
+# --- MediaTek MT7612U ---
+# The only non-Realtek backend. It does not use RtlAdapter: MT7612U is 32-bit
+# registers over EP0 vendor requests plus an in-band MCU on EP8/EP5, with
+# firmware to upload before any of it answers, so it carries its own transport
+# behind the same IRtlDevice factory. The transport is the C library in
+# src/mt7612u/, which also builds standalone with its own Makefile for the
+# bring-up harness and offline tests (make -C src/mt7612u check).
+if(DEVOURER_MT7612U)
+    target_sources(devourer PRIVATE
+        src/mt7612u/RtlMt7612uDevice.cpp src/mt7612u/RtlMt7612uDevice.h
+        src/mt7612u/Mt7612uUsbIds.h
+        src/mt7612u/usb.c src/mt7612u/async.c src/mt7612u/mcu.c
+        src/mt7612u/fw.c src/mt7612u/eeprom.c src/mt7612u/init.c
+        src/mt7612u/phy.c src/mt7612u/tx.c src/mt7612u/rx.c
+        src/mt7612u/radiotap.c src/mt7612u/caps.c
+        src/mt7612u/internal.h src/mt7612u/regs.h src/mt7612u/initvals.h)
+    target_include_directories(devourer PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/mt7612u/include)
+    # The C sources include "internal.h" and "regs.h" as siblings.
+    set_source_files_properties(
+        src/mt7612u/usb.c src/mt7612u/async.c src/mt7612u/mcu.c
+        src/mt7612u/fw.c src/mt7612u/eeprom.c src/mt7612u/init.c
+        src/mt7612u/phy.c src/mt7612u/tx.c src/mt7612u/rx.c
+        src/mt7612u/radiotap.c src/mt7612u/caps.c
+        PROPERTIES INCLUDE_DIRECTORIES
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/mt7612u")
+    target_compile_definitions(devourer PUBLIC DEVOURER_HAVE_MT7612U=1)
 endif()
 
 # --- Kestrel (Wi-Fi 6 / 802.11ax: RTL8852BU / RTL8852CU) ---
@@ -1046,6 +1082,32 @@ add_executable(AdapterCapsSelftest
 target_link_libraries(AdapterCapsSelftest PRIVATE devourer)
 
 add_test(NAME adapter_caps_derive COMMAND AdapterCapsSelftest)
+
+if(DEVOURER_MT7612U)
+    # Pure translations between MT7612U's descriptor vocabulary and devourer's
+    # (RSSI bias, DESC_RATE numbering, channel width). Each is a lookup whose
+    # errors are invisible on a radio; the RSSI bias was caught here after a
+    # live run reported -63 dBm as 193.
+    add_executable(Mt7612uMappingSelftest
+        tests/mt7612u_mapping_selftest.cpp
+    )
+    target_link_libraries(Mt7612uMappingSelftest PRIVATE devourer)
+    add_test(NAME mt7612u_mapping COMMAND Mt7612uMappingSelftest)
+
+    # The subtree's own offline tests: public-API link, frame shapes, field
+    # macros. Driven by its standalone Makefile so the same command works with
+    # or without CMake.
+    add_test(NAME mt7612u_offline
+        COMMAND make -C ${CMAKE_CURRENT_SOURCE_DIR}/src/mt7612u check)
+
+    # The generated initvals.h must match reference/mt76 at the pinned commit.
+    # Skipped rather than failed when the submodule is not checked out.
+    add_test(NAME mt7612u_tables_check
+        COMMAND ${CMAKE_COMMAND}
+            -DSCRIPT=${CMAKE_CURRENT_SOURCE_DIR}/tools/extract_mt7612u_tables.py
+            -DREF=${CMAKE_CURRENT_SOURCE_DIR}/reference/mt76
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/mt7612u_tables_check.cmake)
+endif()
 
 if(DEVOURER_8733B)
     add_executable(Rtl8733bEfuseSelftest

@@ -18,12 +18,23 @@ static uint32_t get_le32(const uint8_t *p)
 }
 static uint16_t get_le16(const uint8_t *p) { return (uint16_t)p[0] | ((uint16_t)p[1] << 8); }
 
-/* Decode the 16-bit rate word - the same encoding the TX path writes. */
-static void decode_rate(uint16_t rate, struct mt7612u_rx_info *out)
+/*
+ * Decode the 16-bit rate word - the same encoding the TX path writes.
+ * Returns -1 when the PHY field names no format this radio can produce.
+ *
+ * MT_RATE_PHY is three bits, so 5, 6 and 7 are representable and mean
+ * nothing; mt76 returns -EINVAL for them in mt76x02_mac_process_rate() and
+ * drops the frame. Decoding one anyway lands it in the caller's `default`
+ * arm and reports it as the lowest legacy rate, which reads as a real CCK
+ * frame rather than as garbage.
+ */
+static int decode_rate(uint16_t rate, struct mt7612u_rx_info *out)
 {
 	uint32_t idx = FIELD_GET(MT_RATE_INDEX, rate);
 
 	out->phy  = (enum mt7612u_phy)FIELD_GET(MT_RATE_PHY, rate);
+	if (out->phy > MT7612U_PHY_VHT)
+		return -1;
 	out->bw   = (enum mt7612u_bw)FIELD_GET(MT_RATE_BW, rate);
 	out->sgi  = !!(rate & MT_RATE_SGI);
 	out->ldpc = !!(rate & MT_RATE_LDPC);
@@ -44,6 +55,7 @@ static void decode_rate(uint16_t rate, struct mt7612u_rx_info *out)
 		out->nss = 1;
 		break;
 	}
+	return 0;
 }
 
 /*
@@ -70,7 +82,10 @@ int mt_rx_parse(struct mt7612u_dev *d, uint8_t *buf, int n,
 	info->seq      = (uint16_t)(get_le16(rxwi + 8) >> 4);
 	info->crc_err  = !!(rxinfo & MT_RXINFO_CRCERR);
 	info->ampdu    = !!(rxinfo & MT_RXINFO_AMPDU);
-	decode_rate(get_le16(rxwi + 10), info);
+	if (decode_rate(get_le16(rxwi + 10), info)) {
+		mt_async_note_invalid(d);
+		return 0;
+	}
 
 	/* Per-chain RSSI is a fixed 4-byte field. Correction terms come from
 	 * the EEPROM (mt76x02_mac_get_rssi); with them at zero these are the

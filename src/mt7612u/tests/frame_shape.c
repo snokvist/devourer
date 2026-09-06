@@ -193,9 +193,52 @@ static void test_vht_bandwidth(void)
 	}
 }
 
+/*
+ * MT_RATE_PHY is three bits, so 5-7 are representable and name no format.
+ * mt76 drops such a frame (mt76x02_mac_process_rate returns -EINVAL); before
+ * this was ported, one decoded through the default arm and was reported as
+ * the lowest legacy rate - a real-looking CCK frame rather than garbage.
+ */
+static void test_invalid_phy(void)
+{
+	struct mt7612u_dev d;
+	uint8_t buf[128];
+	const uint8_t *frame = NULL;
+	struct mt7612u_rx_info info;
+	uint32_t ctl = FIELD_PREP(MT_RXWI_CTL_MPDU_LEN, 40u);
+
+	printf("mt_rx_parse, invalid PHY in the rate word:\n");
+	for (unsigned phy = 0; phy < 8; phy++) {
+		uint16_t rate = (uint16_t)FIELD_PREP(MT_RATE_PHY, phy);
+		int len;
+
+		memset(&d, 0, sizeof d);
+		d.chainmask = 0x0202;
+		memset(buf, 0, sizeof buf);
+		for (int i = 0; i < 4; i++)
+			buf[MT_DMA_HDR_LEN + 4 + i] = (uint8_t)(ctl >> (8 * i));
+		buf[MT_DMA_HDR_LEN + 10] = (uint8_t)(rate & 0xff);
+		buf[MT_DMA_HDR_LEN + 11] = (uint8_t)(rate >> 8);
+		buf[MT_DMA_HDR_LEN + MT_RXWI_LEN] = 0x08;  /* data frame */
+
+		len = mt_rx_parse(&d, buf, MT_DMA_HDR_LEN + MT_RXWI_LEN + 40,
+		                  &frame, &info);
+		if (phy <= 4 && len != 40) {
+			printf("  FAIL phy %u is valid but was dropped\n", phy);
+			fails++;
+		}
+		if (phy > 4 && len != 0) {
+			printf("  FAIL phy %u names no format but decoded as rate %u\n",
+			       phy, info.mcs);
+			fails++;
+		}
+	}
+}
+
 int main(void)
 {
 	test_hdrlen();
+	test_invalid_phy();
 	test_rx_l2pad();
 	test_vht_bandwidth();
 	printf("frame_shape: %s\n", fails ? "FAIL" : "PASS");

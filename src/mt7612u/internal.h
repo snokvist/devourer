@@ -80,7 +80,7 @@ struct mt_async {
 	int tx_inflight, rx_inflight;
 	mt7612u_rx_cb cb;
 	void *cb_user;
-	uint64_t tx_submitted, tx_done_n, tx_err, rx_frames, rx_err;
+	uint64_t tx_submitted, tx_done_n, tx_err, rx_frames, rx_err, rx_invalid;
 };
 
 struct mt7612u_dev {
@@ -88,6 +88,10 @@ struct mt7612u_dev {
 	libusb_device_handle *h;
 	int      kernel_was_attached;
 	int      keep_detached;
+	/* 0 when the handle and context were handed in by a caller that keeps
+	 * ownership of them - mt_close() must then release the interface but
+	 * neither close the handle nor exit the context. */
+	int      owns_handle;
 
 	uint32_t rev;             /* MT_ASIC_VERSION, e.g. 0x76120044 */
 	uint8_t  eeprom[MT7612U_EEPROM_SIZE];
@@ -115,6 +119,9 @@ struct mt7612u_dev {
 
 /* --- usb.c --- */
 int      mt_open(struct mt7612u_dev *d, const char **err);
+/* Adopt a handle the caller already opened, reset and claimed. */
+int      mt_adopt(struct mt7612u_dev *d, libusb_device_handle *h,
+                  libusb_context *ctx, const char **err);
 void     mt_close(struct mt7612u_dev *d);
 /* Checked read: 0 on success with *val filled, -1 on transport failure.
  * Prefer this anywhere the value drives a decision - 0xffffffff is a real
@@ -187,9 +194,10 @@ int mt_radiotap_parse(const uint8_t *buf, size_t len, struct mt7612u_tx_rate *r)
 
 /* --- async.c --- */
 struct mt_async_stats {
-	uint64_t tx_submitted, tx_done, tx_err, rx_frames, rx_err;
+	uint64_t tx_submitted, tx_done, tx_err, rx_frames, rx_err, rx_invalid;
 };
 void mt_async_stats(struct mt7612u_dev *d, struct mt_async_stats *out);
+void mt_async_note_invalid(struct mt7612u_dev *d);
 int  mt_async_start(struct mt7612u_dev *d, mt7612u_rx_cb cb, void *user);
 void mt_async_stop(struct mt7612u_dev *d);
 int  mt_async_tx_submit(struct mt7612u_dev *d, const uint8_t *buf, int len);

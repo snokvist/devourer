@@ -182,11 +182,45 @@ int mt_wait_for_mac(struct mt7612u_dev *d)
 	return 0;
 }
 
+/* Seed the TX power and confirm this really is an MT7612 before anything
+ * writes to it. Shared by both open paths. */
+static int mt_identify(struct mt7612u_dev *d, const char **err)
+{
+	/* 0.5 dB units, as mt76's txpower_conf = power_level * 2. 20 dBm is a
+	 * conservative seed; mt7612u_set_txpower() overrides it. */
+	if (!d->txpower_conf)
+		d->txpower_conf = 40;
+
+	d->rev = mt_rr(d, MT_ASIC_VERSION);
+	if ((d->rev >> 16) != 0x7612) {
+		if (err) *err = "not an MT7612 (unexpected MT_ASIC_VERSION)";
+		return -1;
+	}
+	return 0;
+}
+
+/*
+ * Adopt a handle the caller opened, reset and claimed interface 0 on. No
+ * reset here: it would invalidate the caller's own handle. No detach either -
+ * a caller that got this far already dealt with the kernel driver.
+ */
+int mt_adopt(struct mt7612u_dev *d, libusb_device_handle *h,
+             libusb_context *ctx, const char **err)
+{
+	if (!h) { if (err) *err = "no USB handle"; return -1; }
+	d->h = h;
+	d->ctx = ctx;
+	d->owns_handle = 0;
+	d->kernel_was_attached = 0;
+	return mt_identify(d, err);
+}
+
 int mt_open(struct mt7612u_dev *d, const char **err)
 {
 	int rc;
 
 	if (libusb_init(&d->ctx)) { if (err) *err = "libusb_init failed"; return -1; }
+	d->owns_handle = 1;
 
 	d->h = libusb_open_device_with_vid_pid(d->ctx, MT7612U_VID, MT7612U_PID);
 	if (!d->h) {
@@ -232,14 +266,7 @@ int mt_open(struct mt7612u_dev *d, const char **err)
 		goto fail;
 	}
 
-	/* 0.5 dB units, as mt76's txpower_conf = power_level * 2. 20 dBm is a
-	 * conservative seed; mt7612u_set_txpower() overrides it. */
-	if (!d->txpower_conf)
-		d->txpower_conf = 40;
-
-	d->rev = mt_rr(d, MT_ASIC_VERSION);
-	if ((d->rev >> 16) != 0x7612) {
-		if (err) *err = "not an MT7612 (unexpected MT_ASIC_VERSION)";
+	if (mt_identify(d, err)) {
 		libusb_release_interface(d->h, 0);
 		goto fail;
 	}
@@ -258,14 +285,18 @@ void mt_close(struct mt7612u_dev *d)
 	if (d->wrlog) { fclose(d->wrlog); d->wrlog = NULL; }
 	if (d->mculog) { fclose(d->mculog); d->mculog = NULL; }
 	if (d->h) {
-		libusb_release_interface(d->h, 0);
-		if (d->kernel_was_attached && !d->keep_detached) {
-			if (libusb_attach_kernel_driver(d->h, 0) == 0)
-				LOG("reattached kernel driver");
+		if (d->owns_handle) {
+			libusb_release_interface(d->h, 0);
+			if (d->kernel_was_attached && !d->keep_detached) {
+				if (libusb_attach_kernel_driver(d->h, 0) == 0)
+					LOG("reattached kernel driver");
+			}
+			libusb_close(d->h);
 		}
-		libusb_close(d->h); d->h = NULL;
+		d->h = NULL;
 	}
-	if (d->ctx) { libusb_exit(d->ctx); d->ctx = NULL; }
+	if (d->ctx && d->owns_handle) libusb_exit(d->ctx);
+	d->ctx = NULL;
 }
 
 /* Block write, as mt76u_copy(): one MULTI_WRITE per batch, wValue 0.
