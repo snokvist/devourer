@@ -1,8 +1,13 @@
-# src/mt7612u — MediaTek MT7612U, standalone
+# src/mt7612u — MediaTek MT7612U
 
-**Not built by `CMakeLists.txt`.** This subtree does not implement
-`IRtlDevice`, is not reachable from `WiFiDriver`, and adds nothing to the
-library target. It builds on its own:
+Built into the library by `CMakeLists.txt` behind `DEVOURER_MT7612U`, which is
+**OFF by default**. With it on, `RtlMt7612uDevice` implements `IRtlDevice`,
+`WiFiDriver` dispatches to it on VID:PID ahead of the Realtek `SYS_CFG2` read,
+and `ctest` gains three cells.
+
+The C library underneath is still self-contained — a public header, no
+dependency on `RtlAdapter`, and its own Makefile — so it also builds and tests
+without CMake at all:
 
 ```sh
 make -C src/mt7612u            # -> src/mt7612u/bringup

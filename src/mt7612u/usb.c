@@ -247,7 +247,7 @@ int mt_adopt(struct mt7612u_dev *d, libusb_device_handle *h,
  * across the two tools, which is exactly the case this is meant to stop:
  *   key   bus + USB port path, e.g. "3-1.4", with UsbDeviceLock's
  *         "-a<address>" fallback when the backend reports no port path
- *   path  $TMPDIR (default /tmp) + "/devourer-usb-" + key + ".lock"
+ *   path  "/tmp" + "/devourer-usb-" + key + ".lock"  (UsbDeviceLock's default)
  *   flags O_CREAT|O_RDWR|O_NOFOLLOW, 0666, then flock(LOCK_EX|LOCK_NB)
  *
  * Fail-open vs fail-closed follows UsbDeviceLock too: genuine contention
@@ -278,11 +278,18 @@ static void adapter_key(libusb_device *dev, char *out, size_t n)
  * -2 when another process holds the adapter and the caller must refuse. */
 static int lock_adapter(libusb_device *dev, const char **err)
 {
-	const char *dir = getenv("TMPDIR");
+	/* "/tmp" literally, and deliberately NOT getenv("TMPDIR"): the whole
+	 * point of this lock is to contend with the C++ UsbDeviceLock, and that
+	 * one takes its directory from DeviceConfig usb.lock_dir defaulting to
+	 * "/tmp" (UsbDeviceLock.cpp:101) without ever consulting the
+	 * environment. Reading TMPDIR here would put the two on different files
+	 * whenever it is set, and the exclusion would lapse silently - which
+	 * costs exactly what the comment below describes. A caller that sets a
+	 * non-default usb.lock_dir is out of reach of this harness either way. */
+	const char *dir = "/tmp";
 	char key[64], path[256];
 	int fd;
 
-	if (!dir || !*dir) dir = "/tmp";
 	adapter_key(dev, key, sizeof key);
 	snprintf(path, sizeof path, "%s/devourer-usb-%s.lock", dir, key);
 

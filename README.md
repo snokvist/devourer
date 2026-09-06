@@ -187,6 +187,7 @@ the `env:` tags in [`src/DeviceConfig.h`](src/DeviceConfig.h).
 | `dwelltx` | dwell-1 hopping data plane on the standard Linux driver |
 | `kestrelprobe` | Wi-Fi 6 (RTL8852B/C) bring-up probe, layer by layer |
 | `rtl8733bprobe` | RTL8731BU/RTL8733BU identity, power, firmware and PHY diagnostics |
+| `mt7612uprobe` | MediaTek MT7612U staged bring-up + per-gate on-air checks (`DEVOURER_MT7612U=ON`) |
 | `timesync` | over-the-air clock distribution (master / slave / UE roles) |
 | `sense` | Wi-Fi motion sensing from beamforming reports |
 | `doctor` | adapter-health triage → HEALTHY / SUSPECT / FAILING |

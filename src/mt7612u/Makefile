@@ -1,4 +1,8 @@
-# Standalone. Not reachable from the project's CMakeLists.txt.
+# A second, CMake-free path to the same objects. The library IS built by the
+# project's CMakeLists.txt (behind DEVOURER_MT7612U); this exists so the C
+# port can be built and its offline tests run without configuring the whole
+# project, which is also how tests/api_link.c stays an honest test of the
+# public header alone.
 CC      ?= gcc
 CFLAGS  ?= -O2 -g -Wall -Wextra -Wno-unused-parameter
 # -MMD -MP: without header deps, editing internal.h leaves stale objects with

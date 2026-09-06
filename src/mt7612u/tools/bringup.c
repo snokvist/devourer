@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: BSD-3-Clause-Clear */
 /*
- * MT7612U bringup harness. One subcommand per gate from PLAN.md, so each
+ * MT7612U bringup harness. One subcommand per gate (see src/mt7612u/README.md), so each
  * stage is independently runnable on hardware.
  */
 #include <stdio.h>
@@ -443,7 +443,7 @@ static int gate_hop(void)
 }
 
 /*
- * Gate G, as PLAN.md actually specified it:
+ * Gate G, the per-frame rate-control check:
  *  1. alternate MCS0/MCS7 frame by frame - the witness must see the rate the
  *     frame's own index calls for. Correlating on the index rather than
  *     demanding an unbroken alternating sequence keeps a lost frame from

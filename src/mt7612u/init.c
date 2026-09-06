@@ -2,7 +2,7 @@
 /*
  * Power-on, MAC reset and MAC start/stop. Ported verbatim from
  * mt76/mt76x2/usb_init.c, usb_mac.c and init.c - deliberately NOT minimised.
- * See PLAN.md: trimming this sequence is a post-Gate-E activity, because a
+ * See docs/mt7612u.md: trimming this sequence is a post-bring-up activity, because a
  * 95%-correct init answers every register read and still radiates nothing.
  */
 #include <limits.h>

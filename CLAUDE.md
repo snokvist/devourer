@@ -4,6 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with
 code in this repository. It holds **cross-cutting** facts only. Deep subtree
 facts live in nested `CLAUDE.md` files, auto-loaded when working there:
 `src/{jaguar1,jaguar2,jaguar3,kestrel,rtl8733b}/` for per-generation registers,
+(and `src/mt7612u/README.md` for the MediaTek backend)
 descriptors and per-chip mechanisms; `src/hopset/` for keyed FHSS and the
 adaptive hopset; `src/chanmig/` for channel migration. Add new facts to the
 narrowest file that covers them.
@@ -15,8 +16,10 @@ its adversarial counterpart in the same breath.
 
 ## What this is
 
-Userspace re-implementation of Realtek's USB Wi-Fi drivers (11n RTL873x, 11ac
-RTL88xx and 11ax RTL8852 families) — speaks to the chip directly via libusb
+Userspace re-implementation of USB Wi-Fi drivers — Realtek's 11n RTL873x,
+11ac RTL88xx and 11ax RTL8852 families, plus one non-Realtek backend
+(MediaTek MT7612U, `src/mt7612u/`, opt-in via `DEVOURER_MT7612U`) — speaks to
+the chip directly via libusb
 instead of a kernel module. Static library `devourer` (CMake target) + example
 executables under `examples/` (`rxdemo` and `txdemo` are the canonical RX/TX
 demos). Used by the OpenIPC project for long-range video links.
@@ -66,6 +69,17 @@ construction from the `SYS_CFG2` chip-id (Kestrel: PID-first):
   ported (intra-band, TSSI kept live — `src/rtl8733b/CLAUDE.md`). SGI, LDPC, STBC, VHT
   and HE are refused outright. Scope, one-unit validation record and the
   deferred matrix: `docs/rtl8733b.md`.
+- **MT7612U** (`src/mt7612u/`): the one **non-Realtek** backend — MediaTek
+  MT7662 MAC core, 2T2R 802.11ac, `0e8d:7612`/`0e8d:7662`. Opt-in via
+  `DEVOURER_MT7612U` (**OFF by default**) and POSIX-only. It does not use
+  `RtlAdapter`: MediaTek is 32-bit registers over EP0 vendor requests plus an
+  in-band MCU on EP8/EP5, with firmware uploaded at open from
+  `/lib/firmware/mediatek` (or `DEVOURER_MT7612U_FW_DIR`) rather than compiled
+  in. Dispatch is VID:PID ahead of the Realtek `SYS_CFG2` read, because `0x00FC`
+  is a Realtek address issued with a Realtek vendor request and means nothing
+  on this silicon. Two divergences a caller must know: `Packet::Data` carries
+  **no FCS** (the MAC strips it), and 40/80 MHz are 5 GHz-only except 2.4 GHz
+  channels 4-11. Scope, measurements and the deferred matrix: `docs/mt7612u.md`.
 
 Naming traps: **RTL8821AU is Jaguar1** (not Jaguar2, despite the Jaguar2
 RTL8821C's similar name); RTL8822**B**U (Jaguar2) ≠ RTL8822**C**U (Jaguar3);

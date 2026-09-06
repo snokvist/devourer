@@ -421,6 +421,15 @@ endif()
 # src/mt7612u/, which also builds standalone with its own Makefile for the
 # bring-up harness and offline tests (make -C src/mt7612u check).
 if(DEVOURER_MT7612U)
+    # POSIX-only: the C port uses pthreads for its URB ring and flock() via
+    # <sys/file.h> for the adapter lock. mingw-w64 has neither header. Refuse
+    # at configure time rather than emitting compiler errors, the same way
+    # DEVOURER_PCIE does above. Every Realtek backend builds on all three
+    # matrix platforms; this one does not, and says so.
+    if(NOT UNIX)
+        message(FATAL_ERROR
+            "DEVOURER_MT7612U=ON requires a POSIX host (pthreads + flock).")
+    endif()
     target_sources(devourer PRIVATE
         src/mt7612u/RtlMt7612uDevice.cpp src/mt7612u/RtlMt7612uDevice.h
         src/mt7612u/Mt7612uUsbIds.h
@@ -1109,18 +1118,42 @@ if(DEVOURER_MT7612U)
     add_test(NAME mt7612u_mapping COMMAND Mt7612uMappingSelftest)
 
     # The subtree's own offline tests: public-API link, frame shapes, field
-    # macros. Driven by its standalone Makefile so the same command works with
-    # or without CMake.
-    add_test(NAME mt7612u_offline
-        COMMAND make -C ${CMAKE_CURRENT_SOURCE_DIR}/src/mt7612u check)
+    # macros. Built natively rather than shelled out to the standalone
+    # Makefile: that Makefile has `CC ?= gcc` and `CFLAGS ?= -O2 -g`, so a
+    # `make -C` test would ignore CMAKE_C_COMPILER (testing gcc in the clang
+    # cell) and DEVOURER_SANITIZE (running unsanitized in the ASan job), and
+    # would build into the source tree where every build directory shares one
+    # object set. `make -C src/mt7612u check` still works for a CMake-free
+    # checkout; it is simply no longer what ctest runs.
+    foreach(_mt_test api_link frame_shape field_macros)
+        add_executable(mt7612u_${_mt_test}
+            src/mt7612u/tests/${_mt_test}.c)
+        target_link_libraries(mt7612u_${_mt_test}
+            PUBLIC devourer PRIVATE PkgConfig::libusb)
+        # frame_shape and field_macros reach the internal C API; api_link
+        # deliberately sees only the public header, which is the whole point
+        # of that test, so it gets the include path but uses none of it.
+        target_include_directories(mt7612u_${_mt_test} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/mt7612u)
+        add_test(NAME mt7612u_${_mt_test} COMMAND mt7612u_${_mt_test})
+    endforeach()
 
     # The generated initvals.h must match reference/mt76 at the pinned commit.
-    # Skipped rather than failed when the submodule is not checked out.
-    add_test(NAME mt7612u_tables_check
-        COMMAND ${CMAKE_COMMAND}
-            -DSCRIPT=${CMAKE_CURRENT_SOURCE_DIR}/tools/extract_mt7612u_tables.py
-            -DREF=${CMAKE_CURRENT_SOURCE_DIR}/reference/mt76
-            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/mt7612u_tables_check.cmake)
+    # Registered only when the submodule is actually checked out: the test used
+    # to "skip" by returning 0, which reports checking nothing as a PASS. A
+    # checkout without `--recurse-submodules` now visibly has no such test
+    # rather than a green one. (CI does not fetch submodules today, so this is
+    # the difference between an absent cell and a lie.)
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/reference/mt76/mt76x2/init.c)
+        add_test(NAME mt7612u_tables_check
+            COMMAND ${CMAKE_COMMAND}
+                -DSCRIPT=${CMAKE_CURRENT_SOURCE_DIR}/tools/extract_mt7612u_tables.py
+                -DREF=${CMAKE_CURRENT_SOURCE_DIR}/reference/mt76
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/mt7612u_tables_check.cmake)
+    else()
+        message(STATUS
+            "reference/mt76 not checked out - mt7612u_tables_check not registered")
+    endif()
 endif()
 
 if(DEVOURER_8733B)
