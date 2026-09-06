@@ -1,7 +1,12 @@
 /* SPDX-License-Identifier: BSD-3-Clause-Clear */
-/* GENERATED from openwrt/mt76 mt76x2/init.c mt76_write_mac_initvals()
- * plus mt76x02_regs.h. Do not hand-edit: regenerate with the script in
- * ../../PLAN.md Stage C if the reference tree moves. */
+/* GENERATED - do not hand-edit.
+ * Source: openwrt/mt76 commit be5ce79, mt76_write_mac_initvals() in mt76x2/init.c,
+ * with register names and the DEFAULT_PROT_CFG_* macros resolved
+ * against mt76x02_regs.h.
+ * Regenerate:  tools/extract_mt7612u_tables.py
+ * Verify:      tools/extract_mt7612u_tables.py --check
+ * Table SHA-256 (LE reg,val stream): ba381217626e876b27a2aa9150440ff7c6af86740a3c64afbb36e81347df3719
+ */
 #ifndef MT7612U_INITVALS_H
 #define MT7612U_INITVALS_H
 

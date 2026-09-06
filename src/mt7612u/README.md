@@ -29,6 +29,7 @@ Measurements, methods and limits: [`../../docs/mt7612u.md`](../../docs/mt7612u.m
 | `caps.c` | TSF, capability descriptor, ACK responder |
 | `tools/bringup.c` | one subcommand per verified gate |
 | `tests/` | offline tests (`make check`): public-API link, frame shapes |
+| `initvals.h` | **generated** — see Provenance |
 
 ## The receiver must never run undrained
 
@@ -68,7 +69,20 @@ rtap   send_packet / send_packets           hop    channel-switch cost
 Register sequences and descriptor layouts are derived from `openwrt/mt76`
 (`mt76x2/`, `mt76x02*`, `usb.c`), BSD-3-Clause-Clear, Copyright (C) 2016 Felix
 Fietkau, (C) 2018 Lorenzo Bianconi / Stanislaw Gruszka. Files carrying ported
-sequences keep that notice.
+sequences keep that notice. The tree is pinned as `reference/mt76` at commit
+`be5ce79`.
+
+`initvals.h` is **generated** from it, not transcribed:
+
+```sh
+tools/extract_mt7612u_tables.py            # regenerate
+tools/extract_mt7612u_tables.py --check    # byte-compare the checked-in file
+```
+
+The generator resolves the symbolic register names against `mt76x02_regs.h` and
+evaluates the four `DEFAULT_PROT_CFG_*` macros, so a mistyped address cannot
+survive as a plausible-looking number. It reproduces the previously hand-typed
+table byte for byte, all sixty rows.
 
 Two things here are **not** ports and were proven on air rather than copied:
 the `MT_TXD_INFO_NEXT_VLD` USB chaining in `radiotap.c`, and the ACK responder
