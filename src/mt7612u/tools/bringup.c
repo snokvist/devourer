@@ -1067,6 +1067,101 @@ static int gate_ack(uint8_t chan, int secs, int arm)
 
 
 /*
+ * Does STBC actually put the stream on both antennas, and does the second
+ * chain radiate without it?
+ *
+ * The coding gate proves the STBC bit reaches the air and the receiver
+ * decodes the frame as STBC. It says nothing about radiated power, and there
+ * is a real confound: a chip may already drive the second chain with cyclic
+ * delay diversity on a one-stream frame, in which case "STBC off" is not
+ * "one antenna".
+ *
+ * Phase 1 alternates STBC off/on frame by frame at one rate. Nothing is
+ * reconfigured between them - only one bit of the rate word changes - so
+ * ambient drift, distance and AGC state cancel.
+ *
+ * Phase 2 needs a chainmask change, which costs a channel re-set, so it runs
+ * in blocks and repeats the sequence twice: if the two passes disagree, the
+ * difference is drift and not the chainmask.
+ */
+static int gate_diversity(uint8_t chan, int count)
+{
+	static const uint8_t src[6] = { 0x02, 0x4d, 0x54, 0x76, 0x12, 0x01 };
+	uint8_t f[64];
+
+	if (mt_eeprom_init(&dev)) return 1;
+	if (mt_init_hardware(&dev, NULL)) return 1;
+	if (mt_set_channel(&dev, chan, MT7612U_BW_20)) return 1;
+	if (mt_mac_start(&dev, 0)) return 1;
+
+	memset(f, 0, sizeof f);
+	f[0] = 0x08;
+	memset(f + 4, 0xff, 6);
+	memcpy(f + 10, src, 6);
+	memcpy(f + 16, src, 6);
+	memcpy(f + 24, "MT7612U-HAL ", 12);
+
+	printf("HT MCS2, 1 spatial stream, 20 MHz, ch%u\n", chan);
+	printf("phase 1: STBC off/on alternating frame by frame (tags A / B)\n");
+	{
+		struct mt7612u_tx_rate off = { .phy = MT7612U_PHY_HT, .mcs = 2,
+		                               .nss = 1, .bw = MT7612U_BW_20,
+		                               .no_ack = 1 };
+		struct mt7612u_tx_rate on = off;
+		long n_off = 0, n_on = 0;
+
+		on.stbc = 1;
+		printf("  rate word off 0x%04x  on 0x%04x  (one bit apart)\n",
+		       mt_tx_rate_word(&off), mt_tx_rate_word(&on));
+		for (int i = 0; i < count; i++) {
+			int stbc = i & 1;
+
+			f[22] = (uint8_t)((i & 0xf) << 4);
+			f[23] = (uint8_t)(i >> 4);
+			f[36] = stbc ? 'B' : 'A';
+			f[37] = (uint8_t)i;
+			if (mt7612u_tx(&dev, f, 44, stbc ? &on : &off) == 0) {
+				if (stbc) n_on++; else n_off++;
+			}
+			mt_usleep(1500);
+		}
+		printf("  submitted %ld off, %ld on\n", n_off, n_on);
+	}
+
+	printf("phase 2: 1T1R vs 2T2R, STBC off, two passes (tags C / D)\n");
+	for (int pass = 0; pass < 2; pass++) {
+		for (int two = 0; two < 2; two++) {
+			struct mt7612u_tx_rate r = { .phy = MT7612U_PHY_HT, .mcs = 2,
+			                             .nss = 1, .bw = MT7612U_BW_20,
+			                             .no_ack = 1 };
+			long sent = 0;
+
+			if (mt7612u_set_chainmask(&dev, two ? 0x0202 : 0x0101))
+				return 1;
+			if (mt_set_channel(&dev, chan, MT7612U_BW_20)) return 1;
+			printf("  pass %d chainmask 0x%04x txwi[17]=0x%02x\n", pass,
+			       dev.chainmask, ((dev.chainmask & 0xf) > 1) ? 0x13 : 0);
+			f[36] = two ? 'D' : 'C';
+			for (int i = 0; i < count; i++) {
+				f[22] = (uint8_t)((i & 0xf) << 4);
+				f[23] = (uint8_t)(i >> 4);
+				f[37] = (uint8_t)i;
+				if (mt7612u_tx(&dev, f, 44, &r) == 0) sent++;
+				mt_usleep(1500);
+			}
+			printf("    submitted %ld/%d\n", sent, count);
+		}
+	}
+	mt7612u_set_chainmask(&dev, 0x0202);
+
+	mt_mac_stop(&dev);
+	printf("\nWitness RSSI per tag decides. A vs B is the STBC question with\n"
+	       "nothing else changed; C vs D is whether the second chain radiates\n"
+	       "at all without STBC.\n");
+	return 0;
+}
+
+/*
  * The three modulation flags in the rate word: LDPC, STBC and short GI.
  *
  * Each frame carries both the DESC_RATE it should air at and the flag bits it
@@ -1447,6 +1542,9 @@ int main(int argc, char **argv)
 		              argc > 4 ? atoi(argv[4]) : 0);
 	} else if (!strcmp(cmd, "caps")) {
 		rc = gate_caps(argc > 2 ? (uint8_t)atoi(argv[2]) : 149);
+	} else if (!strcmp(cmd, "diversity")) {
+		rc = gate_diversity(argc > 2 ? (uint8_t)atoi(argv[2]) : 149,
+		                    argc > 3 ? atoi(argv[3]) : 600);
 	} else if (!strcmp(cmd, "coding")) {
 		rc = gate_coding(argc > 2 ? (uint8_t)atoi(argv[2]) : 149,
 		                 argc > 3 ? atoi(argv[3]) : 100,
