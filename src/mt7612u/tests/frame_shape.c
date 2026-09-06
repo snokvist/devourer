@@ -370,6 +370,72 @@ static void test_chan_group(void)
 	}
 }
 
+/*
+ * Radiotap HT bandwidth. The MCS field's `known` byte declares bandwidth with
+ * HAVE_BW (0x01); HAVE_MCS (0x02) declares the MCS index. Gating the width on
+ * 0x02 silently narrowed a requested 40 MHz frame to 20 whenever a caller
+ * declared bandwidth without an MCS index - legal radiotap, and invisible
+ * except on air. The VHT half of this bug was caught in review; this is the
+ * HT twin that came with it.
+ */
+static void test_ht_bandwidth(void)
+{
+	static const struct {
+		uint8_t known, flags; enum mt7612u_bw bw; const char *what;
+	} cases[] = {
+		/* HAVE_BW alone is enough to select the width. */
+		{ 0x01, 0x01, MT7612U_BW_40, "HAVE_BW, bw=40"           },
+		{ 0x01, 0x00, MT7612U_BW_20, "HAVE_BW, bw=20"           },
+		{ 0x01, 0x02, MT7612U_BW_20, "HAVE_BW, bw=20L"          },
+		{ 0x01, 0x03, MT7612U_BW_20, "HAVE_BW, bw=20U"          },
+		/* Both declared: still 40. */
+		{ 0x03, 0x01, MT7612U_BW_40, "HAVE_BW|HAVE_MCS, bw=40"  },
+		/* Bandwidth NOT declared: the field is meaningless, stay at 20
+		 * even though the bits happen to read 40. */
+		{ 0x02, 0x01, MT7612U_BW_20, "HAVE_MCS only, bw bits 40" },
+		{ 0x00, 0x01, MT7612U_BW_20, "nothing declared"          },
+	};
+	uint8_t buf[8 + 3 + 32];
+	struct mt7612u_tx_rate r;
+	unsigned i;
+
+	printf("radiotap HT bandwidth:\n");
+	for (i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+		memset(buf, 0, sizeof buf);
+		buf[2] = 11;                    /* radiotap length: 8 + 3 */
+		buf[6] = 0x08;                  /* present bit 19 = MCS */
+		buf[8]  = cases[i].known;
+		buf[9]  = cases[i].flags;
+		buf[10] = 0;                    /* MCS 0 */
+
+		if (mt_radiotap_parse(buf, sizeof buf, &r) != 11) {
+			printf("  FAIL %-24s header not parsed\n", cases[i].what);
+			fails++;
+			continue;
+		}
+		if (r.bw != cases[i].bw) {
+			printf("  FAIL %-24s want bw %d got %d\n",
+			       cases[i].what, (int)cases[i].bw, (int)r.bw);
+			fails++;
+		}
+	}
+
+	/* A declared field running past the declared header length is
+	 * malformed. This used to return the header length, which both
+	 * injection entry points read as success and then transmitted at
+	 * whatever defaults had accumulated. */
+	{
+		memset(buf, 0, sizeof buf);
+		buf[2] = 9;                     /* claims 9 bytes: 8 + 1 */
+		buf[6] = 0x08;                  /* but declares MCS, which needs 3 */
+		if (mt_radiotap_parse(buf, sizeof buf, &r) > 0) {
+			printf("  FAIL malformed header accepted (MCS field runs "
+			       "past the declared length)\n");
+			fails++;
+		}
+	}
+}
+
 int main(void)
 {
 	test_hdrlen();
@@ -377,6 +443,7 @@ int main(void)
 	test_rx_l2pad();
 	test_chan_group();
 	test_vht_bandwidth();
+	test_ht_bandwidth();
 	printf("frame_shape: %s\n", fails ? "FAIL" : "PASS");
 	return fails ? 1 : 0;
 }

@@ -142,8 +142,20 @@ int mt_radiotap_parse(const uint8_t *buf, size_t len, struct mt7612u_tx_rate *r)
 			if (!size)
 				return (int)rlen;
 			off = (off + align - 1) & ~((size_t)align - 1);
-			if (off + size > rlen)
-				return (int)rlen;
+			/* A declared field that runs past the declared header
+			 * length is a malformed header, not a short one. Returning
+			 * rlen here reported success, and both injection entry
+			 * points then transmitted the frame at whatever defaults
+			 * or half-parsed rate had accumulated - a silently wrong
+			 * rate rather than a refused frame. An unknown *trailing*
+			 * present bit is different and still stops cleanly above:
+			 * there the header is well formed, we just cannot read the
+			 * rest of it. */
+			if (off + size > rlen) {
+				ERR("radiotap: field for present bit %u runs past the "
+				    "declared %zu-byte header", bit, rlen);
+				return -1;
+			}
 			p = buf + off;
 			off += size;
 
@@ -176,7 +188,15 @@ int mt_radiotap_parse(const uint8_t *buf, size_t len, struct mt7612u_tx_rate *r)
 				r->phy = MT7612U_PHY_HT;
 				r->mcs = p[2];
 				r->nss = (uint8_t)(1 + (p[2] >> 3));
-				if ((known & 0x02) && ((flags & 0x03) == 1))
+				/* The bandwidth field is declared by HAVE_BW (0x01),
+				 * NOT by HAVE_MCS (0x02). Gating it on 0x02 narrowed a
+				 * requested 40 MHz frame to 20 whenever a caller
+				 * declared bandwidth without also declaring an MCS
+				 * index - legal radiotap, and silent on air. Same shape
+				 * as the VHT bandwidth bug fixed earlier; this is its
+				 * HT twin. Flags bits 1:0 are 0=20 1=40 2=20L 3=20U, so
+				 * only 1 is a 40 MHz frame. */
+				if ((known & 0x01) && ((flags & 0x03) == 1))
 					r->bw = MT7612U_BW_40;
 				if (known & 0x04) r->sgi  = (flags >> 2) & 1;
 				if (known & 0x10) r->ldpc = (flags >> 4) & 1;
