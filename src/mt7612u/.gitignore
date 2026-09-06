@@ -1,0 +1,4 @@
+bringup
+*.o
+*.d
+firmware/

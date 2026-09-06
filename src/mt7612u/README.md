@@ -1,0 +1,65 @@
+# src/mt7612u — MediaTek MT7612U, standalone
+
+**Not built by `CMakeLists.txt`.** This subtree does not implement
+`IRtlDevice`, is not reachable from `WiFiDriver`, and adds nothing to the
+library target. It builds on its own:
+
+```sh
+make -C src/mt7612u            # -> src/mt7612u/bringup
+sudo ./src/mt7612u/bringup regs
+```
+
+Measurements, methods and limits: [`../../docs/mt7612u.md`](../../docs/mt7612u.md).
+
+## Layout
+
+| file | what |
+|---|---|
+| `usb.c` | libusb transport: EP0 vendor register access, sync bulk, open/claim/reset |
+| `async.c` | event thread, 16-deep RX ring, 32-slot TX pool |
+| `mcu.c` | in-band MCU command framing (EP 8 out, EP 5 in, 4-bit sequence) |
+| `fw.c` | ROM patch + ILM/DLM firmware upload |
+| `eeprom.c` | 512-byte EEPROM: identity, TX power tables, RX gain |
+| `init.c` | power-on, MAC initvals, mac_start/stop, EP-4 flush |
+| `phy.c` | band/bandwidth/TX power registers, channel + calibration sequence |
+| `tx.c` | TXWI + TXINFO construction |
+| `rx.c` | RXWI parse, per-chain RSSI, rate decode |
+| `radiotap.c` | `send_packet` / `send_packets` (USB chaining via `NEXT_VLD`) |
+| `caps.c` | TSF, capability descriptor, ACK responder |
+| `tools/bringup.c` | one subcommand per verified gate |
+
+## Firmware
+
+Needs `mt7662_rom_patch.bin` and `mt7662.bin` from `linux-firmware`
+(`/lib/firmware/mediatek/`, zstd-compressed on most distributions). Not
+vendored here. Point `bringup` at a directory holding the decompressed pair:
+
+```sh
+zstd -d /lib/firmware/mediatek/mt7662{,_rom_patch}.bin.zst -o firmware/
+```
+
+## Gates
+
+Each subcommand is a hardware check that fails loudly, in dependency order:
+
+```
+regs   registers + EEPROM round-trip        chan   channel set, 20 MHz
+fw     ROM patch + firmware + MCU ack       tx     inject at a fixed rate
+init   full bring-up + register-stream log  rx     monitor receive
+caps   capabilities, TSF, 40 MHz            soak   sync vs async throughput
+pwr    TX power vs the kernel's values      ampdu  aggregation A/B
+gateg  per-frame rate control               ack    ACK responder (needs a stimulus)
+rtap   send_packet / send_packets           hop    channel-switch cost
+```
+
+## Provenance
+
+Register sequences and descriptor layouts are derived from `openwrt/mt76`
+(`mt76x2/`, `mt76x02*`, `usb.c`), BSD-3-Clause-Clear, Copyright (C) 2016 Felix
+Fietkau, (C) 2018 Lorenzo Bianconi / Stanislaw Gruszka. Files carrying ported
+sequences keep that notice.
+
+Two things here are **not** ports and were proven on air rather than copied:
+the `MT_TXD_INFO_NEXT_VLD` USB chaining in `radiotap.c`, and the ACK responder
+in `caps.c`. One thing copied from mt76 was **wrong** — see the TSF note in the
+docs.

@@ -1,0 +1,184 @@
+/* SPDX-License-Identifier: BSD-3-Clause-Clear */
+#ifndef MT7612U_INTERNAL_H
+#define MT7612U_INTERNAL_H
+
+#include <libusb-1.0/libusb.h>
+#include <pthread.h>
+#include <time.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <stdio.h>
+#include "regs.h"
+#include "include/mt7612u/mt7612u.h"
+
+/* Per-rate TX power, 0.5 dB units, exactly mt76x02_rate_power's layout. */
+struct mt_rate_power {
+	union {
+		struct { int8_t cck[4], ofdm[8], ht[16], vht[2]; };
+		int8_t all[30];
+	};
+};
+
+struct mt_tx_power_info {
+	uint8_t target_power;
+	int8_t  delta_bw40, delta_bw80;
+	struct { int8_t tssi_slope, tssi_offset, target_power, delta; } chain[2];
+};
+
+/* EEPROM-derived values the host computes with (firmware does the rest). */
+struct mt7612u_cal {
+	int8_t  rssi_offset[2];
+	int8_t  lna_gain;
+	int8_t  high_gain[2];
+	uint8_t init_cal_done;
+	uint8_t channel_cal_done;
+	uint32_t mcu_gain;
+	uint8_t  agc_gain_init[2];
+	uint8_t  tssi_cal_done;
+};
+
+#define MT_RX_RING  16
+#define MT_TX_RING  32
+#define MT_RX_BUFSZ 4096
+#define MT_TX_BUFSZ 2048
+#define MT_USB_AGG_BUF  16384   /* one aggregated bulk-OUT transfer */
+#define MT_USB_AGG_MAX  32      /* frames chained per transfer */
+
+struct mt7612u_dev;
+struct mt_slot { struct mt7612u_dev *d; int idx; };
+
+struct mt_async {
+	struct libusb_transfer *rx[MT_RX_RING], *tx[MT_TX_RING];
+	struct mt_slot rx_slot[MT_RX_RING], tx_slot[MT_TX_RING];
+	uint8_t rx_buf[MT_RX_RING][MT_RX_BUFSZ];
+	uint8_t tx_buf[MT_TX_RING][MT_TX_BUFSZ];
+	int     tx_busy[MT_TX_RING];
+	pthread_mutex_t tx_lock;
+	pthread_cond_t  tx_cv;
+	pthread_t evt;
+	volatile int running, rx_active;
+	volatile int tx_inflight, rx_inflight;
+	mt7612u_rx_cb cb;
+	void *cb_user;
+	uint64_t tx_submitted, tx_done_n, tx_err, rx_frames, rx_err;
+};
+
+struct mt7612u_dev {
+	libusb_context       *ctx;
+	libusb_device_handle *h;
+	int      kernel_was_attached;
+	int      keep_detached;
+
+	uint32_t rev;             /* MT_ASIC_VERSION, e.g. 0x76120044 */
+	uint8_t  eeprom[MT7612U_EEPROM_SIZE];
+	uint8_t  macaddr[6];
+	uint16_t chainmask;       /* 0x202 = 2T2R */
+	uint8_t  mcu_seq;
+	uint8_t  chan;
+	uint8_t  bw;
+	int8_t   txpower_conf;      /* limit, 0.5 dB units (dBm * 2) */
+	int8_t   target_power;
+	int8_t   target_power_delta[2];
+	int      enable_tpc;        /* per-packet TX_PWR_ADJ; mt76 defaults it off */
+	struct mt_rate_power rate_power;
+	struct mt7612u_cal cal;
+
+	/* Oracle-diff log: every EP0 write we emit, in order. */
+	uint8_t  ack_saved_mac[6];
+	int      ack_saved;
+	struct mt_async *a;
+	FILE    *wrlog;
+	FILE    *mculog;
+};
+
+/* --- usb.c --- */
+int      mt_open(struct mt7612u_dev *d, const char **err);
+void     mt_close(struct mt7612u_dev *d);
+uint32_t mt_rr(struct mt7612u_dev *d, uint32_t addr);
+void     mt_wr(struct mt7612u_dev *d, uint32_t addr, uint32_t val);
+void     mt_rmw(struct mt7612u_dev *d, uint32_t addr, uint32_t mask, uint32_t val);
+#define  mt_set(d, a, v)   mt_rmw(d, a, v, v)
+#define  mt_clear(d, a, v) mt_rmw(d, a, v, 0)
+/* Poll until (rr(addr) & mask) == val. Returns 1 on success, 0 on timeout. */
+int      mt_poll(struct mt7612u_dev *d, uint32_t addr, uint32_t mask,
+                 uint32_t val, int timeout_us);
+int      mt_vendor_req(struct mt7612u_dev *d, uint8_t req, uint8_t type,
+                       uint16_t val, uint16_t idx, void *buf, size_t len);
+/* Two 16-bit halves, as mt76u_single_wr(). Used for the FCE DMA regs. */
+void     mt_wr_copy(struct mt7612u_dev *d, uint32_t offset, const void *data, int len);
+void     mt_single_wr(struct mt7612u_dev *d, uint8_t req, uint16_t off, uint32_t val);
+int      mt_bulk(struct mt7612u_dev *d, uint8_t ep, void *buf, int len,
+                 int *xfered, unsigned timeout_ms);
+int      mt_wait_for_mac(struct mt7612u_dev *d);
+void     mt_usleep(unsigned us);
+
+/* --- mcu.c --- */
+int mt_mcu_send(struct mt7612u_dev *d, int cmd, const void *data, int len, int wait_resp);
+int mt_mcu_function_select(struct mt7612u_dev *d, int func, uint32_t val);
+int mt_mcu_set_radio_state(struct mt7612u_dev *d, int on);
+int mt_mcu_calibrate(struct mt7612u_dev *d, int type, uint32_t param);
+int mt_mcu_load_cr(struct mt7612u_dev *d, uint8_t type, uint8_t temp, uint8_t ch);
+int mt_mcu_set_channel(struct mt7612u_dev *d, uint8_t ch, uint8_t bw, uint8_t bw_index, int scan);
+int mt_mcu_init_gain(struct mt7612u_dev *d, uint8_t ch, uint32_t gain, int force);
+
+/* --- fw.c --- */
+int mt_fw_init(struct mt7612u_dev *d, const char *fw_dir);
+
+/* --- eeprom.c --- */
+void mt_get_rate_power(struct mt7612u_dev *d, struct mt_rate_power *t, int band);
+void mt_get_power_info(struct mt7612u_dev *d, struct mt_tx_power_info *t,
+                       uint8_t chan, int band);
+void mt_read_rx_gain(struct mt7612u_dev *d, uint8_t chan, int band);
+int mt_eeprom_init(struct mt7612u_dev *d);
+uint16_t mt_ee(const struct mt7612u_dev *d, unsigned off);
+
+/* --- init.c --- */
+void mt_power_cycle(struct mt7612u_dev *d);
+int mt_init_hardware(struct mt7612u_dev *d, const char *fw_dir);
+int mt_mac_start(struct mt7612u_dev *d, int enable_rx);
+void mt_rx_flush(struct mt7612u_dev *d);
+int mt_mac_stop(struct mt7612u_dev *d);
+
+/* --- tx.c --- */
+uint16_t mt_tx_rate_word(const struct mt7612u_tx_rate *r);
+#define MT_TXOPT_RATE_LUT  0x01  /* set MT_TXWI_FLAGS_TX_RATE_LUT */
+#define MT_TXOPT_AMPDU     0x02  /* AMPDU flag + density + BA window */
+#define MT_TXOPT_QSEL_MGMT 0x04  /* mt76 uses MT_QSEL_MGMT for aggregated TX */
+int mt_tx_build(struct mt7612u_dev *d, uint8_t *buf, size_t bufsz,
+                const void *frame, size_t len,
+                const struct mt7612u_tx_rate *rate, uint8_t wcid, unsigned opts,
+                int next_vld, int trailer);
+int mt_tx_raw(struct mt7612u_dev *d, const void *frame, size_t len,
+              const struct mt7612u_tx_rate *rate, uint8_t wcid, unsigned opts);
+void mt_wcid_setup(struct mt7612u_dev *d, uint8_t idx, const uint8_t *mac);
+
+/* --- radiotap.c --- */
+int mt_radiotap_parse(const uint8_t *buf, size_t len, struct mt7612u_tx_rate *r);
+
+/* --- async.c --- */
+int  mt_async_start(struct mt7612u_dev *d, mt7612u_rx_cb cb, void *user);
+void mt_async_stop(struct mt7612u_dev *d);
+int  mt_async_tx_submit(struct mt7612u_dev *d, const uint8_t *buf, int len);
+
+/* --- rx.c --- */
+int mt_rx_parse(struct mt7612u_dev *d, uint8_t *buf, int n,
+                const uint8_t **frame, struct mt7612u_rx_info *info);
+int mt_rx_one(struct mt7612u_dev *d, uint8_t *buf, int bufsize,
+              const uint8_t **frame, struct mt7612u_rx_info *info,
+              unsigned timeout_ms);
+
+/* --- phy.c / chan.c --- */
+void mt_phy_set_rxpath(struct mt7612u_dev *d);
+void mt_phy_set_txpower(struct mt7612u_dev *d, int band);
+int  mt_tssi_enabled(struct mt7612u_dev *d);
+int8_t mt_tx_get_max_txpwr_adj(struct mt7612u_dev *d,
+                               const struct mt7612u_tx_rate *r);
+int8_t mt_tx_get_txpwr_adj(struct mt7612u_dev *d, int8_t txpwr, int8_t max_adj);
+void mt_phy_set_txdac(struct mt7612u_dev *d);
+int  mt_set_channel(struct mt7612u_dev *d, uint8_t chan, uint8_t bw);
+int  mt_set_channel_ex(struct mt7612u_dev *d, uint8_t chan, uint8_t bw, int fast);
+
+#define LOG(...)  do { fprintf(stderr, "[mt7612u] " __VA_ARGS__); fputc('\n', stderr); } while (0)
+#define ERR(...)  do { fprintf(stderr, "[mt7612u] ERROR " __VA_ARGS__); fputc('\n', stderr); } while (0)
+
+#endif
