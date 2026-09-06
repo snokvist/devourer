@@ -1065,6 +1065,276 @@ static int gate_ack(uint8_t chan, int secs, int arm)
 	return 0;
 }
 
+
+/*
+ * The three modulation flags in the rate word: LDPC, STBC and short GI.
+ *
+ * Each frame carries both the DESC_RATE it should air at and the flag bits it
+ * should carry, so the witness compares the frame against its own claim
+ * rather than against an arm table.
+ *
+ * One arm is a deliberate negative control: STBC is requested at two spatial
+ * streams, where mt_tx_rate_word() refuses to set it because mt76 refuses too
+ * (STBC on this MAC is a 1SS feature). The frame must air with stbc clear. An
+ * arm that only ever asks for things that work cannot tell a working encoder
+ * from one that sets every bit it is handed.
+ */
+static int gate_coding(uint8_t chan, int count, int bw40)
+{
+	static const uint8_t src[6] = { 0x02, 0x4d, 0x54, 0x76, 0x12, 0x01 };
+	static const struct { enum mt7612u_phy phy; uint8_t mcs, nss; int base; }
+	rates[] = {
+		{ MT7612U_PHY_HT,   3, 1, 15 },
+		{ MT7612U_PHY_HT,   7, 1, 19 },
+		{ MT7612U_PHY_HT,  11, 2, 23 },
+		{ MT7612U_PHY_VHT,  3, 1, 47 },
+		{ MT7612U_PHY_VHT,  7, 1, 51 },
+		{ MT7612U_PHY_VHT,  3, 2, 57 },
+		{ MT7612U_PHY_VHT,  7, 2, 61 },
+	};
+	uint8_t f[64];
+	int arms = 0;
+
+	if (mt_eeprom_init(&dev)) return 1;
+	if (mt_init_hardware(&dev, NULL)) return 1;
+	if (mt_set_channel(&dev, chan, bw40 ? MT7612U_BW_40 : MT7612U_BW_20)) return 1;
+	if (mt_mac_start(&dev, 0)) return 1;
+
+	printf("ch%u at %d MHz, %d frames per arm\n\n", chan, bw40 ? 40 : 20, count);
+	printf("  %-16s %-10s %-9s %s\n", "rate", "asked", "rate word", "expect on air");
+
+	memset(f, 0, sizeof f);
+	f[0] = 0x08;
+	memset(f + 4, 0xff, 6);
+	memcpy(f + 10, src, 6);
+	memcpy(f + 16, src, 6);
+	memcpy(f + 24, "MT7612U-HAL ", 12);
+
+	for (unsigned i = 0; i < sizeof rates / sizeof rates[0]; i++) {
+		for (int coding = 0; coding < 8; coding++) {
+			struct mt7612u_tx_rate r = {
+				.phy = rates[i].phy, .mcs = rates[i].mcs,
+				.nss = rates[i].nss,
+				.bw = bw40 ? MT7612U_BW_40 : MT7612U_BW_20,
+				.sgi = (coding & 4) ? 1u : 0u,
+				.ldpc = (coding & 1) ? 1u : 0u,
+				.stbc = (coding & 2) ? 1u : 0u,
+				.no_ack = 1,
+			};
+			uint16_t word = mt_tx_rate_word(&r);
+			/* What the encoder actually committed to, which is what
+			 * the air must show - not what was asked for. */
+			int on_air = ((word & MT_RATE_LDPC) ? 1 : 0) |
+			             ((word & MT_RATE_STBC) ? 2 : 0) |
+			             ((word & MT_RATE_SGI)  ? 4 : 0);
+			char asked[16], expect[24];
+			long sent = 0;
+
+			snprintf(asked, sizeof asked, "%s%s%s",
+			         (coding & 1) ? "L" : "-", (coding & 2) ? "S" : "-",
+			         (coding & 4) ? "G" : "-");
+			snprintf(expect, sizeof expect, "rate %d  %s%s%s",
+			         rates[i].base,
+			         (on_air & 1) ? "L" : "-", (on_air & 2) ? "S" : "-",
+			         (on_air & 4) ? "G" : "-");
+			printf("  %s MCS%-2d %dSS  %-10s 0x%04x    %s%s\n",
+			       rates[i].phy == MT7612U_PHY_HT ? "HT " : "VHT",
+			       rates[i].mcs, rates[i].nss, asked, word, expect,
+			       (coding & 2) && rates[i].nss > 1 ? "   <- STBC refused at 2SS" : "");
+
+			f[36] = (uint8_t)rates[i].base;
+			f[38] = (uint8_t)on_air;
+			for (int n = 0; n < count; n++) {
+				f[22] = (uint8_t)((n & 0xf) << 4);
+				f[23] = (uint8_t)(n >> 4);
+				f[37] = (uint8_t)n;
+				if (mt7612u_tx(&dev, f, 44, &r) == 0) sent++;
+				mt_usleep(1200);
+			}
+			if (sent != count)
+				printf("       submitted only %ld/%d\n", sent, count);
+			arms++;
+			mt_usleep(80000);
+		}
+	}
+
+	mt_mac_stop(&dev);
+	printf("\n%d arms swept. Payload offset 12 is the expected DESC_RATE,\n"
+	       "offset 14 the expected LDPC|STBC|SGI bits.\n", arms);
+	return 0;
+}
+
+/*
+ * Full rate-ladder sweep: every HT MCS 0-15 and every legal VHT MCS at both
+ * stream counts, at whichever width the caller picks.
+ *
+ * Each frame carries its own expected DESC_RATE code in the payload, so the
+ * check is "did this frame air at the rate it says it should have" rather
+ * than an arm table the analysis has to agree with separately. A frame that
+ * airs at the wrong rate indicts itself.
+ *
+ * VHT MCS9 is not legal at 20 MHz for one or two streams, so it is skipped
+ * there and included at 40.
+ */
+static int gate_sweep(uint8_t chan, int count, int bw40)
+{
+	static const uint8_t src[6] = { 0x02, 0x4d, 0x54, 0x76, 0x12, 0x01 };
+	uint8_t f[64];
+	int arms = 0;
+
+	if (mt_eeprom_init(&dev)) return 1;
+	if (mt_init_hardware(&dev, NULL)) return 1;
+	if (mt_set_channel(&dev, chan, bw40 ? MT7612U_BW_40 : MT7612U_BW_20)) return 1;
+	if (mt_mac_start(&dev, 0)) return 1;
+
+	printf("ch%u at %d MHz, chainmask 0x%04x, %d frames per rate\n\n",
+	       chan, bw40 ? 40 : 20, dev.chainmask, count);
+	printf("  %-18s %-9s %s\n", "rate", "rate word", "expected DESC_RATE");
+
+	memset(f, 0, sizeof f);
+	f[0] = 0x08;
+	memset(f + 4, 0xff, 6);
+	memcpy(f + 10, src, 6);
+	memcpy(f + 16, src, 6);
+	memcpy(f + 24, "MT7612U-HAL ", 12);
+
+	for (int phase = 0; phase < 2; phase++) {
+		int last_mcs = phase == 0 ? 15 : (bw40 ? 9 : 8);
+
+		for (int mcs = 0; mcs <= last_mcs; mcs++) {
+			for (int nss = 1; nss <= 2; nss++) {
+				struct mt7612u_tx_rate r = {
+					.bw = bw40 ? MT7612U_BW_40 : MT7612U_BW_20,
+					.no_ack = 1,
+				};
+				char what[32];
+				int expect;
+				long sent = 0;
+
+				if (phase == 0) {
+					/* HT folds the stream count into the MCS
+					 * number, so it is one ladder, not two. */
+					if (nss == 2) continue;
+					r.phy = MT7612U_PHY_HT;
+					r.mcs = (uint8_t)mcs;
+					r.nss = (uint8_t)(1 + (mcs >> 3));
+					expect = 12 + mcs;
+					snprintf(what, sizeof what, "HT  MCS%-2d %dSS", mcs, r.nss);
+				} else {
+					r.phy = MT7612U_PHY_VHT;
+					r.mcs = (uint8_t)mcs;
+					r.nss = (uint8_t)nss;
+					expect = 44 + (nss - 1) * 10 + mcs;
+					snprintf(what, sizeof what, "VHT MCS%-2d %dSS", mcs, nss);
+				}
+
+				printf("  %-18s 0x%04x    %d\n", what,
+				       mt_tx_rate_word(&r), expect);
+				f[36] = (uint8_t)expect;
+				for (int i = 0; i < count; i++) {
+					f[22] = (uint8_t)((i & 0xf) << 4);
+					f[23] = (uint8_t)(i >> 4);
+					f[37] = (uint8_t)i;
+					if (mt7612u_tx(&dev, f, 44, &r) == 0) sent++;
+					mt_usleep(1200);
+				}
+				if (sent != count)
+					printf("       submitted only %ld/%d\n", sent, count);
+				arms++;
+				mt_usleep(100000);
+			}
+		}
+	}
+
+	mt_mac_stop(&dev);
+	printf("\n%d rates swept. Each frame carries its own expected DESC_RATE\n"
+	       "at payload offset 12; the witness compares the two.\n", arms);
+	return 0;
+}
+
+/*
+ * VHT and two spatial streams on air.
+ *
+ * The rate word encodes both and the RX path decodes both, but until now
+ * neither had been transmitted - docs/mt7612u.md listed them as unexercised.
+ * Each arm carries its own tag byte so the witness attributes frames by
+ * content rather than by timestamp, and each has one expected DESC_RATE code
+ * at the witness: HT is 12+mcs, VHT 1SS is 44+mcs, VHT 2SS is 54+mcs. A
+ * stream count that silently collapsed to one would land on the 1SS codes,
+ * which is exactly the failure this is looking for.
+ *
+ * VHT MCS9 is not a legal rate at 20 MHz for one or two streams, so it only
+ * appears in the 40 MHz arms.
+ */
+static int gate_vht(uint8_t chan, int count, int bw40)
+{
+	static const uint8_t src[6] = { 0x02, 0x4d, 0x54, 0x76, 0x12, 0x01 };
+	static const struct {
+		char tag; enum mt7612u_phy phy; uint8_t mcs, nss; int wide_only;
+		const char *what; int expect;
+	} arms[] = {
+		{ 'P', MT7612U_PHY_HT,  7,  1, 0, "HT   MCS7  1SS", 19 },
+		{ 'Q', MT7612U_PHY_HT, 15,  2, 0, "HT   MCS15 2SS", 27 },
+		{ 'R', MT7612U_PHY_VHT, 0,  1, 0, "VHT  MCS0  1SS", 44 },
+		{ 'S', MT7612U_PHY_VHT, 7,  1, 0, "VHT  MCS7  1SS", 51 },
+		{ 'T', MT7612U_PHY_VHT, 8,  1, 0, "VHT  MCS8  1SS", 52 },
+		{ 'U', MT7612U_PHY_VHT, 0,  2, 0, "VHT  MCS0  2SS", 54 },
+		{ 'V', MT7612U_PHY_VHT, 7,  2, 0, "VHT  MCS7  2SS", 61 },
+		{ 'X', MT7612U_PHY_VHT, 8,  2, 0, "VHT  MCS8  2SS", 62 },
+		{ 'Y', MT7612U_PHY_VHT, 9,  1, 1, "VHT  MCS9  1SS", 53 },
+		{ 'Z', MT7612U_PHY_VHT, 9,  2, 1, "VHT  MCS9  2SS", 63 },
+	};
+	uint8_t f[64];
+
+	if (mt_eeprom_init(&dev)) return 1;
+	if (mt_init_hardware(&dev, NULL)) return 1;
+	if (mt_set_channel(&dev, chan, bw40 ? MT7612U_BW_40 : MT7612U_BW_20)) return 1;
+	if (mt_mac_start(&dev, 0)) return 1;
+
+	printf("chainmask 0x%04x -> %d spatial streams, txwi[17]=0x%02x\n",
+	       dev.chainmask, (dev.chainmask & 0xf) > 1 ? 2 : 1,
+	       ((dev.chainmask & 0xf) > 1) ? 0x13 : 0);
+	printf("ch%u at %d MHz, %d frames per arm\n\n", chan, bw40 ? 40 : 20, count);
+	printf("  tag  %-16s rate word  expected witness DESC_RATE\n", "arm");
+
+	memset(f, 0, sizeof f);
+	f[0] = 0x08;                       /* data, 3-address */
+	memset(f + 4, 0xff, 6);            /* broadcast */
+	memcpy(f + 10, src, 6);
+	memcpy(f + 16, src, 6);
+	memcpy(f + 24, "MT7612U-HAL ", 12);
+
+	for (unsigned a = 0; a < sizeof arms / sizeof arms[0]; a++) {
+		struct mt7612u_tx_rate r = { .phy = arms[a].phy, .mcs = arms[a].mcs,
+		                             .nss = arms[a].nss,
+		                             .bw = bw40 ? MT7612U_BW_40 : MT7612U_BW_20,
+		                             .no_ack = 1 };
+		long sent = 0;
+
+		if (arms[a].wide_only && !bw40) continue;
+
+		printf("  %c    %-16s 0x%04x     %d\n", arms[a].tag, arms[a].what,
+		       mt_tx_rate_word(&r), arms[a].expect);
+		f[36] = (uint8_t)arms[a].tag;
+		for (int i = 0; i < count; i++) {
+			f[22] = (uint8_t)((i & 0xf) << 4);
+			f[23] = (uint8_t)(i >> 4);
+			f[37] = (uint8_t)i;
+			f[38] = (uint8_t)(i >> 8);
+			if (mt7612u_tx(&dev, f, 44, &r) == 0) sent++;
+			mt_usleep(1500);
+		}
+		printf("       submitted %ld/%d\n", sent, count);
+		mt_usleep(150000);
+	}
+
+	mt_mac_stop(&dev);
+	printf("\nFrames submitted. The witness decides: each tag must appear at\n"
+	       "its expected DESC_RATE. A 2SS arm landing on a 1SS code means the\n"
+	       "second stream did not go out.\n");
+	return 0;
+}
+
 /*
  * The two radiotap entry points: send_packet (one framed MPDU) and
  * send_packets (several, chained into one bulk-OUT transfer via
@@ -1177,6 +1447,18 @@ int main(int argc, char **argv)
 		              argc > 4 ? atoi(argv[4]) : 0);
 	} else if (!strcmp(cmd, "caps")) {
 		rc = gate_caps(argc > 2 ? (uint8_t)atoi(argv[2]) : 149);
+	} else if (!strcmp(cmd, "coding")) {
+		rc = gate_coding(argc > 2 ? (uint8_t)atoi(argv[2]) : 149,
+		                 argc > 3 ? atoi(argv[3]) : 100,
+		                 argc > 4 ? atoi(argv[4]) : 0);
+	} else if (!strcmp(cmd, "sweep")) {
+		rc = gate_sweep(argc > 2 ? (uint8_t)atoi(argv[2]) : 149,
+		                argc > 3 ? atoi(argv[3]) : 120,
+		                argc > 4 ? atoi(argv[4]) : 0);
+	} else if (!strcmp(cmd, "vht")) {
+		rc = gate_vht(argc > 2 ? (uint8_t)atoi(argv[2]) : 149,
+		              argc > 3 ? atoi(argv[3]) : 300,
+		              argc > 4 ? atoi(argv[4]) : 0);
 	} else if (!strcmp(cmd, "ampdu")) {
 		rc = gate_ampdu(argc > 2 ? (uint8_t)atoi(argv[2]) : 149,
 		                argc > 3 ? atoi(argv[3]) : 400);

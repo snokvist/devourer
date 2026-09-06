@@ -4,6 +4,7 @@
  * plumbing; the wire encoding is identical (verified against usbmon, see
  * ../../INVESTIGATION.md §11).
  */
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include "internal.h"
@@ -215,6 +216,75 @@ int mt_adopt(struct mt7612u_dev *d, libusb_device_handle *h,
 	return mt_identify(d, err);
 }
 
+/*
+ * Open one MT7612U, honouring MT7612U_DEV when more than one is attached.
+ *
+ * libusb_open_device_with_vid_pid() returns whichever matching device
+ * enumerates first, which is fine with one adapter and silently ambiguous
+ * with two - a measurement then attributes itself to whichever unit the bus
+ * happened to hand over. MT7612U_DEV takes a "bus-port" as lsusb and sysfs
+ * spell it ("2-1"), or a bare index into the matches in enumeration order.
+ */
+static libusb_device_handle *open_selected(libusb_context *ctx, const char **err)
+{
+	const char *sel = getenv("MT7612U_DEV");
+	libusb_device **list = NULL;
+	libusb_device_handle *h = NULL;
+	ssize_t n = libusb_get_device_list(ctx, &list);
+	int matches = 0;
+
+	if (n < 0) {
+		if (err) *err = "libusb_get_device_list failed";
+		return NULL;
+	}
+
+	for (ssize_t i = 0; i < n; i++) {
+		struct libusb_device_descriptor desc;
+		uint8_t ports[8];
+		char id[32];
+		int np, off;
+
+		if (libusb_get_device_descriptor(list[i], &desc))
+			continue;
+		if (desc.idVendor != MT7612U_VID || desc.idProduct != MT7612U_PID)
+			continue;
+
+		np = libusb_get_port_numbers(list[i], ports, sizeof ports);
+		off = snprintf(id, sizeof id, "%u", libusb_get_bus_number(list[i]));
+		for (int j = 0; j < np && off > 0 && off < (int)sizeof id; j++)
+			off += snprintf(id + off, sizeof id - (size_t)off, "%s%u",
+			                j ? "." : "-", ports[j]);
+
+		if (!sel || !*sel) {
+			LOG("MT7612U at %s%s", id, matches ? "" : "  <- selected (first)");
+		} else if (!strcmp(sel, id)) {
+			LOG("MT7612U at %s  <- selected by MT7612U_DEV", id);
+		} else {
+			char idx[8];
+
+			snprintf(idx, sizeof idx, "%d", matches);
+			if (strcmp(sel, idx)) { matches++; continue; }
+			LOG("MT7612U at %s  <- selected by MT7612U_DEV index %d", id, matches);
+		}
+
+		if (!h && libusb_open(list[i], &h))
+			h = NULL;
+		matches++;
+		if (h && sel && *sel)
+			break;
+	}
+
+	if (matches > 1 && (!sel || !*sel))
+		LOG("warning: %d MT7612U adapters attached and MT7612U_DEV is unset - "
+		    "using the first. Set MT7612U_DEV=<bus-port> to be explicit.",
+		    matches);
+	libusb_free_device_list(list, 1);
+	if (!h && err)
+		*err = matches ? "MT7612U found but could not be opened (try sudo)"
+		               : "MT7612U not found";
+	return h;
+}
+
 int mt_open(struct mt7612u_dev *d, const char **err)
 {
 	int rc;
@@ -222,9 +292,8 @@ int mt_open(struct mt7612u_dev *d, const char **err)
 	if (libusb_init(&d->ctx)) { if (err) *err = "libusb_init failed"; return -1; }
 	d->owns_handle = 1;
 
-	d->h = libusb_open_device_with_vid_pid(d->ctx, MT7612U_VID, MT7612U_PID);
+	d->h = open_selected(d->ctx, err);
 	if (!d->h) {
-		if (err) *err = "MT7612U not found or permission denied (try sudo)";
 		libusb_exit(d->ctx); d->ctx = NULL;
 		return -1;
 	}
@@ -248,7 +317,7 @@ int mt_open(struct mt7612u_dev *d, const char **err)
 		/* Re-enumerated under a new address: reopen and re-detach. */
 		libusb_close(d->h);
 		mt_usleep(200000);
-		d->h = libusb_open_device_with_vid_pid(d->ctx, MT7612U_VID, MT7612U_PID);
+		d->h = open_selected(d->ctx, NULL);
 		if (!d->h) {
 			if (err) *err = "device vanished after USB reset";
 			libusb_exit(d->ctx); d->ctx = NULL;
