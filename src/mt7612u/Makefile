@@ -7,7 +7,7 @@ CFLAGS  ?= -O2 -g -Wall -Wextra -Wno-unused-parameter
 DEPFLAGS = -MMD -MP
 LDLIBS   = -lusb-1.0 -lpthread
 LIBSRCS  = $(wildcard *.c)
-TESTS    = tests/api_link tests/frame_shape
+TESTS    = tests/api_link tests/frame_shape tests/field_macros
 SRCS     = $(LIBSRCS) tools/bringup.c $(TESTS:=.c)
 OBJS     = $(SRCS:.c=.o)
 LIBOBJS  = $(LIBSRCS:.c=.o)
@@ -24,6 +24,9 @@ tests/api_link: $(LIBOBJS) tests/api_link.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 tests/frame_shape: $(LIBOBJS) tests/frame_shape.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+tests/field_macros: $(LIBOBJS) tests/field_macros.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 %.o: %.c

@@ -14,10 +14,32 @@
 
 #define BIT(n)              (1u << (n))
 #define GENMASK(h, l)       (((~0u) - (1u << (l)) + 1) & (~0u >> (31 - (h))))
-/* Lowest set bit of a contiguous mask, for FIELD_PREP/GET. */
-#define _SHIFT(m)           (__builtin_ctz(m))
-#define FIELD_PREP(m, v)    (((uint32_t)(v) << _SHIFT(m)) & (m))
-#define FIELD_GET(m, v)     (((uint32_t)(v) & (m)) >> _SHIFT(m))
+
+/*
+ * Position of the lowest set bit of a mask, for FIELD_PREP/FIELD_GET.
+ *
+ * Not __builtin_ctz: MSVC has no such builtin, and its _BitScanForward is a
+ * function taking an out-parameter, so it cannot appear in a constant
+ * expression - which these must be, because FIELD_PREP initialises static
+ * tables (see ext_cca_chan in phy.c). The isolate-lowest-bit plus binary
+ * search below is a constant expression on every compiler and folds to a
+ * single instruction under optimisation.
+ *
+ * `m` is evaluated several times; every mask here is a compile-time constant,
+ * so that is a documentation point rather than a hazard.
+ *
+ * The old name for this was `_SHIFT`, which is reserved to the implementation
+ * in every scope - leading underscore followed by a capital.
+ */
+#define MT_LOWBIT(m)        ((uint32_t)(m) & (~(uint32_t)(m) + 1u))
+#define MT_CTZ(m) ( \
+	((MT_LOWBIT(m) & 0xffff0000u) ? 16u : 0u) | \
+	((MT_LOWBIT(m) & 0xff00ff00u) ?  8u : 0u) | \
+	((MT_LOWBIT(m) & 0xf0f0f0f0u) ?  4u : 0u) | \
+	((MT_LOWBIT(m) & 0xccccccccu) ?  2u : 0u) | \
+	((MT_LOWBIT(m) & 0xaaaaaaaau) ?  1u : 0u))
+#define FIELD_PREP(m, v)    (((uint32_t)(v) << MT_CTZ(m)) & (m))
+#define FIELD_GET(m, v)     (((uint32_t)(v) & (m)) >> MT_CTZ(m))
 
 /* Address-space selectors. Stripped before the transfer; they pick bRequest. */
 #define MT_VEND_TYPE_EEPROM BIT(31)

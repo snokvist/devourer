@@ -40,6 +40,28 @@ replug does. So `mt_mac_start()` takes the receiver as an explicit argument,
 `mt7612u_start()` enables RX only when `mt7612u_rx_start()` is already
 running, and every gate that turns RX on starts the ring *first*.
 
+## Portability
+
+Done here, because these are correctness issues regardless of compiler:
+
+- `FIELD_PREP`/`FIELD_GET` no longer use `__builtin_ctz`. MSVC has no such
+  builtin, and its `_BitScanForward` takes an out-parameter, so it cannot
+  appear in a constant expression - which these must be, since `FIELD_PREP`
+  initialises static tables. `MT_CTZ` is a constant expression everywhere and
+  folds to one instruction. `tests/field_macros` checks it against the
+  builtin over all 32 single-bit and all 528 contiguous masks, and fails to
+  compile if it ever stops being constant-foldable.
+- The shift macro was named `_SHIFT`. Leading underscore plus a capital is
+  reserved to the implementation in every scope.
+- `<libusb.h>` (this project's spelling) is tried first, with the
+  distribution's `<libusb-1.0/libusb.h>` as the fallback.
+
+**Not** done here: `async.c` uses pthreads and `usb.c` uses `nanosleep` /
+`clock_gettime`. This project has no C threading or time shim - its shim is
+the C++ standard library, which every other backend uses directly. Building
+a throwaway C shim now would be deleted at integration, so those two files
+keep POSIX until the subtree joins the build. They are the only two.
+
 ## Firmware
 
 Needs `mt7662_rom_patch.bin` and `mt7662.bin` from `linux-firmware`

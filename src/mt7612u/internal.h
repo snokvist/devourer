@@ -2,7 +2,20 @@
 #ifndef MT7612U_INTERNAL_H
 #define MT7612U_INTERNAL_H
 
-#include <libusb-1.0/libusb.h>
+/* The rest of this project includes <libusb.h> and lets the build system
+ * supply the include directory; the standalone Makefile here has no
+ * pkg-config step, and most distributions install the header under
+ * libusb-1.0/. Try the project's spelling first, fall back to the
+ * distribution path. */
+#if defined(__has_include)
+#  if __has_include(<libusb.h>)
+#    include <libusb.h>
+#  else
+#    include <libusb-1.0/libusb.h>
+#  endif
+#else
+#  include <libusb-1.0/libusb.h>
+#endif
 #include <pthread.h>
 #include <time.h>
 #include <stdint.h>
