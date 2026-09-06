@@ -55,6 +55,21 @@ struct mt7612u_cal {
 #define MT_RX_BUFSZ 4096
 #define MT_TX_BUFSZ 2048
 #define MT_USB_AGG_BUF  16384   /* one aggregated bulk-OUT transfer */
+
+/*
+ * One page, matching MT_RX_BUFSZ. The old 2048 silently capped a single frame
+ * at 2016 B while mt7612u_send_packets() bounded only against the 16 KB
+ * aggregate buffer, so the two public TX entry points disagreed about the
+ * largest frame this backend accepts.
+ *
+ * 4096 is a deliberate choice, not the hardware's limit: measured on air, this
+ * part transmits at least 7900 B and an RTL8812AU decoded 60/60 at every size
+ * up to that with zero CRC errors - far past 802.11's 2304 non-A-MSDU MPDU
+ * ceiling. It is capped here to match what this backend can RECEIVE, because
+ * MT_RX_BUFSZ is one page and a frame larger than that is dropped without a
+ * counter moving. Raising this means raising the RX buffer too.
+ */
+#define MT_TX_BUF_MAX 4096
 #define MT_USB_AGG_MAX  32      /* frames chained per transfer */
 
 struct mt7612u_dev;
@@ -81,6 +96,7 @@ struct mt_async {
 	mt7612u_rx_cb cb;
 	void *cb_user;
 	uint64_t tx_submitted, tx_done_n, tx_err, rx_frames, rx_err, rx_invalid;
+	uint64_t rx_dropped;      /* rejected on length: truncated, or > MT_RX_BUFSZ */
 };
 
 struct mt7612u_dev {
@@ -196,6 +212,7 @@ int mt_radiotap_parse(const uint8_t *buf, size_t len, struct mt7612u_tx_rate *r)
 /* --- async.c --- */
 struct mt_async_stats {
 	uint64_t tx_submitted, tx_done, tx_err, rx_frames, rx_err, rx_invalid;
+	uint64_t rx_dropped;
 };
 void mt_async_stats(struct mt7612u_dev *d, struct mt_async_stats *out);
 void mt_async_note_invalid(struct mt7612u_dev *d);

@@ -10,7 +10,6 @@
 #include <string.h>
 #include "internal.h"
 
-#define MT_TX_BUF_MAX 2048
 
 static void put_le16(uint8_t *p, uint16_t v) { p[0] = v & 0xff; p[1] = v >> 8; }
 static void put_le32(uint8_t *p, uint32_t v)

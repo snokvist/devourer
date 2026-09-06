@@ -551,6 +551,75 @@ static double cpu_ms(void)
 }
 
 /* Sustained TX: synchronous path vs the async ring, same frame and rate. */
+/*
+ * Largest MPDU the part will actually put on air. Not a throughput test: one
+ * burst per size, and the witness decides which sizes arrived.
+ *
+ * Worth measuring because the ceiling in this port was a buffer constant, not
+ * a number anyone had checked, and because the two public TX entry points did
+ * not agree on it - mt7612u_tx() refused above MT_TX_BUF_MAX - 32 while
+ * mt7612u_send_packets() bounded only against the 16 KB aggregate buffer.
+ * 802.11 puts the non-A-MSDU MPDU ceiling at 2304, which is the interesting
+ * boundary; sizes above it are here to see whether the MAC or the USB path
+ * objects first.
+ */
+static int gate_mtu(uint8_t chan, int count)
+{
+	static const uint8_t src[6] = { 0x02, 0x4d, 0x54, 0x76, 0x12, 0x01 };
+	static const int sizes[] = {
+		 200, 1000, 1500, 2000, 2304, 3000, 3836, 3837, 4000, 4064, 4065,
+	};
+	static uint8_t frame[8192];
+	struct mt7612u_tx_rate rate = { .phy = MT7612U_PHY_HT, .mcs = 7, .nss = 1,
+	                                .bw = MT7612U_BW_20, .no_ack = 1 };
+	unsigned k;
+
+	if (count <= 0 || count > 1000) count = 60;
+	if (mt_eeprom_init(&dev)) return 1;
+	if (mt_init_hardware(&dev, NULL)) return 1;
+	if (mt_set_channel(&dev, chan, MT7612U_BW_20)) return 1;
+	if (mt_mac_start(&dev, 0)) return 1;
+
+	memset(frame, 0, sizeof frame);
+	frame[0] = 0x08;                        /* data, 3-address */
+	memset(frame + 4, 0xff, 6);             /* broadcast */
+	memcpy(frame + 10, src, 6);
+	memcpy(frame + 16, src, 6);
+	memcpy(frame + 24, "MT7612U-HAL ", 12);
+
+	printf("ch%u, HT MCS7 20 MHz, %d frames per size.\n"
+	       "'accepted' is what this driver submitted; the witness reports\n"
+	       "which lengths actually decoded.\n\n", chan, count);
+	printf("  %-6s %-10s %s\n", "bytes", "accepted", "note");
+
+	for (k = 0; k < sizeof sizes / sizeof sizes[0]; k++) {
+		int len = sizes[k];
+		long ok = 0;
+		int i;
+
+		if ((size_t)len > sizeof frame) continue;
+		/* Tag the payload with the size so the witness can bucket by what
+		 * was ASKED for, not only by what arrived. */
+		frame[36] = (uint8_t)(len & 0xff);
+		frame[37] = (uint8_t)(len >> 8);
+		for (i = 0; i < count; i++) {
+			frame[38] = (uint8_t)i;
+			if (mt7612u_tx(&dev, frame, (size_t)len, &rate) == 0) ok++;
+			mt_usleep(1500);
+		}
+		printf("  %-6d %ld/%-8d %s\n", len, ok, count,
+		       ok == 0 ? "refused by this driver" :
+		       (len > 2304 ? "above the 802.11 MPDU ceiling" : ""));
+		mt_usleep(120000);
+	}
+
+	mt_mac_stop(&dev);
+	printf("\nThe largest size with a non-zero witness count is the answer.\n"
+	       "A size this driver accepted but the witness never saw was\n"
+	       "submitted and dropped somewhere below - that is the real limit.\n");
+	return 0;
+}
+
 static int gate_soak(uint8_t chan, int secs, int framelen)
 {
 	static const uint8_t src[6] = { 0x02, 0x4d, 0x54, 0x76, 0x12, 0x01 };
@@ -687,12 +756,13 @@ static int gate_arx(uint8_t chan, int secs)
 
 		mt_async_stats(&dev, &st);
 		printf("async RX on ch%u for %.1f s: %lu frames (%.0f/s), rx_err=%llu "
-		       "rx_invalid=%llu\n",
+		       "rx_invalid=%llu rx_dropped=%llu\n",
 		       chan, el, ctx.n, ctx.n / (el > 0 ? el : 1),
 		       (unsigned long long)st.rx_err,
-		       (unsigned long long)st.rx_invalid);
+		       (unsigned long long)st.rx_invalid,
+		       (unsigned long long)st.rx_dropped);
 	}
-	for (int i = 0; i < 5; i++)
+	for (int i = 0; i < 8; i++)
 		if (ctx.by_phy[i]) printf("  %-6s %lu\n", phy_name[i], ctx.by_phy[i]);
 	mt7612u_rx_stop(&dev);
 	mt_mac_stop(&dev);
@@ -956,6 +1026,10 @@ static int gate_caps(uint8_t chan)
 	       c.band_2g_min_mhz, c.band_2g_max_mhz);
 	printf("      ampdu_tx=%u per_chain_rssi=%u narrowband=%u fast_retune=%u\n",
 	       c.ampdu_tx, c.per_chain_rssi, c.narrowband, c.fast_retune);
+	printf("      max MPDU: tx %u  rx %u  (rx is MT_MAX_LEN_CFG 0x%03x on air,\n"
+	       "                             less the 4-byte FCS)\n",
+	       c.max_mpdu_tx, c.max_mpdu_rx,
+	       mt_rr(&dev, MT_MAX_LEN_CFG) & 0xfff);
 
 	printf("\nRX gain from EEPROM: rssi_offset=[%d,%d] lna_gain=%d "
 	       "high_gain=[%d,%d] mcu_gain=0x%08x\n",
@@ -2042,6 +2116,9 @@ int main(int argc, char **argv)
 	} else if (!strcmp(cmd, "coding")) {
 		rc = gate_coding(argc > 2 ? (uint8_t)atoi(argv[2]) : 149,
 		                 argc > 3 ? atoi(argv[3]) : 100, want_bw);
+	} else if (!strcmp(cmd, "mtu")) {
+		rc = gate_mtu(argc > 2 ? (uint8_t)atoi(argv[2]) : 149,
+		              argc > 3 ? atoi(argv[3]) : 60);
 	} else if (!strcmp(cmd, "sweep")) {
 		rc = gate_sweep(argc > 2 ? (uint8_t)atoi(argv[2]) : 149,
 		                argc > 3 ? atoi(argv[3]) : 120, want_bw);

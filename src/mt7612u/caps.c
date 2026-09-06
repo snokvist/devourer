@@ -46,6 +46,10 @@ void mt7612u_get_caps(const struct mt7612u_dev *d, struct mt7612u_caps *c)
 	 * control-channel number cannot name the secondary side in 2.4 GHz
 	 * except for channels 4-11. mt7612u_set_channel() refuses the rest. */
 	c->bw_mask = 0x7;               /* 20, 40 and 80 MHz */
+	/* TX is this backend's buffer, RX is the MAC's MT_MAX_LEN_CFG ceiling
+	 * minus the FCS. See the struct for how each was measured. */
+	c->max_mpdu_tx = MT_TX_BUF_MAX - 32;
+	c->max_mpdu_rx = (uint16_t)((mt_rr(d, MT_MAX_LEN_CFG) & 0xfff) - 4);
 	c->band_5g_min_mhz = 5180; c->band_5g_max_mhz = 5825;
 	c->band_2g_min_mhz = 2412; c->band_2g_max_mhz = 2484;
 	c->ampdu_tx = 1;

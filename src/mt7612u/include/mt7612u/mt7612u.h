@@ -232,6 +232,14 @@ struct mt7612u_stats {
 	 * them too. Nonzero here means the RX path is seeing garbage, not that
 	 * the radio is slow. */
 	uint64_t rx_invalid;
+	/* Frames the parser rejected on length - a short or malformed
+	 * transfer. Counted because such a frame used to move no counter at
+	 * all, which is indistinguishable from one that was never sent.
+	 *
+	 * It does NOT count an oversize frame: those are discarded by the MAC
+	 * above max_mpdu_rx, before USB, so they raise nothing here. That
+	 * limit is a capability to read, not an error to count. */
+	uint64_t rx_dropped;
 };
 void mt7612u_get_stats(struct mt7612u_dev *dev, struct mt7612u_stats *out);
 
@@ -288,6 +296,26 @@ struct mt7612u_caps {
 	uint32_t rev;
 	uint8_t  nss_rx, nss_tx;
 	uint8_t  bw_mask;          /* bit0 = 20, bit1 = 40, bit2 = 80 MHz */
+	/*
+	 * Largest MPDU, excluding FCS, in each direction. They differ, and the
+	 * asymmetry is real rather than an oversight:
+	 *
+	 *   max_mpdu_tx  what this backend will submit. A buffer choice, not a
+	 *                silicon limit - measured on air, the part transmits at
+	 *                least 7900 B and an RTL8812AU decoded 60/60 at every
+	 *                size up to that with zero CRC errors, far past the
+	 *                802.11 non-A-MSDU ceiling of 2304.
+	 *   max_mpdu_rx  what the MAC will hand back. Set by MT_MAX_LEN_CFG,
+	 *                whose low 12 bits are the on-air length INCLUDING the
+	 *                4-byte FCS; at the 0xf00 this driver programs that is
+	 *                3840 on air, so 3836 of MPDU. Measured to the byte:
+	 *                3836 arrives, 3837 does not.
+	 *
+	 * A frame above max_mpdu_rx is discarded by the MAC before USB. Nothing
+	 * counts it - not rx_err, not rx_dropped - so a caller that needs to
+	 * know must read this rather than watch for an error.
+	 */
+	uint16_t max_mpdu_tx, max_mpdu_rx;
 	uint16_t band_5g_min_mhz, band_5g_max_mhz;
 	uint16_t band_2g_min_mhz, band_2g_max_mhz;
 	unsigned ampdu_tx : 1;     /* aggregation works on injected frames */

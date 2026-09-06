@@ -55,7 +55,21 @@ static void LIBUSB_CALL rx_done(struct libusb_transfer *t)
 		struct mt7612u_rx_info info;
 		int len = mt_rx_parse(d, t->buffer, t->actual_length, &frame, &info);
 
-		if (len > 0) {
+		if (len <= 0) {
+			/* A frame the parser rejected used to move no counter at
+			 * all, which is indistinguishable from one never sent.
+			 *
+			 * This does NOT cover the oversize case, and it was
+			 * measured not to: frames above the MAC's MT_MAX_LEN_CFG
+			 * ceiling never reach here, never complete a transfer and
+			 * never raise rx_err. The MAC discards them before USB, so
+			 * that loss is invisible from this layer by construction -
+			 * see mt7612u_caps.max_mpdu_rx. What this counts is a
+			 * short or malformed transfer. */
+			pthread_mutex_lock(&a->lock);
+			a->rx_dropped++;
+			pthread_mutex_unlock(&a->lock);
+		} else {
 			pthread_mutex_lock(&a->lock);
 			a->rx_frames++;
 			pthread_mutex_unlock(&a->lock);
@@ -286,6 +300,7 @@ void mt_async_stats(struct mt7612u_dev *d, struct mt_async_stats *out)
 	out->rx_frames    = a->rx_frames;
 	out->rx_err       = a->rx_err;
 	out->rx_invalid   = a->rx_invalid;
+	out->rx_dropped   = a->rx_dropped;
 	pthread_mutex_unlock(&a->lock);
 }
 
@@ -326,4 +341,5 @@ void mt7612u_get_stats(struct mt7612u_dev *d, struct mt7612u_stats *out)
 	out->rx_frames    = st.rx_frames;
 	out->rx_err       = st.rx_err;
 	out->rx_invalid   = st.rx_invalid;
+	out->rx_dropped   = st.rx_dropped;
 }
