@@ -600,6 +600,20 @@ if(DEVOURER_KESTREL)
     target_include_directories(kestrelprobe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
 endif()
 
+# mt7612uprobe — the MT7612U's staged bring-up prober, sibling of pcieprobe /
+# kestrelprobe / rtl8733bprobe. Same program the subtree's standalone Makefile
+# builds as `./bringup`; built here too so a chip-specific tool is not the one
+# thing in this backend that only a second build system can produce, and so
+# that a change breaking a gate fails the normal build rather than shipping.
+# It links the internal C API (internal.h), not just the public header, which
+# is why it needs the private include directory.
+if(DEVOURER_MT7612U)
+    add_executable(mt7612uprobe src/mt7612u/tools/bringup.c)
+    target_link_libraries(mt7612uprobe PUBLIC devourer PRIVATE PkgConfig::libusb)
+    target_include_directories(mt7612uprobe PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/mt7612u)
+endif()
+
 # rtl8733bprobe — staged USB bring-up prober for the RTL8733B (HALMAC 87xx),
 # the pcieprobe/kestrelprobe sibling: identity -> power-on + EFUSE -> firmware
 # -> MAC/PHY -> TSSI audit stages, used alongside normal factory dispatch. It

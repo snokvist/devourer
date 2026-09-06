@@ -86,6 +86,13 @@ gateg  per-frame rate control               ack    ACK responder (needs a stimul
 rtap   send_packet / send_packets           hop    channel-switch cost
 ```
 
+Two builds produce the same program. The standalone `make` here builds it as
+`./bringup`, which is what the hardware notes use; a CMake build with
+`-DDEVOURER_MT7612U=ON` builds it as **`mt7612uprobe`**, the sibling of
+`pcieprobe` / `kestrelprobe` / `rtl8733bprobe`. The CMake target exists so the
+chip-specific tool is not the one part of this backend that only a second
+build system can produce.
+
 `sweep`, `coding` and `vht` take a width as their fourth argument, in the
 `MT7612U_BW_*` numbering — `0` = 20, `1` = 40, `2` = 80 MHz:
 
