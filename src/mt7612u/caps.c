@@ -105,7 +105,14 @@ void mt7612u_clear_ack_responder(struct mt7612u_dev *d)
 
 	/* Move the identity off the responder address first: on a MAC that
 	 * matches on address 1, clearing the gate alone leaves it answering
-	 * for whatever address is still programmed. */
+	 * for whatever address is still programmed.
+	 *
+	 * MT_AUTO_RSP_EN is deliberately NOT cleared here. mt_init_hardware()
+	 * writes MT_AUTO_RSP_CFG = 0x13 (init.c), and MT_AUTO_RSP_EN is BIT(0),
+	 * so the gate is already on before any caller arms a responder - the
+	 * mt_set() in mt7612u_set_ack_responder() is a no-op on it. Clearing it
+	 * here would leave the device in a state its own init never produces;
+	 * restoring the address is what actually stops it answering. */
 	{
 		const uint8_t *a = d->ack_saved_mac;
 

@@ -113,6 +113,14 @@ void mt_get_rate_power(struct mt7612u_dev *d, struct mt_rate_power *t, int band)
 	t->ht[12] = t->ht[13] = rate_power_val(v & 0xff);
 	t->ht[14] = t->ht[15] = rate_power_val(v >> 8);
 
+	/* The double shift on 2.4 GHz is upstream's, not a transcription slip:
+	 * mt76x2_get_rate_power() is byte-for-byte this, and rate_power_val()
+	 * takes a u8 on both sides. So on 2.4 GHz these two entries decode from
+	 * zero, i.e. VHT MCS8/9 there get no per-rate offset off the base target
+	 * power. The EEPROM field is a 5 GHz one and 2.4 GHz VHT is an extension
+	 * outside 802.11ac, so this is left matching mt76 deliberately - fixing
+	 * it here would be a silent divergence from the reference this port is
+	 * checked against. */
 	v = mt_ee(d, MT_EE_TX_POWER_VHT_MCS8);
 	if (!is_5ghz)
 		v >>= 8;

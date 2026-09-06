@@ -266,7 +266,10 @@ static int gate_tx(uint8_t chan, int count, int phy, int mcs)
 		.phy = (enum mt7612u_phy)phy, .mcs = (uint8_t)mcs, .nss = 1,
 		.bw = MT7612U_BW_20, .no_ack = 1, .power_adj = 0,
 	};
-	const char *phy_name[] = { "CCK", "OFDM", "HT", "HT-GF", "VHT" };
+	/* Indexed with (phy & 7): MT_RATE_PHY is three bits, so 5-7 are
+	 * representable and named nothing. Five entries read past the end. */
+	const char *phy_name[] = { "CCK", "OFDM", "HT", "HT-GF", "VHT",
+	                           "?5", "?6", "?7" };
 	int sent = 0;
 
 	if (mt_eeprom_init(&dev))
@@ -320,7 +323,10 @@ static int gate_tx(uint8_t chan, int count, int phy, int mcs)
 /* Gate F: monitor RX. Decode rate/BW and per-chain RSSI from the RXWI. */
 static int gate_rx(uint8_t chan, int want)
 {
-	static const char *phy_name[] = { "CCK", "OFDM", "HT", "HT-GF", "VHT" };
+	static /* Indexed with (phy & 7): MT_RATE_PHY is three bits, so 5-7 are
+	 * representable and named nothing. Five entries read past the end. */
+	const char *phy_name[] = { "CCK", "OFDM", "HT", "HT-GF", "VHT",
+	                           "?5", "?6", "?7" };
 	static const char *bw_name[] = { "20", "40", "80", "?" };
 	uint8_t buf[4096];
 	int got = 0, empty = 0;
@@ -425,6 +431,7 @@ static int gate_g(uint8_t chan, int count)
 	struct mt7612u_tx_rate ofdm6 = { .phy = MT7612U_PHY_OFDM, .mcs = 0, .nss = 1,
 	                                 .bw = MT7612U_BW_20, .no_ack = 1 };
 	uint32_t lut;
+	long sent_alt = 0, sent_lut[2] = { 0, 0 };
 
 	if (mt_eeprom_init(&dev)) return 1;
 	if (mt_init_hardware(&dev, NULL)) return 1;
@@ -446,10 +453,16 @@ static int gate_g(uint8_t chan, int count)
 		frame[36] = 'T';
 		frame[37] = (uint8_t)i;
 		frame[38] = (uint8_t)(i >> 8);
-		mt7612u_tx(&dev, frame, 40, (i & 1) ? &mcs7 : &mcs0);
+		if (mt7612u_tx(&dev, frame, 40, (i & 1) ? &mcs7 : &mcs0) == 0)
+			sent_alt++;
 		mt_usleep(2000);
 	}
-	printf("  sent %d frames, even index = MCS0, odd = MCS7\n", count);
+	/* Report what actually went out, not what was asked for. Printing the
+	 * requested count and returning 0 regardless made this gate pass even
+	 * if every single submit failed - and then handed the witness an
+	 * experiment that never aired. */
+	printf("  sent %ld/%d frames, even index = MCS0, odd = MCS7\n",
+	       sent_alt, count);
 
 	/* Load WCID 1's hardware rate LUT with OFDM 6 Mbps, then transmit
 	 * HT MCS7 frames that point at it. */
@@ -463,18 +476,31 @@ static int gate_g(uint8_t chan, int count)
 	       mt_rr(&dev, MT_WCID_TX_RATE(1)));
 
 	for (int arm = 0; arm < 2; arm++) {
+		long ok = 0;
+
 		for (int i = 0; i < 150; i++) {
 			frame[36] = arm ? 'B' : 'A';
 			frame[37] = (uint8_t)i;
 			frame[38] = 0;
-			mt_tx_raw(&dev, frame, 40, &mcs7, 1, arm);
+			if (mt_tx_raw(&dev, frame, 40, &mcs7, 1, arm) == 0)
+				ok++;
 			mt_usleep(2000);
 		}
-		printf("  arm %c: wcid=1, TX_RATE_LUT flag %s -> 150 frames\n",
-		       arm ? 'B' : 'A', arm ? "SET" : "clear");
+		printf("  arm %c: wcid=1, TX_RATE_LUT flag %s -> %ld/150 frames\n",
+		       arm ? 'B' : 'A', arm ? "SET" : "clear", ok);
+		sent_lut[arm] = ok;
 	}
 
 	mt_mac_stop(&dev);
+	/* An arm that aired nothing is not a result the witness can rule on:
+	 * "no frames decoded" would read as a negative finding rather than as
+	 * a transmitter that never spoke. Fail loudly instead. */
+	if (sent_alt == 0 || sent_lut[0] == 0 || sent_lut[1] == 0) {
+		printf("\nGATE g: FAIL - an arm submitted no frames "
+		       "(alt %ld, lut A %ld, lut B %ld); the witness has nothing "
+		       "to rule on\n", sent_alt, sent_lut[0], sent_lut[1]);
+		return 1;
+	}
 	printf("\nGate G frames sent. The witness decides.\n");
 	return 0;
 }
@@ -596,7 +622,10 @@ static void arx_cb(void *user, const void *frame, size_t len,
 /* Async RX ring: the callback path StartRxLoop needs. */
 static int gate_arx(uint8_t chan, int secs)
 {
-	static const char *phy_name[] = { "CCK", "OFDM", "HT", "HT-GF", "VHT" };
+	static /* Indexed with (phy & 7): MT_RATE_PHY is three bits, so 5-7 are
+	 * representable and named nothing. Five entries read past the end. */
+	const char *phy_name[] = { "CCK", "OFDM", "HT", "HT-GF", "VHT",
+	                           "?5", "?6", "?7" };
 	struct arx_ctx ctx = { 0 };
 	double t0;
 
@@ -1041,6 +1070,17 @@ static int gate_ack(uint8_t chan, int secs, int arm)
 		printf("responder NOT armed (control arm)\n");
 	}
 
+	/* Validate before the cast: `secs` is signed and came from argv, and
+	 * (unsigned)(-1) * 1000000 is roughly 49 days with the receiver left
+	 * running - an RX path enabled and undrained for that long is the wedge
+	 * this port documents as replug-only. */
+	if (secs <= 0 || secs > 3600) {
+		printf("GATE ack: FAIL - listen duration %d out of range (1..3600 s)\n",
+		       secs);
+		mt7612u_rx_stop(&dev);
+		mt_mac_stop(&dev);
+		return 1;
+	}
 	printf("listening %d s ...\n", secs);
 	mt_usleep((unsigned)secs * 1000000u);
 	mt7612u_rx_stop(&dev);

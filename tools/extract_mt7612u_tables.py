@@ -288,7 +288,15 @@ def main() -> int:
     # artifact, so --check must compare identically on every platform.
     if args.check:
         path = root / OUTPUT_H
-        if not path.exists() or path.read_text(encoding="utf-8", newline="") != output:
+        # NOT Path.read_text(newline=""): that keyword only exists on Python
+        # 3.13+, and this script has to run on whatever the CI image ships
+        # (3.12 today). open() has taken `newline` since forever.
+        if not path.exists():
+            existing = None
+        else:
+            with open(path, encoding="utf-8", newline="") as fh:
+                existing = fh.read()
+        if existing != output:
             raise SystemExit(f"stale generated output: {OUTPUT_H}")
         verb = "verified"
     else:
