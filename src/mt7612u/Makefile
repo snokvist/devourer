@@ -34,7 +34,7 @@ tests/field_macros: $(LIBOBJS) tests/field_macros.o
 
 # No hardware and no privileges needed: safe to run anywhere. `bringup` is a
 # dependency but is not run: nothing else compiles it, so without it here a
-# change to a gate's signature ships broken and no test notices.
+# change that breaks a gate ships and no test notices.
 check: $(TESTS) bringup
 	@for t in $(TESTS); do ./$$t || exit 1; done
 
