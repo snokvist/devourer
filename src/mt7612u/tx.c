@@ -58,24 +58,36 @@ uint16_t mt_tx_rate_word(const struct mt7612u_tx_rate *r)
  * and never sets. Exposed so the Gate-G control can make the LUT and the
  * descriptor disagree and see which one airs.
  */
-/* 802.11 header length from the frame control field. QoS data carries two
- * extra bytes, which pushes the header to 26 and so requires the L2 pad -
- * and A-MPDU only ever carries QoS data, so getting this wrong breaks
- * aggregation before the hardware ever sees it. */
-static int hdrlen_from_fc(const uint8_t *f)
+/*
+ * ieee80211_hdrlen(), ported from the kernel's net/mac80211 helper - the same
+ * function mt76 reaches through ieee80211_get_hdrlen_from_skb() on both the
+ * TX (mt76_insert_hdr_pad) and RX (mt76x02_remove_hdr_pad) sides.
+ *
+ * Enumerating "the control frames that are 16 bytes" gets this wrong: the
+ * default for control frames is 16, and only CTS and ACK are 10. Listing
+ * RTS and PS-Poll as the 16-byte cases leaves BlockAckReq, BlockAck and both
+ * CF-End subtypes at 10, which inserts the L2 pad *inside* the frame.
+ */
+int mt_hdrlen_from_fc(const uint8_t *f)
 {
 	unsigned fc = (unsigned)f[0] | ((unsigned)f[1] << 8);
-	unsigned type = (fc >> 2) & 3, stype = (fc >> 4) & 0xf;
+	unsigned type = (fc >> 2) & 3;
 	int len = 24;
 
-	if (type == 1)                       /* control */
-		return ((stype == 0xb) || (stype == 0xa)) ? 16 : 10;
-	if (type == 2) {                     /* data */
+	if (type == 2) {                        /* data */
 		if ((fc & 0x0300) == 0x0300)
-			len = 30;                /* 4-address */
-		if (stype & 0x08)
-			len += 2;                /* QoS control */
+			len = 30;               /* 4-address */
+		if (fc & 0x0080) {              /* QoS subtype bit */
+			len += 2;               /* QoS Control */
+			if (fc & 0x8000)        /* Order -> HT Control */
+				len += 4;
+		}
+		return len;
 	}
+	if (type == 0)                          /* management */
+		return (fc & 0x8000) ? 28 : 24; /* Order -> HT Control */
+	if (type == 1)                          /* control */
+		return ((fc & 0x00e0) == 0x00c0) ? 10 : 16;  /* CTS, ACK */
 	return len;
 }
 
@@ -113,7 +125,7 @@ int mt_tx_build(struct mt7612u_dev *d, uint8_t *buf, size_t bufsz,
 	/* mt76_insert_hdr_pad(): 2 bytes after the header when the 802.11
 	 * header is not a multiple of 4, so the body stays 4-aligned. The MAC
 	 * strips it. A 3-address data header is 24 bytes, so normally none. */
-	hdrlen = hdrlen_from_fc(f);
+	hdrlen = mt_hdrlen_from_fc(f);
 	if (hdrlen > (int)len) hdrlen = (int)len;
 	if (hdrlen % 4) hdr_pad = 2;
 

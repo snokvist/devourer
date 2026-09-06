@@ -1,4 +1,6 @@
 bringup
+tests/api_link
+tests/frame_shape
 *.o
 *.d
 firmware/

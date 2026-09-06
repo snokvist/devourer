@@ -33,6 +33,9 @@ static const struct { uint8_t align, size; } rt_field[] = {
 #define RT_VHT 21
 #define RT_TX_FLAGS_NOACK 0x0008
 
+/* One diagnostic per process for a field we parse but cannot honour. */
+static int warned_tx_power;
+
 static uint16_t rd16(const uint8_t *p) { return (uint16_t)p[0] | ((uint16_t)p[1] << 8); }
 static uint32_t rd32(const uint8_t *p)
 {
@@ -115,7 +118,19 @@ int mt_radiotap_parse(const uint8_t *buf, size_t len, struct mt7612u_tx_rate *r)
 				if (rd16(p) & RT_TX_FLAGS_NOACK) r->no_ack = 1;
 				break;
 			case RT_DBM_TX_POWER:
-				r->power_adj = 0;   /* absolute dBm is a device-level knob */
+				/* Absolute dBm is a device-level knob here
+				 * (mt7612u_set_txpower); txwi carries only a
+				 * 4-bit relative trim, and mapping an absolute
+				 * target onto it needs the per-rate EEPROM
+				 * ceiling for the current channel. Say so
+				 * rather than accept the field and drop it. */
+				if (!warned_tx_power) {
+					warned_tx_power = 1;
+					LOG("radiotap DBM_TX_POWER (%d dBm) ignored: "
+					    "use mt7612u_set_txpower() for the base level "
+					    "and mt7612u_tx_rate.power_adj for per-frame trim",
+					    (int)(int8_t)p[0]);
+				}
 				break;
 			case RT_MCS: {
 				uint8_t known = p[0], flags = p[1];
@@ -187,37 +202,57 @@ size_t mt7612u_send_packets(struct mt7612u_dev *d,
 
 	while (i < count) {
 		size_t off = 0, n_in_buf = 0, j;
-		size_t idx[MT_USB_AGG_MAX];
+		struct { const uint8_t *mpdu; size_t len; struct mt7612u_tx_rate r; }
+			sel[MT_USB_AGG_MAX];
 
-		/* Pass 1: pick the frames that fit in one transfer. */
+		/*
+		 * Pass 1 selects and fully validates. The radiotap parse happens
+		 * here, not in pass 2: a frame that pass 2 could still reject
+		 * would break the chain it is building - NEXT_VLD and the single
+		 * trailing zero word are assigned by position, so dropping the
+		 * frame that happens to be last leaves the transfer unterminated.
+		 */
 		while (i < count && n_in_buf < MT_USB_AGG_MAX) {
-			size_t need;
+			const uint8_t *p = pkts[i].data;
+			size_t plen = pkts[i].len, need;
+			struct mt7612u_tx_rate r;
+			int rlen;
 
-			if (!pkts[i].data || pkts[i].len < 8) { i++; continue; }
-			need = pkts[i].len + 32;
-			if (off + need + 4 > sizeof buf) break;
-			idx[n_in_buf++] = i;
-			off += need;      /* upper bound; pass 2 uses the real size */
+			if (!p || plen < 8) { i++; continue; }
+			rlen = mt_radiotap_parse(p, plen, &r);
+			if (rlen <= 0 || (size_t)rlen >= plen) { i++; continue; }
+
+			/* Worst case for one block: TXINFO + TXWI + hdr pad +
+			 * MPDU + alignment + trailer. */
+			need = 4 + MT_TXWI_LEN + 2 + (plen - (size_t)rlen) + 3 + 4;
+			if (off + need > sizeof buf) break;
+
+			sel[n_in_buf].mpdu = p + rlen;
+			sel[n_in_buf].len  = plen - (size_t)rlen;
+			sel[n_in_buf].r    = r;
+			n_in_buf++;
+			off += need;
 			i++;
 		}
 		if (!n_in_buf) break;
 
-		/* Pass 2: build them back to back. NEXT_VLD on every block except
-		 * the last, and only the last carries the 4-byte zero trailer. */
+		/* Pass 2 only builds. NEXT_VLD on every block except the last,
+		 * and only the last carries the 4-byte zero trailer. */
 		off = 0;
 		for (j = 0; j < n_in_buf; j++) {
-			struct mt7612u_tx_rate r;
-			const uint8_t *p = pkts[idx[j]].data;
-			size_t plen = pkts[idx[j]].len;
 			int last = (j + 1 == n_in_buf);
-			int rlen = mt_radiotap_parse(p, plen, &r);
-			int blk;
+			int blk = mt_tx_build(d, buf + off, sizeof buf - off,
+			                      sel[j].mpdu, sel[j].len, &sel[j].r,
+			                      0xff, 0, !last, last);
 
-			if (rlen <= 0 || (size_t)rlen >= plen) continue;
-			blk = mt_tx_build(d, buf + off, sizeof buf - off,
-			                  p + rlen, plen - (size_t)rlen, &r, 0xff, 0,
-			                  !last, last);
-			if (blk < 0) break;
+			if (blk < 0) {
+				/* Cannot happen after pass 1's checks, but if it
+				 * ever does the chain is unterminated - drop the
+				 * whole transfer rather than air a truncated one. */
+				ERR("send_packets: block %zu failed to build", j);
+				off = 0;
+				break;
+			}
 			off += (size_t)blk;
 		}
 		if (!off) break;

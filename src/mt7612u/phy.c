@@ -433,3 +433,33 @@ int mt7612u_set_txpower(struct mt7612u_dev *d, int dbm)
 		mt_phy_set_txpower(d, d->chan > 14);
 	return 0;
 }
+
+/*
+ * Public channel set. `chan` is an 802.11 channel number, not a frequency;
+ * the width may narrow a frame below the channel but never widen it.
+ */
+int mt7612u_set_channel(struct mt7612u_dev *d, uint8_t chan, enum mt7612u_bw bw)
+{
+	if (!d || !chan) return -1;
+	if (bw != MT7612U_BW_20 && bw != MT7612U_BW_40) {
+		ERR("set_channel: only 20 and 40 MHz are implemented (bw=%d)", (int)bw);
+		return -1;
+	}
+	return mt_set_channel(d, chan, (uint8_t)bw);
+}
+
+/*
+ * 0x202 = 2T2R, 0x101 = 1T1R. Stored now, applied at the next channel set,
+ * which is where the chainmask reaches the firmware in CMD_SWITCH_CHANNEL_OP.
+ */
+int mt7612u_set_chainmask(struct mt7612u_dev *d, uint16_t chainmask)
+{
+	if (!d) return -1;
+	if (chainmask != 0x0202 && chainmask != 0x0101) {
+		ERR("set_chainmask: 0x%04x is neither 2T2R (0x0202) nor 1T1R (0x0101)",
+		    chainmask);
+		return -1;
+	}
+	d->chainmask = chainmask;
+	return 0;
+}

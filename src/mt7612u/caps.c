@@ -4,11 +4,22 @@
 #include "internal.h"
 
 /*
- * DW0 is the LOW word. mt76's mt76x02u_restart_pre_tbtt_timer() assembles this
- * as (dw0 << 32) | dw1, which is backwards - but the result there only ever
- * feeds a dev_dbg() print, so the bug is never exercised and has survived.
- * Copying it produced a clock that advanced by 8.6e14 "us" per 200 ms.
- * Measured: (DW1 << 32) | DW0 gives 200159 us over a 200000 us sleep.
+ * DW0 is the LOW word.
+ *
+ * mt76 assembles it the other way round, in mt76x02u_restart_pre_tbtt_timer()
+ * (mt76x02_usb_core.c:155-158):
+ *
+ *     dw0 = mt76_rr(dev, MT_TSF_TIMER_DW0);
+ *     dw1 = mt76_rr(dev, MT_TSF_TIMER_DW1);
+ *     tsf = (u64)dw0 << 32 | dw1;
+ *     dev_dbg(dev->mt76.dev, "TSF: %llu us TBTT %u us\n", tsf, tbtt);
+ *
+ * `tsf` there is consumed only by the dev_dbg() on the next line, so the order
+ * is never exercised and the mistake has survived upstream. Copying it here
+ * produced a clock that advanced by 8.6e14 "us" per 200 ms; measured,
+ * (DW1 << 32) | DW0 gives 200159 us over a 200000 us sleep. The `caps` gate
+ * prints both orders against a known sleep so the claim is re-checkable on
+ * any sample.
  */
 uint64_t mt7612u_read_tsf(struct mt7612u_dev *d)
 {

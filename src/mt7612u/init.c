@@ -5,6 +5,7 @@
  * See PLAN.md: trimming this sequence is a post-Gate-E activity, because a
  * 95%-correct init answers every register read and still radiates nothing.
  */
+#include <stdlib.h>
 #include <string.h>
 #include "internal.h"
 #include "initvals.h"
@@ -386,5 +387,59 @@ int mt_init_hardware(struct mt7612u_dev *d, const char *fw_dir)
 	/* Leave no half-full RX ring behind for the next run to inherit. */
 	mt_rx_flush(d);
 
+	return mt_mac_stop(d);
+}
+
+/* --- the public lifecycle, as declared in include/mt7612u/mt7612u.h --- */
+
+struct mt7612u_dev *mt7612u_open(const char *fw_dir, const char **err)
+{
+	struct mt7612u_dev *d = calloc(1, sizeof *d);
+
+	if (!d) {
+		if (err) *err = "out of memory";
+		return NULL;
+	}
+	if (mt_open(d, err)) { free(d); return NULL; }
+	if (mt_eeprom_init(d)) {
+		if (err) *err = "EEPROM image did not validate";
+		goto fail;
+	}
+	if (mt_init_hardware(d, fw_dir)) {
+		if (err) *err = "hardware init failed (see log)";
+		goto fail;
+	}
+	return d;
+
+fail:
+	mt_close(d);
+	free(d);
+	return NULL;
+}
+
+void mt7612u_close(struct mt7612u_dev *d)
+{
+	if (!d) return;
+	mt_async_stop(d);
+	if (d->h) mt_mac_stop(d);
+	mt_close(d);
+	free(d);
+}
+
+/*
+ * Enable the MAC. TX always; RX only when an RX ring is already draining
+ * EP 4 - the receiver running with nothing reading is what wedges this part
+ * below the USB level, recoverable only by a physical replug. Call
+ * mt7612u_rx_start() first if you want to receive.
+ */
+int mt7612u_start(struct mt7612u_dev *d)
+{
+	if (!d) return -1;
+	return mt_mac_start(d, d->a && d->a->rx_active);
+}
+
+int mt7612u_stop(struct mt7612u_dev *d)
+{
+	if (!d) return -1;
 	return mt_mac_stop(d);
 }

@@ -543,10 +543,15 @@ static int gate_soak(uint8_t chan, int secs, int framelen)
 	       "submit mean %.3f ms max %.1f ms\n",
 	       n, n * 1000.0 / wall, n * framelen * 8.0 / wall / 1000.0,
 	       100.0 * cpu / wall, ssum / (n ? n : 1), smax);
-	printf("         submitted=%llu completed=%llu errors=%llu\n",
-	       (unsigned long long)dev.a->tx_submitted,
-	       (unsigned long long)dev.a->tx_done_n,
-	       (unsigned long long)dev.a->tx_err);
+	{
+		struct mt_async_stats st;
+
+		mt_async_stats(&dev, &st);
+		printf("         submitted=%llu completed=%llu errors=%llu\n",
+		       (unsigned long long)st.tx_submitted,
+		       (unsigned long long)st.tx_done,
+		       (unsigned long long)st.tx_err);
+	}
 	mt_async_stop(&dev);
 
 	/* Below saturation the pool is never full, so submit returns as soon as
@@ -608,9 +613,14 @@ static int gate_arx(uint8_t chan, int secs)
 	t0 = now_ms();
 	while (now_ms() - t0 < secs * 1000.0)
 		mt_usleep(100000);
-	printf("async RX on ch%u for %d s: %lu frames (%.0f/s), rx_err=%llu\n",
-	       chan, secs, ctx.n, ctx.n / (double)secs,
-	       (unsigned long long)dev.a->rx_err);
+	{
+		struct mt_async_stats st;
+
+		mt_async_stats(&dev, &st);
+		printf("async RX on ch%u for %d s: %lu frames (%.0f/s), rx_err=%llu\n",
+		       chan, secs, ctx.n, ctx.n / (double)secs,
+		       (unsigned long long)st.rx_err);
+	}
 	for (int i = 0; i < 5; i++)
 		if (ctx.by_phy[i]) printf("  %-6s %lu\n", phy_name[i], ctx.by_phy[i]);
 	mt7612u_rx_stop(&dev);
@@ -653,11 +663,16 @@ static int gate_duplex(uint8_t chan, int secs)
 	}
 	wall = now_ms() - t0;
 	printf("duplex on ch%u for %.1f s:\n", chan, wall / 1000.0);
-	printf("  TX %ld frames (%.0f fps)  RX %lu frames (%.0f fps)  "
-	       "tx_err=%llu rx_err=%llu\n",
-	       n, n * 1000.0 / wall, ctx.n, ctx.n * 1000.0 / wall,
-	       (unsigned long long)dev.a->tx_err,
-	       (unsigned long long)dev.a->rx_err);
+	{
+		struct mt_async_stats st;
+
+		mt_async_stats(&dev, &st);
+		printf("  TX %ld frames (%.0f fps)  RX %lu frames (%.0f fps)  "
+		       "tx_err=%llu rx_err=%llu\n",
+		       n, n * 1000.0 / wall, ctx.n, ctx.n * 1000.0 / wall,
+		       (unsigned long long)st.tx_err,
+		       (unsigned long long)st.rx_err);
+	}
 	mt7612u_rx_stop(&dev);
 	mt_mac_stop(&dev);
 	return (n && ctx.n) ? 0 : 1;
@@ -779,7 +794,12 @@ static int gate_ampdu(uint8_t chan, int count)
 		       count * 1000.0 / wall, count * 48 * 8.0 / wall / 1000.0);
 		mt_usleep(200000);
 	}
-	printf("  tx_err=%llu\n", (unsigned long long)dev.a->tx_err);
+	{
+		struct mt_async_stats st;
+
+		mt_async_stats(&dev, &st);
+		printf("  tx_err=%llu\n", (unsigned long long)st.tx_err);
+	}
 
 	/* The bisect above showed unicast is what collapses throughput (the MAC
 	 * arms an ACK timeout for a peer that never answers), so measure the
@@ -828,10 +848,20 @@ static int gate_ampdu(uint8_t chan, int count)
 	return 0;
 }
 
+/* Somebody has to read EP 4 whenever MAC RX is on; this gate does not care
+ * what arrives, only that the endpoint keeps being drained. */
+static void drain_cb(void *user, const void *frame, size_t len,
+                     const struct mt7612u_rx_info *info)
+{
+	(void)frame; (void)len; (void)info;
+	(*(unsigned long *)user)++;
+}
+
 /* Capability descriptor, TSF and 40 MHz. */
 static int gate_caps(uint8_t chan)
 {
 	struct mt7612u_caps c;
+	unsigned long drained = 0;
 	uint64_t t1, t2;
 	int64_t delta;
 	int bad = 0;
@@ -839,7 +869,12 @@ static int gate_caps(uint8_t chan)
 	if (mt_eeprom_init(&dev)) return 1;
 	if (mt_init_hardware(&dev, NULL)) return 1;
 	if (mt_set_channel(&dev, chan, MT7612U_BW_20)) return 1;
-	if (mt_mac_start(&dev, 1)) return 1;
+	/* The RX ring must be draining EP 4 *before* the receiver is enabled.
+	 * This gate then sits through two 200 ms sleeps and a channel switch;
+	 * with nothing reading, that is long enough to wedge the part below
+	 * the USB level, which no software reset recovers. */
+	if (mt_async_start(&dev, drain_cb, &drained)) return 1;
+	if (mt_mac_start(&dev, 1)) { mt_async_stop(&dev); return 1; }
 
 	mt7612u_get_caps(&dev, &c);
 	printf("caps: %s rev 0x%08x  %dTx%dRx  bw_mask 0x%02x (20%s%s)\n",
@@ -936,7 +971,9 @@ static int gate_caps(uint8_t chan)
 		}
 	}
 
+	mt_async_stop(&dev);
 	mt_mac_stop(&dev);
+	printf("\n%lu frames drained from EP 4 while the receiver was on\n", drained);
 	printf("\nGATE caps: %s\n", bad ? "FAIL" : "PASS");
 	return bad;
 }
@@ -975,7 +1012,10 @@ static int gate_ack(uint8_t chan, int secs, int arm)
 	if (mt_eeprom_init(&dev)) return 1;
 	if (mt_init_hardware(&dev, NULL)) return 1;
 	if (mt_set_channel(&dev, chan, MT7612U_BW_20)) return 1;
-	if (mt_mac_start(&dev, 1)) return 1;
+	/* Ring first, receiver second - see gate_caps. Arming the responder and
+	 * printing between the two would otherwise leave RX on and undrained. */
+	if (mt7612u_rx_start(&dev, ack_cb, &off)) return 1;
+	if (mt_mac_start(&dev, 1)) { mt7612u_rx_stop(&dev); return 1; }
 	/* CRC and PHY errors only: DUP must stay clear so retries reach us. */
 	mt_wr(&dev, MT_RX_FILTR_CFG,
 	      MT_RX_FILTR_CFG_CRC_ERR | MT_RX_FILTR_CFG_PHY_ERR);
@@ -991,6 +1031,7 @@ static int gate_ack(uint8_t chan, int secs, int arm)
 	if (arm) {
 		if (mt7612u_set_ack_responder(&dev, g_ack_mac)) {
 			printf("GATE ack: FAIL - could not arm\n");
+			mt7612u_rx_stop(&dev);
 			mt_mac_stop(&dev);
 			return 1;
 		}
@@ -1000,7 +1041,6 @@ static int gate_ack(uint8_t chan, int secs, int arm)
 		printf("responder NOT armed (control arm)\n");
 	}
 
-	if (mt7612u_rx_start(&dev, ack_cb, &off)) return 1;
 	printf("listening %d s ...\n", secs);
 	mt_usleep((unsigned)secs * 1000000u);
 	mt7612u_rx_stop(&dev);

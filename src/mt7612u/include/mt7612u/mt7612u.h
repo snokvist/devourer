@@ -85,10 +85,12 @@ void mt7612u_close(struct mt7612u_dev *dev);
 void mt7612u_keep_detached(struct mt7612u_dev *dev, int keep);
 
 /*
- * Channel + width. Issues CMD_SWITCH_CHANNEL_OP and the firmware calibration
- * burst, so it is not cheap - it is a setup call, not a per-frame one.
+ * Channel + width. `chan` is an 802.11 channel number. Issues
+ * CMD_SWITCH_CHANNEL_OP and the firmware calibration burst, so it is not
+ * cheap - it is a setup call, not a per-frame one. Only 20 and 40 MHz are
+ * implemented; 80 MHz is silicon-capable but the width maths is not ported.
  */
-int mt7612u_set_channel(struct mt7612u_dev *dev, unsigned chan, enum mt7612u_bw bw);
+int mt7612u_set_channel(struct mt7612u_dev *dev, uint8_t chan, enum mt7612u_bw bw);
 
 /* Absolute TX power base, dBm. Per-frame trim is mt7612u_tx_rate.power_adj. */
 int mt7612u_set_txpower(struct mt7612u_dev *dev, int dbm);
@@ -96,7 +98,13 @@ int mt7612u_set_txpower(struct mt7612u_dev *dev, int dbm);
 /* 0x202 = 2T2R (default), 0x101 = 1T1R. Global; takes effect at next channel set. */
 int mt7612u_set_chainmask(struct mt7612u_dev *dev, uint16_t chainmask);
 
-int mt7612u_start(struct mt7612u_dev *dev);  /* enable MAC TX+RX */
+/*
+ * Enable the MAC. TX always; RX only if mt7612u_rx_start() is already
+ * running. That condition is not a convenience: with the receiver on and
+ * nothing draining the bulk-IN endpoint, this part wedges below the USB
+ * level and no software reset recovers it - only a physical replug.
+ */
+int mt7612u_start(struct mt7612u_dev *dev);
 int mt7612u_stop(struct mt7612u_dev *dev);
 
 /*

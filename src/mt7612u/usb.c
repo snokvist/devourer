@@ -10,13 +10,24 @@
 
 #define REQ_IN   (LIBUSB_ENDPOINT_IN  | LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_RECIPIENT_DEVICE)
 #define REQ_OUT  (LIBUSB_ENDPOINT_OUT | LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_RECIPIENT_DEVICE)
-#define CTRL_TIMEOUT_MS 1000
+/* mt76's MT_VEND_REQ_TOUT_MS / MT_VEND_REQ_MAX_RETRY. The product of the two
+ * is the worst-case cost of one register access, so it bounds every poll
+ * loop below - which is why the timeout is 300 ms and not something longer. */
+#define CTRL_TIMEOUT_MS 300
 #define VEND_RETRIES 10
 
 void mt_usleep(unsigned us)
 {
 	struct timespec ts = { .tv_sec = us / 1000000, .tv_nsec = (us % 1000000) * 1000 };
 	nanosleep(&ts, NULL);
+}
+
+static uint64_t now_us(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)(ts.tv_nsec / 1000);
 }
 
 int mt_vendor_req(struct mt7612u_dev *d, uint8_t req, uint8_t type,
@@ -50,16 +61,35 @@ static uint8_t wr_req(uint32_t addr)
 	return MT_VEND_MULTI_WRITE;
 }
 
-uint32_t mt_rr(struct mt7612u_dev *d, uint32_t addr)
+/*
+ * A register read that reports failure separately from the value. This matters
+ * because 0xffffffff is a legitimate read on this part - MT_MAC_CSR0 returns
+ * it while the core is still coming up - so it cannot double as a sentinel.
+ * Returns 0 and fills *val on success, -1 on a transport failure.
+ */
+int mt_rr_chk(struct mt7612u_dev *d, uint32_t addr, uint32_t *val)
 {
 	uint8_t req = rd_req(addr), b[4] = { 0 };
 	uint32_t a = addr & ~MT_VEND_TYPE_MASK;
 
 	if (mt_vendor_req(d, req, REQ_IN, (uint16_t)(a >> 16), (uint16_t)a,
-	                  b, sizeof b) != (int)sizeof b)
-		return ~0u;
-	return (uint32_t)b[0] | ((uint32_t)b[1] << 8) |
+	                  b, sizeof b) != (int)sizeof b) {
+		d->io_err++;
+		return -1;
+	}
+	*val = (uint32_t)b[0] | ((uint32_t)b[1] << 8) |
 	       ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+	return 0;
+}
+
+/* Convenience form for the places that genuinely cannot act on a failure
+ * (logging, one-shot identity reads). It still bumps d->io_err, so a caller
+ * that cares can notice after the fact. */
+uint32_t mt_rr(struct mt7612u_dev *d, uint32_t addr)
+{
+	uint32_t v;
+
+	return mt_rr_chk(d, addr, &v) ? ~0u : v;
 }
 
 void mt_wr(struct mt7612u_dev *d, uint32_t addr, uint32_t val)
@@ -77,23 +107,48 @@ void mt_wr(struct mt7612u_dev *d, uint32_t addr, uint32_t val)
 		        req, (unsigned)(a & 0xffff), b[0], b[1], b[2], b[3]);
 }
 
-void mt_rmw(struct mt7612u_dev *d, uint32_t addr, uint32_t mask, uint32_t val)
+/*
+ * Read-modify-write. A failed read MUST NOT be written back: mt_rr's ~0u would
+ * turn the operation into "set every bit", and the addresses this is used on
+ * (MT_WLAN_FUN_CTRL, MT_MAC_SYS_CTRL, the BBP AGC block) are exactly the ones
+ * where that is destructive. Returns 0 on success, -1 if nothing was written.
+ */
+int mt_rmw(struct mt7612u_dev *d, uint32_t addr, uint32_t mask, uint32_t val)
 {
-	mt_wr(d, addr, (mt_rr(d, addr) & ~mask) | val);
+	uint32_t cur;
+
+	if (mt_rr_chk(d, addr, &cur)) {
+		ERR("rmw 0x%05x skipped: read failed", addr & ~MT_VEND_TYPE_MASK);
+		return -1;
+	}
+	mt_wr(d, addr, (cur & ~mask) | val);
+	return 0;
 }
 
+/*
+ * Poll against a real deadline rather than a count of sleeps. One register
+ * access can itself cost up to VEND_RETRIES * CTRL_TIMEOUT_MS, so counting
+ * iterations would let a caller asking for 200 ms block for seconds.
+ */
 int mt_poll(struct mt7612u_dev *d, uint32_t addr, uint32_t mask,
             uint32_t val, int timeout_us)
 {
-	int elapsed = 0;
+	uint64_t deadline = now_us() + (uint64_t)(timeout_us < 0 ? 0 : timeout_us);
 
-	do {
-		if ((mt_rr(d, addr) & mask) == val)
+	for (;;) {
+		uint32_t cur;
+
+		if (mt_rr_chk(d, addr, &cur)) {
+			ERR("poll 0x%05x aborted: read failed",
+			    addr & ~MT_VEND_TYPE_MASK);
+			return 0;
+		}
+		if ((cur & mask) == val)
 			return 1;
+		if (now_us() >= deadline)
+			return 0;
 		mt_usleep(1000);
-		elapsed += 1000;
-	} while (elapsed < timeout_us);
-	return 0;
+	}
 }
 
 void mt_single_wr(struct mt7612u_dev *d, uint8_t req, uint16_t off, uint32_t val)
@@ -112,12 +167,15 @@ int mt_bulk(struct mt7612u_dev *d, uint8_t ep, void *buf, int len,
 	return rc;
 }
 
-/* mt76x02_wait_for_mac(): MAC_CSR0 reads 0 or ~0 until the core is alive. */
+/* mt76x02_wait_for_mac(): MAC_CSR0 reads 0 or ~0 until the core is alive.
+ * Both are legitimate values here, which is why this uses the checked read -
+ * a transport failure is a different condition from "still coming up". */
 int mt_wait_for_mac(struct mt7612u_dev *d)
 {
 	for (int i = 0; i < 500; i++) {
-		uint32_t v = mt_rr(d, MT_MAC_CSR0);
-		if (v != 0 && v != ~0u)
+		uint32_t v;
+
+		if (!mt_rr_chk(d, MT_MAC_CSR0, &v) && v != 0 && v != ~0u)
 			return 1;
 		mt_usleep(5000);
 	}
@@ -218,15 +276,36 @@ void mt_wr_copy(struct mt7612u_dev *d, uint32_t offset, const void *data, int le
 	const uint8_t *p = data;
 	uint8_t buf[64];
 
-	len = (len + 3) & ~3;
+	/* The hardware wants whole 32-bit words, but only `len` bytes belong to
+	 * the caller. Round the *transfer* up and zero-fill the tail; rounding
+	 * `len` up instead reads past the end of the caller's buffer. */
 	for (int i = 0; i < len; ) {
-		int n = len - i;
+		int n = len - i, xfer;
 
 		if (n > (int)sizeof buf) n = (int)sizeof buf;
+		xfer = (n + 3) & ~3;
+		memset(buf, 0, (size_t)xfer);
 		memcpy(buf, p + i, (size_t)n);
 		if (mt_vendor_req(d, MT_VEND_MULTI_WRITE, REQ_OUT, 0,
-		                  (uint16_t)(offset + i), buf, (size_t)n) < 0)
+		                  (uint16_t)(offset + i), buf, (size_t)xfer) < 0)
 			return;
 		i += n;
 	}
+}
+
+/* --- public lifecycle helpers that belong with the transport --- */
+
+void mt7612u_keep_detached(struct mt7612u_dev *d, int keep)
+{
+	if (d) d->keep_detached = keep;
+}
+
+uint32_t mt7612u_asic_version(const struct mt7612u_dev *d)
+{
+	return d ? d->rev : 0;
+}
+
+const uint8_t *mt7612u_mac_addr(const struct mt7612u_dev *d)
+{
+	return d ? d->macaddr : NULL;
 }

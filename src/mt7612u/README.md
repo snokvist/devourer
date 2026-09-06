@@ -6,6 +6,7 @@ library target. It builds on its own:
 
 ```sh
 make -C src/mt7612u            # -> src/mt7612u/bringup
+make -C src/mt7612u check      # offline tests: no hardware, no privileges
 sudo ./src/mt7612u/bringup regs
 ```
 
@@ -27,6 +28,16 @@ Measurements, methods and limits: [`../../docs/mt7612u.md`](../../docs/mt7612u.m
 | `radiotap.c` | `send_packet` / `send_packets` (USB chaining via `NEXT_VLD`) |
 | `caps.c` | TSF, capability descriptor, ACK responder |
 | `tools/bringup.c` | one subcommand per verified gate |
+| `tests/` | offline tests (`make check`): public-API link, frame shapes |
+
+## The receiver must never run undrained
+
+Enabling MAC RX with nothing reading the bulk-IN endpoint wedges this part
+*below* the USB level: `libusb_reset_device`, the sysfs `authorized` toggle
+and rebinding the kernel driver all fail to recover it, and only a physical
+replug does. So `mt_mac_start()` takes the receiver as an explicit argument,
+`mt7612u_start()` enables RX only when `mt7612u_rx_start()` is already
+running, and every gate that turns RX on starts the ring *first*.
 
 ## Firmware
 

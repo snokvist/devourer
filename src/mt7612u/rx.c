@@ -84,17 +84,33 @@ int mt_rx_parse(struct mt7612u_dev *d, uint8_t *buf, int n,
 	if (rxinfo & MT_RXINFO_L2PAD)
 		pad = 2;
 
+	/* MPDU_LEN excludes the pad: mt76 trims to it only after removing the
+	 * pad (mt76x02_mac_process_rx), so the buffer holds hdrlen + pad + body. */
 	len = (int)info->mpdu_len;
 	if (len > n - MT_DMA_HDR_LEN - MT_RXWI_LEN - pad)
 		len = n - MT_DMA_HDR_LEN - MT_RXWI_LEN - pad;
 	if (len < 0) return 0;
 
 	*frame = buf + MT_DMA_HDR_LEN + MT_RXWI_LEN;
-	/* Fold the L2 pad out by moving the header down over it. */
-	if (pad && len > 24) {
-		memmove(buf + MT_DMA_HDR_LEN + MT_RXWI_LEN + 2,
-		        buf + MT_DMA_HDR_LEN + MT_RXWI_LEN, 24);
-		*frame = buf + MT_DMA_HDR_LEN + MT_RXWI_LEN + 2;
+	/*
+	 * Fold the L2 pad out, exactly as mt76x02_remove_hdr_pad(): move the
+	 * *header* up over the pad, then start the frame two bytes in.
+	 *
+	 * The length moved must be the real header length. L2PAD is only ever
+	 * set when the header is not 4-aligned - 26 bytes (QoS) or 30 (4-addr) -
+	 * so moving a fixed 24 leaves the last two header bytes behind and
+	 * overwrites them with pad. On a QoS frame those two bytes are the QoS
+	 * Control field, i.e. every TID and ack-policy read as zero.
+	 */
+	if (pad) {
+		uint8_t *base = buf + MT_DMA_HDR_LEN + MT_RXWI_LEN;
+		int avail = n - MT_DMA_HDR_LEN - MT_RXWI_LEN, hdrlen;
+
+		if (avail < 2) return 0;
+		hdrlen = mt_hdrlen_from_fc(base);
+		if (len < hdrlen || avail < hdrlen + pad) return 0;
+		memmove(base + pad, base, (size_t)hdrlen);
+		*frame = base + pad;
 	}
 	return len;
 }

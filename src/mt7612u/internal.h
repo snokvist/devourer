@@ -45,7 +45,11 @@ struct mt7612u_cal {
 #define MT_USB_AGG_MAX  32      /* frames chained per transfer */
 
 struct mt7612u_dev;
-struct mt_slot { struct mt7612u_dev *d; int idx; };
+struct mt_async;
+/* Each slot names its own ring, not dev->a: if a teardown has to leak a ring
+ * whose transfers are still in flight, their completions must keep touching
+ * the leaked ring and never a replacement one. */
+struct mt_slot { struct mt7612u_dev *d; struct mt_async *a; int idx; };
 
 struct mt_async {
 	struct libusb_transfer *rx[MT_RX_RING], *tx[MT_TX_RING];
@@ -53,11 +57,14 @@ struct mt_async {
 	uint8_t rx_buf[MT_RX_RING][MT_RX_BUFSZ];
 	uint8_t tx_buf[MT_TX_RING][MT_TX_BUFSZ];
 	int     tx_busy[MT_TX_RING];
-	pthread_mutex_t tx_lock;
-	pthread_cond_t  tx_cv;
+	/* Guards running, rx_active, tx_busy[], tx_inflight and rx_inflight -
+	 * all of which the event thread writes and the caller reads. */
+	pthread_mutex_t lock;
+	pthread_cond_t  cv;
 	pthread_t evt;
-	volatile int running, rx_active;
-	volatile int tx_inflight, rx_inflight;
+	int evt_started;
+	int running, rx_active;
+	int tx_inflight, rx_inflight;
 	mt7612u_rx_cb cb;
 	void *cb_user;
 	uint64_t tx_submitted, tx_done_n, tx_err, rx_frames, rx_err;
@@ -83,6 +90,8 @@ struct mt7612u_dev {
 	struct mt_rate_power rate_power;
 	struct mt7612u_cal cal;
 
+	unsigned io_err;          /* EP0 transfers that exhausted their retries */
+
 	/* Oracle-diff log: every EP0 write we emit, in order. */
 	uint8_t  ack_saved_mac[6];
 	int      ack_saved;
@@ -94,9 +103,14 @@ struct mt7612u_dev {
 /* --- usb.c --- */
 int      mt_open(struct mt7612u_dev *d, const char **err);
 void     mt_close(struct mt7612u_dev *d);
+/* Checked read: 0 on success with *val filled, -1 on transport failure.
+ * Prefer this anywhere the value drives a decision - 0xffffffff is a real
+ * register value here and cannot serve as an error sentinel. */
+int      mt_rr_chk(struct mt7612u_dev *d, uint32_t addr, uint32_t *val);
 uint32_t mt_rr(struct mt7612u_dev *d, uint32_t addr);
 void     mt_wr(struct mt7612u_dev *d, uint32_t addr, uint32_t val);
-void     mt_rmw(struct mt7612u_dev *d, uint32_t addr, uint32_t mask, uint32_t val);
+/* Returns -1 without writing when the read half fails. */
+int      mt_rmw(struct mt7612u_dev *d, uint32_t addr, uint32_t mask, uint32_t val);
 #define  mt_set(d, a, v)   mt_rmw(d, a, v, v)
 #define  mt_clear(d, a, v) mt_rmw(d, a, v, 0)
 /* Poll until (rr(addr) & mask) == val. Returns 1 on success, 0 on timeout. */
@@ -141,6 +155,9 @@ int mt_mac_stop(struct mt7612u_dev *d);
 
 /* --- tx.c --- */
 uint16_t mt_tx_rate_word(const struct mt7612u_tx_rate *r);
+/* ieee80211_hdrlen(), ported. Shared by TX (where to insert the L2 pad) and
+ * RX (how many bytes to move when folding it back out) - they must agree. */
+int mt_hdrlen_from_fc(const uint8_t *frame);
 #define MT_TXOPT_RATE_LUT  0x01  /* set MT_TXWI_FLAGS_TX_RATE_LUT */
 #define MT_TXOPT_AMPDU     0x02  /* AMPDU flag + density + BA window */
 #define MT_TXOPT_QSEL_MGMT 0x04  /* mt76 uses MT_QSEL_MGMT for aggregated TX */
@@ -156,6 +173,10 @@ void mt_wcid_setup(struct mt7612u_dev *d, uint8_t idx, const uint8_t *mac);
 int mt_radiotap_parse(const uint8_t *buf, size_t len, struct mt7612u_tx_rate *r);
 
 /* --- async.c --- */
+struct mt_async_stats {
+	uint64_t tx_submitted, tx_done, tx_err, rx_frames, rx_err;
+};
+void mt_async_stats(struct mt7612u_dev *d, struct mt_async_stats *out);
 int  mt_async_start(struct mt7612u_dev *d, mt7612u_rx_cb cb, void *user);
 void mt_async_stop(struct mt7612u_dev *d);
 int  mt_async_tx_submit(struct mt7612u_dev *d, const uint8_t *buf, int len);
