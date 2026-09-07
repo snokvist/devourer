@@ -11,7 +11,39 @@
 #include <sys/file.h>
 #include <time.h>
 #include <unistd.h>
+#include <stdarg.h>
+
 #include "internal.h"
+
+/* See the LOG/WARN/ERR contract in internal.h. The whole line is formatted
+ * first and emitted with one fwrite + fflush: two stdio calls could interleave
+ * with a line from the libusb event thread, and an unflushed stderr can stall
+ * a piped consumer mid-bring-up. Truncation is silent and deliberate - a
+ * diagnostic is not worth a heap allocation on a path that may already be
+ * failing. */
+void mt_diag(char level, const char *fmt, ...)
+{
+	char line[512];
+	int n;
+	va_list ap;
+
+	n = snprintf(line, sizeof line, "devourer [%c] mt7612u: ", level);
+	if (n < 0 || (size_t)n >= sizeof line)
+		return;
+	va_start(ap, fmt);
+	n += vsnprintf(line + n, sizeof line - (size_t)n - 1, fmt, ap);
+	va_end(ap);
+	if (n < 0)
+		return;
+	/* vsnprintf returns what it WOULD have written, so clamp before using
+	 * it as a length - otherwise a truncated line writes past the buffer. */
+	if ((size_t)n > sizeof line - 2)
+		n = (int)(sizeof line - 2);
+	line[n++] = '\n';
+
+	fwrite(line, 1, (size_t)n, stderr);
+	fflush(stderr);
+}
 
 #define REQ_IN   (LIBUSB_ENDPOINT_IN  | LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_RECIPIENT_DEVICE)
 #define REQ_OUT  (LIBUSB_ENDPOINT_OUT | LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_RECIPIENT_DEVICE)
@@ -107,7 +139,9 @@ void mt_wr(struct mt7612u_dev *d, uint32_t addr, uint32_t val)
 
 	b[0] = val & 0xff; b[1] = (val >> 8) & 0xff;
 	b[2] = (val >> 16) & 0xff; b[3] = (val >> 24) & 0xff;
-	mt_vendor_req(d, req, REQ_OUT, (uint16_t)(a >> 16), (uint16_t)a, b, sizeof b);
+	if (mt_vendor_req(d, req, REQ_OUT, (uint16_t)(a >> 16), (uint16_t)a,
+	                  b, sizeof b) != (int)sizeof b)
+		d->io_err++;
 
 	/* Oracle-diff log: same shape decode.py renders from usbmon. */
 	if (d->wrlog)
@@ -121,6 +155,36 @@ void mt_wr(struct mt7612u_dev *d, uint32_t addr, uint32_t val)
  * (MT_WLAN_FUN_CTRL, MT_MAC_SYS_CTRL, the BBP AGC block) are exactly the ones
  * where that is destructive. Returns 0 on success, -1 if nothing was written.
  */
+/*
+ * Register-I/O failures accumulate per device rather than being returned from
+ * every accessor.
+ *
+ * mt_wr() discarded mt_vendor_req()'s result entirely, so a write that
+ * exhausted its retries mid-bring-up left the hardware partly configured while
+ * the public call still returned success. Threading a status through every
+ * writer would touch several hundred call sites in an initialisation sequence
+ * that is deliberately a verbatim port of mt76's, and that churn would bury
+ * the thing it is meant to protect.
+ *
+ * So this follows the shape the reads already had - mt_rr_chk() has always
+ * bumped this same counter. Writes stay best-effort at the call site, and a
+ * SEQUENCE checks the accumulator at its boundary: mt_io_clear() on entry,
+ * mt_io_errors() on exit, and the whole setup fails if any access failed.
+ * Optional or diagnostic writes stay best-effort by not being bracketed.
+ */
+void mt_io_clear(struct mt7612u_dev *d)      { d->io_err = 0; }
+unsigned mt_io_errors(struct mt7612u_dev *d) { return d->io_err; }
+
+/* Checked single write, for a caller that wants to fail at the write rather
+ * than at a sequence boundary. */
+int mt_wr_chk(struct mt7612u_dev *d, uint32_t addr, uint32_t val)
+{
+	unsigned before = d->io_err;
+
+	mt_wr(d, addr, val);
+	return d->io_err == before ? 0 : -1;
+}
+
 int mt_rmw(struct mt7612u_dev *d, uint32_t addr, uint32_t mask, uint32_t val)
 {
 	uint32_t cur;
@@ -161,8 +225,11 @@ int mt_poll(struct mt7612u_dev *d, uint32_t addr, uint32_t mask,
 
 void mt_single_wr(struct mt7612u_dev *d, uint8_t req, uint16_t off, uint32_t val)
 {
-	mt_vendor_req(d, req, REQ_OUT, (uint16_t)(val & 0xffff), off, NULL, 0);
-	mt_vendor_req(d, req, REQ_OUT, (uint16_t)(val >> 16), (uint16_t)(off + 2), NULL, 0);
+	if (mt_vendor_req(d, req, REQ_OUT, (uint16_t)(val & 0xffff), off, NULL, 0) < 0)
+		d->io_err++;
+	if (mt_vendor_req(d, req, REQ_OUT, (uint16_t)(val >> 16),
+	                  (uint16_t)(off + 2), NULL, 0) < 0)
+		d->io_err++;
 }
 
 int mt_bulk(struct mt7612u_dev *d, uint8_t ep, void *buf, int len,
@@ -297,7 +364,7 @@ static int lock_adapter(libusb_device *dev, const char **err)
 	 * planted there must not redirect the open. UsbDeviceLock does the same. */
 	fd = open(path, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0666);
 	if (fd < 0) {
-		LOG("warning: cannot open lock file %s (%s) - proceeding without "
+		WARN("cannot open lock file %s (%s) - proceeding without "
 		    "exclusivity", path, strerror(errno));
 		return -1;
 	}
@@ -311,7 +378,7 @@ static int lock_adapter(libusb_device *dev, const char **err)
 			       "beyond SIGKILL";
 		return -2;
 	}
-	LOG("warning: cannot lock %s (%s) - proceeding without exclusivity",
+	WARN("cannot lock %s (%s) - proceeding without exclusivity",
 	    path, strerror(errno));
 	return -1;
 }
@@ -375,7 +442,7 @@ static libusb_device_handle *open_selected(libusb_context *ctx, const char **err
 	}
 
 	if (matches > 1 && (!sel || !*sel))
-		LOG("warning: %d MT7612U adapters attached and MT7612U_DEV is unset - "
+		WARN("%d MT7612U adapters attached and MT7612U_DEV is unset - "
 		    "using the first. Set MT7612U_DEV=<bus-port> to be explicit.",
 		    matches);
 	libusb_free_device_list(list, 1);
@@ -426,7 +493,7 @@ int mt_open(struct mt7612u_dev *d, const char **err)
 		if (libusb_kernel_driver_active(d->h, 0) == 1)
 			libusb_detach_kernel_driver(d->h, 0);
 	} else if (rc) {
-		LOG("warning: USB reset returned %s", libusb_error_name(rc));
+		WARN("USB reset returned %s", libusb_error_name(rc));
 	}
 
 	rc = libusb_claim_interface(d->h, 0);
@@ -453,6 +520,19 @@ void mt_close(struct mt7612u_dev *d)
 {
 	if (d->wrlog) { fclose(d->wrlog); d->wrlog = NULL; }
 	if (d->mculog) { fclose(d->mculog); d->mculog = NULL; }
+	if (d->transfers_stranded) {
+		/* Deliberately leaks the handle and context. Transfers submitted
+		 * on them are still owned by libusb with no event thread left to
+		 * complete them; releasing the interface or closing underneath
+		 * that is undefined, and a leaked handle on a process that is
+		 * already tearing down is the cheaper failure. */
+		ERR("close: transfers still owned by libusb - leaking the USB "
+		    "handle and context rather than closing underneath them");
+		d->h = NULL;
+		d->ctx = NULL;
+		if (g_lock_fd >= 0) { close(g_lock_fd); g_lock_fd = -1; }
+		return;
+	}
 	if (d->h) {
 		if (d->owns_handle) {
 			libusb_release_interface(d->h, 0);

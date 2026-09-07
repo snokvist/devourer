@@ -87,7 +87,7 @@ static void power_on(struct mt7612u_dev *d)
 	val = MT_WLAN_MTC_CTRL_STATE_UP | MT_WLAN_MTC_CTRL_PWR_ACK |
 	      MT_WLAN_MTC_CTRL_PWR_ACK_S;
 	if (!mt_poll(d, CFG_ADDR(MT_CFG_MTC_CTRL), val, val, 1000))
-		LOG("warning: MTCMOS power-up did not ack");
+		WARN("MTCMOS power-up did not ack");
 
 	mt_clear(d, CFG_ADDR(MT_CFG_MTC_CTRL), 0x7fu << 16);
 	mt_usleep(20);
@@ -172,7 +172,12 @@ static void mac_reset(struct mt7612u_dev *d)
 
 	mt_wr(d, MT_TX_LINK_CFG, 0x1020);
 	mt_wr(d, MT_AUTO_RSP_CFG, 0x13);
+	/* Low 12 bits are the maximum on-air length INCLUDING the 4-byte FCS,
+	 * so this 0xf00 is 3840 on air and 3836 of MPDU. Cached rather than
+	 * re-read by mt7612u_get_caps(), which is a const snapshot and must not
+	 * touch the bus. Measured to the byte: 3836 arrives, 3837 does not. */
 	mt_wr(d, MT_MAX_LEN_CFG, 0x2f00);
+	d->max_mpdu_rx = (uint16_t)((0x2f00 & 0xfff) - 4);
 
 	mt_wr(d, MT_WMM_AIFSN, 0x2273);
 	mt_wr(d, MT_WMM_CWMIN, 0x2344);
@@ -305,7 +310,7 @@ int mt_mac_stop(struct mt7612u_dev *d)
 		mt_usleep(15);
 	}
 	if (!mt_poll(d, MT_MAC_STATUS, MT_MAC_STATUS_RX, 0, 200000))
-		LOG("warning: MAC RX failed to stop");
+		WARN("MAC RX failed to stop");
 
 	mt_wr(d, MT_TX_RTS_CFG, rts_cfg);
 	return 0;
@@ -343,6 +348,13 @@ void mt_power_cycle(struct mt7612u_dev *d)
 
 int mt_init_hardware(struct mt7612u_dev *d, const char *fw_dir)
 {
+	/* Bracket the whole bring-up: several hundred writes here are a
+	 * verbatim port of mt76's init sequence and are best-effort at the call
+	 * site, so the sequence checks the accumulator at its boundary instead.
+	 * Without this a write that exhausted its retries left the MAC or the
+	 * BBP partly programmed and this function still returned success. */
+	mt_io_clear(d);
+
 	mt_power_cycle(d);
 
 	if (!mt_wait_for_mac(d)) { ERR("MAC not ready after power on"); return -1; }
@@ -367,7 +379,7 @@ int mt_init_hardware(struct mt7612u_dev *d, const char *fw_dir)
 	mac_setaddr(d);
 
 	if (!mt_poll(d, MT_MAC_STATUS, MT_MAC_STATUS_TX | MT_MAC_STATUS_RX, 0, 100000))
-		LOG("warning: TX/RX not idle before table clear");
+		WARN("TX/RX not idle before table clear");
 
 	wcid_and_key_clear(d);
 
@@ -388,7 +400,15 @@ int mt_init_hardware(struct mt7612u_dev *d, const char *fw_dir)
 	/* Leave no half-full RX ring behind for the next run to inherit. */
 	mt_rx_flush(d);
 
-	return mt_mac_stop(d);
+	if (mt_mac_stop(d))
+		return -1;
+	if (mt_io_errors(d)) {
+		ERR("bring-up completed with %u failed register transfers - the "
+		    "MAC or BBP is only partly programmed, refusing to report "
+		    "success", mt_io_errors(d));
+		return -1;
+	}
+	return 0;
 }
 
 /* --- the public lifecycle, as declared in include/mt7612u/mt7612u.h --- */

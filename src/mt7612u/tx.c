@@ -150,7 +150,7 @@ int mt_tx_build(struct mt7612u_dev *d, uint8_t *buf, size_t bufsz,
 
 		if (!d->bw_clamp_warned) {
 			d->bw_clamp_warned = 1;
-			LOG("warning: rate asks for bw %u on a bw %u channel; narrowing "
+			WARN("rate asks for bw %u on a bw %u channel; narrowing "
 			    "to the channel width (further occurrences silent)",
 			    rate->bw, d->bw);
 		}

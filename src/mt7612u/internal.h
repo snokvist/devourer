@@ -125,6 +125,8 @@ struct mt7612u_dev {
 	struct mt7612u_cal cal;
 
 	unsigned io_err;          /* EP0 transfers that exhausted their retries */
+	int      transfers_stranded; /* libusb still owns a cancelled ring */
+	uint16_t max_mpdu_rx;     /* from MT_MAX_LEN_CFG at init, less the FCS */
 
 	/* Oracle-diff log: every EP0 write we emit, in order. */
 	uint8_t  ack_saved_mac[6];
@@ -148,6 +150,10 @@ uint32_t mt_rr(struct mt7612u_dev *d, uint32_t addr);
 void     mt_wr(struct mt7612u_dev *d, uint32_t addr, uint32_t val);
 /* Returns -1 without writing when the read half fails. */
 int      mt_rmw(struct mt7612u_dev *d, uint32_t addr, uint32_t mask, uint32_t val);
+int      mt_wr_chk(struct mt7612u_dev *d, uint32_t addr, uint32_t val);
+/* Register-I/O failure accumulator; see the comment above mt_io_clear(). */
+void     mt_io_clear(struct mt7612u_dev *d);
+unsigned mt_io_errors(struct mt7612u_dev *d);
 #define  mt_set(d, a, v)   mt_rmw(d, a, v, v)
 #define  mt_clear(d, a, v) mt_rmw(d, a, v, 0)
 /* Poll until (rr(addr) & mask) == val. Returns 1 on success, 0 on timeout. */
@@ -240,7 +246,26 @@ int  mt_set_channel_ex(struct mt7612u_dev *d, uint8_t chan, uint8_t bw, int fast
 int  mt_chan_group(uint8_t chan, uint8_t bw, uint8_t *hw_chan,
                    uint8_t *bw_index, uint8_t *ch_group);
 
-#define LOG(...)  do { fprintf(stderr, "[mt7612u] " __VA_ARGS__); fputc('\n', stderr); } while (0)
-#define ERR(...)  do { fprintf(stderr, "[mt7612u] ERROR " __VA_ARGS__); fputc('\n', stderr); } while (0)
+/*
+ * The diagnostic plane, per docs/logging.md: stderr, one line of
+ * `devourer [X] message` with X in T/D/I/W/E.
+ *
+ * The old macros broke that contract three ways. They used a private
+ * `[mt7612u]` prefix rather than the documented one, so a consumer filtering
+ * on level saw nothing; they emitted the text and its newline as two separate
+ * stdio calls, so a line written from the libusb event thread could be split
+ * by one from a caller; and they never flushed, so a piped reader could sit on
+ * a full buffer while the device was mid-bring-up. mt_diag() formats the whole
+ * line first and emits it with a single fwrite + fflush, which is what
+ * src/Event.h does for the machine plane and for the same reason.
+ */
+void mt_diag(char level, const char *fmt, ...)
+#if defined(__GNUC__)
+	__attribute__((format(printf, 2, 3)))
+#endif
+	;
+#define LOG(...)   mt_diag('I', __VA_ARGS__)
+#define WARN(...)  mt_diag('W', __VA_ARGS__)
+#define ERR(...)   mt_diag('E', __VA_ARGS__)
 
 #endif

@@ -3,6 +3,7 @@
  * MT7612U bringup harness. One subcommand per gate (see src/mt7612u/README.md), so each
  * stage is independently runnable on hardware.
  */
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
@@ -715,14 +716,23 @@ static int gate_soak(uint8_t chan, int secs, int framelen)
 	return 0;
 }
 
-struct arx_ctx { unsigned long n; unsigned long by_phy[8]; };
+/*
+ * Written by the libusb event thread, read by the gate while that thread is
+ * still running - gate_arx() and gate_duplex() both print before calling
+ * mt7612u_rx_stop(). Plain increments there are a data race, so the displayed
+ * rate and the duplex pass/fail verdict could be built from torn counts.
+ * Relaxed atomics: these are counters, nothing orders anything else off them,
+ * and this is the RX hot path in a throughput gate.
+ */
+struct arx_ctx { _Atomic unsigned long n; _Atomic unsigned long by_phy[8]; };
 static void arx_cb(void *user, const void *frame, size_t len,
                    const struct mt7612u_rx_info *info)
 {
 	struct arx_ctx *c = user;
 	(void)frame; (void)len;
-	c->n++;
-	c->by_phy[info->phy & 7]++;
+	atomic_fetch_add_explicit(&c->n, 1, memory_order_relaxed);
+	atomic_fetch_add_explicit(&c->by_phy[info->phy & 7], 1,
+	                          memory_order_relaxed);
 }
 
 /* Async RX ring: the callback path StartRxLoop needs. */
@@ -995,7 +1005,8 @@ static void drain_cb(void *user, const void *frame, size_t len,
                      const struct mt7612u_rx_info *info)
 {
 	(void)frame; (void)len; (void)info;
-	(*(unsigned long *)user)++;
+	atomic_fetch_add_explicit((_Atomic unsigned long *)user, 1,
+	                          memory_order_relaxed);
 }
 
 /* Capability descriptor, TSF and 40 MHz. */
@@ -1133,7 +1144,8 @@ static int gate_caps(uint8_t chan)
  * The RX filter must keep MT_RX_FILTR_CFG_DUP clear or the hardware drops the
  * duplicates this test is counting.
  */
-struct ack_ctx { unsigned long to_us, retry_to_us, other; };
+/* Same event-thread/gate split as arx_ctx above. */
+struct ack_ctx { _Atomic unsigned long to_us, retry_to_us, other; };
 
 static const uint8_t g_ack_mac[6] = { 0x02, 0x4d, 0x54, 0x76, 0x12, 0xaa };
 
@@ -1145,9 +1157,13 @@ static void ack_cb(void *user, const void *frame, size_t len,
 
 	(void)info;
 	if (len < 16) return;
-	if (memcmp(f + 4, g_ack_mac, 6) != 0) { c->other++; return; }
-	c->to_us++;
-	if (f[1] & 0x08) c->retry_to_us++;      /* FC Retry bit */
+	if (memcmp(f + 4, g_ack_mac, 6) != 0) {
+		atomic_fetch_add_explicit(&c->other, 1, memory_order_relaxed);
+		return;
+	}
+	atomic_fetch_add_explicit(&c->to_us, 1, memory_order_relaxed);
+	if (f[1] & 0x08)                        /* FC Retry bit */
+		atomic_fetch_add_explicit(&c->retry_to_us, 1, memory_order_relaxed);
 }
 
 static int gate_ack(uint8_t chan, int secs, int arm)

@@ -117,6 +117,11 @@ static void LIBUSB_CALL tx_done(struct libusb_transfer *t)
 
 int mt_async_start(struct mt7612u_dev *d, mt7612u_rx_cb cb, void *user)
 {
+	if (d->transfers_stranded) {
+		ERR("async start refused: a previous ring's transfers are still "
+		    "owned by libusb on these endpoints");
+		return -1;
+	}
 	struct mt_async *a;
 
 	if (d->a) return 0;
@@ -224,9 +229,18 @@ void mt_async_stop(struct mt7612u_dev *d)
 
 	d->a = NULL;
 	if (stuck_tx || stuck_rx) {
+		/* Leaking the ring is the safe half. The other half is that libusb
+		 * still owns those transfers while the event thread has just been
+		 * joined, so nothing will ever complete them - and releasing the
+		 * interface, closing the handle or exiting the context underneath
+		 * them is undefined. Mark the device stranded: mt_close() then
+		 * leaks the USB objects too rather than freeing what libusb holds,
+		 * and mt_async_start() refuses to submit a second ring onto the
+		 * same endpoints. Consistent with the leak, not a new policy. */
+		d->transfers_stranded = 1;
 		ERR("async stop: %d TX and %d RX transfers still in flight after 2 s "
-		    "- leaking the ring rather than freeing memory libusb owns",
-		    stuck_tx, stuck_rx);
+		    "- leaking the ring, and the USB handle with it, rather than "
+		    "freeing memory libusb still owns", stuck_tx, stuck_rx);
 		return;
 	}
 

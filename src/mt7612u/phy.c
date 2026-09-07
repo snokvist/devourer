@@ -453,6 +453,11 @@ int mt_set_channel_ex(struct mt7612u_dev *d, uint8_t chan, uint8_t bw, int fast)
 	if (mt_chan_group(chan, bw, &hw_chan, &bw_index, &ch_group_index))
 		return -1;
 
+	/* Same bracket as the bring-up: the tune is a long run of best-effort
+	 * writes, and a channel reported as set while half its registers never
+	 * landed is worse than a refusal. */
+	mt_io_clear(d);
+
 	d->cal.channel_cal_done = fast;
 	d->chan = chan;
 	d->bw = bw;
@@ -553,6 +558,12 @@ int mt_set_channel_ex(struct mt7612u_dev *d, uint8_t chan, uint8_t bw, int fast)
 			flag |= BIT(8);
 		mt_mcu_calibrate(d, MCU_CAL_TSSI, flag);
 		d->cal.tssi_cal_done = 1;
+	}
+	if (mt_io_errors(d)) {
+		ERR("channel %u set with %u failed register transfers - the tune "
+		    "is incomplete", chan, mt_io_errors(d));
+		d->chan = 0;
+		return -1;
 	}
 	return 0;
 }
