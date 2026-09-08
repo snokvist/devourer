@@ -273,6 +273,9 @@ void mt_beacon_init(struct mt7612u_dev *d);
 int  mt_beacon_write(struct mt7612u_dev *d, const void *frame, size_t len,
                      const struct mt7612u_tx_rate *rate);
 int  mt_beacon_set_enable(struct mt7612u_dev *d, int on, unsigned interval_tu);
+/* Publish the AP's BSSID in APC slot `idx` so the MAC matches and auto-ACKs
+ * frames addressed to the BSS. mac_setaddr() zeroes every slot at init. */
+void mt_ap_set_bssid(struct mt7612u_dev *d, uint8_t idx, const uint8_t *addr);
 
 /* --- radiotap.c --- */
 int mt_radiotap_parse(const uint8_t *buf, size_t len, struct mt7612u_tx_rate *r);

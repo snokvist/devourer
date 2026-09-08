@@ -446,23 +446,24 @@ static int build_beacon(uint8_t chan, const uint8_t *bssid, uint8_t *out,
 
 static int gate_beacon(uint8_t chan, int secs)
 {
-	/* A chosen unicast AP BSSID (I/G bit clear - an I/G-set BSSID makes a STA
-	 * drop auth, per docs/ap-mode.md). Stage A only needs it in the beacon
-	 * frame; Stage B (association/auto-ACK) must ALSO program it into the
-	 * MT_MAC_BSSID address-match registers, which mac_setaddr() currently
-	 * fills from the EEPROM MAC. Consistent there is a Stage-B task. */
-	static const uint8_t bssid[6] = { 0x02, 0x4d, 0x54, 0x76, 0x12, 0x0a };
+	/* The AP's BSSID is the device's own MAC, which mac_setaddr() has already
+	 * programmed into MT_MAC_ADDR (what the MAC auto-ACKs against) and
+	 * MT_MAC_BSSID. Advertising anything else in the beacon would leave a
+	 * station addressing auth to an address the MAC does not answer for. It
+	 * is a real, unicast address, which is what a STA requires (an I/G-set
+	 * BSSID makes it drop auth before the air - docs/ap-mode.md). */
+	const uint8_t *bssid;
 	struct mt7612u_tx_rate rate = {
 		.phy = MT7612U_PHY_OFDM, .mcs = 0, .nss = 1,
 		.bw = MT7612U_BW_20, .no_ack = 1,
 	};
 	uint8_t bcn[128];
-	int n = build_beacon(chan, bssid, bcn, sizeof bcn);
-	int rc = 1;
-
-	if (n < 0) { printf("GATE A: FAIL - beacon build\n"); return 1; }
+	int n, rc = 1;
 
 	if (mt_eeprom_init(&dev)) return 1;
+	bssid = dev.macaddr;
+	n = build_beacon(chan, bssid, bcn, sizeof bcn);
+	if (n < 0) { printf("GATE A: FAIL - beacon build\n"); return 1; }
 	if (mt_init_hardware(&dev, NULL)) {
 		printf("GATE A: FAIL - init_hardware\n"); return 1;
 	}
@@ -530,6 +531,173 @@ static int gate_beacon(uint8_t chan, int secs)
 
 out:
 	mt_beacon_set_enable(&dev, 0, 0);   /* never leave a beacon airing */
+	mt_mac_stop(&dev);
+	return rc;
+}
+
+/*
+ * Stage B: the beacon plus a receiver, so a real station can probe, authenticate
+ * and associate against us.
+ *
+ * The measurement that matters is the RETRY BIT. An ACK is SIFS-timed and can
+ * only come from the MAC, so it cannot be observed directly from userspace -
+ * but a station that does not get one retransmits with FC Retry set. Auth
+ * arriving at retry=0 is therefore the proof that the hardware auto-ACKed it;
+ * a pile of retry=1 auths is the proof it did not.
+ */
+struct ap_ctx {
+	_Atomic unsigned probe_req, auth, auth_retry, assoc, assoc_retry;
+	_Atomic unsigned data_to_us, mgmt_other;
+	uint8_t bssid[6];
+};
+
+static void ap_cb(void *user, const void *frame, size_t len,
+                  const struct mt7612u_rx_info *info)
+{
+	struct ap_ctx *c = user;
+	const uint8_t *f = frame;
+	unsigned fc, type, subtype;
+	int retry, to_us;
+
+	(void)info;
+	if (len < 16) return;
+	fc = (unsigned)f[0] | ((unsigned)f[1] << 8);
+	type = (fc >> 2) & 3;
+	subtype = (fc >> 4) & 0xf;
+	retry = (f[1] & 0x08) != 0;        /* FC Retry */
+	to_us = memcmp(f + 4, c->bssid, 6) == 0;   /* addr1 == our BSSID */
+
+	if (type == 2) {                   /* data */
+		if (to_us)
+			atomic_fetch_add_explicit(&c->data_to_us, 1, memory_order_relaxed);
+		return;
+	}
+	if (type != 0) return;             /* control */
+
+	switch (subtype) {
+	case 4:                            /* probe request (usually broadcast) */
+		atomic_fetch_add_explicit(&c->probe_req, 1, memory_order_relaxed);
+		break;
+	case 11:                           /* authentication */
+		if (!to_us) break;
+		atomic_fetch_add_explicit(&c->auth, 1, memory_order_relaxed);
+		if (retry)
+			atomic_fetch_add_explicit(&c->auth_retry, 1, memory_order_relaxed);
+		break;
+	case 0: case 2:                    /* (re)association request */
+		if (!to_us) break;
+		atomic_fetch_add_explicit(&c->assoc, 1, memory_order_relaxed);
+		if (retry)
+			atomic_fetch_add_explicit(&c->assoc_retry, 1, memory_order_relaxed);
+		break;
+	default:
+		if (to_us)
+			atomic_fetch_add_explicit(&c->mgmt_other, 1, memory_order_relaxed);
+		break;
+	}
+}
+
+static int gate_ap(uint8_t chan, int secs)
+{
+	struct ap_ctx ctx;
+	struct mt7612u_tx_rate rate = {
+		.phy = MT7612U_PHY_OFDM, .mcs = 0, .nss = 1,
+		.bw = MT7612U_BW_20, .no_ack = 1,
+	};
+	uint8_t bcn[128];
+	int n, rc = 1;
+	unsigned pr, au, aur, as, asr, dt;
+
+	memset(&ctx, 0, sizeof ctx);
+
+	if (secs <= 0 || secs > 3600) {
+		printf("GATE B: FAIL - duration %d out of range (1..3600 s)\n", secs);
+		return 1;
+	}
+	if (mt_eeprom_init(&dev)) return 1;
+	memcpy(ctx.bssid, dev.macaddr, 6);
+	n = build_beacon(chan, dev.macaddr, bcn, sizeof bcn);
+	if (n < 0) { printf("GATE B: FAIL - beacon build\n"); return 1; }
+
+	if (mt_init_hardware(&dev, NULL)) {
+		printf("GATE B: FAIL - init_hardware\n"); return 1;
+	}
+	if (mt_set_channel(&dev, chan, MT7612U_BW_20)) {
+		printf("GATE B: FAIL - set_channel\n"); return 1;
+	}
+	/* Ring first, receiver second - RX must never run with EP 4 undrained. */
+	if (mt7612u_rx_start(&dev, ap_cb, &ctx)) {
+		printf("GATE B: FAIL - rx_start\n"); return 1;
+	}
+	if (mt_mac_start(&dev, MT_RX_DRAIN_RING)) {
+		printf("GATE B: FAIL - mac_start\n"); mt7612u_rx_stop(&dev); return 1;
+	}
+	/*
+	 * AP receive filter. The managed default (0x00015f97) already leaves
+	 * OTHER_BSS and BCAST undropped, so a probe request with a wildcard BSSID
+	 * reaches us - mt76 clears OTHER_BSS for every mode too. The one change an
+	 * AP needs is DUP: dropping duplicates would hide exactly the
+	 * retransmissions this gate measures.
+	 */
+	mt_wr(&dev, MT_RX_FILTR_CFG, 0x00015f97 & ~MT_RX_FILTR_CFG_DUP);
+
+	/* The address-match half of "being an AP": the MAC auto-ACKs against
+	 * MT_MAC_ADDR (already our MAC) and matches the BSS against this slot,
+	 * which mac_setaddr() zeroed. There is no separate AP op-mode register on
+	 * this part - mt76 sets none either; address match + beacon IS the AP. */
+	mt_ap_set_bssid(&dev, 0, dev.macaddr);
+
+	mt_beacon_init(&dev);
+	if (mt_beacon_write(&dev, bcn, (size_t)n, &rate)) {
+		printf("GATE B: FAIL - beacon_write\n"); goto out;
+	}
+	if (mt_beacon_set_enable(&dev, 1, 100)) {
+		printf("GATE B: FAIL - beacon_set_enable\n"); goto out;
+	}
+
+	printf("AP up: ch%u  BSSID/MAC %02x:%02x:%02x:%02x:%02x:%02x  SSID \"MT7612U-AP\"\n",
+	       chan, dev.macaddr[0], dev.macaddr[1], dev.macaddr[2],
+	       dev.macaddr[3], dev.macaddr[4], dev.macaddr[5]);
+	printf("MT_RX_FILTR_CFG=0x%08x  APC_BSSID_L(0)=0x%08x  AUTO_RSP_CFG=0x%08x\n",
+	       mt_rr(&dev, MT_RX_FILTR_CFG), mt_rr(&dev, MT_MAC_APC_BSSID_L(0)),
+	       mt_rr(&dev, MT_AUTO_RSP_CFG));
+	printf("stimulus: on a station radio run\n"
+	       "  sudo iw dev <sta> scan          (probe requests)\n"
+	       "  sudo wpa_supplicant ... / iw dev <sta> connect MT7612U-AP\n");
+	printf("listening %d s ...\n", secs);
+
+	if (!wait_ticking(secs * 1000.0))
+		printf("(interrupted)\n");
+
+	pr  = atomic_load_explicit(&ctx.probe_req, memory_order_relaxed);
+	au  = atomic_load_explicit(&ctx.auth, memory_order_relaxed);
+	aur = atomic_load_explicit(&ctx.auth_retry, memory_order_relaxed);
+	as  = atomic_load_explicit(&ctx.assoc, memory_order_relaxed);
+	asr = atomic_load_explicit(&ctx.assoc_retry, memory_order_relaxed);
+	dt  = atomic_load_explicit(&ctx.data_to_us, memory_order_relaxed);
+
+	printf("\nprobe-req %u | auth %u (retry %u) | assoc %u (retry %u) | data-to-us %u | other-mgmt %u\n",
+	       pr, au, aur, as, asr, dt,
+	       atomic_load_explicit(&ctx.mgmt_other, memory_order_relaxed));
+
+	if (!au) {
+		printf("GATE B: INCONCLUSIVE - no auth reached us "
+		       "(probe-req %u). Did a station try to connect?\n", pr);
+	} else if (aur == 0) {
+		printf("GATE B: PASS - %u auth frame(s), none retried: "
+		       "the MAC auto-ACKed them\n", au);
+		rc = 0;
+	} else if (aur < au) {
+		printf("GATE B: PARTIAL - %u auth, %u retried: ACKs land but not always\n",
+		       au, aur);
+		rc = 0;
+	} else {
+		printf("GATE B: FAIL - every auth (%u) was a retry: nothing is ACKing\n", au);
+	}
+
+out:
+	mt_beacon_set_enable(&dev, 0, 0);   /* never leave a beacon airing */
+	mt7612u_rx_stop(&dev);
 	mt_mac_stop(&dev);
 	return rc;
 }
@@ -2559,6 +2727,9 @@ int main(int argc, char **argv)
 	} else if (!strcmp(cmd, "beacon")) {
 		rc = gate_beacon(argc > 2 ? (uint8_t)atoi(argv[2]) : 149,
 		                 argc > 3 ? atoi(argv[3]) : 10);
+	} else if (!strcmp(cmd, "ap")) {
+		rc = gate_ap(argc > 2 ? (uint8_t)atoi(argv[2]) : 149,
+		             argc > 3 ? atoi(argv[3]) : 30);
 	} else if (!strcmp(cmd, "chan")) {
 		rc = gate_chan(argc > 2 ? (uint8_t)atoi(argv[2]) : 149,
 		               argc > 3 ? argv[3] : NULL);
@@ -2572,6 +2743,7 @@ int main(int argc, char **argv)
 		fprintf(stderr, "unknown subcommand '%s'\n", cmd);
 		fprintf(stderr, "usage: bringup [regs|fw|init|chan|tx|rx|hop|gateg] [chan] [count] [phy 0=CCK 1=OFDM 2=HT 4=VHT] [mcs]\n");
 		fprintf(stderr, "       bringup beacon [chan] [secs]   (Stage A: static AP beacon on air)\n");
+		fprintf(stderr, "       bringup ap     [chan] [secs]   (Stage B: beacon + RX, probe/auth/assoc)\n");
 		fprintf(stderr, "       bringup [sweep|coding|vht] [chan] [count] [bw 0=20 1=40 2=80]\n");
 		fprintf(stderr, "       the witness must listen at the same width (DEVOURER_BW=40|80)\n");
 		rc = 2;

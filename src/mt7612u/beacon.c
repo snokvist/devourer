@@ -97,6 +97,25 @@ int mt_beacon_write(struct mt7612u_dev *d, const void *frame, size_t len,
 }
 
 /*
+ * mt76x02_mac_set_bssid(): the per-BSS address the MAC matches receptions
+ * against. mac_setaddr() zeroes all eight APC slots at init, which is right for
+ * an injector; an AP must publish its own BSSID in the slot its MBSS index
+ * selects (0 for a single BSS) or the MAC matches nothing for the BSS - a
+ * station's auth is then neither accepted nor auto-ACKed, and it retries
+ * forever. Called by the AP path; the injector never needs it.
+ */
+void mt_ap_set_bssid(struct mt7612u_dev *d, uint8_t idx, const uint8_t *addr)
+{
+	uint32_t lo = (uint32_t)addr[0] | ((uint32_t)addr[1] << 8) |
+	              ((uint32_t)addr[2] << 16) | ((uint32_t)addr[3] << 24);
+	uint32_t hi = (uint32_t)addr[4] | ((uint32_t)addr[5] << 8);
+
+	idx &= 7;
+	mt_wr(d, MT_MAC_APC_BSSID_L(idx), lo);
+	mt_rmw(d, MT_MAC_APC_BSSID_H(idx), MT_MAC_APC_BSSID_H_ADDR, hi);
+}
+
+/*
  * mt76x02_mac_set_beacon_enable(), static path. No pre-TBTT timer: the MAC
  * transmits the reserved-page beacon on its own once BEACON_TX|TBTT_EN|TIMER_EN
  * are set. interval_tu is the beacon interval in TU (1024 us); the register
