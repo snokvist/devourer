@@ -400,6 +400,140 @@ static int gate_chan(uint8_t chan, const char *fw_dir)
 	return 0;
 }
 
+/*
+ * Stage A: a static beacon on air. The MAC auto-transmits it from the reserved
+ * page, so there is nothing to loop over here except watching the TSF advance;
+ * the RTL8812AU witness (rxdemo) and a kernel station's `iw scan` decide
+ * PASS/FAIL. The beacon is ALWAYS disabled before returning - a beacon left
+ * armed keeps airing after the process exits and contaminates the next run.
+ */
+static int build_beacon(uint8_t chan, const uint8_t *bssid, uint8_t *out,
+                        size_t outsz)
+{
+	/* 5 GHz: OFDM basic set. 2.4 GHz: CCK + OFDM basic set. */
+	static const uint8_t rates_5g[] = { 0x8c, 0x12, 0x98, 0x24,
+	                                    0xb0, 0x48, 0x60, 0x6c };
+	static const uint8_t rates_2g[] = { 0x82, 0x84, 0x8b, 0x96,
+	                                    0x0c, 0x12, 0x18, 0x24 };
+	static const char ssid[] = "MT7612U-AP";
+	const uint8_t *rates = chan <= 14 ? rates_2g : rates_5g;
+	const int ssidlen = (int)sizeof ssid - 1;
+	uint8_t *p = out;
+
+	if (outsz < 128)
+		return -1;
+
+	*p++ = 0x80; *p++ = 0x00;                 /* FC: mgmt, beacon */
+	*p++ = 0x00; *p++ = 0x00;                 /* duration */
+	memset(p, 0xff, 6); p += 6;               /* addr1 = broadcast */
+	memcpy(p, bssid, 6); p += 6;              /* addr2 = SA (BSSID) */
+	memcpy(p, bssid, 6); p += 6;              /* addr3 = BSSID */
+	*p++ = 0x00; *p++ = 0x00;                 /* seq ctl (HW assigns) */
+
+	memset(p, 0, 8); p += 8;                  /* timestamp (HW fills) */
+	*p++ = 0x64; *p++ = 0x00;                 /* beacon interval = 100 TU */
+	*p++ = 0x01; *p++ = 0x00;                 /* capability: ESS */
+
+	*p++ = 0; *p++ = (uint8_t)ssidlen;                    /* SSID IE */
+	memcpy(p, ssid, (size_t)ssidlen); p += ssidlen;
+	*p++ = 1; *p++ = 8; memcpy(p, rates, 8); p += 8;      /* Supported Rates */
+	*p++ = 3; *p++ = 1; *p++ = chan;                      /* DS Parameter Set */
+	*p++ = 5; *p++ = 4;                                   /* TIM (DTIM=1, empty) */
+	*p++ = 0; *p++ = 1; *p++ = 0; *p++ = 0;
+
+	return (int)(p - out);
+}
+
+static int gate_beacon(uint8_t chan, int secs)
+{
+	/* A chosen unicast AP BSSID (I/G bit clear - an I/G-set BSSID makes a STA
+	 * drop auth, per docs/ap-mode.md). Stage A only needs it in the beacon
+	 * frame; Stage B (association/auto-ACK) must ALSO program it into the
+	 * MT_MAC_BSSID address-match registers, which mac_setaddr() currently
+	 * fills from the EEPROM MAC. Consistent there is a Stage-B task. */
+	static const uint8_t bssid[6] = { 0x02, 0x4d, 0x54, 0x76, 0x12, 0x0a };
+	struct mt7612u_tx_rate rate = {
+		.phy = MT7612U_PHY_OFDM, .mcs = 0, .nss = 1,
+		.bw = MT7612U_BW_20, .no_ack = 1,
+	};
+	uint8_t bcn[128];
+	int n = build_beacon(chan, bssid, bcn, sizeof bcn);
+	int rc = 1;
+
+	if (n < 0) { printf("GATE A: FAIL - beacon build\n"); return 1; }
+
+	if (mt_eeprom_init(&dev)) return 1;
+	if (mt_init_hardware(&dev, NULL)) {
+		printf("GATE A: FAIL - init_hardware\n"); return 1;
+	}
+	if (mt_set_channel(&dev, chan, MT7612U_BW_20)) {
+		printf("GATE A: FAIL - set_channel\n"); return 1;
+	}
+	/* TX-only: beaconing never reads EP 4. */
+	if (mt_mac_start(&dev, MT_RX_DRAIN_NONE)) {
+		printf("GATE A: FAIL - mac_start\n"); return 1;
+	}
+
+	mt_beacon_init(&dev);
+	if (mt_beacon_write(&dev, bcn, (size_t)n, &rate)) {
+		printf("GATE A: FAIL - beacon_write\n"); goto out;
+	}
+	if (mt_beacon_set_enable(&dev, 1, 100)) {
+		printf("GATE A: FAIL - beacon_set_enable\n"); goto out;
+	}
+
+	printf("beacon armed: ch%u, BSSID %02x:%02x:%02x:%02x:%02x:%02x, "
+	       "SSID \"MT7612U-AP\", 100 TU, OFDM 6M, %d B MPDU\n",
+	       chan, bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5], n);
+	printf("MT_BEACON_TIME_CFG=0x%08x (bit16 TIMER bit19 TBTT bit20 TX)\n",
+	       mt_rr(&dev, MT_BEACON_TIME_CFG));
+	printf("MT_MAC_BSSID_DW1  =0x%08x (MBSS_MODE 17:16 should read 3)\n",
+	       mt_rr(&dev, MT_MAC_BSSID_DW1));
+	printf("witness: run rxdemo on the 8812AU and grep the BSSID; "
+	       "or `iw dev <sta> scan | grep MT7612U-AP`\n");
+
+	/* Watch the TSF advance - proof the beacon timer is running. DW0 is the
+	 * low word on this silicon (mt76's debug read has it backwards). */
+	{
+		uint64_t prev = 0;
+		int good = 0;
+
+		for (int s = 0; s < secs && !g_stop; s++) {
+			uint32_t lo = mt_rr(&dev, MT_TSF_TIMER_DW0);
+			uint32_t hi = mt_rr(&dev, MT_TSF_TIMER_DW1);
+			uint64_t tsf = ((uint64_t)hi << 32) | lo;
+
+			if (s)
+				printf("  t=%ds TSF=%llu (+%llu us)\n", s,
+				       (unsigned long long)tsf,
+				       (unsigned long long)(tsf - prev));
+			if (s && tsf > prev)
+				good++;
+			prev = tsf;
+			if (!wait_ms(1000))
+				break;
+		}
+		/* A running TSF is necessary, not sufficient - the witness is the
+		 * real gate - but a frozen TSF means no beacons are being sent. */
+		if (good == 0) {
+			printf("GATE A: FAIL - TSF did not advance; beacon timer is dead\n");
+			goto out;
+		}
+		printf("TSF advanced on %d sample(s) - beacon timer is live\n", good);
+	}
+	rc = 0;
+	/* This is a LOCAL precondition only: an advancing TSF proves the beacon
+	 * timer runs, not that a frame reaches the air. The witness (rxdemo /
+	 * `iw scan`) is the actual Gate A. */
+	printf("\nGATE A (local): beacon armed, timer live. On-air PASS/FAIL is "
+	       "the witness's call - grep the 8812AU for our SSID/BSSID.\n");
+
+out:
+	mt_beacon_set_enable(&dev, 0, 0);   /* never leave a beacon airing */
+	mt_mac_stop(&dev);
+	return rc;
+}
+
 /* Gate E: inject frames. The witness is a separate radio - our own RX seeing
  * these would prove nothing. */
 static int gate_tx(uint8_t chan, int count, int phy, int mcs)
@@ -2422,6 +2556,9 @@ int main(int argc, char **argv)
 		             argc > 3 ? atoi(argv[3]) : 200,
 		             argc > 4 ? atoi(argv[4]) : MT7612U_PHY_OFDM,
 		             argc > 5 ? atoi(argv[5]) : 0);
+	} else if (!strcmp(cmd, "beacon")) {
+		rc = gate_beacon(argc > 2 ? (uint8_t)atoi(argv[2]) : 149,
+		                 argc > 3 ? atoi(argv[3]) : 10);
 	} else if (!strcmp(cmd, "chan")) {
 		rc = gate_chan(argc > 2 ? (uint8_t)atoi(argv[2]) : 149,
 		               argc > 3 ? argv[3] : NULL);
@@ -2434,6 +2571,7 @@ int main(int argc, char **argv)
 	} else {
 		fprintf(stderr, "unknown subcommand '%s'\n", cmd);
 		fprintf(stderr, "usage: bringup [regs|fw|init|chan|tx|rx|hop|gateg] [chan] [count] [phy 0=CCK 1=OFDM 2=HT 4=VHT] [mcs]\n");
+		fprintf(stderr, "       bringup beacon [chan] [secs]   (Stage A: static AP beacon on air)\n");
 		fprintf(stderr, "       bringup [sweep|coding|vht] [chan] [count] [bw 0=20 1=40 2=80]\n");
 		fprintf(stderr, "       the witness must listen at the same width (DEVOURER_BW=40|80)\n");
 		rc = 2;
