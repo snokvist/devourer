@@ -104,15 +104,20 @@ int mt_beacon_write(struct mt7612u_dev *d, const void *frame, size_t len,
  * station's auth is then neither accepted nor auto-ACKed, and it retries
  * forever. Called by the AP path; the injector never needs it.
  */
-void mt_ap_set_bssid(struct mt7612u_dev *d, uint8_t idx, const uint8_t *addr)
+int mt_ap_set_bssid(struct mt7612u_dev *d, uint8_t idx, const uint8_t *addr)
 {
 	uint32_t lo = (uint32_t)addr[0] | ((uint32_t)addr[1] << 8) |
 	              ((uint32_t)addr[2] << 16) | ((uint32_t)addr[3] << 24);
 	uint32_t hi = (uint32_t)addr[4] | ((uint32_t)addr[5] << 8);
 
 	idx &= 7;
-	mt_wr(d, MT_MAC_APC_BSSID_L(idx), lo);
-	mt_rmw(d, MT_MAC_APC_BSSID_H(idx), MT_MAC_APC_BSSID_H_ADDR, hi);
+	if (mt_wr_chk(d, MT_MAC_APC_BSSID_L(idx), lo))
+		return -1;
+	/* mt_rmw() skips the write entirely when its read half fails, so an
+	 * unchecked call can leave bytes 4-5 zero - a half-programmed BSSID that
+	 * matches nothing while the L half still reads back correct. mt76 returns
+	 * void here because MMIO cannot fail; USB can. */
+	return mt_rmw(d, MT_MAC_APC_BSSID_H(idx), MT_MAC_APC_BSSID_H_ADDR, hi);
 }
 
 /*

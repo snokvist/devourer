@@ -605,7 +605,7 @@ static int gate_ap(uint8_t chan, int secs)
 		.bw = MT7612U_BW_20, .no_ack = 1,
 	};
 	uint8_t bcn[128];
-	int n, rc = 1;
+	int n, rc = 1, rx_up = 0;
 	unsigned pr, au, aur, as, asr, dt;
 
 	memset(&ctx, 0, sizeof ctx);
@@ -629,23 +629,42 @@ static int gate_ap(uint8_t chan, int secs)
 	if (mt7612u_rx_start(&dev, ap_cb, &ctx)) {
 		printf("GATE B: FAIL - rx_start\n"); return 1;
 	}
+	rx_up = 1;
 	if (mt_mac_start(&dev, MT_RX_DRAIN_RING)) {
 		printf("GATE B: FAIL - mac_start\n"); mt7612u_rx_stop(&dev); return 1;
 	}
 	/*
-	 * AP receive filter. The managed default (0x00015f97) already leaves
-	 * OTHER_BSS and BCAST undropped, so a probe request with a wildcard BSSID
-	 * reaches us - mt76 clears OTHER_BSS for every mode too. The one change an
-	 * AP needs is DUP: dropping duplicates would hide exactly the
-	 * retransmissions this gate measures.
+	 * AP receive filter. The managed default mt_mac_start() just wrote already
+	 * leaves OTHER_BSS, BCAST and MCAST undropped, so a probe request with a
+	 * wildcard BSSID reaches us - mt76 clears OTHER_BSS for every mode too.
+	 * The one change an AP needs is DUP: dropping duplicates would hide exactly
+	 * the retransmissions this gate measures. Clear the bit in place rather
+	 * than re-write a copied literal, so this cannot drift from the default.
 	 */
-	mt_wr(&dev, MT_RX_FILTR_CFG, 0x00015f97 & ~MT_RX_FILTR_CFG_DUP);
+	mt_clear(&dev, MT_RX_FILTR_CFG, MT_RX_FILTR_CFG_DUP);
 
-	/* The address-match half of "being an AP": the MAC auto-ACKs against
+	/*
+	 * The address-match half of "being an AP": the MAC auto-ACKs against
 	 * MT_MAC_ADDR (already our MAC) and matches the BSS against this slot,
 	 * which mac_setaddr() zeroed. There is no separate AP op-mode register on
-	 * this part - mt76 sets none either; address match + beacon IS the AP. */
-	mt_ap_set_bssid(&dev, 0, dev.macaddr);
+	 * this part - mt76 sets none either; address match + beacon IS the AP.
+	 *
+	 * Slot 0 is only right for a globally-administered MAC. Under MBSS_MODE=3
+	 * the hardware takes the BSS index from the address bits, and mt76 uses
+	 * 1 + (((macaddr[0] ^ addr[0]) >> 2) & 7) whenever the locally-administered
+	 * bit is set (mt76x02_util.c). Refuse loudly rather than guess: a cloned
+	 * 02:/06:/0a: MAC would match nothing and void every result below.
+	 */
+	if (dev.macaddr[0] & 0x02) {
+		printf("GATE B: FAIL - MAC %02x:.. is locally administered; APC slot 0 "
+		       "is not the slot this MAC selects (mt76 derives 1+n)\n",
+		       dev.macaddr[0]);
+		goto out;
+	}
+	if (mt_ap_set_bssid(&dev, 0, dev.macaddr)) {
+		printf("GATE B: FAIL - could not program the APC BSSID slot\n");
+		goto out;
+	}
 
 	mt_beacon_init(&dev);
 	if (mt_beacon_write(&dev, bcn, (size_t)n, &rate)) {
@@ -658,8 +677,13 @@ static int gate_ap(uint8_t chan, int secs)
 	printf("AP up: ch%u  BSSID/MAC %02x:%02x:%02x:%02x:%02x:%02x  SSID \"MT7612U-AP\"\n",
 	       chan, dev.macaddr[0], dev.macaddr[1], dev.macaddr[2],
 	       dev.macaddr[3], dev.macaddr[4], dev.macaddr[5]);
-	printf("MT_RX_FILTR_CFG=0x%08x  APC_BSSID_L(0)=0x%08x  AUTO_RSP_CFG=0x%08x\n",
-	       mt_rr(&dev, MT_RX_FILTR_CFG), mt_rr(&dev, MT_MAC_APC_BSSID_L(0)),
+	/* Read back BOTH halves of the BSSID: mt_rmw() skips its write when the
+	 * read fails, so printing only the L half would show a correct-looking
+	 * address for a BSSID whose top two bytes never landed. */
+	printf("MT_RX_FILTR_CFG=0x%08x  APC_BSSID(0)=%04x%08x  AUTO_RSP_CFG=0x%08x\n",
+	       mt_rr(&dev, MT_RX_FILTR_CFG),
+	       (unsigned)(mt_rr(&dev, MT_MAC_APC_BSSID_H(0)) & MT_MAC_APC_BSSID_H_ADDR),
+	       mt_rr(&dev, MT_MAC_APC_BSSID_L(0)),
 	       mt_rr(&dev, MT_AUTO_RSP_CFG));
 	printf("stimulus: on a station radio run\n"
 	       "  sudo iw dev <sta> scan          (probe requests)\n"
@@ -668,6 +692,36 @@ static int gate_ap(uint8_t chan, int secs)
 
 	if (!wait_ticking(secs * 1000.0))
 		printf("(interrupted)\n");
+
+	/*
+	 * Receiver loss belongs next to the verdict: a retried auth we simply
+	 * missed biases the result toward PASS, which is the direction that
+	 * produces a false hardware conclusion. Sample it while the ring still
+	 * EXISTS - mt7612u_rx_stop() tears the ring down and takes its counters
+	 * with it, which reads back as a flat zero and looks like a clean capture.
+	 */
+	{
+		struct mt7612u_stats st;
+
+		mt7612u_get_stats(&dev, &st);
+		printf("rx frames %llu  err %llu  invalid %llu  dropped %llu\n",
+		       (unsigned long long)st.rx_frames,
+		       (unsigned long long)st.rx_err,
+		       (unsigned long long)st.rx_invalid,
+		       (unsigned long long)st.rx_dropped);
+	}
+
+	/*
+	 * Now stop the producer, BEFORE reading the verdict counters. ap_cb() runs
+	 * on the RX event thread, and auth/auth_retry are two independent relaxed
+	 * atomics - sampling them live can catch one increment half-applied and
+	 * invert the verdict outright (auth=0 with auth_retry=1 reads as "no auth
+	 * reached us"; auth_retry>auth reads as "every auth was a retry").
+	 * mt_async_stop() joins the event thread, so after this no callback can
+	 * run. gate_ack orders it the same way.
+	 */
+	mt7612u_rx_stop(&dev);
+	rx_up = 0;
 
 	pr  = atomic_load_explicit(&ctx.probe_req, memory_order_relaxed);
 	au  = atomic_load_explicit(&ctx.auth, memory_order_relaxed);
@@ -697,7 +751,19 @@ static int gate_ap(uint8_t chan, int secs)
 
 out:
 	mt_beacon_set_enable(&dev, 0, 0);   /* never leave a beacon airing */
-	mt7612u_rx_stop(&dev);
+	/* Retract the BSS address too, so the teardown matches the contract the
+	 * beacon half states. Inert in practice (the MAC is stopped and
+	 * mac_setaddr() re-zeroes every slot on the next bring-up), but leaving
+	 * half the AP identity programmed contradicts what this gate promises. */
+	{
+		static const uint8_t zero[6] = { 0 };
+
+		mt_ap_set_bssid(&dev, 0, zero);
+	}
+	/* rx_up: the verdict path already stopped the ring so the counters could
+	 * be read with the producer joined; stopping twice must not happen. */
+	if (rx_up)
+		mt7612u_rx_stop(&dev);
 	mt_mac_stop(&dev);
 	return rc;
 }
