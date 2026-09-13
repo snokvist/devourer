@@ -345,8 +345,9 @@ Behavioural traps the per-field docs can't carry:
   all-or-nothing call and is `SetCcaGates(d, d)`. Both gate calls are
   post-bring-up only and return false before it — see `src/IRtlRadio.h` for
   the contract, and `tests/cca_gates_regcheck.sh` to reproduce the tables.
-  **On by default on the streamtx FPV
-  downlink** (the link owns the channel — CSMA backoff only stutters it);
+
+  `DEVOURER_DIS_CCA` is **on by default on the streamtx FPV downlink** (the
+  link owns the channel — CSMA backoff only stutters it);
   `DEVOURER_DIS_CCA=0` forces standard carrier-sense back. On Kestrel the
   8852C runs the same enabled default (measured: full-rate TX, 2.4x flood
   deferral); the 8852B TX bring-up still clears the gates and WARNS pending

@@ -1023,6 +1023,19 @@ void RtlJaguarDevice::apply_cca(bool primary_disabled, bool edcca_disabled) {
     v520 &= ~(1u << 15);
   _device.rtw_write<uint32_t>(0x0520, v520);
 
+  /* Stop the EDCCA tracker BEFORE touching 0x8a4, not after. The phydm
+   * watchdog owns that register while tracking, and it runs on its own
+   * thread from rtw_hal_init — i.e. already before bring-up's SetCcaMode.
+   * Clearing the flag last left a window in which a tick could re-derive
+   * L2H from IGI and overwrite the park, leaving live thresholds behind a
+   * disable the caller had asked for. SetEdccaTrack is synchronous, so once
+   * it returns the writes below are ours. The enable direction hands the
+   * register over only after it is programmed, at the end of this function.
+   * Harmless when no watchdog was built (the default config). */
+  if (edcca_disabled)
+    if (auto *wd = _halModule.phydm_watchdog())
+      wd->SetEdccaTrack(false);
+
   /* BB EDCCA thresholds (rEDCCA_Jaguar 0x8a4: L2H byte0 / H2L byte1). The
    * BB init table parks them at 0x7f/0x7f = never-trigger — the vendor's
    * adaptivity-off default (CONFIG_RTW_ADAPTIVITY_EN 0). Parked, the BB
@@ -1049,9 +1062,11 @@ void RtlJaguarDevice::apply_cca(bool primary_disabled, bool edcca_disabled) {
                   l2h, l2h - 7, igi);
   }
   /* With the watchdog running, DIG walks IGI — hand it the re-track so the
-   * threshold follows (vendor couples them per adaptivity cycle). */
-  if (auto *wd = _halModule.phydm_watchdog())
-    wd->SetEdccaTrack(!edcca_disabled);
+   * threshold follows (vendor couples them per adaptivity cycle). Only the
+   * enable direction is done here; the disable ran above, before the park. */
+  if (!edcca_disabled)
+    if (auto *wd = _halModule.phydm_watchdog())
+      wd->SetEdccaTrack(true);
 }
 
 bool RtlJaguarDevice::SetAmpduMode(const devourer::AmpduMode &mode) {

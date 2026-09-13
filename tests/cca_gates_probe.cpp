@@ -30,6 +30,7 @@
 #include <libusb-1.0/libusb.h>
 #endif
 
+#include "AdapterCaps.h"
 #include "DeviceSession.h"
 #include "IRtlRadio.h"
 #include "WiFiDriver.h"
@@ -108,6 +109,15 @@ int main(int argc, char **argv) {
     return 4;
   }
 
+  /* Name the family for the harness. The BB EDCCA threshold register is
+   * per-generation (Jaguar1 0x8a4, Jaguar3 0x84c) and a tracker cell that
+   * pokes the wrong one reports "no tracker running" instead of failing —
+   * a false negative on exactly the arm the split exists to serve. Caps are
+   * resolved at construction, so this is readable before bring-up. */
+  std::printf("GATES-GEN %s\n",
+              devourer::generation_name(dev->GetAdapterCaps().generation));
+  std::fflush(stdout);
+
   /* Pre-bring-up: both calls must refuse, and the refusal must not write the
    * caller's variables. Poisoned true so an assignment is visible. */
   {
@@ -174,6 +184,10 @@ int main(int argc, char **argv) {
     bool p = false, e = false;
     const bool got = rtl->GetCcaGates(p, e);
     report("after-retune", got, p, e);
+    /* GetCcaGates reads 0x520 only, so the API cannot speak for the rest of
+     * the gate state. Hold so the harness can peek 0x524[11] out of band. */
+    if (hold)
+      std::this_thread::sleep_for(std::chrono::seconds(hold));
   }
 
   /* FastRetune is the other channel path, and on Jaguar3 its fallback does
@@ -185,6 +199,8 @@ int main(int argc, char **argv) {
     bool p = false, e = false;
     const bool got = rtl->GetCcaGates(p, e);
     report("after-fast-retune", got, p, e);
+    if (hold)
+      std::this_thread::sleep_for(std::chrono::seconds(hold));
   }
 
   /* Legacy path: SetCcaMode must still be exactly SetCcaGates(d, d). */

@@ -32,15 +32,22 @@
 #   legacy    SetCcaMode(d) writes what SetCcaGates(d, d) writes, so the split
 #             changed no default. The no-regression cell.
 #   track     the phydm EDCCA tracker stops in an EDCCA-off arm. Poked rather
-#             than sampled: PhydmRuntimeJaguar3::edcca() recomputes the same
-#             th_l2h from a static IGI, so an active tracker rewrites the SAME
-#             bytes and is indistinguishable from an idle one by observation.
-#             Write a value it would never choose and see if it is restored.
-#             Skipped where no tracker is running in the default arm.
-#   retune    the state survives SetMonitorChannel within a band and across a
-#             band change. Jaguar3 re-asserts by design; Jaguar1 merely is not
-#             clobbered (see src/IRtlRadio.h) — so this reports the mechanism
-#             and fails only on actual loss.
+#             than sampled: the tracker recomputes the same th_l2h from a
+#             static IGI, so an active tracker rewrites the SAME bytes and is
+#             indistinguishable from an idle one by observation. Write a value
+#             it would never choose and see if it is restored. The threshold
+#             register is PER-FAMILY (Jaguar1 0x8a4 bytes 0/1, Jaguar3
+#             0x84c[23:16]), taken from the generation the probe reports —
+#             poking the other family's register reports "no tracker" and
+#             passes a broken tracker silently. Skipped where no tracker runs
+#             in the default arm, or where the generation has no known
+#             threshold register.
+#   retune    the state survives SetMonitorChannel and FastRetune, within a
+#             band and across a band change. Jaguar3 re-asserts by design;
+#             Jaguar1 merely is not clobbered (see src/IRtlRadio.h) — so this
+#             reports the mechanism and fails only on actual loss. Checks
+#             0x524[11] alongside the API readback, because GetCcaGates reads
+#             0x520 alone and cannot see the countdown bit go missing.
 #
 # Usage: sudo -v && tests/cca_gates_regcheck.sh            # every plugged part
 #        PIDS=0xc812 sudo -v && tests/cca_gates_regcheck.sh
@@ -54,6 +61,14 @@ VID=${VID:-0x0bda}
 PIDS="${PIDS:-0x8812 0xc812 0xf72b}"   # Jaguar1, Jaguar3, and an unported family
 CH="${CH:-36}"; CH_SAME="${CH_SAME:-40}"; CH_BAND="${CH_BAND:-6}"
 MARK_L2H=0x11                          # nothing max(igi+8,48) can produce
+# The BB EDCCA threshold register is per-generation — Jaguar1 writes L2H/H2L
+# as 0x8a4 bytes 0/1 (src/jaguar1/RtlJaguarDevice.cpp apply_cca and
+# PhydmWatchdog::TickOnce), Jaguar3 writes th_l2h to 0x84c[23:16]
+# (src/jaguar3/PhydmRuntimeJaguar3.cpp). Poking the other family's register
+# reports "no tracker running" instead of failing, so the probe names its
+# generation (GATES-GEN) and the track cell picks from here.
+edcca_th_reg() { case "$1" in jaguar1) echo $((0x8a4));; jaguar3) echo $((0x84c));; *) echo "";; esac; }
+edcca_th_shift() { case "$1" in jaguar1) echo 0;; jaguar3) echo 16;; *) echo "";; esac; }
 mkdir -p "$OUT"
 
 PASS=0; FAIL=0; SKIP=0
@@ -62,7 +77,11 @@ fail() { echo "  FAIL: $*"; FAIL=$((FAIL+1)); }
 skip() { echo "  SKIP: $*"; SKIP=$((SKIP+1)); }
 note() { echo "  note: $*"; }
 probe_pid=""
-cleanup() { [ -n "$probe_pid" ] && kill "$probe_pid" 2>/dev/null; sudo -n pkill -x CcaGatesProbe 2>/dev/null; true; }
+# The probe is started through sudo, so its process is root-owned and a plain
+# kill from this (unprivileged) shell gets EPERM — silently, leaving `wait` to
+# block for the probe's whole hold walk. Every stop goes through sudo.
+kill_probe() { [ -n "$probe_pid" ] && sudo -n kill "$probe_pid" 2>/dev/null; true; }
+cleanup() { kill_probe; sudo -n pkill -x CcaGatesProbe 2>/dev/null; true; }
 trap cleanup EXIT INT TERM
 
 echo "== building =="
@@ -112,7 +131,15 @@ wait_marker() { # $1=log $2=marker
     done
     return 1
 }
-stop_hold() { [ -n "$probe_pid" ] && { kill "$probe_pid" 2>/dev/null; wait "$probe_pid" 2>/dev/null; }; probe_pid=""; }
+stop_hold() {
+    [ -n "$probe_pid" ] || return 0
+    kill_probe
+    # sudo forwards the signal to the child, but reaps it first; give the
+    # probe a moment to release the interface before the next claim.
+    wait "$probe_pid" 2>/dev/null
+    sudo -n pkill -x CcaGatesProbe 2>/dev/null
+    probe_pid=""
+}
 
 sudo -n true 2>/dev/null || { echo "needs a live sudo credential: sudo -v"; exit 2; }
 
@@ -158,8 +185,11 @@ for pid in $PIDS; do
     [ $rc -eq 0 ] && pass "$pid api: probe walk clean" \
                   || fail "$pid api: probe reported failures (see $log)"
 
+    gen=$(sed -n 's/^GATES-GEN //p' "$log" | head -1)
+    note "$pid generation: ${gen:-unknown}"
+
     # --- regs + cntdown ---------------------------------------------------
-    cd_seen=""
+    cd_seen=""; uses_cd=0
     for arm in "0 0" "0 1" "1 0" "1 1"; do
         set -- $arm; want_p=$1; want_e=$2
         hold_log="$OUT/hold-$pid-$want_p$want_e.log"
@@ -201,7 +231,13 @@ for pid in $PIDS; do
     # disabled, whatever primary CCA is doing. A backend that never moves it
     # does not use it in this role; one that moves it on primary CCA, or with
     # the pair, fails here.
-    if [ "$(echo "$cd_seen" | tr ' ' '\n' | grep -c .)" -eq 4 ]; then
+    if [ "$(echo "$cd_seen" | tr ' ' '\n' | grep -c .)" -ne 4 ]; then
+        # Fewer than four arms reported, so there is nothing to compare.
+        # Say so: dropping the cell without a verdict moves no counter and
+        # reads, in the summary, exactly like a cell that was never meant
+        # to run here.
+        skip "$pid cntdown: only $(echo "$cd_seen" | tr ' ' '\n' | grep -c .)/4 arms reported (see $OUT)"
+    else
         vals=$(echo "$cd_seen" | tr ' ' '\n' | grep . | cut -d: -f2 | sort -u | tr -d '\n')
         # Whether this backend drives 0x524[11] is discovered, not tabulated:
         # SetCcaMode moves both gates, so if the bit is in this role at all it
@@ -218,7 +254,7 @@ for pid in $PIDS; do
             fi
         elif [ "$vals" != "01" ]; then
             fail "$pid cntdown: SetCcaMode moves 0x524[11] but the split leaves it at $vals ($cd_seen)"
-        elif true; then
+        else
             ok=1
             for e in $cd_seen; do
                 want_e=${e%%:*}; want_e=${want_e#?}; got=${e##*:}
@@ -228,8 +264,6 @@ for pid in $PIDS; do
             [ "$ok" = 1 ] \
                 && pass "$pid cntdown: 0x524[11] follows the EDCCA gate alone ($cd_seen)" \
                 || fail "$pid cntdown: 0x524[11] moves, but not with EDCCA ($cd_seen)"
-        else
-            note "$pid cntdown: 0x524[11] constant at $vals — not an EDCCA gate on this backend"
         fi
     fi
 
@@ -239,7 +273,12 @@ for pid in $PIDS; do
 
     # --- track ------------------------------------------------------------
     # Does an EDCCA tracker overwrite the BB thresholds behind the caller?
+    th_reg=$(edcca_th_reg "$gen"); th_shift=$(edcca_th_shift "$gen")
     tracker_in_default=""
+    if [ -z "$th_reg" ]; then
+        skip "$pid track: no EDCCA threshold register known for generation '${gen:-unknown}'"
+    else
+    th_name=$(printf '0x%x' "$th_reg")
     for arm in "0 0" "0 1"; do
         set -- $arm; want_p=$1; want_e=$2
         tlog="$OUT/track-$pid-$want_p$want_e.log"
@@ -248,24 +287,24 @@ for pid in $PIDS; do
             fail "$pid track: probe never reported primary=$want_p edcca=$want_e"
             stop_hold; continue
         fi
-        native=$(peek32 "$pid" $((0x84c))) || { fail "$pid track: 0x84c peek failed"; stop_hold; continue; }
-        poke32 "$pid" $((0x84c)) $(( (native & 0xff00ffff) | (MARK_L2H << 16) ))
+        native=$(peek32 "$pid" "$th_reg") || { fail "$pid track: $th_name peek failed"; stop_hold; continue; }
+        poke32 "$pid" "$th_reg" $(( (native & ~(0xff << th_shift)) | (MARK_L2H << th_shift) ))
         sleep 5
         # Restore BEFORE any early exit: leaving the BB threshold at the
         # marker would hand the next arm — and the next run — a chip in a
         # state this script invented.
-        after=$(peek32 "$pid" $((0x84c)))
+        after=$(peek32 "$pid" "$th_reg")
         rc2=$?
-        poke32 "$pid" $((0x84c)) "$native"
-        [ $rc2 -eq 0 ] || { fail "$pid track: 0x84c re-read failed"; stop_hold; continue; }
+        poke32 "$pid" "$th_reg" "$native"
+        [ $rc2 -eq 0 ] || { fail "$pid track: $th_name re-read failed"; stop_hold; continue; }
         stop_hold
-        if [ $(( (after >> 16) & 0xff )) -eq $(( MARK_L2H )) ]; then
+        if [ $(( (after >> th_shift) & 0xff )) -eq $(( MARK_L2H )) ]; then
             restored=0; else restored=1; fi
         if [ "$want_e" = 0 ]; then
             tracker_in_default=$restored
             [ "$restored" = 1 ] \
-                && note "$pid track: tracker IS running in the default arm (as expected)" \
-                || note "$pid track: no EDCCA tracker running in the default arm"
+                && note "$pid track: tracker IS running at $th_name in the default arm (as expected)" \
+                || note "$pid track: no EDCCA tracker running at $th_name in the default arm"
         else
             if [ -z "$tracker_in_default" ]; then
                 fail "$pid track: default arm never measured, so the EDCCA-off arm proves nothing"
@@ -274,10 +313,11 @@ for pid in $PIDS; do
             elif [ "$restored" = 0 ]; then
                 pass "$pid track: EDCCA tracking stops when EDCCA is the gate turned off"
             else
-                fail "$pid track: tracker still rewriting 0x84c with EDCCA disabled"
+                fail "$pid track: tracker still rewriting $th_name with EDCCA disabled"
             fi
         fi
     done
+    fi
 
     # --- retune -----------------------------------------------------------
     # Both channel paths, and both a same-band hop and a band change, because
@@ -286,14 +326,29 @@ for pid in $PIDS; do
     for target in "$CH_SAME" "$CH_BAND"; do
         for path in retune fast-retune; do
             rlog="$OUT/$path-$pid-$target.log"
-            sudo -n "$BUILD/CcaGatesProbe" --vid "$VID" --pid "$pid" \
-                --channel "$CH" "--$path" "$target" >"$rlog" 2>&1
             marker=$([ "$path" = retune ] && echo after-retune || echo after-fast-retune)
+            # Held after the report so 0x524 can be peeked while the state is
+            # still applied: GetCcaGates reads 0x520 alone, so the API half of
+            # this cell cannot see the countdown bit being lost.
+            start_hold "$pid" "$rlog" "--$path" "$target"
+            if ! wait_marker "$rlog" "^GATES $marker "; then
+                fail "$pid $path ch$CH->ch$target: probe never reported $marker"
+                stop_hold; continue
+            fi
+            v524=$(peek32 "$pid" $((0x524))); rc3=$?
+            stop_hold
             line=$(grep "^GATES $marker" "$rlog" | head -1)
-            if echo "$line" | grep -q "ret=1 primary=1 edcca=0"; then
-                pass "$pid $path ch$CH->ch$target: gate state intact"
-            else
+            if ! echo "$line" | grep -q "ret=1 primary=1 edcca=0"; then
                 fail "$pid $path ch$CH->ch$target: expected primary=1 edcca=0, got '${line:-no line}'"
+                continue
+            fi
+            # The arm is EDCCA ENABLED (edcca=0), so an EDCCA-scoped
+            # countdown bit must still be set. Only assert it where the
+            # cntdown cell established the backend drives the bit at all.
+            if [ "$uses_cd" = 1 ] && [ $rc3 -eq 0 ] && [ "$(bit "$v524" 11)" != 1 ]; then
+                fail "$pid $path ch$CH->ch$target: 0x520 survived but 0x524[11] was lost"
+            else
+                pass "$pid $path ch$CH->ch$target: gate state intact"
             fi
         done
     done
