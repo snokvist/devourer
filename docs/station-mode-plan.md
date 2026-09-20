@@ -629,17 +629,48 @@ after it; nothing in Phase 3 depends on it.
 |---|---|---|
 | 2b.1 | ~~Fix the CCMP nonce flags octet~~ **DONE 2026-09-20** | Gate met: mutation reintroducing `nonce[0] = 0` fails 8 checks (4 vector cells + 4 direct assertions in `test_nonce_flags()`); regeneration changed only the two QoS vectors. **Not met:** vectors still come from `ccmp_gen_vectors.py` (fixed in the same pass, so they are a regression gate, not an independent one), and interop is unproven because this AP advertises neither WMM nor HT, so no station sends it QoS. Annex J, and an on-air TID 1..7 cell, ride with the WMM work |
 | 2b.2 | ~~Per-station table in `src/sta/`~~ **DONE 2026-09-20** — `src/sta/StationTable.h`, `tests/station_table_selftest.cpp`, ctest 74 | Gate met: `test_two_stations_are_independent()` holds two PTKs, two TX PN spaces and two CCMP windows, and a mutation collapsing `add()` to slot 0 is caught. 4 mutations run, 3 caught; the survivor (deleting `add()`'s redundant wipe) is recorded in the test rather than hidden. **Wired and device-verified 2026-09-20**: `tests/ap_wpa2.cpp` runs on the table, and TWO STATIONS ASSOCIATED AT ONCE — see "The two-station cell" below. `ap_responder.cpp` and `ul_trigger_ap.cpp` still use their own `g_sta` |
-| 2b.3 | Pass the real SA; read addr3 | ctest on the frame builders; a relayed header byte-compared against Table 9-26 |
-| 2b.4 | Real DHCP address pool + binding table | Two stations lease two distinct addresses on air |
-| 2b.5 | Association-table ARP responder answering with the target's real MAC | A resolves B and gets **B's** MAC, not the AP's |
-| 2b.6 | GTK transmit path: key id 1, one GTK per BSS, own PN space | A second association must not revoke the first station's group key. On-air: a group frame decrypts at both stations |
-| 2b.7 | Intra-BSS relay, with duplicate detection and a stated position on fragmentation and A-MSDU | A pings B through the AP. Negative control: a retransmitted MPDU is relayed **once** |
-| 2b.8 | TAP forwarder in `tests/` or `tools/`; 802.11 ↔ 802.3 helper (incl. the Ethernet II header) in `src/sta/` | Host stack reaches a station through the TAP; the doc states which side owns ARP/ICMP |
+| 2b.3 | ~~Pass the real SA; read addr3~~ **DONE** | `data_da`/`data_sa`/`data_da_is_group` in `Dot11.h`; relayed header byte-compared against Table 9-26 by hand, not against the builder. The cell caught its own author — the first version passed `data_hdr_to_ds`'s arguments in the wrong order and failed eight checks |
+| 2b.4 | ~~Real DHCP address pool + binding table~~ **DONE** | The station table IS the binding table: address = `192.168.99.(1 + aid)`, so nothing can outlive its lease or be double-allocated. On air: `DHCP: ACK 192.168.99.2 to aid=1` and `192.168.99.3 to aid=2` |
+| 2b.5 | ~~Association-table ARP responder~~ **DONE** | `Unicast reply from 192.168.99.3 [40:A5:EF:2F:22:9B]` — B's own MAC, not the AP's, which is what keeps the traffic at layer 2 instead of making the AP an L3 hop |
+| 2b.6 | ~~GTK transmit path~~ **DONE** | Key id 1 (the TX path hardcoded 0, so every group frame was looked up as the pairwise key and MIC-failed), one GTK per BSS, its own PN space. Probed with an ARP for an address **nobody holds**, so the AP's responder cannot answer and the flood is the only path: B received it decrypted |
+| 2b.7 | ~~Intra-BSS relay~~ **DONE (partially)** | A pings B through the AP: 100% loss → **4/4, 0% loss**, `relayed=8 dropped=0`. **Not done:** duplicate detection, fragmentation and A-MSDU still have no implementation and no stated refusal — carried forward |
+| 2b.8 | TAP forwarder in `tests/` or `tools/`; 802.11 ↔ 802.3 helper (incl. the Ethernet II header) in `src/sta/` | **NOT STARTED** — the one item of this phase still open. Host stack reaches a station through the TAP; the doc states which side owns ARP/ICMP |
 
 **Acceptance for the phase as a whole.** Two associated stations, both
 configured with power save off, exchanging encrypted unicast through the AP,
 plus a group-addressed frame that both decrypt. And per rule 2, two adversarial
 reviews with every finding resolved.
+
+### Phase 2b acceptance — MET 2026-09-20, with 2b.8 still open
+
+The bar was "two associated stations, both configured with power save off,
+exchanging encrypted unicast through the AP, plus a group-addressed frame that
+both decrypt". Both halves now hold, measured in one run:
+
+```
+A->B unicast   4 packets transmitted, 4 received, 0% packet loss
+               rtt min/avg/max/mdev = 1.165/1.558/2.034/0.310 ms
+B's interface  ARP, Request who-has 192.168.99.77 (ff:ff:ff:ff:ff:ff) tell 192.168.99.2
+               IP 192.168.99.2 > 192.168.99.255: ICMP echo request
+AP ledger      to this AP=328, to a peer station=8 (relayed=8 dropped=0),
+               off-BSS=0, group frames aired=39
+               encrypted frames received=336, MIC failures=0, replays rejected=0
+```
+
+The group probe is an ARP for **192.168.99.77, an address nobody holds**. The
+AP's own responder cannot answer it, so the only way it reaches B is as a
+flooded frame under the GTK — a probe the AP could answer would have proved
+nothing.
+
+**Two limits that travel with this result.** Both stations are interfaces on
+one host in one subnet, so the cell lowers `rp_filter` and sets
+`accept_local=1`; B was otherwise dropping perfectly good relayed frames as
+martians, which cost a diagnostic pass to find. Separate hosts would need
+neither. And this is two stations, not seven, with no churn during traffic.
+
+**Still open at the phase boundary:** 2b.8 (the TAP forwarder), and within
+2b.7 the duplicate detection, fragmentation and A-MSDU positions that its gate
+asked for and that this implementation neither built nor refused in writing.
 
 ### The two-station cell — measured 2026-09-20
 
