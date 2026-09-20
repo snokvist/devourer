@@ -263,7 +263,15 @@ public:
     (void)bssid;
     return false;
   }
-  virtual void ClearStationIdentity() {}
+  /* Returns whether the pre-arm state was restored AND verified. On a
+   * backend whose arm wrote nothing there is nothing to undo and this is
+   * trivially true; on one that moved a filter or a MACID, a false return is
+   * the only way a caller learns the rollback could not be confirmed. That is
+   * the same contract SetAckResponder's clear half spends a paragraph on, and
+   * an earlier draft of this seam dropped it to `void` - which would have
+   * made an unverifiable rollback unreportable on exactly the backends where
+   * rollback is real. */
+  virtual bool ClearStationIdentity() { return false; }
 
   /* 802.11 A-MPDU TX mode (src/AmpduMode.h): the first-class bundle of the
    * recipe the spike + pacing sweep proved on-air. When enabled, every data

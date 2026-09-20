@@ -1,174 +1,155 @@
 # What an MT7612U station actually needs programmed
 
 Phase 2's measurement record. `docs/station-mode-scope.md` raised two risks
-against the backend half of `SetStationIdentity` and neither had been
-measured — R5 (what the APC BSSID slot does for a managed station) and R6
-(`MT_MAC_ADDR` gaining a third co-owner). Both are measured here.
+against the backend half of `SetStationIdentity` — R5 (what the APC BSSID slot
+does for a managed station) and R6 (`MT_MAC_ADDR` gaining a third co-owner).
 
-Reproduce with a real AP on the channel:
-
-```sh
-# the RTL8812AU runs hostapd; the MT7612U is the device under test
-sudo tests/mt7612u_sta_identity.sh
-```
-
-Or the gates directly, against any AP:
+**Read the retraction section first if you saw an earlier revision of this
+file.** Its headline numbers were taken with the wrong receive filter and are
+withdrawn. The conclusions survived re-measurement; two of the three arguments
+for them did not.
 
 ```sh
-sudo build/mt7612uprobe sta    6 12 <ap-bssid>   # R5: what gates receive
-sudo build/mt7612uprobe staack 6 25 <ap-bssid>   # R6: do we auto-ACK
+sudo AP_SYSFS=6-1 DUT_SYSFS=7-1 CH=6 tests/mt7612u_sta_identity.sh
 ```
 
-Rig: AP = RTL8812AU `0bda:8812` on the in-tree rtw88 driver running
-hostapd 2.10, BSSID `02:42:75:05:d6:aa` (deliberately locally administered —
-see below). DUT = MT7612U `0e8d:7612`, own MAC `40:a5:ef:5a:32:f8`, driven by
-`build/mt7612uprobe`. Channel 6, near field.
+Rig: AP = RTL8812AU on the in-tree rtw88 driver running hostapd 2.10, BSSID
+`02:42:75:05:d6:aa` (locally administered on purpose — see R5). DUT = MT7612U,
+own MAC `40:a5:ef:5a:32:f8`. Channel 6, near field, 20 s per arm.
 
-## R5 — the BSSID registers do not gate a station's receive. At all.
+## The retraction, and what caused it
 
-Six arms over the two places a BSSID can live on this part: `MT_MAC_BSSID`
-(the MBSS base that the APC slot index is derived from) and the
-`MT_MAC_APC_BSSID` slot table. **No arm touches `MT_MAC_ADDR`.**
+Every arm of the first run called `mt7612u_set_monitor_rx()` under a comment
+reading `/* managed filter, not monitor */`. That is exactly inverted. The
+function writes `MT_RX_FILTR_CFG = PHY_ERR|CRC_ERR` and nothing else — its own
+doc says it "clears everything except the two error classes" — so it turns
+every address and BSS drop bit **off**.
 
-The AP's BSSID is locally administered on purpose. mt76 derives the slot as
-`idx = 1 + (((mbss_base[0] ^ addr[0]) >> 2) & 7)` for a locally administered
-address and **0 otherwise** — so with a factory BSSID the "slot 0" and
-"derived slot" arms would have been the same test. Here the rule yields
-slot 1, and slot 0 and slot 1 are both exercised.
+So the gate replaced the configuration under test with its opposite, one
+statement before the dwell. Six identical arms were guaranteed before any
+frame arrived, and the null result was a tautology. It is the Phase 0 defect
+in a new costume, two lines below a comment congratulating the gate for not
+repeating Phase 0.
 
-Unicast at the DUT is injected from a monitor vif on the AP's own phy,
-because an unassociated station is sent no unicast by hostapd and every arm
-otherwise reads `to_us = 0` — i.e. the first run of this gate measured
-broadcast reception only and could not have answered the question.
+A second error fed it. Review round 1 had "corrected" the scope document to say
+that because bit 3 (`OTHER_BSS`) is clear in the managed filter `0x00015f97`,
+other-BSS frames are accepted and a wrong BSSID cannot deafen a station. But
+bit **2** (`PROMISC`) is SET in that value, and in mt76 bit 2 is the one mapped
+to `FIF_OTHER_BSS`. So round 1 replaced a wrong mechanism with a second wrong
+mechanism, and three documents carried it as settled. Because the reasoning had
+already concluded the filter was not in play, nobody noticed the gate
+overwriting it.
+
+Everything below is re-measured with `MT_RX_FILTR_CFG = 0x00015f97` in force,
+which the gate now prints per arm and flags if it is not.
+
+## R5 — the BSSID registers do not gate a managed station's receive
+
+Six arms over the two places a BSSID can live: `MT_MAC_BSSID` (the MBSS base
+the APC slot index derives from) and the `MT_MAC_APC_BSSID` slot table. **No
+arm touches `MT_MAC_ADDR`.** Both register families are reset to their init
+state between arms — an earlier version reset only the MBSS base, so arm F's
+"both programmed WRONG" still had arm C's correct BSSID live in slot 0.
+
+The AP's BSSID is locally administered so that mt76's rule
+`idx = 1 + (((mbss_base[0] ^ addr[0]) >> 2) & 7)` yields a non-zero slot; with
+a factory BSSID it returns 0 and the "slot 0" and "derived slot" arms would be
+the same test. Unicast at the DUT comes from a monitor vif on the AP's own phy,
+because hostapd sends an unassociated station none and every arm would
+otherwise read `to_us = 0`.
 
 | arm | configuration | slot | from_bss | beacons | unicast to us |
 |---|---|---|---|---|---|
-| A | init only, nothing programmed | 1 | 3989 | 105 | 3884 |
-| B | `MT_MAC_BSSID` = AP | 1 | 3654 | 105 | 3547 |
-| C | APC slot 0 = AP | 1 | 3647 | 112 | 3533 |
-| D | APC slot (mt76 rule) = AP | 1 | 3662 | 115 | 3545 |
-| E | `MT_MAC_BSSID` + derived slot = AP | 1 | 3657 | 117 | 3540 |
-| **F** | **both programmed WRONG** | 1 | 3657 | 117 | **3538** |
+| A | init only, nothing programmed | 1 | 6445 | 195 | 6250 |
+| B | `MT_MAC_BSSID` = AP | 1 | 6071 | 194 | 5877 |
+| C | APC slot 0 = AP | 1 | 6072 | 194 | 5878 |
+| D | APC slot (mt76 rule) = AP | 1 | 6083 | 192 | 5891 |
+| E | `MT_MAC_BSSID` + derived slot = AP | 1 | 6083 | 195 | 5888 |
+| **F** | **both programmed WRONG** | 1 | 6073 | 196 | **5877** |
 
-Register read-backs confirm the writes landed (arm B/E `dw0=05754202
-dw1=003faad6` is `02:42:75:05:d6:aa` little-endian; arm F `dw0=de000002`
-is the wrong address).
+`filtr=00015f97` in every arm. Register read-backs confirm the `MT_MAC_BSSID`
+writes land; the APC writes are **not** read back, which is a gap the scope
+document specifically asked for and this gate still does not close.
 
-**Arm F is the finding.** A deliberately wrong BSSID in both registers
-receives 3538 unicast frames against 3884 with nothing programmed — the same
-number, within the spread the arms show among themselves. Programming the
-BSSID correctly, incorrectly, or not at all makes no difference to what a
-managed station receives, broadcast or unicast.
+**Arm F is the finding.** A deliberately wrong BSSID in both registers receives
+5877 unicast frames against arm A's 6250 with nothing programmed — flat, and
+arm A's ~6% excess is the first-arm-of-the-run pattern that appears in every
+run of this gate rather than a response to configuration.
 
-This is the **opposite** of the AP-side result, where a wrong APC slot was
-silent but fatal ("beacons perfectly, acknowledges nobody" —
-`docs/mt7612u-ap-mode.md` finding 2). Note what that phrasing actually says:
-the AP-side failure was in **acknowledgement**, not reception. So the two
-results do not contradict each other, and the AP finding must not be
-extrapolated to a station's receive path — which is exactly the extrapolation
-review round 1 caught the scope document making.
+This is the opposite of the AP-side result, where a wrong APC slot was silent
+but fatal. Read that finding's own words — "beacons perfectly, **acknowledges**
+nobody" — and the AP-side failure was in acknowledgement, not reception. The
+two do not conflict, and the AP result must not be extrapolated to a station's
+receive path.
 
-Arm A is ~9% above the others on both counts. That is the injector warming up
-in the first arm, not a signal; nothing here rests on a 9% difference.
+## R6 — NOT established. The method is void on this rig.
 
-## R6 — this MAC auto-ACKs with nothing armed, and moving `MT_MAC_ADDR` destroys that
+The scope document asserted, as "good news", that this MAC auto-ACKs a
+station's unicast with no call at all, because the auto-response engine matches
+address 1 against `MT_MAC_ADDR` and `MT_AUTO_RSP_EN` is on from init. That was
+read off the registers. **It is still not measured.**
 
-The scope document asserted, as "good news", that because the auto-response
-engine matches address 1 against `MT_MAC_ADDR` and `MT_AUTO_RSP_EN` is on
-from init, an MT7612U station auto-ACKs the AP's unicast with no call at all.
-That was read off the registers and never measured.
-
-Measuring it needs someone to observe the ACK, and the obvious approaches do
-not work. **What failed, recorded so it is not retried:** injecting at
-ourselves from a monitor vif on the AP's phy and capturing ACKs there
-produced **zero in both the DUT-present and DUT-absent arms**. The control is
-the only reason that non-result was not written up as "the station does not
-ACK" — a radio cannot hear an ACK to its own transmission, and
-monitor-injected frames default to no-ack in mac80211 so they never solicited
-one.
-
-What works needs no second observer. Send the AP a **directed probe request**
-from our own address; it answers with a unicast probe response through its
-normal transmit path, with retries. Then count the copies:
-
-- if we ACK it, the AP is done — one copy, FC Retry clear;
-- if we do not, its MAC retransmits until its limit — the same response
-  again with FC Retry **set**.
-
-`retried` is the signal. It is the sound form of the auto-ACK test, and the
-same "count the retried copies" that `docs/mt7612u-ap-mode.md`'s Gate B row
-used and the AP on-air script never did.
+The approach was to make the AP answer a directed probe request through its
+normal transmit path and count retried copies: if we acknowledge, one copy with
+Retry clear; if we do not, retransmissions with Retry set.
 
 | arm | probe reqs | responses to us | retried | |
 |---|---|---|---|---|
-| A — nothing armed | 125 | 126 | 1 | **0.8%** |
-| B — `MT_MAC_ADDR` retargeted away | 125 | 23082 | 22611 | **98.0%** |
+| A — nothing armed | 100 | 103 | 0 | 0.0% |
+| B — **`MT_AUTO_RSP_EN` cleared** (control) | 100 | 100 | 1 | **1.0%** |
+| C — `MT_MAC_ADDR` retargeted | 100 | **0** | — | no responses |
 
-**Arm B is the control, and it is what makes arm A quotable.** Without it,
-"few retries" might simply be what this AP always does, and the gate could
-not have failed. Arm B reaches the failing state by doing precisely what R6
-warns against — `mt7612u_set_ack_responder()` retargets `MT_MAC_ADDR` to a
-foreign address, so the engine stops matching our own.
+**Arm B is a single-variable control and it did not move.** Reception is
+identical to arm A — same port identity, same filter, responses still addressed
+to us — and the only change is that the answering engine is disabled. The
+retried fraction stayed flat. So either this MAC acknowledges by a path
+`MT_AUTO_RSP_EN` does not gate, or **retried copies do not track
+acknowledgement on this rig at all** — the likeliest reading being that this AP
+does not retransmit an unacknowledged probe response. Either way the method
+cannot fail, so arm A's 0.0% proves nothing and the gate reports INCONCLUSIVE.
 
-Two things follow:
+### What is withdrawn
 
-1. **R6's claim is true, measured.** With nothing armed at all, this MAC
-   acknowledges unicast addressed to its own address.
-2. **The R6 hazard is real and large, demonstrated rather than asserted.**
-   `SetAckResponder(bssid)` on a station would move `MT_MAC_ADDR` to the AP's
-   address and take acknowledgement from 0.8% retried to 98%. That is the
-   reason the seam is `SetStationIdentity` and not a reuse of
-   `SetAckResponder`.
+An earlier revision reported arm A at 0.8% against a control at **98.0%** over
+23082 responses, and called that proof. That control was the `MT_MAC_ADDR`
+retarget, run with the monitor filter installed by mistake — promiscuous, so
+every retransmission on the channel was visible. Under the managed filter the
+same arm (C above) receives **nothing at all**. Both the 98% and the two-ladder
+arithmetic offered to explain 23082 are withdrawn.
 
-### Arm B changes two things, and the raw count says so
+### What arm C does establish, and it is cleaner than what R6 asked for
 
-Arm B received **23082** responses to 125 probe requests. An earlier revision
-of this document called that "the AP's retry ladder running to exhaustion,
-~184 copies per response". That cannot be right: no 802.11 retry limit is
-anywhere near 184.
+Under the managed filter, moving `MT_MAC_ADDR` takes reception from 103
+responses to **zero**. The port identity gates what a station *receives*, not
+merely whether it acknowledges — which is a larger failure than the one the
+seam was designed around, and it is measured, single-variable, and
+unambiguous.
 
-Moving `MT_MAC_ADDR` has a second consequence, and this tree already documents
-it — `src/mt7612u/tools/bringup.cpp` notes that this MAC matches an **inbound**
-ACK's address 1 against `MT_MAC_ADDR` as well. So in arm B:
-
-1. the AP's ACKs to **our** probe requests are rejected by our own MAC, so our
-   MAC retransmits each request through its ladder; and
-2. each copy that reaches the AP draws a fresh probe response, each of which we
-   then fail to acknowledge, so the AP retransmits that too.
-
-Two ladders multiplying, which is the right order of magnitude for 23082 from
-125. **That is inference from the arithmetic plus a documented property of this
-MAC, not a separate measurement**, and it is written here as inference.
-
-It matters for how much arm B is allowed to prove. The arm is not a clean
-single-variable change — it stops us acknowledging *and* stops us accepting
-acknowledgement. But the **retried fraction** is unharmed in the direction
-that counts: our own retransmissions make the AP emit *fresh* responses, which
-arrive with Retry **clear** and so push the fraction DOWN. The measured 98% is
-therefore conservative, and the conclusion — that we stopped acknowledging —
-is the one reading the fraction supports.
+So `SetStationIdentity`'s refusal to move `MT_MAC_ADDR` is fully justified —
+just not by the argument that was originally offered for it.
 
 ## What this means for `SetStationIdentity` on MT7612U
 
-On the evidence above, and stated as what was measured rather than what was
-expected:
+- It **must not** move `MT_MAC_ADDR`. Established by arm C above (reception),
+  not by the auto-ACK story (unmeasured).
+- It does **not** need to program the BSSID, and a wrong value there is
+  harmless for receive. Established by R5.
+- Whether this MAC auto-ACKs is **open**. Nothing in the implementation depends
+  on the answer — it makes no call either way — but `AdapterCaps::station_mode_ok`
+  does, and stays false.
 
-- It **must not** move `MT_MAC_ADDR`. That is the one action shown to break a
-  station, and it is the failure mode with the largest measured effect in
-  this document.
-- It does **not** need to program the BSSID for receive to work, and a wrong
-  value there is harmless for receive.
-- Auto-ACK needs no call.
+## What is not established
 
-So the honest MT7612U implementation is small, and its job is mostly to
-**refuse** things: verify `own` is the port identity the MAC was brought up
-with and fail if it is not, rather than "fixing" it by writing the register.
-
-**What is NOT established.** Every number here is from an unassociated
-station receiving traffic it did not negotiate. Nothing here says the BSSID
-registers are irrelevant to an *associated* station — only that they do not
-gate reception or acknowledgement of frames addressed to us. Anything that
-depends on the hardware knowing which BSS we belong to (power save, TIM
-parsing, duplicate detection across BSSIDs, hardware key lookup by BSS) is
-untested, and Phase 3 should expect to revisit this. One AP, one DUT, one
-channel, near field, no repetition beyond what the tables show.
+- **Auto-ACK, either direction.** Needs an instrument that survives the managed
+  filter: the chip's own `MT_TX_STAT_FIFO` retry count for a station's uplink
+  (`bringup txs`) is the obvious candidate and has not been pointed at this.
+- **The APC writes are never read back.** Arm F could be writing a slot the
+  hardware does not consult and the table would look the same.
+- **A per-slot enable bit.** Upstream mt76 carries `MT_MAC_APC_BSSID0_H_EN` at
+  BIT(16) of the slot-0 high register; this tree defines no such bit and none
+  of arms C–F sets one. If per-slot enable is real here, those arms may never
+  have enabled the slot they programmed.
+- **Everything is an unassociated station** receiving traffic it did not
+  negotiate. Power save, TIM parsing, cross-BSS duplicate detection and
+  hardware key lookup are untested; Phase 3 should expect to revisit this.
+- One AP, one DUT, one channel, near field.

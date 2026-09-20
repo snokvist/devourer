@@ -281,6 +281,9 @@ void     mt_wr(struct mt7612u_dev *d, uint32_t addr, uint32_t val);
 /* Returns -1 without writing when the read half fails. */
 int      mt_rmw(struct mt7612u_dev *d, uint32_t addr, uint32_t mask, uint32_t val);
 int      mt_wr_chk(struct mt7612u_dev *d, uint32_t addr, uint32_t val);
+/* Announce that MT_MAC_ADDR is about to move, so a live station identity does
+ * not silently survive as a lie. src/mt7612u/station.cpp. */
+void     mt7612u_station_identity_lost(struct mt7612u_dev *d, const char *who);
 /* Register-I/O failure accumulator; see the comment above mt_io_clear(). */
 void     mt_io_clear(struct mt7612u_dev *d);
 /* Restore a previously sampled accumulator; see the note in usb.c. */

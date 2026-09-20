@@ -918,10 +918,15 @@ bool Mt7612uRadio::SetStationIdentity(const devourer::MacAddr &own,
   return mt7612u_set_station_identity(_dev, own.data(), bssid.data()) == 0;
 }
 
-void Mt7612uRadio::ClearStationIdentity() {
+bool Mt7612uRadio::ClearStationIdentity() {
   std::lock_guard<std::recursive_mutex> lock(_mu);
-  if (_dev)
-    mt7612u_clear_station_identity(_dev);
+  if (!_dev)
+    return false;
+  mt7612u_clear_station_identity(_dev);
+  /* True without qualification only because the arm wrote no hardware state
+   * on this part. A backend that starts writing registers here must return
+   * what it actually verified. */
+  return true;
 }
 
 /* The beacon plane. Thin on purpose: the sequence these wrap is the one the
@@ -1150,28 +1155,31 @@ devourer::AdapterCaps Mt7612uRadio::GetAdapterCaps() {
    * close it is, because the remaining gap is one cell rather than a body of
    * work. docs/mt7612u-station-identity.md has the measurements.
    *
-   * MEASURED, on air, against hostapd on independent silicon:
+   * MEASURED, on air, with the managed receive filter in force:
    *   - a station-configured MT7612U receives the AP's traffic, including
-   *     unicast addressed to its own address (3884 frames), and programming
+   *     unicast addressed to its own address (6250 frames), and programming
    *     the BSSID registers correctly, wrongly, or not at all changes none of
    *     it;
-   *   - it auto-ACKs that unicast with nothing armed - 0.8% of the AP's
-   *     responses arrive retried, against 98.0% in the control arm where
-   *     MT_MAC_ADDR is retargeted away;
-   *   - `bringup staid` checks the seam's own contract on hardware, 9/9,
+   *   - moving MT_MAC_ADDR takes that reception to ZERO, which is what makes
+   *     this seam's refusal to move it necessary;
+   *   - `bringup staid` checks the seam's own contract on hardware, 10/10,
    *     including that it REFUSES while an ACK responder holds the port
-   *     identity.
+   *     identity and that it DROPS an armed station when one takes it.
    *
-   * And SetStationIdentity writes no register at all on this part, so the
-   * hardware state those numbers were taken in is byte-identical to the state
-   * a successful arm leaves behind. The evidence is therefore about the right
-   * configuration.
+   * SetStationIdentity writes no register at all on this part, so the hardware
+   * state those numbers were taken in is byte-identical to what a successful
+   * arm leaves behind. The evidence is about the right configuration.
    *
-   * NOT MEASURED: the other half of this flag's documented bar - that the AP
-   * ACKs what this station TRANSMITS. Nothing here has read the chip's own
-   * retry count for a station's uplink; `bringup txs` and MT_TX_STAT_FIFO are
-   * the instrument for it and that cell has not been run. Until it has, the
-   * flag reports what was established rather than what is expected.
+   * NOT MEASURED, and this is why the flag is false rather than a formality:
+   *   - whether this MAC ACKNOWLEDGES the AP's unicast at all. The scope
+   *     document asserts it does from a register reading; the gate's
+   *     single-variable control (clear MT_AUTO_RSP_EN, hold reception
+   *     constant) does not move, so the retried-copy method is void here and
+   *     the question is open. An earlier revision of this comment quoted
+   *     "0.8% vs 98.0%" - that control ran with the monitor filter by
+   *     mistake and is withdrawn.
+   *   - that the AP acknowledges what this station TRANSMITS. MT_TX_STAT_FIFO
+   *     and `bringup txs` are the instrument and have not been pointed at it.
    */
   c.station_mode_ok = false;
   /* Unmeasured, so false rather than optimistic - nothing here drives the

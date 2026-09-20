@@ -83,6 +83,10 @@ int mt7612u_set_ack_responder(struct mt7612u_dev *d, const uint8_t mac[6])
 		ERR("ack responder address must be unicast");
 		return -1;
 	}
+	/* Arming a responder retargets MT_MAC_ADDR, which is the register a
+	 * station identity depends on. Say so before it happens rather than
+	 * leaving a live station silently unacknowledged. */
+	mt7612u_station_identity_lost(d, "an ACK responder");
 
 	if (!d->ack_saved) {
 		memcpy(d->ack_saved_mac, d->macaddr, 6);

@@ -99,8 +99,16 @@ grep -q "AP-ENABLED" "$OUT/hostapd.log" 2>/dev/null || {
 echo "$DUT_SYSFS:1.0" > /sys/bus/usb/drivers/mt76x2u/unbind 2>/dev/null
 sleep 2
 
-DUT_MAC=$("$BUILD/mt7612uprobe" regs 2>&1 | sed -n 's/.*EEPROM: chip [0-9a-fx]*  MAC \([0-9a-f:]*\).*/\1/p' | head -1)
-[ -n "$DUT_MAC" ] || { echo "could not read the DUT's MAC"; exit 1; }
+# The contract gate needs no AP, prints the DUT's own address, and is the
+# cheapest thing that fails loudly if the DUT is not usable - so it runs
+# first and doubles as this harness's source for the MAC. (`regs` does not
+# work for this: it never calls mt_eeprom_init, so it prints no MAC.)
+echo
+echo "########## the SetStationIdentity contract (no AP needed) ##########"
+"$BUILD/mt7612uprobe" staid 2>&1 | tee "$OUT/staid.txt"
+staid=${PIPESTATUS:-0}
+DUT_MAC=$(sed -n 's/^own \([0-9a-f:]\{17\}\).*/\1/p' "$OUT/staid.txt" | head -1)
+[ -n "$DUT_MAC" ] || { echo "could not read the DUT's MAC from the staid gate"; exit 1; }
 echo "DUT MAC $DUT_MAC"
 
 # --- R6 first: no monitor vif needed, and it is the sharper result ---------
@@ -131,5 +139,6 @@ r5=$?
 
 echo
 echo "=== logs: $OUT ==="
+[ "${staid:-0}" = 0 ] || echo "the contract gate FAILED - see $OUT/staid.txt"
 [ "$r6" = 0 ] || echo "R6 did not pass - see $OUT/r6.txt"
-exit $(( r5 != 0 || r6 != 0 ))
+exit $(( r5 != 0 || r6 != 0 || ${staid:-0} != 0 ))
