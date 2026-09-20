@@ -608,6 +608,46 @@ inline bool is_qos_data(uint8_t fc0) { return (fc0 & 0x8c) == 0x88; }
  * 4-address frame, +4 for HT Control when the Order bit is set
  * (802.11-2016 9.2.4.1.10). Getting this wrong reads the LLC header at the
  * wrong offset and silently drops the frame. */
+/* Direction-aware addressing — 802.11-2016 Table 9-26.
+ *
+ * An AP that relays needs the DESTINATION of a frame, and the destination is
+ * not in a fixed place: it is addr1 when the frame comes from the DS and addr3
+ * when it goes to the DS. Nothing in this tree read addr3 at all until Phase
+ * 2b.3 — every receive path read addr1 and addr2 and assumed the frame was for
+ * the AP itself, which is true right up until the AP has a second station to
+ * forward to.
+ *
+ *   ToDS FromDS | addr1   addr2   addr3   addr4
+ *     0    0    | DA      SA      BSSID   -        (IBSS)
+ *     0    1    | DA      BSSID   SA      -        (from the DS)
+ *     1    0    | BSSID   SA      DA      -        (to the DS)
+ *     1    1    | RA      TA      DA      SA       (4-address / WDS)
+ *
+ * `hdr` must be at least data_hdr_len() bytes; for the 4-address case that is
+ * 30, and data_sa() reads addr4 at offset 24. */
+inline const uint8_t* data_da(const uint8_t* hdr, uint8_t fc1) {
+  const bool to_ds = (fc1 & kFcToDs) != 0;
+  /* DA is addr1 unless the frame is going TO the DS, where addr1 is the
+   * BSSID and the real destination sits in addr3. */
+  return to_ds ? hdr + 16 : hdr + 4;
+}
+
+inline const uint8_t* data_sa(const uint8_t* hdr, uint8_t fc1) {
+  const bool to_ds = (fc1 & kFcToDs) != 0;
+  const bool from_ds = (fc1 & kFcFromDs) != 0;
+  if (to_ds && from_ds) return hdr + 24;   /* addr4 */
+  if (from_ds) return hdr + 16;            /* addr3 */
+  return hdr + 10;                         /* addr2 */
+}
+
+/* True when this frame's final destination is a group address. Note this is
+ * NOT the same question as "is this frame group-addressed", which is about
+ * addr1/RA and decides which key protects it: a station's broadcast ARP goes
+ * out as an individually addressed frame to the AP with a group DA in addr3. */
+inline bool data_da_is_group(const uint8_t* hdr, uint8_t fc1) {
+  return (data_da(hdr, fc1)[0] & 0x01) != 0;
+}
+
 inline size_t data_hdr_len(uint8_t fc0, uint8_t fc1) {
   size_t n = 24;
   if (is_qos_data(fc0)) n += 2;

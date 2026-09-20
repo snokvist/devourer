@@ -391,6 +391,14 @@ static HarnessCrypto g_crypto;
 // Data-plane visibility. The one thing the on-air runs could not answer was
 // whether encrypted frames were arriving at all, because nothing counted them.
 static std::atomic<uint64_t> g_enc_rx{0}, g_mic_fail{0}, g_replayed{0};
+/* Frames whose DESTINATION is not this AP. Until Phase 2b.3 nothing read
+ * addr3, so every decrypted frame was handed to the local IP responders no
+ * matter who it was addressed to - harmless while the AP is the only thing on
+ * the BSS worth addressing, and not harmless once there is a second station.
+ * Counted rather than relayed: the relay is 2b.7, and a counter that moves is
+ * how that gate will be read. */
+static std::atomic<uint64_t> g_to_peer{0};      /* DA is another associated station */
+static std::atomic<uint64_t> g_to_elsewhere{0}; /* DA is off-BSS entirely */
 
 static uint16_t csum16(const uint8_t* d, int len) {
   uint32_t s = 0; for (int i=0;i+1<len;i+=2) s += (d[i]<<8)|d[i+1];
@@ -613,10 +621,27 @@ static void on_rx(const Packet& p) {
         const int tid = devourer::sta::is_qos_data(fc0)
                             ? (d[qoff] & 0x0f)
                             : devourer::sta::CcmpReplay::kNonQosTid;
-        if (sender->rx_replay.accept(pn, tid))
-          handle_plain(sta, pt.data(), (int)ptlen);      // decrypted -> ARP/ICMP
-        else
+        if (sender->rx_replay.accept(pn, tid)) {
+          /* WHO IS THIS FOR? addr3 on a to-DS frame, which nothing in this
+           * tree read before 2b.3. A group DA - a station's broadcast ARP, its
+           * DHCP DISCOVER - still reaches the local responders, because those
+           * are exactly the requests this AP answers. */
+          const uint8_t* da = devourer::sta::data_da(d, fc1);
+          if (devourer::sta::data_da_is_group(d, fc1) ||
+              std::memcmp(da, kBssid, 6) == 0) {
+            handle_plain(sta, pt.data(), (int)ptlen);    // decrypted -> ARP/ICMP
+          } else if (g_stas.find(da)) {
+            /* Destined for another station on this BSS. 2b.7 will relay it;
+             * for now it is dropped, which is what the old code did too - it
+             * just did it by accident, inside responders that ignore anything
+             * not addressed to the AP's own IP. */
+            g_to_peer.fetch_add(1);
+          } else {
+            g_to_elsewhere.fetch_add(1);
+          }
+        } else {
           g_replayed.fetch_add(1);
+        }
       } else {
         g_mic_fail.fetch_add(1);
       }
@@ -770,6 +795,13 @@ int main(int argc, char** argv) {
    * frame is 4 bytes long and would be counted here as a MIC failure rather
    * than as the length bug it is. Fix the trim before trusting this ledger on
    * anything but MediaTek. */
+  fprintf(stderr,
+          "  addressing: to this AP=%llu, to a peer station=%llu"
+          " (relay is 2b.7), off-BSS=%llu\n",
+          (unsigned long long)(g_enc_rx.load() - g_to_peer.load()
+                               - g_to_elsewhere.load()),
+          (unsigned long long)g_to_peer.load(),
+          (unsigned long long)g_to_elsewhere.load());
   fprintf(stderr,
           "  data plane: encrypted frames received=%llu, MIC failures=%llu, "
           "replays rejected=%llu, frames sent=%llu\n",

@@ -696,6 +696,85 @@ void test_tim() {
   }
 }
 
+/* Phase 2b.3 — direction-aware DA/SA, against 802.11-2016 Table 9-26, and the
+ * relayed header an AP has to build.
+ *
+ * Nothing in this tree read addr3 before this: every receive path took addr1
+ * and addr2 and assumed the frame was for the AP. That assumption holds
+ * exactly until there is a second station to forward to.
+ *
+ * The relay cell is the load-bearing one. It builds the to-DS frame station A
+ * sends for station B, extracts DA and SA with the accessors, rebuilds the
+ * from-DS frame the AP must air, and byte-compares the result against the
+ * layout written out by hand - not against another call of the same builder,
+ * which would only prove the builder agrees with itself. */
+static void test_relay_addressing() {
+  const uint8_t A[6]     = {0x02, 0xaa, 0, 0, 0, 0x01};   /* station A */
+  const uint8_t B[6]     = {0x02, 0xbb, 0, 0, 0, 0x02};   /* station B */
+  const uint8_t BSSID[6] = {0x02, 0x42, 0x75, 0x05, 0xd6, 0x00};
+  const uint8_t GRP[6]   = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+
+  /* --- to-DS: addr1 = BSSID, addr2 = SA, addr3 = DA ---------------------- */
+  /* data_hdr_to_ds is (bssid, own, dest) - A sending to B. Writing this test
+   * against a guessed (dest, bssid, own) is how the first version of it
+   * failed, which is the cell doing its job on its own author. */
+  std::vector<uint8_t> up = devourer::sta::data_hdr_to_ds(BSSID, A, B,
+                                                          /*protect=*/false, 0);
+  check(up.size() == 24, "a to-DS data header is 24 bytes");
+  check(std::memcmp(up.data() + 4, BSSID, 6) == 0, "to-DS addr1 is the BSSID");
+  check(std::memcmp(up.data() + 10, A, 6) == 0,    "to-DS addr2 is the source");
+  check(std::memcmp(up.data() + 16, B, 6) == 0,    "to-DS addr3 is the destination");
+  check(std::memcmp(devourer::sta::data_da(up.data(), up[1]), B, 6) == 0,
+        "data_da reads addr3 on a to-DS frame");
+  check(std::memcmp(devourer::sta::data_sa(up.data(), up[1]), A, 6) == 0,
+        "data_sa reads addr2 on a to-DS frame");
+
+  /* --- the relay: same payload, rebuilt as from-DS ----------------------- */
+  const uint8_t* da = devourer::sta::data_da(up.data(), up[1]);
+  const uint8_t* sa = devourer::sta::data_sa(up.data(), up[1]);
+  std::vector<uint8_t> down = devourer::sta::data_hdr_from_ds(da, BSSID, sa,
+                                                              /*protect=*/false, 0);
+  /* Written out by hand rather than by calling the builder again. */
+  uint8_t want[24] = {0};
+  want[0] = 0x08;                       /* type data, subtype data */
+  want[1] = 0x02;                       /* From DS */
+  std::memcpy(want + 4,  B, 6);         /* addr1 = DA */
+  std::memcpy(want + 10, BSSID, 6);     /* addr2 = BSSID */
+  std::memcpy(want + 16, A, 6);         /* addr3 = SA */
+  check(down.size() == 24 && std::memcmp(down.data(), want, 24) == 0,
+        "the relayed from-DS header is byte-for-byte Table 9-26");
+
+  /* And it round-trips: the relayed frame's DA/SA are the originals. */
+  check(std::memcmp(devourer::sta::data_da(down.data(), down[1]), B, 6) == 0,
+        "data_da reads addr1 on a from-DS frame");
+  check(std::memcmp(devourer::sta::data_sa(down.data(), down[1]), A, 6) == 0,
+        "data_sa reads addr3 on a from-DS frame");
+
+  /* --- a station's broadcast is individually addressed to the AP --------- */
+  std::vector<uint8_t> bc = devourer::sta::data_hdr_to_ds(BSSID, A, GRP,
+                                                          /*protect=*/false, 0);
+  check((bc[4] & 0x01) == 0,
+        "a station's broadcast has an INDIVIDUAL addr1 - it goes to the AP");
+  check(devourer::sta::data_da_is_group(bc.data(), bc[1]),
+        "...while its DA in addr3 is the group address");
+
+  /* This distinction is why the uplink is pairwise-protected however broadcast
+   * its payload: the key follows addr1, not the DA. */
+  check(!devourer::sta::data_da_is_group(up.data(), up[1]),
+        "a unicast relay's DA is not a group address");
+
+  /* --- 4-address: SA moves to addr4 -------------------------------------- */
+  uint8_t four[30] = {0};
+  four[0] = 0x08;
+  four[1] = (uint8_t)(devourer::sta::kFcToDs | devourer::sta::kFcFromDs);
+  std::memcpy(four + 16, B, 6);         /* addr3 = DA */
+  std::memcpy(four + 24, A, 6);         /* addr4 = SA */
+  check(std::memcmp(devourer::sta::data_da(four, four[1]), B, 6) == 0,
+        "4-address DA is addr3");
+  check(std::memcmp(devourer::sta::data_sa(four, four[1]), A, 6) == 0,
+        "4-address SA is addr4, not addr2");
+}
+
 int main() {
   test_tim();
   test_fcs_trim();
@@ -710,6 +789,7 @@ int main() {
   test_data_frames();
   test_rsn_real_world();
   test_data_seq();
+  test_relay_addressing();
 
   if (g_fail) {
     std::printf("dot11_selftest: %d failure(s)\n", g_fail);
