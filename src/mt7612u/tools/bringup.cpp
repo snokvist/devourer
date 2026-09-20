@@ -2335,11 +2335,20 @@ static void txs_drain(struct mt7612u_dev *d, struct txs_sum *o)
  * What is already known and is NOT re-derived here:
  *   - On the AP side a wrong APC slot was silent: "beacons perfectly,
  *     acknowledges nobody" (docs/mt7612u-ap-mode.md finding 2).
- *   - The obvious extrapolation to a station is WRONG. The managed RX filter
- *     mt_mac_start() leaves is 0x00015f97 and bit 3 (OTHER_BSS) is CLEAR -
- *     these are drop bits, so other-BSS frames are ACCEPTED. A wrong slot
- *     cannot deafen a station by that route. Review round 1 caught the scope
- *     document asserting exactly that mechanism.
+ *   - The obvious extrapolation to a station is WRONG, but NOT for the reason
+ *     an earlier version of this comment gave. It argued that bit 3
+ *     (OTHER_BSS) is clear in the managed value 0x00015f97, so other-BSS
+ *     frames are accepted and a wrong slot cannot deafen a station. Bit **2**
+ *     (PROMISC) is SET in that value, and in mt76 bit 2 is the one mapped to
+ *     FIF_OTHER_BSS - init.cpp:552 describes 0x00015f97 as dropping exactly
+ *     what that argument said it accepted. Reading bit 3 alone is how this
+ *     gate came to overwrite the filter it was supposed to be testing under.
+ *     Do not reason about this register from one bit.
+ *
+ *     The extrapolation is wrong for a plainer reason: the AP-side finding's
+ *     own words are "beacons perfectly, ACKNOWLEDGES nobody", so it is about
+ *     acknowledgement, not reception. And the answer here is now measured
+ *     rather than argued - see docs/mt7612u-station-identity.md.
  *   - The auto-response engine matches address 1 against MT_MAC_ADDR, which
  *     init leaves at the factory address, so a station should auto-ACK its own
  *     unicast with no call at all (R6). NO ARM HERE TOUCHES MT_MAC_ADDR -

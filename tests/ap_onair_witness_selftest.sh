@@ -72,9 +72,16 @@ count() { # $1 = ssid  $2 = bssid  $3 = freq|any ; stdin = scan text
                 (want == "any" || f[j] == want + 0)) c++
           print (c + 0) " " (k + 0) }'
 }
-gone_verdict() { # stdin = scan text
-  local r m b; r=$(count "$@"); m=${r%% *}; b=${r##* }
-  if [ "$b" -eq 0 ]; then echo SCAN_DEAD
+# $4 = the scan command's exit status (0 = the scan ran).
+#
+# What decides "the scan worked" is that exit status, NOT how many other
+# networks were found. The first version of this keyed on the BSS count, which
+# is wrong: on a channel with no other APs a perfectly healthy scan returns
+# nothing once our own beacon stops - exactly the case the gone checks exist
+# for - and it produced three false failures the first time it met one.
+gone_verdict() { # stdin = scan text; $4 = scan rc
+  local r m rc="${4:-0}"; r=$(count "$1" "$2" "$3"); m=${r%% *}
+  if [ "$rc" != 0 ]; then echo SCAN_DEAD
   elif [ "$m" -eq 0 ]; then echo GONE
   else echo STILL_AIRING; fi
 }
@@ -87,15 +94,19 @@ chk "1 1"  "$(count devourerAP 02:42:75:05:d6:00 5180 <<<"$ours")"  "airing: our
 chk "0 1"  "$(count devourerAP 02:42:75:05:d6:00 5180 <<<"$ghost")" "airing: pinned to freq, ghost excluded"
 # THE REGRESSION THIS EXISTS TO CATCH: a beacon still airing but filed under
 # another frequency. A freq-pinned "gone" check would call this silenced.
-chk STILL_AIRING "$(gone_verdict devourerAP 02:42:75:05:d6:00 any <<<"$ghost")" \
+chk STILL_AIRING "$(gone_verdict devourerAP 02:42:75:05:d6:00 any 0 <<<"$ghost")" \
      "gone: still-airing beacon on a wrong freq is NOT gone"
-chk GONE         "$(gone_verdict devourerAP 02:42:75:05:d6:00 any <<<"$nbr")" \
+chk GONE         "$(gone_verdict devourerAP 02:42:75:05:d6:00 any 0 <<<"$nbr")" \
      "gone: genuinely absent, with the scan proven alive"
 # THE OTHER REGRESSION: a scan that never ran must not read as silence.
-chk SCAN_DEAD    "$(gone_verdict devourerAP 02:42:75:05:d6:00 any <<<'')" \
-     "gone: dead scan refused, not counted as gone"
-chk SCAN_DEAD    "$(gone_verdict devourerAP 02:42:75:05:d6:00 any <<<'command failed: Device or resource busy (-16)')" \
+chk SCAN_DEAD    "$(gone_verdict devourerAP 02:42:75:05:d6:00 any 1 <<<'')" \
+     "gone: failed scan refused, not counted as gone"
+chk SCAN_DEAD    "$(gone_verdict devourerAP 02:42:75:05:d6:00 any 1 <<<'command failed: Device or resource busy (-16)')" \
      "gone: busy-interface error refused"
+# AND THE FALSE FAILURE THE FIRST FIX INTRODUCED: an empty channel is not a
+# broken scan. This is the case that cost three PASSes on hardware.
+chk GONE         "$(gone_verdict devourerAP 02:42:75:05:d6:00 any 0 <<<'')" \
+     "gone: quiet channel, scan OK and nothing found, IS gone"
 # exact SSID match, not substring
 chk "0 1"  "$(count devourerAP 02:42:75:05:d6:00 5180 <<<$'BSS 02:42:75:05:d6:00(on wlan0)\n\tfreq: 5180.0\n\tSSID: devourerAP2')" \
      "airing: devourerAP2 does not match devourerAP"

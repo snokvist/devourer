@@ -314,6 +314,13 @@ say "AP $AP_SYSFS   station $STA_SYSFS ($STA_IF)   ch$CH ($FREQ MHz)"
 # (common seconds after a disconnect or a supplicant kill, and silenced by the
 # 2>/dev/null below) would have scored a still-airing beacon as silenced.
 #
+# The evidence that the scan worked is the SCAN'S EXIT STATUS, not how many
+# other networks it found. A first version of this control required at least
+# one BSS in the scan. That is wrong, and it produced three false failures the
+# first time it met a quiet channel: on a channel with no other APs a
+# perfectly healthy scan legitimately returns nothing once our own beacon
+# stops - which is precisely the situation the "gone" checks exist for.
+#
 # The station's netdev can DISAPPEAR MID-RUN: the adapter stays on the bus and
 # authorized, but its interface 0 ends up with no driver bound and no netdev.
 # Every scan after that returns nothing - which, before the block count below
@@ -346,10 +353,10 @@ sta_check() {
   return 1
 }
 
-# Prints "<matches> <total_bss_blocks>". Use the on_air/gone wrappers.
+# Prints "<matches> <total_bss_blocks> <scan_rc>". Use on_air/gone.
 seen() {   # $1 = SSID, $2 = BSSID, $3 = frequency or "any"
-  local i n best=0 blocks=0 out b
-  sta_check || { printf '0 0'; return; }
+  local i n best=0 blocks=0 out b scan rc ok_scan=0
+  sta_check || { printf '0 0 1'; return; }
   for i in 1 2 3; do
     # Count BSS *entries*, keyed on all three of BSSID, SSID and the frequency
     # we actually scanned. Every part of that is load-bearing:
@@ -377,7 +384,9 @@ seen() {   # $1 = SSID, $2 = BSSID, $3 = frequency or "any"
     #
     # The callers compare `-gt 0` / `= 0`, never `= 1`: how many cache entries
     # cfg80211 chooses to keep is not a property of the AP under test.
-    out=$(iw dev "$STA_IF" scan flush freq "$FREQ" 2>/dev/null |
+    scan=$(iw dev "$STA_IF" scan flush freq "$FREQ" 2>/dev/null); rc=$?
+    [ "$rc" = 0 ] && ok_scan=1
+    out=$(printf '%s\n' "$scan" |
         awk -v b="$2" -v ss="$1" -v want="${3:-$FREQ}" '
           /^BSS / { k++; bssid[k] = tolower($2); sub(/\(.*/, "", bssid[k]); next }
           k > 0 && $1 == "freq:" { f[k] = $2 + 0; next }
@@ -395,8 +404,11 @@ seen() {   # $1 = SSID, $2 = BSSID, $3 = frequency or "any"
     [ "$best" -gt 0 ] && break
     sleep 2
   done
-  printf '%s %s' "$best" "$blocks"
+  printf '%s %s %s' "$best" "$blocks" "$([ "$ok_scan" = 1 ] && echo 0 || echo 1)"
 }
+
+# Pull one space-separated field out of seen()'s triple.
+_fld() { printf '%s' "$2" | cut -d' ' -f"$1"; }
 
 # "The beacon is on the air, on the channel we told the AP to use." Pinned to
 # $FREQ, which also fails an AP that beacons on the wrong channel.
@@ -412,10 +424,12 @@ on_air() {  # $1 = SSID, $2 = BSSID
 # scan must have seen at least one BSS, so a scan that did not run cannot
 # masquerade as silence.
 gone() {    # $1 = SSID, $2 = BSSID
-  local r matches blocks
-  r=$(seen "$1" "$2" any); matches=${r%% *}; blocks=${r##* }
-  if [ "$blocks" -eq 0 ]; then
-    say "        (the scan returned no BSS at all - refusing to read that as 'gone')"
+  local r matches rc
+  r=$(seen "$1" "$2" any)
+  matches=$(_fld 1 "$r")
+  rc=$(_fld 3 "$r")
+  if [ "${rc:-1}" != 0 ]; then
+    say "        (every scan attempt FAILED - refusing to read that as 'gone')"
     return 1
   fi
   [ "$matches" -eq 0 ]

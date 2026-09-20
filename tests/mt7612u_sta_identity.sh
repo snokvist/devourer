@@ -46,9 +46,23 @@ cleanup() {
   pkill -f "hostapd.*$OUT/hostapd.conf" 2>/dev/null
   sleep 1
   iw dev staid_mon del 2>/dev/null
+  # RE-ENUMERATE the AP adapter, do not just bounce the link.
+  #
+  # hostapd's `bssid=` leaves the interface carrying that address after it
+  # exits, and the adapter does not recover from `ip link down/up` - it comes
+  # back still holding the BSSID, DOWN, and scanning nothing. Left that way it
+  # silently breaks the next harness that expects this adapter to be a
+  # station, which is how it was found: three spurious failures in
+  # tests/mt7612u_ap_onair.sh on the run straight after this one.
+  if [ -n "${AP_SYSFS:-}" ] && [ -e "/sys/bus/usb/devices/$AP_SYSFS/authorized" ]; then
+    echo 0 > "/sys/bus/usb/devices/$AP_SYSFS/authorized" 2>/dev/null
+    sleep 3
+    echo 1 > "/sys/bus/usb/devices/$AP_SYSFS/authorized" 2>/dev/null
+    sleep 8
+  fi
+  AP_IF=$(ls "/sys/bus/usb/devices/$AP_SYSFS:1.0/net/" 2>/dev/null | head -1)
   [ -n "$AP_IF" ] && {
-    ip link set "$AP_IF" down 2>/dev/null
-    iw dev "$AP_IF" set type managed 2>/dev/null
+    rfkill unblock wlan 2>/dev/null
     ip link set "$AP_IF" up 2>/dev/null
     nmcli device set "$AP_IF" managed yes >/dev/null 2>&1
   }
