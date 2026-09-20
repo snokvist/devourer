@@ -13,6 +13,9 @@ Worktree `.claude/worktrees/mt7612u-station-scope`, branch
 Nothing is pushed and no PR exists.
 
 ```
+082c89d tests: adversarial review round 5 - two gate checks could not fail
+e26d12c tests: the AP acceptance harness passes 14/14 on an independent station
+5d2af14 docs: station-mode handoff - state, rig, and what to distrust
 63a618c sta: review round 4 - the replay reset was defeatable, and I overclaimed
 112d7cc sta: ccmp_encrypt bounds its output buffer
 22e0518 sta: harnesses derive the header length instead of testing fc0 == 0x88
@@ -40,7 +43,7 @@ that tree up; nothing here depends on it any more.
 | Phase | State |
 |---|---|
 | 0 — can the part carry a station? | **PASS.** The 40× unicast cliff is a property of TX-only injection with the MAC receiver disabled, not of the part. Station-shaped TX runs at 2084 fps / 99.9% ACK. |
-| 1 — shared frame + crypto layer | **Substantially done, gate open.** See below. |
+| 1 — shared frame + crypto layer | **DONE, GATE CLOSED.** 14/14 twice on each band against independent silicon. See below. |
 | 2 — the `IRadio` seam | Not started. `SetStationIdentity` / `ClearStationIdentity`, MT7612U implementation, caps flag. |
 | 3 — pure station logic | Not started. BSS table, association state machine, 4-way supplicant. |
 | 4–6 | Not started. |
@@ -75,56 +78,93 @@ for the Phase 0 measurement.
 | role | part | sysfs | notes |
 |---|---|---|---|
 | AP | MT7612U `0e8d:7612` | `7-1` | USB **2.0** link; firmware from `/lib/firmware/mediatek` |
-| station | RTL8812AU `0bda:8812` | `1-1` | `rtw_8812au`; **independent silicon**, which is the witness `docs/mt7612u-ap-mode.md` says it lacked |
+| station | RTL8812AU `0bda:8812` | `1-1` | the **in-tree rtw88** driver: module `rtw88_8812au`, sysfs driver name `rtw_8812au` (both spellings are in this tree; they name different things). **Independent silicon**, which is the witness `docs/mt7612u-ap-mode.md` says it lacked |
 
 ```sh
-sudo AP_SYSFS=7-1 STA_SYSFS=1-1 CH=6 tests/ap_onair_rtl_sta.sh both
+sudo AP_SYSFS=7-1 STA_SYSFS=1-1 CH=6  FW_DIR=/lib/firmware/mediatek tests/mt7612u_ap_onair.sh all
+sudo AP_SYSFS=7-1 STA_SYSFS=1-1 CH=36 FW_DIR=/lib/firmware/mediatek tests/mt7612u_ap_onair.sh all
 ```
 
-`tests/ap_onair_rtl_sta.sh` encodes the three things that each cost a run:
+That is the whole recipe now. **`tests/ap_onair_rtl_sta.sh` is gone** — every
+check in it was strictly weaker than the equivalent above (substring SSID
+match with no BSSID or frequency, "AP up" taken from a banner that prints
+`beacon=FAIL` unconditionally, `iw connect`'s exit status discarded, power
+save never touched, an unguarded `authorized` write to a caller-supplied
+sysfs path). It existed only because the acceptance harness could not drive a
+non-MediaTek station, which is no longer true. Earlier revisions of this file
+named it as *the* reproduction recipe; it could not even run in its committed
+form until `e26d12c` fixed its `env` invocation.
 
-1. The station must be **re-enumerated** (authorized toggle), not driver-bound.
-   devourer's libusb claim leaves the interface on `usbfs`, and writing a
-   driver's `bind` reports success without re-probing — no netdev appears.
-2. `DEVOURER_BCN_TU=25`. `tests/mt7612u_ap_onair.sh` hardcodes 100 TU, which
-   its own MediaTek station tolerated and this one does not.
-3. Ping on `CTRL-EVENT-CONNECTED`, against a **truncated** supplicant log. This
-   station drops on inactivity within seconds of a completed 4-way, so a fixed
-   sleep straddles the timer; and a stale `CONNECTED` in an appended log
-   matches instantly, producing the same wrong answer from the other side.
+Things the harness now encodes that each cost a run to learn:
+
+1. **Station power save must be off**, and the harness enforces it. This AP
+   cannot serve a power-saving station at all — see below.
+2. The station must be **re-enumerated** (authorized toggle), not driver-bound,
+   if its netdev is missing: devourer's libusb claim leaves the interface on
+   `usbfs`, and writing a driver's `bind` reports success without re-probing.
+   The netdev can also vanish *mid-run* if another process claims the adapter;
+   `sta_check()` recovers it and says so rather than scoring it as an AP result.
+3. `BCN_TU` defaults to 100 and **that is fine** — see the withdrawn claim
+   below.
 
 To free the MT7612U from the kernel: `echo 7-1:1.0 > /sys/bus/usb/drivers/mt76x2u/unbind`.
 
 ## What the on-air runs actually showed
 
-```
-  data plane: encrypted frames received=98, MIC failures=0,
-              replays rejected=1, frames sent=27
-  5 packets transmitted, 5 received, 0% packet loss
-```
+`tests/mt7612u_ap_onair.sh` reads **14/14 twice on 2.4 GHz (ch6) and twice on
+5 GHz (ch36)**, at the default `BCN_TU=100`. Beacon armed and scannable, open
+auth+assoc, hardware auto-ACK, an ARP/ICMP data plane, the WPA2 4-way with a
+verified MIC, an encrypted data plane, and the full beacon lifecycle
+(arm → stop → re-arm) on both bands. RTT 0.7–2.4 ms in every cell.
 
-Beacon scannable, open auth+assoc complete, WPA2 4-way complete with a verified
-MIC, and ~250 encrypted frames decrypted across two runs with **zero MIC
-failures**. 2.4 GHz only.
+The adversarial counterpart, in the same breath, because this tree's rules
+require it:
+
+- **Power save is forced off, and this AP cannot serve a power-saving station
+  at all.** None of the three beacon builders appends a TIM element. Linux
+  defaults to `power_save on`, so 14/14 does *not* certify this AP against a
+  default-configured Linux client.
+- The 5 GHz open cell's data-plane check **failed once in three runs** on a
+  single lost ping — 6 packets at 0% loss on a channel with several strong
+  neighbours. Brittle by construction; recorded, not loosened.
+- n=2 per band, one AP unit, one station unit, near field, nothing soaked
+  (longest run about two minutes).
 
 ## What to distrust
 
-- **`tests/mt7612u_ap_onair.sh` 14/14 on both bands has NOT been re-run.** That
-  is the formal acceptance bar and it is outstanding. Everything above is
-  manual cells on one band against a station that harness cannot drive.
-- **The link is unstable on this rig.** Roughly half the runs never carry a
-  packet — the station drops on inactivity after the handshake. The ledger is
-  what distinguishes those (`received=0`) from a crypto failure; without it
-  they read identically, and an earlier session spent a long time believing
-  the refactor had broken something.
-- **RTT is poor and unexplained** — 524 ms mean, 1729 ms max, near-field.
-- **Nothing is soaked.** Longest run under a minute.
+- **Power save is the single biggest caveat on the 14/14.** It is forced off,
+  and this AP has no TIM element in any beacon and buffers nothing, so it
+  cannot serve a power-saving station — which is what Linux defaults to. The
+  score is real and its scope is narrower than it looks.
+- **"The link is unstable" and "RTT is poor" (524 ms mean, 1729 ms max) were
+  probably power save, and that is inference from ONE ordered pair of runs.**
+  PS on gave 0/60 pings, PS off gave 60/60 at 0.735/1.530/7.644 ms. Note what
+  that pair does *not* do: it never reproduces the 524 ms RTT in either arm —
+  the PS-on arm received nothing at all — and it cannot by itself explain a
+  population claim like "half the runs carry no packet". Post-fix RTT is
+  0.7–2.4 ms everywhere, so something real changed. Do not write it up as
+  settled.
+- **The AUTH-at-retry=1 asymmetry is unexplained.** Five runs: AUTH arrived
+  retried in four, ASSOC at retry=0 in all five. The new auto-ACK witness
+  reads the station's per-peer counters, which are created at association, so
+  it says nothing about the AUTH that precedes them. Still open.
+- **Nothing is soaked.** Longest run about two minutes; n=2 per band.
 - **The sequence-number causality is inference.** The data plane went from
   100% loss to 0% when data-frame sequence numbers landed, and the QoS AAD fix
   had already shipped before the failing run — so by elimination it was the
-  sequence number. That is an ordered pair of runs, not an A/B.
-- **5 GHz `iw connect` fails with -22** under a no-IR regulatory domain even
-  though the beacon scans fine. Not investigated.
+  sequence number. That is an ordered pair of runs, not an A/B. And with power
+  save now known to produce exactly this symptom, that elimination has one
+  more untested alternative in it than it did when it was written.
+- **5 GHz on this station is `no IR` on every channel**, yet association works
+  and the earlier "-22 from `iw connect`" did not recur. What changed is not
+  established; the harness now pins frequency and BSSID on connect, which
+  makes the cell deterministic without explaining it.
+- **A second cfg80211 cache entry for our own BSSID** appears while the AP is
+  up, carrying a frequency we are not airing on and an SSID-only IE set. Its
+  origin is NOT established. Pinning the BSSID changes which BSS the *station*
+  targets and changes nothing about what the AP transmits — so if that entry
+  is produced by something this AP airs, the harness now passes without
+  surfacing it.
 - **The ledger lies on Realtek.** `Packet::Data` carries a trailing FCS on
   every Realtek generation and not on MT7612U, and `on_rx` does not trim it,
   so a Realtek AP would report a length bug as MIC failures. Fix the trim

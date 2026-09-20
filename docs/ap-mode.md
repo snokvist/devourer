@@ -11,8 +11,12 @@ harnesses under `tests/`, not a library API — the pieces (beacon, RX callback,
 responses, DHCP/ARP/ICMP, the WPA2 4-way handshake, software CCMP) lives in the
 harness. All bench-validated against the real Linux `rtw88`/`mac80211` stack.
 
-A dense beacon interval (`DEVOURER_BCN_TU=25`) is needed throughout, so a
-supplicant's fast channel-hopping scan catches the AP. The AP adapter must
+A dense beacon interval (`DEVOURER_BCN_TU=25`) was believed to be needed
+throughout, so a supplicant's fast channel-hopping scan catches the AP. **That
+does not reproduce on the MT7612U bench**: `tests/mt7612u_ap_onair.sh` scores
+14/14 on both bands at the default 100 TU, and its `stop` cell's binary
+hardcodes 100 TU and has always passed its scan checks. Treat 25 as a knob to
+reach for if a particular station misses the beacon, not as a requirement. The AP adapter must
 run `StartBeacon` (all generations) plus full-duplex `StartRxLoop` — the AP
 harnesses are bench-validated on J2/J3 adapters; the station is a second
 Realtek adapter bound to the kernel (rtw88 auto-probes a VBUS-cold dongle to a
@@ -33,6 +37,13 @@ station bound to `rtw88` runs `iw scan` and lists devourer, parsing every elemen
     capability: ESS   SSID: devourerAP
     Supported rates: 1.0* 2.0* 5.5* 11.0* 18.0 24.0 36.0 54.0
     DS Parameter set: channel 6   TIM: DTIM Count 0 Period 1   ERP: <no flags>
+
+**The `TIM` in that capture is not reproducible from the harnesses in this
+tree today.** None of `tests/ap_responder.cpp`, `tests/ap_wpa2.cpp` or
+`tests/mt7612u_beacon_stop_check.cpp` appends a TIM element — checked by
+reading all three beacon builders — although `src/sta/Dot11.h` defines
+`kEidTim`. Whatever produced that line, it was not any of them. Do not read
+this scan as evidence that power save is handled: see the scope note below.
 
 Confirmed on **both bands** — ch6 (2437 MHz) and ch36 (5180 MHz).
 
@@ -94,7 +105,20 @@ descriptor fields, which are absent in devourer (only Jaguar1 has
 These harnesses implement enough AP-side logic to interoperate with a real station
 end to end. What is intentionally out of scope (AP-*stack* breadth, not driver
 parity): multiple concurrent clients, GTK broadcast/rekey, routing/NAT, and a real
-DHCP address pool. The bench caveat is that a single clean end-to-end run of the
+DHCP address pool.
+
+**802.11 power save is out of scope too, and this is the one that bites.** The
+beacons carry no TIM element, so a station has no DTIM schedule to wake on,
+and nothing is buffered for a dozing peer — every reply is enqueued the moment
+the request is parsed and airs whether or not the station is listening. A
+station in power save therefore loses most of what the AP sends it. Measured
+on the MT7612U bench, open network, 60 pings at 1/s, changing only the
+station's setting: `power_save on` gave 0/60 received and the link dropped
+mid-run; `power_save off` gave 60/60 at 0% loss, RTT 0.735/1.530/7.644 ms.
+`tests/mt7612u_ap_onair.sh` now requires power save off and says so in its
+summary line — which also means its 14/14 does **not** certify these harnesses
+against a default-configured Linux station, because Linux defaults to
+power save on. The bench caveat is that a single clean end-to-end run of the
 whole WPA2 chain is flaky after many cycles when the AP adapter has no VBUS reset
 (an xhci root-hub port) — cold-cycle the station between runs, and prefer a
 VBUS-cyclable AP adapter.

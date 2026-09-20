@@ -54,6 +54,43 @@ favourable measurement without its adversarial counterpart in the same breath.
 | Phase 1 | `src/sta/*` + harness switch | Flash (Dot11 vs the standard) | changes required | 9 | yes |
 | Phase 1 | `src/sta/*` + harness switch | Flash (byte-equivalence) | claim upheld | 5 | yes |
 | Phase 1 | `src/sta/*` + harness switch | Opus subagent | **API defect found** | 13 | yes |
+| Phase 1 gate | `tests/mt7612u_ap_onair.sh` @ e26d12c | Flash (harness logic) | changes required | 8 (F1–F8) | yes |
+| Phase 1 gate | `tests/mt7612u_ap_onair.sh` @ e26d12c | Flash (evidence vs claims) | **overclaims found** | 10 (F1–F10) | yes |
+| Phase 1 gate | `tests/mt7612u_ap_onair.sh` @ e26d12c | Opus subagent | **two checks could not fail** | 14 + clean bills | yes |
+
+### Round 5 — the Phase 1 gate, 2026-09-20
+
+The gate's own acceptance harness, reviewed after it first read 14/14. All
+three reviewers independently reached the same top finding: **the score was
+real in that the checks ran and passed, and two of those checks could not
+have returned anything else.**
+
+What it caught, and none of this was in `src/sta/`:
+
+1. The auto-ACK witness proved the AP's *receiver* worked, not its ACK
+   responder — and the previous round had widened it after the evidence
+   disagreed, while describing that as "not a weaker bar". Replaced with the
+   station's own `tx_retries`/`tx_failed`.
+2. Every "beacon is gone" check passed on a scan that returned nothing, which
+   is also what a scan that never ran returns. That is the only air evidence
+   this suite has that `StopBeacon` works.
+3. The BCN_TU=25 rationale was contradicted by the harness itself — the `stop`
+   cell hardcodes 100 TU and its scan checks always passed.
+4. Three mysteries were retired on one ordered pair of runs, one of whose
+   symptoms (the 524 ms RTT) neither arm reproduced.
+5. A stale `STA_SYSFS` would re-enumerate whatever was plugged there, with
+   none of the VID:PID guarding the AP's identical toggle already documented.
+
+Both verdict functions now have a headless ctest guard
+(`tests/ap_onair_witness_selftest.sh`) with every case verified able to fail —
+the reviewers noted that nothing in CI protected any of this.
+
+The reviewers also issued explicit clean bills worth keeping: the awk's
+block-state machine and its BSSID/SSID/frequency keying were verified correct
+against fixtures; `iw connect`'s argument order is right and pinning
+frequency+BSSID is strictly *stricter*; `came_up()` greps a string the MT7612U
+backend emits only after a successful arm; and the `env` fix to the deleted
+RTL script was the correct diagnosis of a real shell trap.
 
 ### Round 3 — Phase 1, 2026-09-20
 
@@ -261,7 +298,7 @@ switch `ap_responder.cpp` and `ap_wpa2.cpp` onto it.
 reads 14/14 on ch36 and 14/14 on ch6 (the merged baseline in
 `docs/mt7612u-ap-mode.md`). Behaviour change of exactly zero.
 
-**Status: half done, gate NOT closed.**
+**Status: GATE CLOSED.** See “Closing the gate” at the end of this phase.
 
 Done:
 - The `bench/mt7612u-ccmp` artifacts are landed, rebased onto master. That
@@ -287,7 +324,7 @@ Also done since:
   switched onto it**. That switch is the part that proves the module is
   role-neutral rather than a station module with AP-shaped holes.
 - Three adversarial reviews (round 3 above), all findings resolved.
-- On-air, against an **RTL8812AU station on `rtw_8812au`** — independent
+- On-air, against an **RTL8812AU station on the in-tree rtw88 driver (module `rtw88_8812au`, sysfs driver name `rtw_8812au`)** — independent
   silicon, which is a stronger witness than the same-MediaTek station
   `docs/mt7612u-ap-mode.md` used and states as its own weakness:
   - beacon aired and **scannable** (`SSID: devourerAP`, `BSS 02:42:75:05:d6:00`);
@@ -310,7 +347,7 @@ as a refactor regression.
 ### The four items flagged before Phase 3 — all closed
 
 **1. The encrypted data plane is demonstrated.** MT7612U AP, RTL8812AU station
-on `rtw_8812au`, 2.4 GHz:
+on the in-tree rtw88 driver (module `rtw88_8812au`, sysfs driver name `rtw_8812au`), 2.4 GHz:
 
 ```
   data plane: encrypted frames received=98, MIC failures=0,
@@ -363,20 +400,94 @@ now derive their header length from `data_hdr_len()` rather than
 left it in the harnesses, where it would have disagreed with the `is_qos_data`
 mask used two lines below it.
 
+## Closing the gate
+
+`tests/mt7612u_ap_onair.sh` now reads **14/14 twice on 2.4 GHz (ch6) and twice
+on 5 GHz (ch36)**, at the **default** `BCN_TU=100`, against an RTL8812AU on
+the in-tree rtw88 driver — independent silicon on both ends, which is what
+`docs/mt7612u-ap-mode.md` admits its own same-silicon witness lacked.
+
+Getting there took two review rounds and cost four defects in the harness plus
+one in the WPA2 authenticator. None was in `src/sta/`, which is the Phase 1
+deliverable — worth saying, because it is the only part of this that Phase 2
+builds on.
+
+### What the first run found: station power save
+
+Neither AP harness implements 802.11 power save. Verified by reading all three
+beacon builders: **none of them appends a TIM element**, though
+`src/sta/Dot11.h` defines `kEidTim`. A beacon with no TIM is not a conforming
+AP beacon (802.11-2016 9.4.2.6) and gives a dozing station no DTIM schedule;
+nothing is buffered either. Open network, 60 pings at 1/s:
+
+| | received | RTT |
+|---|---|---|
+| `power_save on` | 0/60, link dropped mid-run, AP saw 2 of ~62 | — |
+| `power_save off` | **60/60, 0% loss** | 0.735 / 1.530 / 7.644 ms |
+
+**That is one ordered pair, not an A/B**, and it is not enough to retire the
+three items this document previously listed as unexplained. Specifically: the
+524 ms / 1729 ms RTT was measured on the WPA2 path and is reproduced by
+*neither* arm here — the PS-on arm received nothing at all, so it has no RTT —
+and "roughly half the runs carry no packet" is a population claim that a
+0/60-vs-60/60 pair cannot explain by itself. Related, and large enough to act
+on. Explained, not yet. The three items stay open below, qualified.
+
+**The gate's scope shrank as a result, and that has to be said in the same
+breath as the 14/14:** a score obtained with power save forced off does not
+certify this AP against a default-configured Linux station, because Linux
+defaults to `power_save on`. This is now in `docs/ap-mode.md`'s out-of-scope
+list, where it never was.
+
+### What the second round found: two checks that could not fail
+
+- **The auto-ACK witness was decoration.** It grepped the AP's log for a
+  management frame at retry=0; the AP logs every received copy and reception
+  does not depend on ACKing, so a disarmed ACK responder passed it. And the
+  previous round had *widened* it from AUTH to AUTH-or-ASSOC after AUTH came
+  in at retry=1 in four runs of five — widening a predicate until the evidence
+  stops disagreeing, which that round then described as "not a weaker bar".
+  Replaced by the station's own `tx_retries` / `tx_failed`, which is the only
+  side that knows whether its frames were acknowledged. Measured: 25 frames,
+  0 retries, 0 failed.
+- **"The beacon is gone" passed on a dead scan.** Absence checks pass on zero,
+  so a scan that errored or never ran read exactly like a silenced beacon —
+  and that is the only air evidence this suite has that `StopBeacon` works.
+  It now requires the same scan to have seen some BSS. The control caught a
+  real event on its first run.
+
+Both are now guarded headlessly by `tests/ap_onair_witness_selftest.sh` in
+ctest, 14 cases each verified able to fail. Nothing in CI protected them
+before.
+
+- **The authenticator never retransmitted.** `ap_wpa2` sent msg1 and msg3 once
+  each, so a single lost frame stalled the handshake permanently — which is
+  what the wpa2 cell failed on. Fixed per 802.11-2016 12.7.6.4, reusing the
+  ANonce and GTK and incrementing the Key Replay Counter.
+
 ### What is still not done, stated plainly
 
-- **`tests/mt7612u_ap_onair.sh` has not been re-run for its 14/14 on both
-  bands.** That remains the formal acceptance bar. The evidence above is from
-  manual cells driving the same binaries, on 2.4 GHz only, against a station
-  the harness does not know how to drive (it expects an MT7612U at a given
-  sysfs path). Treat 14/14 as outstanding.
-- **The link is unstable on this rig.** The station drops on inactivity
-  (reason 4) if traffic does not start promptly after the 4-way, and roughly
-  half the runs never carry a packet. The ledger is what distinguishes those
-  runs (`received=0`) from a crypto failure; without it they read identically.
-- **RTT is poor and unexplained** — 524 ms mean, 1729 ms max on a near-field
-  link. Not investigated.
-- **Nothing here is soaked.** Longest run under a minute.
+- **`BCN_TU=25` was never needed, and this harness was always the evidence.**
+  The `stop` cell's binary hardcodes 100 TU and ignores the variable, and its
+  scan checks passed in every run. `docs/ap-mode.md`'s "a dense beacon
+  interval is needed throughout" does not reproduce on this bench; the earlier
+  claim here that this station "misses a 100 TU beacon entirely" is withdrawn.
+- **The AUTH-at-retry=1 asymmetry is unexplained.** Five runs, AUTH at retry=1
+  in four; ASSOC at retry=0 in all five. The station's counters are created
+  with the peer entry at association, so the new witness says nothing about
+  the exchange that precedes it. Not closed.
+- **The link is unstable on this rig** and **RTT was poor** (524 ms mean,
+  1729 ms max) — both now *probably* power save, on the evidence above, but
+  neither is demonstrated. Post-fix RTT is 0.7–2.4 ms across every cell.
+- **The 5 GHz open cell's data-plane check is brittle.** It failed once in
+  three runs on a single lost ping: 6 packets at 0% loss, on a channel with
+  several strong neighbours. Not loosened — recorded.
+- **Nothing here is soaked.** Longest run about two minutes; n=2 per band,
+  one AP unit, one station unit, near field.
+- **A second cfg80211 cache entry for our own BSSID** appears while the AP is
+  up, carrying a frequency we are not airing on. Its origin is not
+  established. The harness now pins frequency and BSSID on connect, which
+  makes the cell deterministic **without** explaining the entry.
 
 **A caveat that belongs in the record:** the vectors are cross-implementation,
 not official. The IEEE 802.11-2016 Annex J CCMP vector would be strictly better

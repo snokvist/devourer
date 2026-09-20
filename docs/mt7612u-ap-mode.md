@@ -38,7 +38,7 @@ station, plus an RTL8812AU running `rxdemo` as an independent on-air witness.
 | HW sequence (`ACK_CTL_NSEQ`) | `wlan.seq` increments **+1 per beacon** (2140, 2141, 2142 …) |
 | Beacon interval math | On-air spacing 102.4 ms, confirming `INTVAL = interval_tu << 4` (1/16 TU) |
 | Corrected MBSS masks | `MT_MAC_BSSID_DW1` reads `0x003fa127` — upper bits exactly mt76's `MBSS_MODE=3 / MBEACON_N=7 / LOCAL_BIT` |
-| Hardware auto-ACK (Gate B) | A real station's **3 auth frames, 0 retried**. An un-ACKed frame is retransmitted with FC Retry set, so retry=0 is the ACK |
+| Hardware auto-ACK (Gate B) | A real station's **3 auth frames, 0 retried**. Counting retried copies is the sound form of this; the *presence* of a retry=0 line is not (see the auto-ACK note below) |
 | APC BSSID slot programmed | `MT_MAC_APC_BSSID_L(0)=0x50efa540` (device MAC `40:a5:ef:50:…`) |
 
 Not yet done: probe **responses**, auth/assoc **responses** and the data plane —
@@ -58,7 +58,26 @@ one is devourer itself: `tests/ap_responder.cpp`, built unchanged against
 | The beacon is on air and correct | station `iw scan`: `SSID: devourerAP`, `BSS 02:42:75:05:d6:00`, `beacon interval: 100 TUs`, `capability: ESS (0x0001)`, `DS Parameter set: channel 36`, −32 dBm |
 | A locally-administered BSSID works | that BSSID is `02:…`, so it lands in APC slot 1 by mt76's rule. The first draft of `mt7612u_beacon_start()` refused it outright |
 | A real station associates | `wlx…: connected to 02:42:75:05:d6:00`, `freq: 5180.0` |
-| The MAC auto-ACKs | AP side, three runs: `AUTH req … alg=0 seq=1 retry=0` and `ASSOC req … retry=0`. An un-ACKed frame is retransmitted with FC Retry set, so retry=0 IS the ACK |
+| The MAC auto-ACKs | AP side, three runs: `AUTH req … alg=0 seq=1 retry=0` and `ASSOC req … retry=0`. **This inference is wrong and the evidence has been superseded — see the note under the table.** |
+
+> **On "retry=0 IS the ACK".** It is not, and three independent reviewers said
+> so. The AP logs *every* received copy of a management frame, and reception
+> does not depend on ACKing: disarm the ACK responder entirely and the
+> station's first transmission still arrives with Retry clear, still gets
+> logged at retry=0, and the check still passes. The station then retransmits
+> until it gives up, and nothing was looking at that. What discriminates is
+> the **absence of a retried copy** — which is what Gate B's "3 auth frames,
+> 0 retried" row actually measured, and what the on-air script never
+> implemented.
+>
+> Against independent silicon the retry=0 reading also simply does not hold:
+> five runs gave AUTH at retry=1 in four of them, on links that then passed
+> every other check and carried 60/60 pings. `tests/mt7612u_ap_onair.sh` now
+> takes the witness from the station instead — mac80211's per-peer
+> `tx_retries` / `tx_failed`, the only side that knows whether its frames were
+> acknowledged (measured: 25 frames, 0 retries, 0 failed). Those counters are
+> created with the peer entry at association, so the AUTH-at-retry=1
+> asymmetry remains **unexplained**.
 | The data plane works | `6 packets transmitted, 6 received, 0% packet loss, rtt avg 0.808 ms`; AP side `data(arp/icmp)=8 responses_sent=16` |
 | `StopBeacon` silences it | `tests/mt7612u_beacon_stop_check.cpp`: armed → SSID seen; stopped → gone; re-armed → seen again |
 | WPA2-PSK 4-way completes | AP side: `msg2 OK (SNonce, MIC verified) — PTK derived`, `sent msg3 (GTK, MIC)`, `msg4 OK — 4-WAY HANDSHAKE COMPLETE (station keyed)` against `wpa_supplicant` with `proto=RSN pairwise=CCMP group=CCMP` |
@@ -124,8 +143,11 @@ that the code now depends on.
    is set in it. What leaves DUP clear is `mt7612u_set_monitor_rx()`
    (`init.cpp:560-569`), deliberately, because duplicate suppression hides the
    retransmissions an ACK-responder test counts — a station's retry with the FC
-   Retry bit set is exactly how you learn whether your ACKs are landing, and
-   `auth … retry=0` in the on-air harness is that evidence. Every AP path
+   Retry bit set is exactly how you learn whether your ACKs are landing. Note
+   the direction: what carries information is a RETRIED copy arriving, not a
+   retry=0 one, and the on-air harness used to have that backwards (see the
+   auto-ACK note above). Keeping DUP clear is still right, and now also lets
+   the harness see the retried copies rather than only infer them. Every AP path
    reaches it (`StartRxLoop` calls it, and an AP must receive); a TX-only
    consumer does not, and has no receiver to count retries with anyway. The
    beacon path therefore touches the filter in neither direction.
@@ -248,4 +270,20 @@ see the comment there). Environment: `CH`, `BUILD`, `FW_DIR`, `PSK`, `SECS`,
 
 Success = a real Linux station associates and passes IP traffic against the
 MT7612U backend, open and WPA2-PSK, on both 2.4 and 5 GHz, with the static
-beacon. Measured: 14/14 on ch36 and 14/14 on ch6.
+beacon. Measured: 14/14 on ch36 and 14/14 on ch6 against a second MT7612U.
+
+**Re-measured 2026-09-20 against independent silicon** — an RTL8812AU on the
+in-tree rtw88 driver — at **14/14 twice on ch6 and twice on ch36**, at the
+default `BCN_TU=100`. That is the stronger witness this document's own
+"Weaknesses" section asks for, since the original station was the same chip as
+the AP.
+
+Its conditions, which belong in the same breath as the score: station power
+save **forced off** (these harnesses have no TIM element and buffer nothing,
+so they cannot serve a power-saving station, which is what Linux defaults to);
+one AP unit; one station unit; near field; n=2 per band; nothing soaked
+(longest run ~2 min); and the 5 GHz open cell's data-plane check failed once
+in three runs on a single lost ping, being 6 packets at 0% loss on a channel
+with several strong neighbours. The harness prints its own conditions in the
+summary line. `BCN_TU`, `BENCH_SECS`, `BENCH_PAYLOAD` and `OUT` are also
+environment knobs, and `bench` is a fourth cell.
