@@ -82,7 +82,10 @@ arm() {
     # 1 = receiver on, managed filter, NOTHING armed - that is the claim.
     # 2 = the same, with MT_AUTO_RSP_EN cleared: one bit different, which is
     #     the single-variable test of WHICH mechanism answers.
-    if [ "$dut_up" = 2 ]; then
+    if [ "$dut_up" = 3 ]; then
+      "$BUILD/mt7612uprobe" bssen "$CH" $((SECS + 14)) \
+          >"$OUT/dut_$tag.log" 2>&1 &
+    elif [ "$dut_up" = 2 ]; then
       "$BUILD/mt7612uprobe" norsp "$CH" $((SECS + 14)) \
           >"$OUT/dut_$tag.log" 2>&1 &
     else
@@ -148,6 +151,9 @@ c=$(arm C "$DUT_MAC" 0); echo "  $c"
 echo "== D: destination is the DUT, DUT receiving, MT_AUTO_RSP_EN CLEARED =="
 echo "     (single-variable: which mechanism answers?)"
 d=$(arm D "$DUT_MAC" 2); echo "  $d"
+echo "== E: destination is the DUT, DUT receiving, WRONG BSSID in an ENABLED APC slot =="
+echo "     (R5's last caveat: does an enabled slot gate a station?)"
+e=$(arm E "$DUT_MAC" 3); echo "  $e"
 echo
 
 rm -f "$ROOT/firmware"
@@ -158,13 +164,14 @@ a_ok=$(printf '%s' "$a" | sed -n 's/.*ok_pct=\([0-9.]*\).*/\1/p')
 b_ok=$(printf '%s' "$b" | sed -n 's/.*ok_pct=\([0-9.]*\).*/\1/p')
 c_ok=$(printf '%s' "$c" | sed -n 's/.*ok_pct=\([0-9.]*\).*/\1/p')
 d_ok=$(printf '%s' "$d" | sed -n 's/.*ok_pct=\([0-9.]*\).*/\1/p')
+e_ok=$(printf '%s' "$e" | sed -n 's/.*ok_pct=\([0-9.]*\).*/\1/p')
 
 # EVERY arm must have produced reports. An arm that aborted, or one the peer
 # never reported on, yields an empty ok_pct - and an empty value compared
 # numerically reads as 0, which is the PASSING value for a control. That is
 # how an aborted arm D was scored as "MT_AUTO_RSP_EN is the gate" on the first
 # run of this harness.
-for pair in "A:$a" "B:$b" "C:$c" "D:$d"; do
+for pair in "A:$a" "B:$b" "C:$c" "D:$d" "E:$e"; do
   t=${pair%%:*}; v=${pair#*:}
   case "$v" in
     *ABORTED*)   echo "ARM $t ABORTED: ${v#* ABORTED }"
@@ -192,6 +199,15 @@ awk -v a="${a_ok:-0}" -v d="${d_ok:-0}" 'BEGIN{
   exit !(d < a - 40)
 }' && ok "MT_AUTO_RSP_EN is the gate - SetStationIdentity is right to refuse when it is clear" \
    || bad "MT_AUTO_RSP_EN is NOT the gate here - the seam refuses on a bit that does not control this"
+
+# E closes R5's last caveat: every earlier arm left mt76's per-slot enable
+# clear, so "a wrong BSSID changes nothing" could have meant "nothing was
+# reading the BSSID". Here the slot is wrong AND enabled.
+awk -v a="${a_ok:-0}" -v e="${e_ok:-0}" 'BEGIN{
+  printf "E (wrong BSSID, slot ENABLED) ok=%.1f%%\n", e
+  exit !(e > a - 20)
+}' && ok "a wrong BSSID in an ENABLED APC slot does not gate the station - R5 closed" \
+   || bad "an enabled APC slot DOES gate the station - R5's null result was an artefact of the enable bit being clear"
 
 echo
 echo "=== $pass passed, $fail failed  (logs: $OUT) ==="

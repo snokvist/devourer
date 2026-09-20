@@ -2426,6 +2426,41 @@ static int sta_set_bss_base(struct mt7612u_dev *d, const uint8_t *a)
 	return mt_rmw(d, MT_MAC_BSSID_DW1, MT_MAC_BSSID_DW1_ADDR, dw1);
 }
 
+/* Read a slot back into `out`. docs/station-mode-scope.md's R5 asked for this
+ * from the start - "whatever the arm path does it should read the slot back" -
+ * and the first three revisions of this gate did not, so arm F could have been
+ * writing a slot the hardware never consults and the table would have looked
+ * identical either way. */
+static int sta_read_apc(struct mt7612u_dev *d, int idx, uint8_t *out)
+{
+	uint32_t lo = 0, hi = 0;
+
+	if (mt_rr_chk(d, MT_MAC_APC_BSSID_L(idx), &lo) ||
+	    mt_rr_chk(d, MT_MAC_APC_BSSID_H(idx), &hi))
+		return -1;
+	out[0] = (uint8_t)(lo & 0xff);
+	out[1] = (uint8_t)((lo >> 8) & 0xff);
+	out[2] = (uint8_t)((lo >> 16) & 0xff);
+	out[3] = (uint8_t)((lo >> 24) & 0xff);
+	out[4] = (uint8_t)(hi & 0xff);
+	out[5] = (uint8_t)((hi >> 8) & 0xff);
+	return 0;
+}
+
+/* The slot-0 high register's BIT(16) is MT_MAC_APC_BSSID0_H_EN upstream in
+ * mt76; this tree has never defined it, and no arm has ever set it. If a
+ * per-slot enable is real on this part then every "slot programmed" arm may
+ * have written a slot the engine was not consulting - which would make R5's
+ * null result mean something much weaker than it appears to. The gate cannot
+ * settle that, but it CAN report the bit rather than leave it unmentioned. */
+static uint32_t sta_apc_high_raw(struct mt7612u_dev *d, int idx)
+{
+	uint32_t hi = 0;
+
+	mt_rr_chk(d, MT_MAC_APC_BSSID_H(idx), &hi);
+	return hi;
+}
+
 static int sta_write_apc(struct mt7612u_dev *d, int idx, const uint8_t *a)
 {
 	const uint32_t lo = (uint32_t)a[0] | ((uint32_t)a[1] << 8) |
@@ -2486,7 +2521,9 @@ static int gate_sta(uint8_t chan, int secs, const char *bssid_str)
 	for (unsigned a = 0; a < sizeof arms / sizeof arms[0]; a++) {
 		const uint8_t *want = arms[a].bad ? wrong : bssid;
 		int derived = sta_apc_idx(dev.macaddr, want);
-		uint32_t dw0 = 0, dw1 = 0, filtr = 0;
+		uint32_t dw0 = 0, dw1 = 0, filtr = 0, apc_hi = 0;
+		uint8_t apc_rb[6] = { 0 };
+		int wrote_slot = -1, apc_ok = 1, apc_read_ok = 0;
 		double t0;
 
 		memcpy(ctr.bssid, bssid, 6);
@@ -2507,8 +2544,14 @@ static int gate_sta(uint8_t chan, int secs, const char *bssid_str)
 		}
 
 		if (arms[a].mbss) sta_set_bss_base(&dev, want);
-		if (arms[a].apc0) sta_write_apc(&dev, 0, want);
-		if (arms[a].apc_derived) sta_write_apc(&dev, derived, want);
+		if (arms[a].apc0) {
+			wrote_slot = 0;
+			apc_ok = (sta_write_apc(&dev, 0, want) == 0);
+		}
+		if (arms[a].apc_derived) {
+			wrote_slot = derived;
+			apc_ok = (sta_write_apc(&dev, derived, want) == 0);
+		}
 
 		if (mt_mac_start(&dev, MT_RX_DRAIN_NONE)) return 1;
 		if (mt_async_start(&dev, sta_rx_cb, &ctr)) { mt_mac_stop(&dev); return 1; }
@@ -2540,6 +2583,13 @@ static int gate_sta(uint8_t chan, int secs, const char *bssid_str)
 
 		mt_rr_chk(&dev, MT_MAC_BSSID_DW0, &dw0);
 		mt_rr_chk(&dev, MT_MAC_BSSID_DW1, &dw1);
+		/* Read the slot back AFTER the filter write, for the same reason
+		 * the BSSID registers are read here: anything written earlier
+		 * could have been overwritten since. */
+		if (wrote_slot >= 0) {
+			apc_read_ok = (sta_read_apc(&dev, wrote_slot, apc_rb) == 0);
+			apc_hi = sta_apc_high_raw(&dev, wrote_slot);
+		}
 
 		t0 = now_ms();
 		while (now_ms() - t0 < secs * 1000.0 && !g_stop)
@@ -2556,6 +2606,26 @@ static int gate_sta(uint8_t chan, int secs, const char *bssid_str)
 		       dw0, dw1, filtr,
 		       (filtr & MT_RX_FILTR_CFG_PROMISC) ? "" : " PROMISC-OFF!",
 		       ctr.to_us_data.load());
+		if (wrote_slot >= 0) {
+			if (!apc_ok)
+				printf("       APC slot %d WRITE FAILED - this arm "
+				       "programmed nothing\n", wrote_slot);
+			else if (!apc_read_ok)
+				printf("       APC slot %d could not be read back - "
+				       "this arm is unverified\n", wrote_slot);
+			else if (memcmp(apc_rb, want, 6) != 0)
+				printf("       APC slot %d READ BACK WRONG: "
+				       "%02x:%02x:%02x:%02x:%02x:%02x - the write did "
+				       "not stick, so this arm tested nothing\n",
+				       wrote_slot, apc_rb[0], apc_rb[1], apc_rb[2],
+				       apc_rb[3], apc_rb[4], apc_rb[5]);
+			else
+				printf("       APC slot %d verified, high reg %08x "
+				       "(bit16 %s - mt76's per-slot enable, which this "
+				       "tree never sets)\n",
+				       wrote_slot, apc_hi,
+				       (apc_hi & (1u << 16)) ? "SET" : "clear");
+		}
 
 		if (ctr.beacons.load()) any_beacon = 1;
 		if (a == 0) { base_bss = ctr.from_bss.load(); base_bcn = ctr.beacons.load(); }
@@ -3036,6 +3106,84 @@ static int gate_norsp(uint8_t chan, int secs)
 	mt_async_stop(&dev);
 	mt_mac_stop(&dev);
 	printf("GATE NORSP: done (restored)\n");
+	return 0;
+}
+
+/* -------------------------------------------------------------- gate_bssen
+ *
+ * The last caveat on R5: a WRONG BSSID in an APC slot that is actually
+ * ENABLED.
+ *
+ * R5's six arms all left the slot-0 high register's BIT(16) clear - upstream
+ * mt76 calls it MT_MAC_APC_BSSID0_H_EN and this tree has never defined it. So
+ * every "slot programmed" arm may have written a slot the engine was not
+ * consulting, which would make R5's null result mean far less than it looks:
+ * "a wrong BSSID changes nothing" is uninteresting if nothing was reading the
+ * BSSID.
+ *
+ * This arm programs a deliberately WRONG BSSID into both MT_MAC_BSSID and the
+ * derived APC slot, sets that bit, verifies it stuck, and then receives. The
+ * peer (tests/mt7612u_sta_autoack.sh) transmits unicast at this station's own
+ * address throughout. If acknowledgement and reception survive that, the
+ * BSSID plane does not gate a station on this part even when its enable is
+ * set - and R5 is closed rather than merely measured.
+ *
+ * If the bit will not stick, that is reported and the arm refuses: an
+ * unsettable bit is not evidence about anything.
+ *
+ *   bringup bssen <chan> <secs>
+ */
+static int gate_bssen(uint8_t chan, int secs)
+{
+	static const uint8_t wrong[6] = { 0x02, 0x00, 0x00, 0xde, 0xad, 0x02 };
+	uint8_t rb[6] = { 0 };
+	uint32_t hi = 0;
+	int idx;
+	double t0;
+
+	if (mt_eeprom_init(&dev)) return 1;
+	if (mt_init_hardware(&dev, NULL)) return 1;
+	if (mt_set_channel(&dev, chan, MT7612U_BW_20)) return 1;
+	if (mt_mac_start(&dev, MT_RX_DRAIN_NONE)) return 1;
+	if (mt_async_start(&dev, norsp_rx_cb, NULL)) { mt_mac_stop(&dev); return 1; }
+	if (mt_mac_start(&dev, MT_RX_DRAIN_RING)) {
+		mt_async_stop(&dev); mt_mac_stop(&dev); return 1;
+	}
+	/* Managed filter as mt_mac_start() left it. */
+
+	idx = sta_apc_idx(dev.macaddr, wrong);
+	sta_set_bss_base(&dev, wrong);
+	sta_write_apc(&dev, idx, wrong);
+	/* The enable bit mt76 has and this tree does not. */
+	mt_rmw(&dev, MT_MAC_APC_BSSID_H(idx), 1u << 16, 1u << 16);
+
+	if (sta_read_apc(&dev, idx, rb) || memcmp(rb, wrong, 6) != 0) {
+		printf("GATE BSSEN: FAIL - the slot did not read back\n");
+		mt_async_stop(&dev); mt_mac_stop(&dev); return 2;
+	}
+	hi = sta_apc_high_raw(&dev, idx);
+	if (!(hi & (1u << 16))) {
+		printf("GATE BSSEN: INCONCLUSIVE - BIT(16) of the APC high register "
+		       "would not stay set (%08x). Either it is not a per-slot "
+		       "enable on this part, or it is not writable here; either way "
+		       "this arm proves nothing about an enabled slot.\n", hi);
+		mt_async_stop(&dev); mt_mac_stop(&dev); return 2;
+	}
+
+	printf("WRONG BSSID %02x:%02x:%02x:%02x:%02x:%02x in MT_MAC_BSSID and APC "
+	       "slot %d, BIT(16) SET (high reg %08x)\n",
+	       wrong[0], wrong[1], wrong[2], wrong[3], wrong[4], wrong[5], idx, hi);
+	printf("receiving %d s on ch%u as %02x:%02x:%02x:%02x:%02x:%02x\n",
+	       secs, chan, dev.macaddr[0], dev.macaddr[1], dev.macaddr[2],
+	       dev.macaddr[3], dev.macaddr[4], dev.macaddr[5]);
+
+	t0 = now_ms();
+	while (now_ms() - t0 < secs * 1000.0 && !g_stop)
+		usleep(20000);
+
+	mt_async_stop(&dev);
+	mt_mac_stop(&dev);
+	printf("GATE BSSEN: done\n");
 	return 0;
 }
 
@@ -5165,6 +5313,9 @@ int main(int argc, char **argv)
 		rc = gate_txs(argc > 2 ? (uint8_t)atoi(argv[2]) : 149,
 		              argc > 3 ? atoi(argv[3]) : 40,
 		              argc > 4 ? argv[4] : NULL);
+	} else if (!strcmp(cmd, "bssen")) {
+		rc = gate_bssen(argc > 2 ? (uint8_t)atoi(argv[2]) : 6,
+		                argc > 3 ? atoi(argv[3]) : 25);
 	} else if (!strcmp(cmd, "norsp")) {
 		rc = gate_norsp(argc > 2 ? (uint8_t)atoi(argv[2]) : 6,
 		                argc > 3 ? atoi(argv[3]) : 25);

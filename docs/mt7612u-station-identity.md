@@ -67,9 +67,16 @@ otherwise read `to_us = 0`.
 | E | `MT_MAC_BSSID` + derived slot = AP | 1 | 6083 | 195 | 5888 |
 | **F** | **both programmed WRONG** | 1 | 6073 | 196 | **5877** |
 
-`filtr=00015f97` in every arm. Register read-backs confirm the `MT_MAC_BSSID`
-writes land; the APC writes are **not** read back, which is a gap the scope
-document specifically asked for and this gate still does not close.
+`filtr=00015f97` in every arm, and **every write is now read back** — the gap
+the scope document asked about from the start. Arm C's slot 0 reads
+`hi=00009111` (the AP's `…:11:91`) and arm F's slot 1 reads `hi=000001ad` (the
+wrong `…:ad:01`), so the arms programmed what they claimed to.
+
+The read-back also settled a question that would otherwise have undermined all
+of this: **BIT(16) of the APC high register was CLEAR in every arm.** Upstream
+mt76 calls that `MT_MAC_APC_BSSID0_H_EN` and this tree has never defined it,
+so "a wrong BSSID changes nothing" could have meant "nothing was reading the
+BSSID". That is closed below — see arm E.
 
 **Arm F is the finding.** A deliberately wrong BSSID in both registers receives
 5877 unicast frames against arm A's 6250 with nothing programmed — flat, and
@@ -102,10 +109,11 @@ outcome is visible per frame.
 
 | arm | reports | ok | retries (mean) |
 |---|---|---|---|
-| **A** — DUT receiving, **nothing armed** | 876 | **100.0%** | **0.06** |
+| **A** — DUT receiving, **nothing armed** | 887 | **100.0%** | **0.10** |
 | B — destination nobody holds | 272 | 0.0% | 12.00 |
-| C — DUT not running | 269 | 0.0% | 12.00 |
-| **D** — DUT receiving, `MT_AUTO_RSP_EN` **cleared** | 261 | 0.0% | 12.00 |
+| C — DUT not running | 262 | 0.0% | 12.00 |
+| **D** — DUT receiving, `MT_AUTO_RSP_EN` **cleared** | 273 | 0.0% | 12.00 |
+| **E** — DUT receiving, **wrong BSSID in an ENABLED APC slot** | 863 | **100.0%** | **0.14** |
 
 **A against B and C** establishes the claim: with nothing armed at all, this
 MAC acknowledges unicast addressed to its own address. B holds the
@@ -118,6 +126,14 @@ port identity, same managed filter, one bit different — and acknowledgement
 stops dead. So `MT_AUTO_RSP_EN` *is* the gate on this part, which retroactively
 justifies `SetStationIdentity` refusing to arm when that bit is clear: a branch
 that shipped on an assumption now has a measurement behind it.
+
+**E closes R5.** It programs a deliberately wrong BSSID into both
+`MT_MAC_BSSID` and the derived APC slot, sets mt76's per-slot enable bit,
+verifies the bit stuck, and then receives — and acknowledgement is unchanged
+at 100%. So the BSSID plane does not gate a station on this part even when its
+enable is set, and R5's null result is not an artefact of that bit being
+clear. The gate refuses rather than reports if the bit will not stay set: an
+unsettable bit is not evidence about anything.
 
 ### The two methods that failed first
 
@@ -163,20 +179,48 @@ reception one is the larger failure.
 - Auto-ACK needs no call: with nothing armed, 100% of the peer's frames are
   acknowledged at 0.06 mean retries.
 
+## The uplink — what this station transmits is acknowledged
+
+The other half of `AdapterCaps::station_mode_ok`'s bar. Everything above
+measures frames sent *to* the DUT; this measures frames sent *by* it.
+
+Instrument: the DUT's own `MT_TX_STAT_FIFO` via `bringup txs`, which reports
+the MAC's per-MPDU retry count. The peer is a Realtek adapter running `rxdemo`
+with `DEVOURER_ACK_RESPONDER` armed — the same responder
+`tests/ack_txreport_matrix.sh` uses.
+
+`sudo tests/mt7612u_sta_uplink.sh`
+
+| arm | acknowledged | mean retries | max |
+|---|---|---|---|
+| **A** — peer answers for the address we transmit to | **200/200** | **0.0** | 1 |
+| B — peer answers for a *different* address (control) | 0/200 | 16.0 | 16 |
+
+Read from the gate's **"MAC receiver ON"** table. That gate prints its arms
+twice, receiver off and receiver on, which is Phase 0's result built in: with
+the receiver off the MAC cannot hear an ACK, so every unicast arm runs its
+ladder to exhaustion regardless of what the peer does. A station runs with its
+receiver on. Reading the wrong table reported UNSETTLED for both arms and
+threw away a clean measurement.
+
+**On arm B and the UNSETTLED marker.** The gate flags an arm when fewer status
+entries land than frames were sent, because it cannot then guarantee each
+entry belongs to the arm it is printed under. The failing control trips that
+*by construction*: with nothing acknowledging, every frame runs the full
+16-retry ladder, the MAC is about two orders of magnitude slower per frame,
+and the 16-slot ring cannot keep up. A control that always reads UNSETTLED is
+not a control.
+
+It is accepted here, and only here, for a stated reason: misattributed entries
+would come from the neighbouring arms, which in the same table run at 200/200
+and zero retries — so contamination can only make a failing arm look *better*.
+Arm B's 0/200 at 16.0 retries is therefore a floor, and a floor is all a
+control needs to be. The harness still refuses an UNSETTLED arm that *claims
+success*.
+
 ## What is not established
 
-- **The station's own uplink.** Everything above measures frames sent *to* the
-  DUT. Whether an AP acknowledges what this station *transmits* is a different
-  question, and `AdapterCaps::station_mode_ok`'s bar asks for it;
-  `MT_TX_STAT_FIFO` and `bringup txs` are the instrument and have not been
-  pointed at it.
-- **The APC writes are never read back.** Arm F could be writing a slot the
-  hardware does not consult and the table would look the same.
-- **A per-slot enable bit.** Upstream mt76 carries `MT_MAC_APC_BSSID0_H_EN` at
-  BIT(16) of the slot-0 high register; this tree defines no such bit and none
-  of arms C–F sets one. If per-slot enable is real here, those arms may never
-  have enabled the slot they programmed.
 - **Everything is an unassociated station** receiving traffic it did not
   negotiate. Power save, TIM parsing, cross-BSS duplicate detection and
   hardware key lookup are untested; Phase 3 should expect to revisit this.
-- One AP, one DUT, one channel, near field.
+- One AP, one DUT, one channel, near field, and no soak.

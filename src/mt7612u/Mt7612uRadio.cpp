@@ -1151,37 +1151,40 @@ devourer::AdapterCaps Mt7612uRadio::GetAdapterCaps() {
   /* Measured on air: 0 frames at the stimulus radio unarmed, 3500+ armed. */
   c.ack_responder_ok = true;
   /*
-   * station_mode_ok stays FALSE, and it is worth writing down exactly how
-   * close it is, because the remaining gap is one cell rather than a body of
-   * work. docs/mt7612u-station-identity.md has the measurements.
+   * station_mode_ok: TRUE, and both halves of the bar this flag's declaration
+   * sets are measured on air against independent silicon. The record, with
+   * the arms and their controls, is docs/mt7612u-station-identity.md - read
+   * its retraction section before quoting anything from it, because two
+   * earlier attempts at the acknowledgement half produced confident-looking
+   * non-results.
    *
-   * MEASURED, on air, with the managed receive filter in force:
-   *   - a station-configured MT7612U receives the AP's traffic, including
-   *     unicast addressed to its own address (6250 frames), and programming
-   *     the BSSID registers correctly, wrongly, or not at all changes none of
-   *     it;
-   *   - moving MT_MAC_ADDR takes that reception to ZERO, which is what makes
-   *     this seam's refusal to move it necessary;
-   *   - `bringup staid` checks the seam's own contract on hardware, 10/10,
-   *     including that it REFUSES while an ACK responder holds the port
-   *     identity and that it DROPS an armed station when one takes it.
+   * DOWNLINK - the AP's unicast reaches this station and is acknowledged by
+   * it, with NOTHING armed. A Realtek peer injects at the DUT and reads its
+   * own per-frame CCX reports: 887 frames, 100% acknowledged, 0.10 mean
+   * retries. Three controls, all pinned at the 12-retry descriptor limit with
+   * 0% acknowledged - a destination nobody holds, the DUT not running, and
+   * (single-variable) the DUT running with MT_AUTO_RSP_EN cleared. The last
+   * one also settles the mechanism, and is why SetStationIdentity refuses to
+   * arm when that bit is clear.
    *
-   * SetStationIdentity writes no register at all on this part, so the hardware
-   * state those numbers were taken in is byte-identical to what a successful
-   * arm leaves behind. The evidence is about the right configuration.
+   * UPLINK - what this station transmits is acknowledged by its peer. The
+   * DUT's own MT_TX_STAT_FIFO, receiver ON, transmitting from its own address
+   * with normal ack policy: 200/200 acknowledged at 0.0 mean retries against
+   * a control - the same peer answering for a DIFFERENT address - at 0/200
+   * and 16.0 retries.
    *
-   * NOT MEASURED, and this is why the flag is false rather than a formality:
-   *   - whether this MAC ACKNOWLEDGES the AP's unicast at all. The scope
-   *     document asserts it does from a register reading; the gate's
-   *     single-variable control (clear MT_AUTO_RSP_EN, hold reception
-   *     constant) does not move, so the retried-copy method is void here and
-   *     the question is open. An earlier revision of this comment quoted
-   *     "0.8% vs 98.0%" - that control ran with the monitor filter by
-   *     mistake and is withdrawn.
-   *   - that the AP acknowledges what this station TRANSMITS. MT_TX_STAT_FIFO
-   *     and `bringup txs` are the instrument and have not been pointed at it.
+   * RECEIVE CONFIGURATION - the BSSID registers do not gate any of it. Six
+   * arms across MT_MAC_BSSID and the APC slot table, read back, including one
+   * with both deliberately WRONG and one with a wrong BSSID in a slot whose
+   * per-slot enable bit is SET: reception and acknowledgement are unchanged.
+   * So SetStationIdentity writing no register is a measured decision.
+   *
+   * WHAT THIS FLAG STILL DOES NOT CERTIFY: everything above is an
+   * unassociated station receiving traffic it did not negotiate. Power save,
+   * TIM parsing, cross-BSS duplicate detection and hardware key lookup are
+   * untested. One AP, one DUT, one channel, near field.
    */
-  c.station_mode_ok = false;
+  c.station_mode_ok = true;
   /* Unmeasured, so false rather than optimistic - nothing here drives the
    * hardware retry counter. */
   c.tx_retry_limit_ok = false;
