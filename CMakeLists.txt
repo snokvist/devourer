@@ -966,6 +966,19 @@ if(OpenSSL_FOUND)
     target_include_directories(CcmpSwBench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
     target_link_libraries(CcmpSwBench PRIVATE OpenSSL::Crypto)
     add_test(NAME ccmp_software_roundtrip COMMAND CcmpSwBench --self-test)
+
+    # src/sta/Ccmp.h - the 802.11 CCMP framing both roles share - against
+    # vectors from a third implementation (tests/ccmp_gen_vectors.py, which
+    # transcribes 802.11-2016 12.5.3.3 independently of the header it checks).
+    # Also pins the AAD masking rules, the 48-bit PN packing, and the replay
+    # gate's `<=`, which PR #335 shipped as `<` - a KRACK-class defect its
+    # review caught. Header-only; no libusb, no device.
+    add_executable(CcmpSelftest tests/ccmp_selftest.cpp)
+    target_include_directories(CcmpSelftest PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(CcmpSelftest PRIVATE OpenSSL::Crypto)
+    add_test(NAME ccmp_framing COMMAND CcmpSelftest)
 endif()
 
 # Headless guard for the TX quiesce seam (ITransport::quiesce_tx via
