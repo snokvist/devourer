@@ -589,7 +589,7 @@ after it; nothing in Phase 3 depends on it.
 | # | Item | Gate |
 |---|---|---|
 | 2b.1 | ~~Fix the CCMP nonce flags octet~~ **DONE 2026-09-20** | Gate met: mutation reintroducing `nonce[0] = 0` fails 8 checks (4 vector cells + 4 direct assertions in `test_nonce_flags()`); regeneration changed only the two QoS vectors. **Not met:** vectors still come from `ccmp_gen_vectors.py` (fixed in the same pass, so they are a regression gate, not an independent one), and interop is unproven because this AP advertises neither WMM nor HT, so no station sends it QoS. Annex J, and an on-air TID 1..7 cell, ride with the WMM work |
-| 2b.2 | ~~Per-station table in `src/sta/`~~ **DONE 2026-09-20** — `src/sta/StationTable.h`, `tests/station_table_selftest.cpp`, ctest 74 | Gate met: `test_two_stations_are_independent()` holds two PTKs, two TX PN spaces and two CCMP windows, and a mutation collapsing `add()` to slot 0 is caught. 4 mutations run, 3 caught; the survivor (deleting `add()`'s redundant wipe) is recorded in the test rather than hidden. **Not done:** nothing is wired onto it yet — the three harnesses still use their own `g_sta`, so this is a container with its contract pinned, not a multi-client AP |
+| 2b.2 | ~~Per-station table in `src/sta/`~~ **DONE 2026-09-20** — `src/sta/StationTable.h`, `tests/station_table_selftest.cpp`, ctest 74 | Gate met: `test_two_stations_are_independent()` holds two PTKs, two TX PN spaces and two CCMP windows, and a mutation collapsing `add()` to slot 0 is caught. 4 mutations run, 3 caught; the survivor (deleting `add()`'s redundant wipe) is recorded in the test rather than hidden. **Wired and device-verified 2026-09-20**: `tests/ap_wpa2.cpp` runs on the table, and TWO STATIONS ASSOCIATED AT ONCE — see "The two-station cell" below. `ap_responder.cpp` and `ul_trigger_ap.cpp` still use their own `g_sta` |
 | 2b.3 | Pass the real SA; read addr3 | ctest on the frame builders; a relayed header byte-compared against Table 9-26 |
 | 2b.4 | Real DHCP address pool + binding table | Two stations lease two distinct addresses on air |
 | 2b.5 | Association-table ARP responder answering with the target's real MAC | A resolves B and gets **B's** MAC, not the AP's |
@@ -601,6 +601,54 @@ after it; nothing in Phase 3 depends on it.
 configured with power save off, exchanging encrypted unicast through the AP,
 plus a group-addressed frame that both decrypt. And per rule 2, two adversarial
 reviews with every finding resolved.
+
+### The two-station cell — measured 2026-09-20
+
+The first half of that acceptance bar is met. AP: MT7612U at `1-1` running
+`tests/ap_wpa2.cpp` on ch6. Stations: RTL8812AU (`20:0d:b0:c4:a7:6a`) and
+RTL8812CU (`40:a5:ef:2f:22:9b`), both on rtw88, both with power save off.
+
+Sequence, run one command at a time rather than as a script, so each step's
+result was visible before the next:
+
+1. Station A associates, four-way completes, **5/5 pings** to the AP.
+2. Station B associates, its own four-way completes.
+3. **Station A pings again — 5/5.** This is the gate. Under the previous
+   file-scope `g_ptk`/`g_sta`, B's association overwrote A's key material and
+   A went dead; under the table it does not.
+4. Both stations ping concurrently, 15 each: **0% loss on both.**
+
+The AP's own exit summary, which is the table reporting on itself:
+
+```
+sent=82 stations=2 [aid=1 20:0d:b0:c4:a7:6a 4way_state=3]
+                   [aid=2 40:a5:ef:2f:22:9b 4way_state=3]
+data plane: encrypted frames received=36, MIC failures=0, replays rejected=0
+```
+
+Two records, two distinct AIDs, both at state 3 (Done). The two zero counters
+are the discriminating evidence, not decoration:
+
+- **MIC failures = 0** means no key cross-contamination: each station's frames
+  decrypted under that station's own PTK.
+- **replays rejected = 0** means the per-station receive windows did their job.
+  A shared window is exactly where this breaks — B's ordinary PN 1..N are the
+  same integers A already used, so a single window would reject all of them and
+  the counter would be non-zero while B showed total loss.
+
+**What this cell does NOT show**, and none of it is incidental:
+
+- Both stations were given **static** addresses. The DHCP server still leases
+  one hardcoded `192.168.99.2` to whoever asks, so two stations over DHCP would
+  collide — that is item 2b.4, unbuilt.
+- **No station-to-station traffic.** Both pinged the AP, not each other; the
+  relay is 2b.7 and does not exist.
+- **No group-addressed traffic.** The GTK transmit path is 2b.6 and does not
+  exist, so the second half of the phase's acceptance bar is untouched.
+- **Non-QoS only.** The AP advertises neither WMM nor HT, so this says nothing
+  about the 2b.1 nonce fix, which remains interop-unproven.
+- **Two stations, not seven**, and no churn: no station deauthenticated and
+  re-associated while another held a key.
 
 **Structural property to hold, stated because Phase 1's equivalent is what made
 that phase checkable:** none of 2b.1-2b.7 may add a backend branch. All of it
