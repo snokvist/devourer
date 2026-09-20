@@ -401,6 +401,7 @@ static std::atomic<uint64_t> g_to_peer{0};      /* DA is another associated stat
 static std::atomic<uint64_t> g_to_elsewhere{0}; /* DA is off-BSS entirely */
 static std::atomic<uint64_t> g_relayed{0};      /* ...and actually forwarded */
 static std::atomic<uint64_t> g_relay_drop{0};   /* ...dropped: peer not keyed, or cipher refused */
+static std::atomic<uint64_t> g_group_tx{0};     /* group-addressed frames aired under the GTK */
 
 static uint16_t csum16(const uint8_t* d, int len) {
   uint32_t s = 0; for (int i=0;i+1<len;i+=2) s += (d[i]<<8)|d[i+1];
@@ -410,6 +411,49 @@ static uint16_t csum16(const uint8_t* d, int len) {
 // tested against vectors from a third implementation (ctest ccmp_framing).
 // They used to be inline here and in nobody's test.
 // Encrypt an AP->STA payload (LLC/SNAP+eth+data) into a CCMP data frame.
+/* THE GROUP TRANSMIT PATH (Phase 2b.6).
+ *
+ * Until now the GTK was generated, wrapped into msg3 and installed by every
+ * station - and then never used to encrypt anything. Stations held a group key
+ * nothing would ever arrive under, so broadcast and multicast simply did not
+ * exist on this BSS: a station's ARP request reached the AP's own responder
+ * and no further.
+ *
+ * Three things had to be right, and only the second was:
+ *
+ *  - KEY ID 1. msg3 advertises the GTK at key id 1 (the GTK KDE's third byte),
+ *    while the only data transmit path hardcoded key id 0. A group frame sent
+ *    at key id 0 is looked up as the PAIRWISE key at the station and fails its
+ *    MIC with no diagnostic at either end.
+ *  - ONE GTK PER BSS. Fixed in 2b.2 - it used to be regenerated inside every
+ *    four-way, so a second association revoked the first station's group key.
+ *  - ITS OWN PN SPACE. The group key is shared, so its packet numbers cannot
+ *    come from any station's pairwise counter; two stations' frames would
+ *    then collide in one PN space under one key.
+ *
+ * Power save off by fleet policy is what keeps this simple: a conforming AP
+ * must buffer group traffic and release it after a DTIM beacon, and with no
+ * dozing stations there is nothing to buffer. That is recorded in the scope
+ * document as a policy, not an oversight.
+ *
+ * Caller holds g_hs_mu. */
+static uint64_t g_gtk_pn = 1;
+
+static std::vector<uint8_t> ccmp_group_tx(const uint8_t* src,
+                                          const uint8_t* msdu, int len) {
+  static const uint8_t kBroadcast[6] = {0xff,0xff,0xff,0xff,0xff,0xff};
+  std::vector<uint8_t> hdr = devourer::sta::data_hdr_from_ds(
+      kBroadcast, kBssid, src, /*protect=*/true, g_seq.next());
+  const uint64_t pn = g_gtk_pn++;
+  std::vector<uint8_t> m(devourer::sta::ccmp_encrypted_len(hdr.size(),
+                                                           (size_t)len));
+  const size_t n = devourer::sta::ccmp_encrypt(
+      g_crypto, g_gtk, hdr.data(), hdr.size(), kBssid, pn, /*key_id=*/1,
+      msdu, (size_t)len, m.data(), m.size());
+  m.resize(n);
+  return m;
+}
+
 /* INTRA-BSS RELAY (Phase 2b.7).
  *
  * Take a frame station A sent for station B, and air it to B. The MSDU is
@@ -728,8 +772,24 @@ static void on_rx(const Packet& p) {
            * DHCP DISCOVER - still reaches the local responders, because those
            * are exactly the requests this AP answers. */
           const uint8_t* da = devourer::sta::data_da(d, fc1);
-          if (devourer::sta::data_da_is_group(d, fc1) ||
-              std::memcmp(da, kBssid, 6) == 0) {
+          if (devourer::sta::data_da_is_group(d, fc1)) {
+            /* Answer it locally AND flood it to the BSS. A station's broadcast
+             * is both a request this AP may answer (ARP for the AP's own
+             * address, DHCP DISCOVER) and traffic its peers are entitled to
+             * see. Before 2b.6 only the first half happened.
+             *
+             * The sender receives its own broadcast back, which is what a
+             * group-addressed frame means and what every AP does; a station
+             * discards a frame whose SA is its own. */
+            handle_plain(sta, pt.data(), (int)ptlen);    // decrypted -> ARP/ICMP
+            if (g_stas.count() > 1) {
+              std::vector<uint8_t> f = ccmp_group_tx(sta, pt.data(), (int)ptlen);
+              if (!f.empty()) {
+                enqueue(std::move(f));
+                g_group_tx.fetch_add(1);
+              }
+            }
+          } else if (std::memcmp(da, kBssid, 6) == 0) {
             handle_plain(sta, pt.data(), (int)ptlen);    // decrypted -> ARP/ICMP
           } else if (g_stas.find(da)) {
             /* Destined for another station on this BSS: relay it. */
@@ -905,13 +965,15 @@ int main(int argc, char** argv) {
    * anything but MediaTek. */
   fprintf(stderr,
           "  addressing: to this AP=%llu, to a peer station=%llu"
-          " (relayed=%llu dropped=%llu), off-BSS=%llu\n",
+          " (relayed=%llu dropped=%llu), off-BSS=%llu,"
+          " group frames aired=%llu\n",
           (unsigned long long)(g_enc_rx.load() - g_to_peer.load()
                                - g_to_elsewhere.load()),
           (unsigned long long)g_to_peer.load(),
           (unsigned long long)g_relayed.load(),
           (unsigned long long)g_relay_drop.load(),
-          (unsigned long long)g_to_elsewhere.load());
+          (unsigned long long)g_to_elsewhere.load(),
+          (unsigned long long)g_group_tx.load());
   fprintf(stderr,
           "  data plane: encrypted frames received=%llu, MIC failures=%llu, "
           "replays rejected=%llu, frames sent=%llu\n",
