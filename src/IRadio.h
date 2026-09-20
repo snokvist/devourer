@@ -219,6 +219,52 @@ public:
   }
   virtual void ClearAckResponder() {}
 
+  /* --- 802.11 infrastructure station (client) identity ---------------------
+   *
+   * Program the MAC for the STATION half of an infrastructure BSS: this
+   * adapter is `own`, the AP it has joined is `bssid`. Arms whatever the
+   * silicon needs to receive that BSS's traffic addressed to `own` and to
+   * auto-ACK it. `ClearStationIdentity` returns to the pre-arm state.
+   *
+   * WHY THIS IS NOT SetAckResponder(bssid). The two look interchangeable and
+   * are not, at least on MT7612U, where the auto-response engine matches
+   * address 1 against the port identity register. Arming an ACK responder
+   * there *retargets* that register, so `SetAckResponder(bssid)` on a station
+   * would move the port identity to the AP's address and break ACK for the
+   * station's own traffic - the exact opposite of what a station needs. A
+   * station's port identity is its OWN address, which is where MAC bring-up
+   * already leaves it, so a correct implementation on that part must write
+   * the BSSID somewhere else and leave the port identity alone. Backends
+   * where one register genuinely serves both may implement this in terms of
+   * the other; they must not assume it.
+   *
+   * ORDERING. Call after the RX loop is running, not before. This is not a
+   * style preference: a backend may program the receive filter when the RX
+   * loop starts and overwrite anything an earlier call wrote (MT7612U does
+   * exactly this - see Mt7612uRadio::StartRxLoop). An implementation that
+   * cannot detect being called too early must say so at its declaration;
+   * one that can should refuse and log rather than arm something that will
+   * be silently undone.
+   *
+   * `own` and `bssid` must both be unicast (I/G clear) and must differ.
+   * Returns false when unsupported, when the arguments are refused, or when
+   * the arm cannot be read back. As with SetAckResponder, false is not proof
+   * of passive state: an implementation that cannot verify its own rollback
+   * logs that rather than claiming it. Clear is a non-throwing best effort
+   * and does not promise the MAC stops responding - a die that matches on an
+   * address alone will answer for whatever address is left programmed.
+   *
+   * Gate this on AdapterCaps::station_mode_ok rather than on a nullptr check;
+   * the default here returns false for every backend that has not ported it,
+   * which is all of them until a backend says otherwise. */
+  virtual bool SetStationIdentity(const devourer::MacAddr &own,
+                                  const devourer::MacAddr &bssid) {
+    (void)own;
+    (void)bssid;
+    return false;
+  }
+  virtual void ClearStationIdentity() {}
+
   /* 802.11 A-MPDU TX mode (src/AmpduMode.h): the first-class bundle of the
    * recipe the spike + pacing sweep proved on-air. When enabled, every data
    * frame is marked aggregatable (data QSEL + AGG_EN + MAX_AGG_NUM +

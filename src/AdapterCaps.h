@@ -231,6 +231,23 @@ struct AdapterCaps {
   bool ack_responder_ok = false;
   bool tx_retry_limit_ok = false;
 
+  /* station_mode_ok: IRadio::SetStationIdentity programs this MAC for the
+   * STATION half of an infrastructure BSS and the arm was READ BACK. Gate
+   * station-mode callers on this rather than on SetStationIdentity's return
+   * value alone, so a caller can refuse before it starts a handshake it
+   * cannot finish.
+   *
+   * FALSE EVERYWHERE TODAY, and false here means "not ported / not measured",
+   * never "the silicon cannot". Do not set it from a code-reading: the bar is
+   * an on-air cell showing this adapter, armed as a station, receiving an
+   * AP's unicast traffic and being ACKed for its own - the same shape of
+   * evidence ack_responder_ok carries, measured per die. Two MT7612U-specific
+   * unknowns are written up as R5 and R6 in docs/station-mode-scope.md; the
+   * relevant one for anyone setting this flag is that it is NOT known what
+   * the APC BSSID slot does for a managed station on that MAC, so no failure
+   * mode should be assumed until a bring-up gate has measured it. */
+  bool station_mode_ok = false;
+
   /* --- feature flags --- */
   /* Per-packet TX power: a per-frame power trim driven by radiotap
    * DBM_TX_POWER (dB delta vs the calibrated table / session base) or a
