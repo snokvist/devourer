@@ -2960,6 +2960,85 @@ static int gate_staid(void)
 	return fail ? 1 : 0;
 }
 
+/* -------------------------------------------------------------- gate_norsp
+ *
+ * Receive with MT_AUTO_RSP_EN CLEARED, for the single-variable arm of
+ * tests/mt7612u_sta_autoack.sh.
+ *
+ * That harness establishes that this MAC acknowledges unicast addressed to it
+ * with nothing armed (100% ok, retries 0.03) against two controls that pin at
+ * the retry limit. What it does not establish is WHICH mechanism answers, and
+ * SetStationIdentity refuses to arm when MT_AUTO_RSP_EN is clear - a branch
+ * shipped on the assumption that the bit matters. This is that assumption's
+ * test: same receiver, same port identity, same filter, one bit different.
+ *
+ * If the peer's ok rate collapses here, the refusal is justified. If it does
+ * not, MT_AUTO_RSP_EN is not the gate on this part and that branch is
+ * refusing for a reason that does not hold - which is worth knowing before
+ * Phase 3 builds on it.
+ *
+ *   bringup norsp <chan> <secs>
+ */
+static void norsp_rx_cb(void *user, const void *frame, size_t len,
+                        const struct mt7612u_rx_info *info)
+{
+	(void)user; (void)frame; (void)len; (void)info;
+}
+
+static int gate_norsp(uint8_t chan, int secs)
+{
+	uint32_t before = 0, after = 0;
+	double t0;
+
+	if (mt_eeprom_init(&dev)) return 1;
+	if (mt_init_hardware(&dev, NULL)) return 1;
+	if (mt_set_channel(&dev, chan, MT7612U_BW_20)) return 1;
+	if (mt_mac_start(&dev, MT_RX_DRAIN_NONE)) return 1;
+	/* A NON-NULL callback, because mt_async_start(NULL) starts the TX slots
+	 * and NOT the RX ring - and mac_start(MT_RX_DRAIN_RING) then refuses,
+	 * correctly, with "no ring draining EP4". The first version of this gate
+	 * passed NULL and died there. */
+	if (mt_async_start(&dev, norsp_rx_cb, NULL)) { mt_mac_stop(&dev); return 1; }
+	if (mt_mac_start(&dev, MT_RX_DRAIN_RING)) {
+		mt_async_stop(&dev); mt_mac_stop(&dev); return 1;
+	}
+	/* Managed filter left exactly as mt_mac_start() programmed it - do NOT
+	 * call mt7612u_set_monitor_rx(), which installs the monitor value and
+	 * is how the first R5/R6 gates came to measure the wrong thing. */
+
+	if (mt_rr_chk(&dev, MT_AUTO_RSP_CFG, &before)) {
+		printf("GATE NORSP: FAIL - cannot read MT_AUTO_RSP_CFG\n");
+		mt_async_stop(&dev); mt_mac_stop(&dev); return 1;
+	}
+	if (mt_rmw(&dev, MT_AUTO_RSP_CFG, MT_AUTO_RSP_EN, 0)) {
+		printf("GATE NORSP: FAIL - cannot clear MT_AUTO_RSP_EN\n");
+		mt_async_stop(&dev); mt_mac_stop(&dev); return 1;
+	}
+	mt_rr_chk(&dev, MT_AUTO_RSP_CFG, &after);
+	if (after & MT_AUTO_RSP_EN) {
+		printf("GATE NORSP: FAIL - MT_AUTO_RSP_EN did not stay clear "
+		       "(%08x -> %08x); the arm would measure nothing\n",
+		       before, after);
+		mt_rmw(&dev, MT_AUTO_RSP_CFG, MT_AUTO_RSP_EN, MT_AUTO_RSP_EN);
+		mt_async_stop(&dev); mt_mac_stop(&dev); return 2;
+	}
+
+	printf("MT_AUTO_RSP_CFG %08x -> %08x (EN cleared), receiving %d s on ch%u\n",
+	       before, after, secs, chan);
+
+	t0 = now_ms();
+	while (now_ms() - t0 < secs * 1000.0 && !g_stop)
+		usleep(20000);
+
+	/* Put it back: this is the state init leaves and everything else on the
+	 * part assumes. */
+	mt_rmw(&dev, MT_AUTO_RSP_CFG, MT_AUTO_RSP_EN, MT_AUTO_RSP_EN);
+	mt_async_stop(&dev);
+	mt_mac_stop(&dev);
+	printf("GATE NORSP: done (restored)\n");
+	return 0;
+}
+
 static int gate_txs(uint8_t chan, int frames, const char *peer_str)
 {
 	static const uint8_t src[6]   = { 0x02, 0x4d, 0x54, 0x76, 0x12, 0x01 };
@@ -5086,6 +5165,9 @@ int main(int argc, char **argv)
 		rc = gate_txs(argc > 2 ? (uint8_t)atoi(argv[2]) : 149,
 		              argc > 3 ? atoi(argv[3]) : 40,
 		              argc > 4 ? argv[4] : NULL);
+	} else if (!strcmp(cmd, "norsp")) {
+		rc = gate_norsp(argc > 2 ? (uint8_t)atoi(argv[2]) : 6,
+		                argc > 3 ? atoi(argv[3]) : 25);
 	} else if (!strcmp(cmd, "staid")) {
 		rc = gate_staid();
 	} else if (!strcmp(cmd, "staack")) {
