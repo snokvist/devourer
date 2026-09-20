@@ -383,8 +383,14 @@ static void on_rx(const Packet& p) {
     fprintf(stderr, "  ASSOC from %02x:%02x:%02x:%02x:%02x:%02x -> start 4-way\n",
             sta[0],sta[1],sta[2],sta[3],sta[4],sta[5]);
     send_msg1();
-  } else if ((fc0 == 0x08 || fc0 == 0x88) && (fc1 & 0x01) && to_us) {  // data to-DS
-    int hlen = 24 + (fc0 == 0x88 ? 2 : 0);
+  } else if ((fc0 == 0x08 || devourer::sta::is_qos_data(fc0)) &&
+             (fc1 & 0x01) && to_us) {                   // data to-DS
+    // data_hdr_len(), not `fc0 == 0x88`: QoS Null (0xc8) is a frame real
+    // stations send, and an exact test gives it a 24-byte header. The TID read
+    // below and the AAD would then both come from the wrong offset - and with
+    // is_qos_data() used for the TID and an exact test for the length, the two
+    // would actively disagree.
+    int hlen = (int)devourer::sta::data_hdr_len(fc0, fc1);
     if ((fc1 & 0x40) && g_state == 2) {                 // PROTECTED (CCMP) data
       int len = (int)p.Data.size();
       if (len < hlen + 8 + 8) return;                   // hdr + CCMP hdr + MIC

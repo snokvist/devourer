@@ -197,9 +197,12 @@ static void on_rx(const Packet& p) {
     m.insert(m.end(), {0x01,0x00, 0x00,0x00, 0x01,0xc0});   // cap, status 0, AID 1
     append_ies(m, false);
     enqueue(std::move(m));
-  } else if ((fc0 == 0x08 || fc0 == 0x88) && (fc1 & 0x01) && to_us) {  // data, to-DS
+  } else if ((fc0 == 0x08 || devourer::sta::is_qos_data(fc0)) &&
+             (fc1 & 0x01) && to_us) {                   // data, to-DS
     // Data plane: answer ARP + ICMP echo so an associated station can ping the AP.
-    int hlen = 24 + (fc0 == 0x88 ? 2 : 0);               // QoS data adds 2 bytes
+    // Every QoS subtype, not just QoS Data - a QoS Null read as a 24-byte
+    // header finds its LLC/SNAP two bytes early and is silently dropped.
+    int hlen = (int)devourer::sta::data_hdr_len(fc0, fc1);
     if ((int)p.Data.size() < hlen + 8) return;
     const uint8_t* llc = p.Data.data() + hlen;
     if (!(llc[0] == 0xaa && llc[1] == 0xaa && llc[2] == 0x03)) return;

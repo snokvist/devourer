@@ -307,21 +307,70 @@ station, which has never been used with these harnesses (the validated runs
 used an MT7612U kernel station). Without that control the run would have read
 as a refactor regression.
 
-Gate still open until:
-- The encrypted data plane is demonstrated on *some* rig — either by restoring
-  an MT7612U station, or by finding what this Realtek station needs. The
-  leading hypothesis is that it associates 802.11n and sends QoS data, which
-  the pre-refactor AP could never have decrypted (22-byte AAD for a QoS frame);
-  if so the fix is already in, and what is missing is a station that gets far
-  enough to prove it. `tests/mt7612u_ap_onair.sh`'s 14/14 on both bands remains
-  the acceptance bar and has NOT been re-run.
-- The remaining review findings judged low-priority and deliberately deferred,
-  recorded here rather than dropped: the harness data planes still air
-  sequence 0 (only management frames got the counter); `CcmpReplay` is
-  implemented and tested but **no production path calls it**; `parse_beacon`
-  rejects mixed-mode WPA/WPA2 and WPA3-transition APs because it byte-compares
-  a canonical RSN layout instead of searching the suite lists — that one will
-  bite a real station and should be fixed before Phase 3 ships.
+### The four items flagged before Phase 3 — all closed
+
+**1. The encrypted data plane is demonstrated.** MT7612U AP, RTL8812AU station
+on `rtw_8812au`, 2.4 GHz:
+
+```
+  data plane: encrypted frames received=98, MIC failures=0,
+              replays rejected=1, frames sent=27
+  5 packets transmitted, 5 received, 0% packet loss
+```
+
+Zero MIC failures across ~250 encrypted frames over two successful runs, so
+the promoted CCMP module decrypts a real station's traffic correctly. The
+replay window rejected one genuine on-air replay, which makes it a deployed
+control rather than a test fixture.
+
+**The earlier 100% loss was ours, not the rig's.** The leading hypothesis in
+the previous revision — that the Realtek station sends QoS data the
+pre-refactor AP could not decrypt — was **wrong**: the QoS AAD correction
+shipped a commit before that run and the run still lost every packet. By
+elimination the cause was the data-plane sequence number, item 2 below. That
+is inference from an ordered pair of runs rather than an A/B, and it is stated
+as inference.
+
+**2. The data planes air sequence numbers.** Both harnesses' data headers now
+come from the shared builder with a real 12-bit counter. This was the fix that
+turned the data plane on, and it is exactly the mechanism review round 1
+predicted when it found the sequence-number gap: *"a station's data plane
+feeds the AP's duplicate detector, where a pinned seq=0 is precisely what gets
+dropped."* The prediction was right and the first on-air run mistook its
+consequence for a rig fault.
+
+**3. `CcmpReplay` is called.** Checked after the MIC verifies and never
+before, keyed by the frame's TID, reset on every PTK install.
+
+**4. RSN parsing no longer rejects real APs.** `parse_rsn()` reads the counts
+and searches the suite lists instead of byte-comparing a canonical
+one-of-each layout, so mixed-mode WPA/WPA2 and WPA3-transition BSSes are
+joinable. MFP-required BSSes are refused, and surfaced as such rather than
+failing the handshake later. The test was verified to catch the old
+semantics.
+
+Also closed on the way: `SeqCounter` is atomic; `build_probe_req` no longer
+emits a 2.4 GHz-only DS Parameter Set on 5 GHz; the station builders abort on
+an over-length SSID instead of airing a frame missing it; and both harnesses
+now derive their header length from `data_hdr_len()` rather than
+`fc0 == 0x88` — I had fixed that exact-equality test in the shared module and
+left it in the harnesses, where it would have disagreed with the `is_qos_data`
+mask used two lines below it.
+
+### What is still not done, stated plainly
+
+- **`tests/mt7612u_ap_onair.sh` has not been re-run for its 14/14 on both
+  bands.** That remains the formal acceptance bar. The evidence above is from
+  manual cells driving the same binaries, on 2.4 GHz only, against a station
+  the harness does not know how to drive (it expects an MT7612U at a given
+  sysfs path). Treat 14/14 as outstanding.
+- **The link is unstable on this rig.** The station drops on inactivity
+  (reason 4) if traffic does not start promptly after the 4-way, and roughly
+  half the runs never carry a packet. The ledger is what distinguishes those
+  runs (`received=0`) from a crypto failure; without it they read identically.
+- **RTT is poor and unexplained** — 524 ms mean, 1729 ms max on a near-field
+  link. Not investigated.
+- **Nothing here is soaked.** Longest run under a minute.
 
 **A caveat that belongs in the record:** the vectors are cross-implementation,
 not official. The IEEE 802.11-2016 Annex J CCMP vector would be strictly better
