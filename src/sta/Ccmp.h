@@ -26,6 +26,7 @@
 #include <cstring>
 
 #include "sta/CryptoOps.h"
+#include "sta/Dot11.h"
 
 namespace devourer {
 namespace sta {
@@ -39,54 +40,69 @@ constexpr size_t kCcmpNonceLen = 13;
 
 /* Additional authenticated data over the 802.11 header (802.11-2016 12.5.3.3.3).
  *
+ * Everything is derived from the header itself. An earlier version took a
+ * `qos_tid` argument alongside a header it then read only 24 bytes of, so a
+ * caller could hand it a real 26-byte QoS header and have the QoS Control
+ * octets silently overwritten by the CCMP header - an API that invited the
+ * exact bug it existed to prevent. `hdr_len` is now explicit and the TID comes
+ * out of the frame.
+ *
  * The masking is the part that is easy to get subtly wrong and impossible to
  * debug from the other end, because a wrong AAD looks exactly like a wrong key:
  * the MIC simply fails.
  *
- *  - Frame Control: subtype bits, Retry, Pwr Mgmt and More Data are masked out
- *    because they may legitimately change between transmission and reception
- *    (a retransmission sets Retry; a buffering AP sets More Data). Protected
- *    is forced ON because the receiver sees it set.
+ *  - Frame Control: Retry, Pwr Mgmt and More Data are masked because they may
+ *    legitimately differ between transmission and reception. Protected is
+ *    forced ON because the receiver sees it set. The SUBTYPE bits are masked
+ *    only for non-management frames - a protected management frame (802.11w)
+ *    keeps its subtype in the AAD, which is what mac80211 and hostapd's
+ *    wlantest both do.
  *  - Sequence Control: the sequence number is masked, the FRAGMENT number is
  *    kept. Masking both breaks fragmented frames; keeping both breaks every
  *    frame, because the sequence number is assigned after the MIC is computed
  *    on a hardware-sequencing MAC.
+ *  - A4 is included for a 4-address frame (ToDS and FromDS both set).
+ *  - QoS Control is included for a QoS data frame, with only the TID retained;
+ *    the ack-policy, EOSP and A-MSDU bits are masked.
  *
- *  - QoS Control: for a QoS data frame the AAD gains two more octets carrying
- *    the TID, everything else masked. `qos_tid` selects that form; -1 is the
- *    non-QoS form. This is NOT cosmetic - a peer that includes the QoS field
- *    while we omit it computes a different MIC, and the frame is dropped with
- *    no diagnostic on either side. The AP harnesses have always used the
- *    non-QoS form and interoperate, so the station side must not assume the
- *    other one works until it is measured against a real AP.
- *
- * `hdr` is a 24-byte 3-address header. Returns the AAD length: 22, or 24 for
- * the QoS form.
+ * Returns the AAD length: 22, +6 for A4, +2 for QoS. Zero if `hdr_len` is too
+ * short for what the frame control claims.
  */
-inline size_t ccmp_aad(const uint8_t* hdr, uint8_t* aad, int qos_tid = -1) {
+inline size_t ccmp_aad(const uint8_t* hdr, size_t hdr_len, uint8_t* aad) {
+  const bool four_addr =
+      (hdr[1] & (kFcToDs | kFcFromDs)) == (kFcToDs | kFcFromDs);
+  const bool qos = is_qos_data(hdr[0]);
+  const bool mgmt = (hdr[0] & 0x0c) == 0x00; /* type 0 = management */
+  const size_t need = 24 + (four_addr ? 6 : 0) + (qos ? 2 : 0);
   uint16_t fc = (uint16_t)(hdr[0] | (hdr[1] << 8));
+  size_t n;
 
-  fc &= (uint16_t)~0x0070u;                      /* subtype */
-  fc &= (uint16_t)~(0x0800u | 0x1000u | 0x2000u); /* retry, pwr mgmt, more data */
-  fc |= 0x4000u;                                  /* protected */
+  if (hdr_len < need) return 0;
+  if (!mgmt) fc &= (uint16_t)~0x0070u;             /* subtype: data/control */
+  fc &= (uint16_t)~(0x0800u | 0x1000u | 0x2000u);  /* retry, pwr mgmt, more data */
+  fc |= 0x4000u;                                   /* protected */
   aad[0] = (uint8_t)(fc & 0xff);
   aad[1] = (uint8_t)(fc >> 8);
-  std::memcpy(aad + 2, hdr + 4, 18);              /* addr1, addr2, addr3 */
+  std::memcpy(aad + 2, hdr + 4, 18);               /* addr1, addr2, addr3 */
   {
     uint16_t seq = (uint16_t)((hdr[22] | (hdr[23] << 8)) & 0x000f);
 
     aad[20] = (uint8_t)(seq & 0xff);
     aad[21] = (uint8_t)(seq >> 8);
   }
-  if (qos_tid >= 0) {
-    /* 802.11-2016 12.5.3.3.3: the QoS Control octets are included with only
-     * the TID retained; the ack-policy, EOSP and A-MSDU bits are masked
-     * because they may differ between transmission and reception. */
-    aad[22] = (uint8_t)(qos_tid & 0x0f);
-    aad[23] = 0;
-    return 24;
+  n = 22;
+  if (four_addr) {
+    std::memcpy(aad + n, hdr + 24, 6);             /* addr4 */
+    n += 6;
   }
-  return 22;
+  if (qos) {
+    /* The QoS Control field sits immediately after the addresses. */
+    const size_t qoff = four_addr ? 30 : 24;
+
+    aad[n++] = (uint8_t)(hdr[qoff] & 0x0f);
+    aad[n++] = 0;
+  }
+  return n;
 }
 
 /* CCM nonce: flag octet 0, then A2, then the 48-bit PN BIG-endian
@@ -123,60 +139,71 @@ inline uint64_t ccmp_header_pn(const uint8_t* ccmp_hdr) {
 
 /* Protect one MPDU.
  *
- * `hdr` is the 24-byte header (its Protected bit need not be set; the AAD
- * forces it and this writes it into the output). `a2` is the transmitter
- * address the nonce is built from - passed separately rather than read from
- * the header because a 4-address frame puts it elsewhere, and silently reading
- * the wrong one would produce frames that only decrypt locally.
+ * `hdr` is the frame header and `hdr_len` its true length - 24, 26 for QoS, 30
+ * for 4-address, 32 for both. `a2` is the transmitter address the nonce is
+ * built from, passed separately rather than read from the header because a
+ * 4-address frame puts it elsewhere and silently reading the wrong one would
+ * produce frames that only decrypt locally.
  *
- * Writes 24 + 8 + plain_len + 8 bytes to `out`. Returns the length written, or
- * 0 on failure.
+ * Writes hdr_len + 8 + plain_len + 8 bytes to `out`, which the caller must
+ * size accordingly. Returns the length written, or 0 on failure.
  */
 inline size_t ccmp_encrypt(CryptoOps& crypto, const uint8_t tk[16],
-                           const uint8_t* hdr, const uint8_t a2[6], uint64_t pn,
-                           uint8_t key_id, const uint8_t* plain,
-                           size_t plain_len, uint8_t* out, int qos_tid = -1) {
+                           const uint8_t* hdr, size_t hdr_len,
+                           const uint8_t a2[6], uint64_t pn, uint8_t key_id,
+                           const uint8_t* plain, size_t plain_len,
+                           uint8_t* out) {
   uint8_t aad[kCcmpAadMax];
   uint8_t nonce[kCcmpNonceLen];
-  size_t aad_len = ccmp_aad(hdr, aad, qos_tid);
+  size_t aad_len = ccmp_aad(hdr, hdr_len, aad);
 
+  if (aad_len == 0) return 0;
   ccmp_nonce(a2, pn, nonce);
-  std::memcpy(out, hdr, 24);
+  std::memcpy(out, hdr, hdr_len);
   out[1] |= 0x40; /* Protected, in the frame we actually air */
-  ccmp_header(pn, key_id, out + 24);
+  ccmp_header(pn, key_id, out + hdr_len);
   if (!crypto.aes_ccm(true, tk, nonce, aad, aad_len, plain, plain_len,
-                      out + 24 + kCcmpHdrLen,
-                      out + 24 + kCcmpHdrLen + plain_len))
+                      out + hdr_len + kCcmpHdrLen,
+                      out + hdr_len + kCcmpHdrLen + plain_len))
     return 0;
-  return 24 + kCcmpHdrLen + plain_len + kCcmpMicLen;
+  return hdr_len + kCcmpHdrLen + plain_len + kCcmpMicLen;
 }
 
 /* Unprotect one MPDU. `mpdu` is the whole received frame starting at the
- * 802.11 header, WITHOUT the FCS. On success writes the plaintext to `out`
- * (at most mpdu_len - 40 bytes) and reports its length and the frame's PN.
+ * 802.11 header, WITHOUT the FCS, and `hdr_len` is its header length
+ * (data_hdr_len() computes it).
  *
  * Returns false when the frame is too short, or when the MIC does not verify.
  * A false return means DROP: `out` holds no trustworthy bytes, and the PN must
  * not be admitted to a replay window. Replay checking itself is the caller's -
- * it needs per-TID state this function does not own. */
+ * it needs per-TID state this function does not own.
+ */
 inline bool ccmp_decrypt(CryptoOps& crypto, const uint8_t tk[16],
-                         const uint8_t* mpdu, size_t mpdu_len,
+                         const uint8_t* mpdu, size_t mpdu_len, size_t hdr_len,
                          const uint8_t a2[6], uint8_t* out, size_t* out_len,
-                         uint64_t* pn_out, int qos_tid = -1) {
-  const size_t overhead = 24 + kCcmpHdrLen + kCcmpMicLen;
+                         uint64_t* pn_out) {
+  const size_t overhead = hdr_len + kCcmpHdrLen + kCcmpMicLen;
   uint8_t aad[kCcmpAadMax];
   uint8_t nonce[kCcmpNonceLen];
+  /* The tag is COPIED rather than passed by casting away const on the input.
+   * A CryptoOps that writes the computed tag into the buffer before comparing
+   * - a perfectly normal implementation shape - would otherwise write through
+   * a pointer into the caller's frame, or into .rodata for a static test
+   * vector. The old inline harness code did this memcpy; the first version of
+   * this function dropped it. */
+  uint8_t tag[kCcmpMicLen];
   size_t aad_len, body;
   uint64_t pn;
 
-  if (mpdu_len <= overhead) return false;
+  if (mpdu_len < overhead) return false;
   body = mpdu_len - overhead;
-  pn = ccmp_header_pn(mpdu + 24);
-  aad_len = ccmp_aad(mpdu, aad, qos_tid);
+  pn = ccmp_header_pn(mpdu + hdr_len);
+  aad_len = ccmp_aad(mpdu, hdr_len, aad);
+  if (aad_len == 0) return false;
   ccmp_nonce(a2, pn, nonce);
-  if (!crypto.aes_ccm(false, tk, nonce, aad, aad_len, mpdu + 24 + kCcmpHdrLen,
-                      body, out,
-                      const_cast<uint8_t*>(mpdu + 24 + kCcmpHdrLen + body)))
+  std::memcpy(tag, mpdu + hdr_len + kCcmpHdrLen + body, kCcmpMicLen);
+  if (!crypto.aes_ccm(false, tk, nonce, aad, aad_len,
+                      mpdu + hdr_len + kCcmpHdrLen, body, out, tag))
     return false;
   if (out_len) *out_len = body;
   if (pn_out) *pn_out = pn;
@@ -185,31 +212,50 @@ inline bool ccmp_decrypt(CryptoOps& crypto, const uint8_t tk[16],
 
 /* Per-key receive replay state (802.11-2016 12.5.3.4.4).
  *
+ * ONE COUNTER PER TID, not one per key. 802.11 keeps a separate receive
+ * replay counter for each TID of QoS traffic, and a single shared counter
+ * drops legitimate frames as soon as two TIDs interleave - which is routine
+ * the moment voice or video shares a link with best-effort. Non-QoS traffic
+ * uses a counter of its own (index kNonQosTid).
+ *
  * The gate is `pn <= last`, NOT `pn < last`. PR #335 shipped the strict form
- * and its review called it out as KRACK-class: an equal-counter replay passed,
- * which is exactly how a group-key reinstallation attack lands. Keep the
- * equality. */
+ * and its review called it KRACK-class: an equal-counter replay passed, which
+ * is exactly how a group-key reinstallation attack lands. Keep the equality.
+ */
 class CcmpReplay {
 public:
+  static constexpr int kNonQosTid = 16;
+  static constexpr int kSlots = 17;
+
   /* True when this PN is acceptable AND records it. A rejected PN leaves the
-   * window untouched — accepting a frame's PN before its MIC verifies would
-   * let an attacker advance the window with garbage. Call this only after a
-   * successful decrypt. */
-  bool accept(uint64_t pn) {
-    if (seen_ && pn <= last_) return false;
-    last_ = pn;
-    seen_ = true;
+   * window untouched - accepting a frame's PN before its MIC verifies would
+   * let an attacker advance the window with garbage, locking out the real
+   * peer. Call this only after a successful decrypt.
+   *
+   * PN 0 is never valid: a CCMP transmitter starts at 1, so a frame claiming
+   * 0 is malformed or forged. */
+  bool accept(uint64_t pn, int tid = kNonQosTid) {
+    if (pn == 0) return false;
+    if (tid < 0 || tid >= kSlots) return false;
+    if (seen_[tid] && pn <= last_[tid]) return false;
+    last_[tid] = pn;
+    seen_[tid] = true;
     return true;
   }
+  /* Every rekey resets every counter: a new key means a new PN space. */
   void reset() {
-    last_ = 0;
-    seen_ = false;
+    for (int i = 0; i < kSlots; i++) {
+      last_[i] = 0;
+      seen_[i] = false;
+    }
   }
-  uint64_t last() const { return last_; }
+  uint64_t last(int tid = kNonQosTid) const {
+    return (tid >= 0 && tid < kSlots) ? last_[tid] : 0;
+  }
 
 private:
-  uint64_t last_ = 0;
-  bool seen_ = false;
+  uint64_t last_[kSlots] = {0};
+  bool seen_[kSlots] = {false};
 };
 
 }  // namespace sta

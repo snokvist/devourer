@@ -287,7 +287,7 @@ static std::vector<uint8_t> ccmp_tx(const uint8_t* sta, uint16_t eth,
   // asserts that a frame built under one does not verify under the other.
   std::vector<uint8_t> m(24 + devourer::sta::kCcmpHdrLen + pt.size() +
                          devourer::sta::kCcmpMicLen);
-  size_t n = devourer::sta::ccmp_encrypt(g_crypto, g_ptk + 32, hdr.data(),
+  size_t n = devourer::sta::ccmp_encrypt(g_crypto, g_ptk + 32, hdr.data(), 24,
                                          kBssid, pn, 0, pt.data(), pt.size(),
                                          m.data());
   // A zero return means the cipher refused. The old code ignored the result
@@ -381,17 +381,19 @@ static void on_rx(const Packet& p) {
       int len = (int)p.Data.size();
       if (len < hlen + 8 + 8) return;                   // hdr + CCMP hdr + MIC
       const uint8_t* d = p.Data.data();
-      // ccmp_decrypt works from the 802.11 header, so a QoS frame's two extra
-      // bytes have to be folded out first - the AAD is built over the 24-byte
-      // header in either case. The harness has always done it this way; what
-      // is new is that the rule is now in one tested place.
-      std::vector<uint8_t> frame(d, d + len);
-      if (hlen > 24) frame.erase(frame.begin() + 24, frame.begin() + hlen);
-      std::vector<uint8_t> pt(frame.size());
+      // The header length is passed explicitly, so a QoS frame's AAD includes
+      // its TID as 802.11-2016 12.5.3.3.3 requires. This is a deliberate
+      // CORRECTNESS change, not byte-identity: the previous code folded the
+      // QoS Control field out and built a 22-byte AAD for every frame, which
+      // is wrong for QoS and survived only because the validated runs used a
+      // station that associated legacy and sent non-QoS data. A real 802.11n
+      // station sends QoS, and every one of its frames would have failed the
+      // MIC with no diagnostic at either end.
+      std::vector<uint8_t> pt(len);
       size_t ptlen = 0;
       uint64_t pn = 0;
-      if (devourer::sta::ccmp_decrypt(g_crypto, g_ptk + 32, frame.data(),
-                                      frame.size(), sta, pt.data(), &ptlen,
+      if (devourer::sta::ccmp_decrypt(g_crypto, g_ptk + 32, d, (size_t)len,
+                                      (size_t)hlen, sta, pt.data(), &ptlen,
                                       &pn))
         handle_plain(sta, pt.data(), (int)ptlen);        // decrypted -> ARP/ICMP
       return;
