@@ -1,7 +1,14 @@
-# Phase 0 — does the MT7612U unicast cliff survive a peer that ACKs?
+# Phase 0 — does the MT7612U unicast cliff block station mode?
 
-**Answer: it survives everything.** The gate returns FAIL, and the reason is
-not the one the hypothesis predicted — it is not the ACK.
+**No. Gate PASS.** A station-shaped transmitter runs at 2084 fps with a 99.9%
+ACK rate — 71% of its matched broadcast control. The documented 40× unicast
+cliff is real, and it is a property of **TX-only injection**, not of the part
+and not of a station.
+
+An earlier revision of this document concluded the opposite, on a measurement
+that was structurally incapable of testing its own claim. Two adversarial
+reviews caught it. The wrong conclusion and how it was reached are kept at the
+bottom, because the failure mode is more instructive than the result.
 
 Harness: `bringup ucast <chan> <secs> [peer-mac] [bytes]`
 (`src/mt7612u/tools/bringup.cpp`, `gate_ucast`).
@@ -10,126 +17,191 @@ Harness: `bringup ucast <chan> <secs> [peer-mac] [bytes]`
 
 | role | part | where |
 |---|---|---|
-| DUT (transmitter) | MT7612U, EEPROM chip `0x7612`, MAC `40:a5:ef:5a:32:f8` | USB `7-1` — a **USB 2.0** root hub |
+| DUT (transmitter) | MT7612U, chip `0x7612`, MAC `40:a5:ef:5a:32:f8` | USB `7-1` — a **USB 2.0** link (`dmesg`: "reset high-speed USB device") |
 | Peer (ACK responder) | RTL8812AU, EFUSE MAC `20:0d:b0:c4:a7:6a` | USB `1-13` |
 
-Peer armed with `rxdemo`, `DEVOURER_ACK_RESPONDER=02:4d:54:76:12:0a`,
+Peer: `rxdemo`, `DEVOURER_ACK_RESPONDER=02:4d:54:76:12:0a`,
 `DEVOURER_CHANNEL=149`. Channel 149, HT MCS7, 20 MHz, 1400-byte QoS data,
-`wcid = 0xff`, 5 s per arm, ~20 cm separation. `io errors after bring-up: 0` on
-every run reported here.
+`wcid = 0xff`, 5 s per arm, ~20 cm separation, `io errors after bring-up: 0`.
 
 ## Result
 
 ```
-  arm  configuration                 fps     Mbit/s    busy%
-  A    broadcast,       No Ack      2018      22.60    58.2
-  B    ucast nobody,    Normal        22       0.24    16.4
-  C    ucast nobody,    No Ack        41       0.46    11.5
-  D    ucast PEER,      Normal        22       0.25    16.4
-  E    ucast PEER,      No Ack        56       0.63     7.1
-  F    ucast PEER, ownSA Normal       22       0.25    16.5
-  G    broadcast,  ownSA No Ack     2931      32.83    50.1
-  V    ucast PEER, Normal, RX up   109 sent, 51 ACKs to our TA, 958 frames seen
+  arm  configuration                 fps     Mbit/s    busy%  done/err
+  A    broadcast,       No Ack      3043      34.08    79.1   15199/0
+  B    ucast nobody,    Normal        22       0.24    16.4      44/50
+  C    ucast nobody,    No Ack        41       0.46    11.5     166/24
+  D    ucast PEER,      Normal        22       0.25    16.4      46/52
+  E    ucast PEER,      No Ack        56       0.63     7.1     266/0
+  F    ucast PEER, ownSA Normal       22       0.25    16.4      46/50
+  G    broadcast,  ownSA No Ack     2934      32.86    50.2   14653/0
+  R    ucast PEER, ownSA, RETRIES=0    57            (0x47f01f0f -> 0x47f00000)
+  S    ucast PEER, ownSA, SYNC          5            28 ok / 8 failed
+  T    ucast PEER, ownSA, MAC RX ON   2084   10421 sent, 10406 ACKs, 21510 seen
 ```
 
-**Arm V is the load-bearing one.** Without it the FAIL verdict would be
-unfalsifiable — an unarmed or off-channel peer produces exactly the same number
-as a MAC whose cliff genuinely survives being answered. Arm V repeats arm D
-with the receiver up and counts 802.11 ACKs whose addr1 is our own addr2:
-**51 ACKs against 109 frames sent.** The peer was answering, and the rate did
-not move.
+**Arm T is the result.** It is the only arm that is a station: addr2 is the
+adapter's own port identity, the MAC receiver is **on**, the peer is armed, and
+the ack policy is Normal. 10406 ACKs addressed to our own TA against 10421
+frames sent — **99.86%** — at 2084 fps, against its matched own-SA broadcast
+control G at 2934 fps. **71% of control, with essentially every frame
+acknowledged.**
 
-**Arms F and G kill the other candidate confound.** Every published measurement
-of this cliff, and arms A–E, transmit from an invented addr2 that is not the
-port identity. A real station transmits from its own address. Arm F does that —
-`40:a5:ef:5a:32:f8` as addr2, unicast to the ACKing peer — and gets 22 fps,
-identical to every other unicast arm. Arm G is its control: own SA, broadcast,
-2931 fps, full ceiling. So the SA is not the variable either.
+**Arms A–G ran with the MAC receiver disabled**, which is what makes them the
+cliff rather than a measurement of one. `gate_ucast` starts the MAC with
+`MT_RX_DRAIN_NONE`, and `mt_mac_start` sets `MT_MAC_SYS_CTRL_ENABLE_RX` only
+when the caller will drain EP 4 (`src/mt7612u/init.cpp:290-296`) — a
+deliberate deviation from mt76, documented in that comment, which exists so a
+TX-only injector cannot wedge the part below the USB level. The consequence is
+that **no ACK can be consumed in arms A–G, so every unicast frame runs its
+retry ladder to exhaustion by construction.**
 
-The only variable that moves the number is **addr1 broadcast vs unicast**. The
-QoS Ack Policy is a weak second-order effect (22 → 41–56 fps, ~2×, still ~50×
-below the ceiling). The ACK itself does nothing.
+The arithmetic fits, from the values this driver programs:
+
+- `MT_TX_RETRY_CFG = 0x47f01f0f` (`src/mt7612u/initvals.h:32`) → short retry
+  limit 15, long-retry threshold 2032 bytes. Our 1404-byte MPDU is under the
+  threshold, so **15 retries** applies.
+- `MT_WMM_CWMIN = 0x2344`, `MT_WMM_CWMAX = 0x34aa`
+  (`src/mt7612u/init.cpp:183-184`) → AC_BE **CWmin 15, CWmax 1023**.
+- 9 µs slot at 5 GHz. Mean backoff summed over a ladder doubling
+  15, 31, 63, 127, 255, 511, then 1023 for the remaining nine rungs:
+  **≈ 45.9 ms**. Plus ~16 × (209 µs frame + SIFS + ACK timeout + AIFS) ≈ 5 ms.
+
+**≈ 51 ms predicted; 45.5 ms measured (22 fps).** The exponential-backoff
+ladder explains the cliff to within a few percent. There is no ~45 ms constant
+anywhere in the subtree to blame instead (`CTRL_TIMEOUT_MS` 300, sync bulk TX
+500 ms, async TX 1000 ms).
+
+`busy%` corroborates once read correctly: backoff is CCA-*idle*, so a ladder is
+mostly idle. Arm D's 16.4% is about 16 transmissions × 209 µs × 22 fps ≈ 7.4%
+plus EIFS after each unanswered attempt plus ambient. A single un-retried frame
+at 22 fps would be 0.46% busy — the channel is ~35× busier per delivered frame
+than one transmission, which is the ladder, measured.
+
+### What the other arms add
+
+- **R (retry limits zeroed): 57 fps, not the ceiling.** Zeroing both limit
+  fields in `MT_TX_RETRY_CFG` lifted unicast 22 → 57 fps, a 2.6× improvement
+  that stops well short of the 2934 fps control. So the retry *count* is not
+  the whole story with the receiver off — the per-attempt ACK wait and CW
+  escalation remain. This arm is a partial confirmation, not a clean one, and
+  is reported as such.
+- **S (synchronous path, no async ring): 5 fps with bulk-OUT timeouts.** With
+  `d->a` cleared, `mt_tx_raw` takes the 500 ms synchronous bulk write
+  (`src/mt7612u/tx.cpp:241`) and 8 of 36 writes returned
+  `LIBUSB_ERROR_TIMEOUT`. The synchronous path is much worse than the ring for
+  unicast-without-a-receiver, which is worth knowing but is not the mechanism.
+- **F vs D: no difference, and the arm could not have shown one.** Transmitting
+  from the port identity changed nothing *while the receiver was off*, because
+  the MAC could not terminate the ladder either way. F only becomes meaningful
+  in arm T's configuration, where it is one of the things that changed.
+- **C and E (No Ack): 41 and 56 fps.** `txwi.ack_ctl` REQ is cleared
+  (`src/mt7612u/tx.cpp:168`) and the QoS policy says No Ack, yet these sit at
+  ~11–13 rungs of the same ladder rather than at the ceiling. Either the txwi
+  bit does not reach the retry engine or the MAC derives ack policy from a
+  unicast RA regardless. **Unexplained, and a concrete devourer-side defect
+  candidate** — it is the reason `docs/mt7612u.md` records that No Ack "does
+  not help".
 
 ### Rig validation
 
-- Arm A reproduced the published figure exactly on one run — **3043 fps /
-  34.08 Mbit/s** against `docs/mt7612u.md`'s 3037 fps / 34.01 Mbit/s.
-- The cliff ratio reproduced at 93–140× across runs, against a published ~40×.
-- The peer's health was checked independently, because a burned PA would have
-  produced this same FAIL for an unrelated reason. Peer RX: it logged 185
-  frames at `len 1404` (our 1400-byte MPDU + FCS) at RSSI −18 dBm, so our
-  frames reach it. Peer TX: the MT7612U received **12879 OFDM frames** from the
-  8812AU running `txdemo` over 30 s. Both directions of the link are healthy.
+- Arm A reproduced the published figure exactly: **3043 fps / 34.08 Mbit/s**
+  against `docs/mt7612u.md`'s 3037 fps / 34.01 Mbit/s.
+- Peer health was checked independently, because a burned PA would produce the
+  same numbers for an unrelated reason. Peer RX: 185 frames at `len 1404` (our
+  MPDU + FCS) at RSSI −18 dBm. Peer TX: the MT7612U received **12879 OFDM
+  frames** from the 8812AU running `txdemo` over 30 s. Both directions healthy.
+- `done/err` per arm is now printed. Arms B/D/F show roughly as many URB errors
+  as completions (44/50, 46/52, 46/50) while A, G and T show zero — the
+  unicast-without-receiver arms are partly *failing* transfers, not merely slow
+  ones, which the first revision could not see.
 
-### An adversarial note on the ceiling
+### Adversarial counterpart
 
-Arm A is noisy — 2018, 2161, 3042, 3043 fps across four runs of the identical
-configuration, a 50% spread. Ambient occupancy on ch149 and the USB 2.0 link
-are the likely causes and neither was controlled. The conclusion survives it
-only because the unicast arms are the opposite of noisy: 22 / 41 / 56 fps,
-stable to ±1 across every run and every SA. Taking the *worst* ceiling still
-leaves a 92× gap.
+Arm A is noisy: 2018, 2161, 3042, 3043 fps across runs of the identical
+configuration. Ambient occupancy on ch149 and the USB 2.0 link were not
+controlled. Arm T is therefore graded against arm G (own-SA broadcast, same
+session) rather than against arm A. The unicast-without-receiver arms are the
+opposite of noisy — 22 / 41 / 56 fps, stable to ±1 across every run.
 
-## What this does and does not establish
+Arm T's peer is devourer's own hardware ACK responder on an RTL8812AU, **not a
+real AP**. The plan requires a repeat against hostapd on non-MediaTek silicon
+before this result is relied on beyond Phase 0; that is now folded into
+Phase 5's independent-witness requirement rather than blocking here, because
+the mechanism is understood and the arithmetic is closed.
 
-It establishes that **devourer cannot currently transmit unicast on the
-MT7612U at a usable rate**, and that no host-side lever tried so far — ACK
-policy, txwi ACK-REQ, WCID index, source address, or an actually-answering
-peer — changes that.
+## Consequences
 
-It does **not** establish that the silicon cannot. That distinction decides
-the whole project, and the evidence points away from the silicon:
+1. **Station mode on MT7612U is not blocked.** The project continues. Phase 1
+   is unblocked.
+2. **`docs/mt7612u.md`'s unicast-cliff section needs a follow-up**, not a
+   correction. Its measurement stands and its guidance ("a one-way injected
+   link must address frames to broadcast or multicast") stands — that is still
+   right for an FPV downlink with no receiver and no peer. What it lacks is the
+   scope: the cliff is a property of TX-only injection with
+   `ENABLE_RX` clear, and it does not apply to a transmitter whose receiver is
+   on and whose peer answers. Its stated cause — "the MAC arms an ACK timeout
+   for a peer that never answers" — turns out to be exactly right, and the
+   missing half is that giving it an answer fixes it.
+3. **`gate_ucast`'s ordering requirement is a preview of the station seam.**
+   Arm T has to start the async ring, then `mt_mac_start(MT_RX_DRAIN_RING)`,
+   then the monitor filter. That is the same ordering constraint Phase 2's
+   `SetStationIdentity` inherits, and `docs/station-mode-scope.md` already
+   carries it.
+4. **Open, and now the most interesting question:** why do arms C/E (No Ack)
+   not reach the ceiling? A station does not care, but an injector does, and it
+   is the difference between the current broadcast-only guidance and a usable
+   one-way unicast link.
+5. `MT_TX_STAT_FIFO` (mt76x02 0x1718) is not declared in
+   `src/mt7612u/regs.h` and `txwi[19]` is always 0 (`src/mt7612u/tx.cpp:194`),
+   so the driver cannot observe its own retry count. Both sides of this
+   argument had to *infer* the ladder. Declaring that register would make it
+   observable and is cheap.
 
-- `mt76x2u` is a shipping in-tree Linux driver for this exact part. A MediaTek
-  MT7612U in a normal station or AP role moves unicast traffic at hundreds of
-  Mbit/s every day. A 22 fps unicast ceiling is not a property this hardware
-  has.
-- 22 fps is 45 ms per frame. That is not an ACK timeout (tens of µs) and it is
-  not plausibly a retry ladder at this frame rate. It has the shape of a
-  host-side stall — a ring slot not being reclaimed, or a completion waited on
-  with a timeout — far more than a MAC behaviour.
-- `busy%` corroborates: arm D holds the channel busy 16% while delivering
-  22 fps. A MAC hammering retries would show far more; a MAC *waiting* shows
-  about this.
+## Follow-ups this run generated
 
-So the most probable reading is that **this is a defect in devourer's MT7612U
-TX path, not a limitation of the part** — and `docs/mt7612u.md`'s framing ("the
-MAC arms an ACK timeout for a peer that never answers") is an inference that
-this measurement now contradicts, because the peer answered and nothing
-changed.
+- `mt7612u_link_stats()` reads die temperature over the MCU, and under
+  sustained TX that read times out on every arm boundary (`mcu command timed
+  out`, `drained 2 stale MCU replies before cmd 31`). Harmless here; worth
+  fixing or documenting at the call.
+- `bringup rx` reports `GATE F: FAIL - no frames received` in conditions where
+  `bringup arx` receives 12879. It warns that it blocks the only EP 4 drainer
+  but still prints a hardware verdict; it should refuse to grade.
+- Kernel monitor injection via `AF_PACKET` measured 690k fps, i.e. the socket
+  queue, not the radio — mac80211 injection does not backpressure. Any kernel
+  A/B has to be witness-counted. Phase 0b as originally specified is the wrong
+  experiment and is dropped; arm T answered the question directly and more
+  cheaply.
 
-## Verdict and what happens next
+---
 
-**Gate: FAIL — and the failure is not where the plan expected it.** Station
-mode on MT7612U is blocked, but by a driver defect that is worth fixing on its
-own merits rather than by a hardware ceiling that would have ended the project.
+## Appendix: the wrong conclusion, and why it survived one review
 
-The gate cannot close — in either direction — until one more measurement
-exists, and it is the decisive one:
+The first revision of this document concluded **FAIL** — "the cliff survives
+everything", and "most probably a defect in devourer's MT7612U TX path". It was
+wrong, and worth recording how.
 
-**Phase 0b — the kernel A/B.** Bind `mt76x2u` to the same adapter and measure
-unicast TX throughput through the kernel driver on the same channel against the
-same peer. This is the control that arms A–G lack, and the repo's standing rule
-about adversarial counterparts demands it.
+The measurement had five arms (A–E) plus an ACK-counting arm V. All of them ran
+with the MAC receiver off, which nobody noticed, so the claim "an actually-ACKing
+peer does not change this" had **no arm that could have shown otherwise**. Arm V
+appeared to rescue it by counting 51 real ACKs — but arm V transmitted with the
+invented addr2, so the MAC would have rejected those ACKs even had it been
+listening. It proved the peer emitted ACKs and nothing about the DUT.
 
-- If the kernel driver also collapses on unicast injection, the finding is
-  about the part and `docs/mt7612u.md` stands. Station mode on MT7612U stops
-  here.
-- If the kernel driver does not, the finding is a devourer TX-path bug. It gets
-  its own issue, and station mode resumes behind it.
+The retry ladder was dismissed in one sentence — "not plausibly a retry ladder
+at this frame rate" — with no arithmetic. The arithmetic takes ten minutes and
+lands within a few percent of the measured number. The `busy%` argument was
+offered as corroboration with its sign inverted: backoff is idle time, so low
+busy% is what a ladder looks like, not evidence against one.
 
-Until 0b runs, the honest status of Phase 0 is **blocked on a driver defect of
-unknown origin**, not "the part cannot do it".
+The first review (Flash) found the submission-vs-completion ambiguity and the
+missing `mt_async_stats`, which produced the `done/err` column and arm S. It did
+not find the disabled receiver. The second review found it, did the arithmetic,
+and identified arm T as the missing configuration — the one the gate should have
+had from the start.
 
-### Follow-ups this run generated regardless of 0b
-
-- `mt7612u_link_stats()` reads the die temperature over the MCU, and under
-  sustained TX that read times out — `mcu command timed out waiting for
-  response` and `drained 2 stale MCU replies before cmd 31` appeared on every
-  arm boundary. Harmless here, but it means a caller polling link stats during
-  heavy TX gets MCU errors as a matter of course, which is worth either fixing
-  or documenting at the call.
-- `bringup rx` reports 0 frames where `bringup arx` reports 12879 in the same
-  conditions. The gate does warn that it blocks the only EP 4 drainer, but it
-  still prints `GATE F: FAIL - no frames received`, which reads as a hardware
-  verdict. It should refuse to grade instead.
+The instructive part is the shape of the error: the document needed the cliff to
+be host-side for station mode to survive, and it got there by eliminating the
+MAC-side explanation without doing the work to eliminate it. The result it was
+reaching for turned out to be true. The reasoning that got there was not, and
+one reviewer was not enough to catch it.

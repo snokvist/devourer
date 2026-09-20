@@ -1860,10 +1860,12 @@ static int gate_ucast(uint8_t chan, int secs, const char *peer_str, int bytes)
 	static uint8_t frame[1600];
 	size_t flen;
 	struct mt7612u_link_stats ls;
+	struct mt_async_stats s0, s1;
 	unsigned io_before;
 	double ceiling = 0.0, cliff = 0.0, answered = 0.0;
 	long acks = 0, sent_v = 0;
-	double own_sa_fps = 0.0, own_sa_bcast = 0.0;
+	double own_sa_fps = 0.0, own_sa_bcast = 0.0, sync_fps = 0.0;
+	double retry0_fps = 0.0, station_fps = 0.0;
 	/*
 	 * `own_sa` is the arm that matters most and the one the first draft of
 	 * this gate did not have. Every published measurement of the cliff - and
@@ -1925,7 +1927,8 @@ static int gate_ucast(uint8_t chan, int secs, const char *peer_str, int bytes)
 	printf("peer %02x:%02x:%02x:%02x:%02x:%02x  (arm this address as an ACK "
 	       "responder on another radio)\n\n",
 	       peer[0], peer[1], peer[2], peer[3], peer[4], peer[5]);
-	printf("  arm  %-24s %8s %10s %8s\n", "configuration", "fps", "Mbit/s", "busy%");
+	printf("  arm  %-24s %8s %10s %8s  %s\n", "configuration", "fps",
+	       "Mbit/s", "busy%", "done/err");
 
 	for (unsigned a = 0; a < sizeof arms / sizeof arms[0]; a++) {
 		struct mt7612u_tx_rate rate = { };
@@ -1961,6 +1964,7 @@ static int gate_ucast(uint8_t chan, int secs, const char *peer_str, int bytes)
 		/* Discard whatever the previous arm left in the counters; each
 		 * read is an interval, so this one is the barrier. */
 		mt7612u_link_stats(&dev, &ls);
+		mt_async_stats(&dev, &s0);
 
 		t0 = now_ms();
 		while (now_ms() - t0 < secs * 1000.0 && !g_stop) {
@@ -1970,14 +1974,24 @@ static int gate_ucast(uint8_t chan, int secs, const char *peer_str, int bytes)
 				n++;
 		}
 		wall = now_ms() - t0;
+		mt_async_stats(&dev, &s1);
 		if (mt7612u_link_stats(&dev, &ls) == 0 && (ls.ch_busy + ls.ch_idle))
 			busy = 100.0 * ls.ch_busy / (double)(ls.ch_busy + ls.ch_idle);
 		fps = n * 1000.0 / wall;
 
-		printf("  %c    %-24s %8.0f %10.2f %7.1f%s%s\n",
+		/* submitted/done/err, not just fps. mt_async_tx_submit() BLOCKS
+		 * on a full 16-slot ring, so in steady state the submit rate IS
+		 * the completion rate - but a completion can be a 1000 ms URB
+		 * timeout as easily as a transmitted frame, and those two mean
+		 * opposite things. Without this column the arm cannot tell a MAC
+		 * that transmits slowly from a bulk-OUT endpoint that stalls. */
+		printf("  %c    %-24s %8.0f %10.2f %7.1f  %6llu/%-6llu%s%s\n",
 		       arms[a].tag, arms[a].what, fps,
 		       n * flen * 8.0 / wall / 1000.0,
-		       busy < 0 ? 0.0 : busy, busy < 0 ? " (n/a)" : "",
+		       busy < 0 ? 0.0 : busy,
+		       (unsigned long long)(s1.tx_done - s0.tx_done),
+		       (unsigned long long)(s1.tx_err - s0.tx_err),
+		       busy < 0 ? " busy-n/a" : "",
 		       mt_io_errors(&dev) != io_before ? "   IO-ERRORS" : "");
 
 		if (arms[a].tag == 'A') ceiling = fps;
@@ -1990,7 +2004,113 @@ static int gate_ucast(uint8_t chan, int secs, const char *peer_str, int bytes)
 		mt_usleep(200000);
 	}
 
+	/*
+	 * Arm R - the same frame with the RETRY LADDER DISABLED.
+	 *
+	 * This is the arm that decides the whole question, and the first draft
+	 * of the gate did not have it because the write-up had already talked
+	 * itself out of the retry-ladder explanation without doing the
+	 * arithmetic. The arithmetic, from the values this driver actually
+	 * programs:
+	 *
+	 *   MT_TX_RETRY_CFG = 0x47f01f0f (initvals.h) -> SHORT_RTY_LIMIT 15, and
+	 *   the 1400-byte MPDU is under the 2032-byte LONG_RTY_THRE, so 15 is
+	 *   the limit that applies. MT_WMM_CWMIN/CWMAX = 0x2344/0x34aa
+	 *   (init.cpp) -> AC_BE CWmin 15, CWmax 1023. At a 9 us 5 GHz slot the
+	 *   mean backoff over a ladder doubling 15,31,...,1023 sums to ~45.9 ms.
+	 *
+	 * Measured unicast: 45.5 ms per frame. So before blaming anything else,
+	 * remove the ladder and see if the cliff goes with it.
+	 */
+	{
+		struct mt7612u_tx_rate rate = { };
+		uint32_t saved = 0;
+		int have_saved = (mt_rr_chk(&dev, MT_TX_RETRY_CFG, &saved) == 0);
+		double t0, wall;
+		long n = 0;
+
+		if (!have_saved) {
+			printf("  R    (skipped - could not read MT_TX_RETRY_CFG)\n");
+		} else {
+			/* Keep every other field; zero only the two retry limits. */
+			mt_wr(&dev, MT_TX_RETRY_CFG, saved & 0xffff0000u);
+
+			rate.phy = MT7612U_PHY_HT;
+			rate.mcs = 7;
+			rate.nss = 1;
+			rate.bw = MT7612U_BW_20;
+
+			memset(frame, 0, sizeof frame);
+			frame[0] = 0x88;
+			memcpy(frame + 4,  peer, 6);
+			memcpy(frame + 10, dev.macaddr, 6);
+			memcpy(frame + 16, dev.macaddr, 6);
+			frame[24] = 0x00;
+			memcpy(frame + 26, "MT7612U-UCAST-R", 15);
+
+			t0 = now_ms();
+			while (now_ms() - t0 < secs * 1000.0 && !g_stop) {
+				frame[22] = (uint8_t)((n & 0xf) << 4);
+				frame[23] = (uint8_t)(n >> 4);
+				if (mt_tx_raw(&dev, frame, flen, &rate, 0xff, 0) == 0) n++;
+			}
+			wall = now_ms() - t0;
+			retry0_fps = n * 1000.0 / wall;
+			printf("  R    ucast PEER, ownSA, RETRIES=0     %8.0f fps  "
+			       "(MT_TX_RETRY_CFG 0x%08x -> 0x%08x)\n",
+			       retry0_fps, saved, saved & 0xffff0000u);
+			mt_wr(&dev, MT_TX_RETRY_CFG, saved);
+		}
+	}
+
 	mt_async_stop(&dev);
+
+	/*
+	 * Arm S - the same frame with NO async ring.
+	 *
+	 * Arms A-G all ride mt_async_tx_submit(), which blocks once all 16 ring
+	 * slots are in flight and gives each transfer a 1000 ms timeout
+	 * (async.cpp). Sixteen slots retiring on timeout is ~16-32 completions a
+	 * second, which is the same order as the 22 fps those arms report - so
+	 * the ring is a candidate explanation for the whole result, and it is a
+	 * hidden choice the first draft of this gate never disclosed.
+	 *
+	 * With d->a cleared, mt_tx_raw() takes the synchronous path: one bulk
+	 * write, 500 ms, a short write or an error reported per call (tx.cpp).
+	 * If arm S is fast, the cliff was the ring. If arm S is equally slow and
+	 * its writes succeed, the MAC really is servicing unicast at this rate.
+	 */
+	{
+		struct mt7612u_tx_rate rate = { };
+		double t0, wall;
+		long n = 0, fail = 0;
+
+		rate.phy = MT7612U_PHY_HT;
+		rate.mcs = 7;
+		rate.nss = 1;
+		rate.bw = MT7612U_BW_20;
+
+		memset(frame, 0, sizeof frame);
+		frame[0] = 0x88;
+		memcpy(frame + 4,  peer, 6);
+		memcpy(frame + 10, dev.macaddr, 6);
+		memcpy(frame + 16, dev.macaddr, 6);
+		frame[24] = 0x00;
+		memcpy(frame + 26, "MT7612U-UCAST-S", 15);
+
+		t0 = now_ms();
+		while (now_ms() - t0 < secs * 1000.0 && !g_stop) {
+			frame[22] = (uint8_t)((n & 0xf) << 4);
+			frame[23] = (uint8_t)(n >> 4);
+			if (mt_tx_raw(&dev, frame, flen, &rate, 0xff, 0) == 0) n++;
+			else fail++;
+		}
+		wall = now_ms() - t0;
+		sync_fps = n * 1000.0 / wall;
+		printf("  S    ucast PEER, ownSA, SYNC (no ring)  %.0f fps, "
+		       "%ld ok / %ld failed\n", sync_fps, n, fail);
+	}
+
 	mt_mac_stop(&dev);
 
 	if (g_stop) {
@@ -2024,7 +2144,13 @@ static int gate_ucast(uint8_t chan, int secs, const char *peer_str, int bytes)
 		double t0, wall;
 		long n = 0;
 
-		memcpy(ctr.ta, src, 6);
+		/* The TA must be the PORT IDENTITY, not the invented src. This MAC
+		 * matches an inbound ACK's addr1 against MT_MAC_ADDR_DW0/DW1; with
+		 * a foreign addr2 the ACK is counted on the host ring but rejected
+		 * by the MAC, so the ladder runs to exhaustion anyway and the arm
+		 * tests nothing about ACK termination. The first draft used `src`
+		 * and was therefore structurally unable to measure its own claim. */
+		memcpy(ctr.ta, dev.macaddr, 6);
 		rate.phy = MT7612U_PHY_HT;
 		rate.mcs = 7;
 		rate.nss = 1;
@@ -2034,10 +2160,10 @@ static int gate_ucast(uint8_t chan, int secs, const char *peer_str, int bytes)
 		memset(frame, 0, sizeof frame);
 		frame[0] = 0x88;
 		memcpy(frame + 4,  peer, 6);
-		memcpy(frame + 10, src, 6);
-		memcpy(frame + 16, src, 6);
+		memcpy(frame + 10, dev.macaddr, 6);
+		memcpy(frame + 16, dev.macaddr, 6);
 		frame[24] = 0x00;                  /* Normal Ack, as arm D */
-		memcpy(frame + 26, "MT7612U-UCAST-V", 15);
+		memcpy(frame + 26, "MT7612U-STATION", 15);
 
 		if (mt_mac_start(&dev, MT_RX_DRAIN_NONE)) return 1;
 		if (mt_async_start(&dev, ucast_rx_cb, &ctr)) { mt_mac_stop(&dev); return 1; }
@@ -2056,18 +2182,22 @@ static int gate_ucast(uint8_t chan, int secs, const char *peer_str, int bytes)
 		wall = now_ms() - t0;
 		acks = (long)ctr.acks.load(std::memory_order_relaxed);
 		sent_v = n;
-		printf("  V    ucast PEER, Normal, RX up  %ld sent, %ld ACKs to our TA, "
-		       "%lu frames seen  (%.0f fps - NOT comparable, ring is up)\n",
-		       n, acks, ctr.frames.load(std::memory_order_relaxed),
-		       n * 1000.0 / wall);
+		station_fps = n * 1000.0 / wall;
+		printf("  T    ucast PEER, ownSA, MAC RX ON   %8.0f fps  "
+		       "%ld sent, %ld ACKs to our TA, %lu frames seen\n",
+		       station_fps, n, acks,
+		       ctr.frames.load(std::memory_order_relaxed));
 		mt_async_stop(&dev);
 		mt_mac_stop(&dev);
 	}
 
 	if (sent_v > 0 && acks == 0) {
-		printf("\nGATE UCAST: VOID - the peer never ACKed (%ld frames sent, "
-		       "0 ACKs to our TA). This measures the rig, not the MAC. Arm the "
-		       "responder, put it on channel %u, and re-run.\n", sent_v, chan);
+		printf("\nGATE UCAST: VOID - no ACK to our TA was OBSERVED (%ld frames "
+		       "sent). Either the peer did not answer or this receiver did not "
+		       "deliver the control frames - the two are indistinguishable from "
+		       "here. Check the responder is armed on channel %u, and that "
+		       "arm V's frames-seen count is nonzero, before re-running.\n",
+		       sent_v, chan);
 		return 3;
 	}
 	if (ceiling <= 0.0 || cliff <= 0.0) {
@@ -2084,9 +2214,34 @@ static int gate_ucast(uint8_t chan, int secs, const char *peer_str, int bytes)
 		       "so arm D measures nothing\n", ceiling / cliff);
 		return 3;
 	}
-	printf("\n  ceiling A %.0f fps, cliff B %.0f fps (%.0fx), peer D %.0f fps, "
-	       "own-SA peer F %.0f fps (own-SA bcast control G %.0f fps)\n",
-	       ceiling, cliff, ceiling / cliff, answered, own_sa_fps, own_sa_bcast);
+	printf("\n  ceiling A %.0f, own-SA bcast control G %.0f, cliff B %.0f (%.0fx),\n"
+	       "  peer D %.0f, own-SA peer F %.0f, retries=0 R %.0f, sync S %.0f,\n"
+	       "  STATION CONFIG T %.0f fps (%ld ACKs)\n",
+	       ceiling, own_sa_bcast, cliff, ceiling / cliff, answered, own_sa_fps,
+	       retry0_fps, sync_fps, station_fps, acks);
+
+	/* Graded against arm G, the matched control: own-SA broadcast. Arm A is
+	 * foreign-SA and swings 50% run to run, so it is the wrong denominator
+	 * for an own-SA arm. */
+	{
+		const double ctrl = own_sa_bcast > 0.0 ? own_sa_bcast : ceiling;
+
+		if (station_fps >= 0.5 * ctrl) {
+			printf("GATE UCAST: PASS - the STATION configuration (own address, "
+			       "MAC receiver on, answering peer) runs at %.0f%% of its "
+			       "matched control. The cliff is a property of TX-only "
+			       "injection, not of a station.\n", 100.0 * station_fps / ctrl);
+			return 0;
+		}
+		if (retry0_fps >= 0.5 * ctrl) {
+			printf("GATE UCAST: EXPLAINED - the station configuration is still "
+			       "slow (%.0f fps), but zeroing the retry limits lifts unicast "
+			       "to %.0f fps against a %.0f control. The cliff IS the retry "
+			       "ladder; the open question is why the ACK does not "
+			       "terminate it.\n", station_fps, retry0_fps, ctrl);
+			return 1;
+		}
+	}
 	/* Checked BEFORE the D verdict: if transmitting from the port identity
 	 * lifts the cliff, then arms A-E measured injection from a foreign
 	 * address, and a station - which never does that - is unaffected. */
@@ -2107,9 +2262,10 @@ static int gate_ucast(uint8_t chan, int secs, const char *peer_str, int bytes)
 	}
 	if (answered <= 2.0 * cliff) {
 		printf("GATE UCAST: FAIL - the cliff survives an answering peer "
-		       "(%.0f fps against a %.0f fps cliff), and arm V proves the peer "
-		       "WAS answering (%ld ACKs). The ACK is not what the MAC is "
-		       "waiting for.\n", answered, cliff, acks);
+		       "(%.0f fps against a %.0f fps cliff). Arm V observed %ld ACKs "
+		       "addressed to our TA, so the PEER emitted them; whether this "
+		       "MAC consumed them is NOT tested here. Sync-path arm S ran at "
+		       "%.0f fps.\n", answered, cliff, acks, sync_fps);
 		return 1;
 	}
 	printf("GATE UCAST: INCONCLUSIVE - arm D landed between the ceiling and "

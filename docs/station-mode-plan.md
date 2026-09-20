@@ -49,7 +49,8 @@ favourable measurement without its adversarial counterpart in the same breath.
 | Gate | Artifact | Reviewer | Verdict | Findings | Resolved |
 |---|---|---|---|---|---|
 | Scope | `docs/station-mode-scope.md` | Flash (`deepseek-v4.1-flash`) | changes required | 17 (F1–F17) | yes — see below |
-| Scope | scope + plan + `gate_ucast` | *round 2, pending* | — | — | — |
+| Phase 0 | `docs/station-mode-phase0.md` + `gate_ucast` | Flash (`deepseek-v4.1-flash`) | changes required | 9 (F1–F9) | yes |
+| Phase 0 | `docs/station-mode-phase0.md` + `gate_ucast` | Opus subagent | **verdict overturned** | 9 (S1–S9) | yes |
 
 ### Round 1 — Flash, 2026-09-20
 
@@ -172,29 +173,51 @@ reproduces the known result), and arm D either near arm A (**go**) or near arm
 B (**stop, re-scope**). A result between them is not a pass — it is a number
 that needs a reason before the project spends anything on it.
 
-**Status: RUN — verdict FAIL, gate NOT closed.** Full record:
+**Status: RUN — verdict PASS, gate CLOSED.** Full record:
 `docs/station-mode-phase0.md`.
 
-The cliff survives an answering peer. Arm V proved the peer was answering (51
-ACKs to our own TA against 109 frames), and two arms the original design did
-not have — F and G, transmitting from the adapter's *own* port identity rather
-than an invented addr2 — showed the source address is not the variable either.
-The only thing that moves the number is broadcast vs unicast addr1.
+The station configuration — own port identity as addr2, MAC receiver on,
+armed peer, Normal Ack — runs at **2084 fps with 10406 ACKs against 10421
+frames sent (99.9%)**, 71% of its matched own-SA broadcast control. The 40×
+unicast cliff is real and is a property of **TX-only injection with the MAC
+receiver disabled**, where no ACK can be consumed and every frame runs a
+15-deep exponential-backoff ladder to exhaustion (~46 ms by arithmetic, 45.5 ms
+measured). It does not apply to a station.
 
-The gate does not close on that, because the result is not the one the design
-anticipated and it has an alternative explanation the arms cannot rule out:
-`mt76x2u` is a shipping kernel driver for this part and moves unicast traffic
-normally, so a 22 fps unicast ceiling is far more likely to be a **devourer
-TX-path defect** than a silicon property. **Phase 0b** is the kernel A/B that
-decides between those, and it is now the blocking measurement.
+**This verdict is the reverse of the one this gate first reached**, and the
+reversal is the clearest argument for the two-reviewer rule in this document.
+The first run measured seven arms, every one of them with the MAC receiver
+off, and concluded FAIL. The write-up then dismissed the retry ladder without
+arithmetic and read `busy%` with the sign inverted. Review round 2 found the
+disabled receiver, did the arithmetic, and named the missing arm. See the
+appendix of `docs/station-mode-phase0.md`.
 
-Arms A–G and V also grew out of review rather than design — the five-arm plan
-above was what the first draft measured, and it was not sufficient. That is
-recorded here rather than quietly edited away, because the plan's own claim is
-that gates catch things, and this is what it looked like when one did.
+Phase 0b (the kernel A/B) is **dropped**: kernel monitor injection through
+`AF_PACKET` measures the socket queue, not the radio (690k fps), so it would
+have needed a witness-counted rebuild — and arm T answered the question
+directly and more cheaply.
 
-Two reviewers are attacking the Phase 0 conclusion now; the ledger records
-their verdicts before the gate moves in either direction.
+### Round 2 — Flash and an Opus subagent, 2026-09-20
+
+Flash (9 findings) established that the gate never read `mt_async_stats`, so
+submitted-vs-completed was invisible; that the ring is a hidden choice the
+write-up never disclosed; and that arm V's verdict string ("the ACK is not
+what the MAC is waiting for") claimed more than arm V could show. All folded
+in: a `done/err` column per arm, a synchronous-path arm S, and softened
+verdict language.
+
+The Opus subagent overturned the conclusion outright. Its critical finding:
+`gate_ucast` starts the MAC with `MT_RX_DRAIN_NONE`, and
+`src/mt7612u/init.cpp:290-296` sets `ENABLE_RX` only when the caller will
+drain EP 4 — so **the receiver was off for every arm**, and no arm could have
+detected an ACK changing anything. It then did the arithmetic the write-up had
+skipped (`MT_TX_RETRY_CFG` 15 retries, `MT_WMM_CWMIN/CWMAX` 15/1023, 9 µs
+slot → ~46 ms per frame against 45.5 ms measured), showed the `busy%`
+corroboration was sign-inverted, and specified the two missing arms. Both were
+implemented (R and T) and arm T reversed the verdict.
+
+Both reviewers' critical findings were verified against the source by hand
+before being accepted. Nothing was rejected.
 
 ## Phase 1 — shared frame and crypto layer. No new behaviour.
 
