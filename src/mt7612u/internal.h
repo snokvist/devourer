@@ -27,6 +27,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdio.h>
+#include "StationIdentity.h"
 #include "regs.h"
 #include "include/mt7612u/mt7612u.h"
 
@@ -230,8 +231,7 @@ struct mt7612u_dev {
 	 * no difference to what a managed station receives, and MT_MAC_BSSID
 	 * already has two owners. The host still needs the value - it is addr3
 	 * on every frame a station transmits. docs/mt7612u-station-identity.md */
-	uint8_t  sta_bssid[6];
-	int      sta_armed;
+	struct mt7612u_sta_state sta;
 	/* The addr2 AND addr3 mt7612u_beacon_start() programmed, so an in-place
 	 * update can refuse a beacon that would change either. Both, because they
 	 * land in different registers: addr2 in MT_MAC_ADDR and the MBSS base,

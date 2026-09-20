@@ -1470,6 +1470,19 @@ add_executable(ChanMigGateSelftest tests/chanmig_gate_selftest.cpp)
 target_link_libraries(ChanMigGateSelftest PRIVATE devourer)
 add_test(NAME chanmig_gate_policy COMMAND ChanMigGateSelftest)
 
+# The MT7612U station-identity decision and the ownership hand-off
+# (src/mt7612u/StationIdentity.h). Phase 2's plan asked for a headless guard
+# on the hand-off "in the style of tests/ack_responder_selftest.cpp"; this is
+# it. The policy is split from the register I/O precisely so it can run here -
+# both defects this logic has had were decisions, not writes, and neither is
+# visible in a register trace. Hardware coverage is `bringup staid`.
+if(DEVOURER_MT7612U)
+    add_executable(Mt7612uStationSelftest tests/mt7612u_station_selftest.cpp)
+    target_include_directories(Mt7612uStationSelftest PRIVATE
+                               ${CMAKE_CURRENT_SOURCE_DIR}/src/mt7612u)
+    add_test(NAME mt7612u_station_identity COMMAND Mt7612uStationSelftest)
+endif()
+
 # The AP on-air acceptance harness (tests/mt7612u_ap_onair.sh) needs root, a
 # claimed MT7612U and a second station adapter, so none of it can run in CI.
 # Its two verdict functions are pure text processing, though, and both of them

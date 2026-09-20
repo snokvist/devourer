@@ -39,6 +39,7 @@
  */
 #include <string.h>
 
+#include "StationIdentity.h"
 #include "internal.h"
 #include "regs.h"
 
@@ -71,91 +72,70 @@ static int sta_read_port_identity(struct mt7612u_dev *d, uint8_t out[6])
 int mt7612u_set_station_identity(struct mt7612u_dev *dev,
                                  const uint8_t own[6], const uint8_t bssid[6])
 {
-	uint8_t port[6];
+	uint8_t port[6] = { 0 };
 	uint32_t rsp = 0;
+	int port_ok, rsp_ok;
+	enum mt7612u_sta_verdict v;
 
-	if (!dev || !own || !bssid)
-		return -1;
-
-	/* Both must be real unicast addresses, and they must differ - a station
-	 * whose own address is its BSSID is not a station. */
-	if ((own[0] & 0x01) || (bssid[0] & 0x01))
-		return -1;
-	if (memcmp(own, bssid, 6) == 0)
+	if (!dev)
 		return -1;
 
-	/*
-	 * `own` must already BE the port identity. This is a check and not a
-	 * write, and the difference is the measurement in the file header: this
-	 * register is co-owned with the beacon path and the ACK responder, and
-	 * moving it is precisely what takes a station from 0.8% to 98% retried
-	 * downlink frames.
-	 *
-	 * Refusing is the useful behaviour. A caller asking us to be an address
-	 * the MAC is not holding has either armed an ACK responder or a beacon
-	 * underneath itself, or has the wrong adapter - and in every one of
-	 * those cases quietly writing the register would produce a station that
-	 * half works, which is the failure mode this part specialises in.
-	 */
-	if (sta_read_port_identity(dev, port) != 0) {
-		WARN("station identity refused: could not read the MAC's port "
-		     "identity back, so there is nothing to verify `own` against");
+	/* Read, then decide. The deciding is in StationIdentity.h so that every
+	 * branch below - including both failed-read paths, which is where this
+	 * logic has been wrong twice - is exercised headlessly by
+	 * tests/mt7612u_station_selftest.cpp rather than only on a device. */
+	port_ok = (sta_read_port_identity(dev, port) == 0);
+	rsp_ok  = (mt_rr_chk(dev, MT_AUTO_RSP_CFG, &rsp) == 0);
+
+	v = mt7612u_sta_decide(own, bssid, port, port_ok, rsp,
+	                       rsp_ok, MT_AUTO_RSP_EN);
+	switch (v) {
+	case MT7612U_STA_OK:
+		break;
+	case MT7612U_STA_BAD_ARGS:
+		WARN("station identity refused: null address");
 		return -1;
-	}
-	if (memcmp(port, own, 6) != 0) {
+	case MT7612U_STA_MULTICAST:
+		WARN("station identity refused: own and bssid must both be unicast");
+		return -1;
+	case MT7612U_STA_SAME_ADDR:
+		WARN("station identity refused: own == bssid");
+		return -1;
+	case MT7612U_STA_READ_FAILED:
+		WARN("station identity refused: could not read the MAC back, so "
+		     "there is nothing to verify against - refusing rather than "
+		     "arming a station whose ability to receive and acknowledge is "
+		     "unknown");
+		return -1;
+	case MT7612U_STA_PORT_MISMATCH:
 		WARN("station identity refused: the MAC's port identity is "
 		     "%02x:%02x:%02x:%02x:%02x:%02x, not the requested "
 		     "%02x:%02x:%02x:%02x:%02x:%02x. Something else owns it (a "
-		     "beacon or an ACK responder); moving it here would stop this "
-		     "station acknowledging its own traffic.",
+		     "beacon or an ACK responder); moving it here would make this "
+		     "station DEAF - measured, reception goes to zero.",
 		     port[0], port[1], port[2], port[3], port[4], port[5],
 		     own[0], own[1], own[2], own[3], own[4], own[5]);
 		return -1;
-	}
-
-	/*
-	 * The auto-response engine's enable. init leaves this on, and the
-	 * measured auto-ACK depends on it, so a station that finds it clear is
-	 * not going to work and should say so now rather than at the first lost
-	 * downlink frame. Read-only: if it is off, something deliberate turned
-	 * it off and silently re-enabling it would hide that.
-	 */
-	if (mt_rr_chk(dev, MT_AUTO_RSP_CFG, &rsp) != 0) {
-		/* Fail CLOSED, like the port-identity check two blocks up. The
-		 * first version of this used `== 0 && !(rsp & EN)`, so a stalled
-		 * EP0 read skipped the check entirely and armed anyway - the two
-		 * adjacent reads had opposite failure semantics and neither said
-		 * so. If we could not find out whether this MAC will acknowledge
-		 * anything, we do not get to claim it will. */
-		WARN("station identity refused: could not read MT_AUTO_RSP_CFG, so "
-		     "whether this MAC will acknowledge unicast addressed to it is "
-		     "unknown");
-		return -1;
-	}
-	if (!(rsp & MT_AUTO_RSP_EN)) {
+	case MT7612U_STA_AUTO_RSP_OFF:
 		WARN("station identity refused: MT_AUTO_RSP_EN is CLEAR (cfg %08x) "
-		     "- this MAC will not acknowledge unicast addressed to it, and "
-		     "an AP will retransmit every downlink frame until it gives up",
-		     rsp);
+		     "- the auto-response engine is switched off", rsp);
 		return -1;
 	}
 
 	/*
-	 * NOT written, deliberately: MT_MAC_BSSID and the MT_MAC_APC_BSSID slot
-	 * table. Measured to make no difference to what a managed station
-	 * receives - correct, wrong or absent - and MT_MAC_BSSID already has two
-	 * owners (mac_setaddr at init and the beacon path). Adding a third
-	 * writer to a register that is not needed would recreate the exact
-	 * co-ownership hazard this seam was split out to avoid, in exchange for
-	 * nothing measurable.
+	 * NOT written, deliberately: MT_MAC_ADDR, MT_MAC_BSSID and the
+	 * MT_MAC_APC_BSSID slot table. The first must not move - that is the
+	 * measured "reception goes to zero" failure. The other two make no
+	 * measurable difference to what a managed station receives, correct or
+	 * wrong, and MT_MAC_BSSID already has two owners; a third writer on a
+	 * register nothing needs would recreate the hazard this seam exists to
+	 * avoid. docs/mt7612u-station-identity.md.
 	 *
-	 * The BSSID is still recorded, because the host needs it - every frame
-	 * this station transmits carries it as addr3 - and because a later
-	 * revision that finds a hardware use for it (power save, TIM parsing,
-	 * per-BSS key lookup: all untested) should find the value already here.
+	 * The BSSID is recorded because a later revision that finds a hardware
+	 * use for it (power save, TIM parsing, per-BSS key lookup: all
+	 * untested) should find the value already here.
 	 */
-	memcpy(dev->sta_bssid, bssid, 6);
-	dev->sta_armed = 1;
+	mt7612u_sta_arm(&dev->sta, bssid);
 	return 0;
 }
 
@@ -165,8 +145,7 @@ void mt7612u_clear_station_identity(struct mt7612u_dev *dev)
 		return;
 	/* Nothing to undo in hardware - this seam never wrote any. That is a
 	 * property of this part and not a promise of the interface. */
-	memset(dev->sta_bssid, 0, sizeof dev->sta_bssid);
-	dev->sta_armed = 0;
+	mt7612u_sta_clear(&dev->sta);
 }
 
 /*
@@ -186,22 +165,21 @@ void mt7612u_clear_station_identity(struct mt7612u_dev *dev)
  */
 void mt7612u_station_identity_lost(struct mt7612u_dev *dev, const char *who)
 {
-	if (!dev || !dev->sta_armed)
+	if (!dev)
+		return;
+	if (!mt7612u_sta_identity_taken(&dev->sta))
 		return;
 	WARN("station identity DROPPED: %s is moving MT_MAC_ADDR away from this "
-	     "station's own address. This MAC acknowledges unicast by matching "
-	     "address 1 against that register, so the station stops being "
-	     "acknowledged from here on - measured as 0.8%% -> 98%% retried "
-	     "downlink frames. Re-arm the station identity after %s releases it.",
-	     who, who);
-	dev->sta_armed = 0;
-	memset(dev->sta_bssid, 0, sizeof dev->sta_bssid);
+	     "station's own address. Measured on this part, that takes the "
+	     "station's reception of the AP's unicast to ZERO - it goes deaf, "
+	     "not merely silent. Re-arm the station identity after %s releases "
+	     "it.", who, who);
 }
 
 int mt7612u_station_bssid(struct mt7612u_dev *dev, uint8_t out[6])
 {
-	if (!dev || !out || !dev->sta_armed)
+	if (!dev || !out || !dev->sta.armed)
 		return -1;
-	memcpy(out, dev->sta_bssid, 6);
+	memcpy(out, dev->sta.bssid, 6);
 	return 0;
 }
