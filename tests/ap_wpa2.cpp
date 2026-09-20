@@ -226,19 +226,27 @@ static void prf(const uint8_t* key, int klen, const char* label,
     int c = (olen-gen < 20) ? olen-gen : 20; memcpy(out+gen, d, c);
   }
 }
-static void compute_ptk(devourer::sta::Station& st) {
-  const uint8_t *aa = kBssid, *sa = st.addr;
+/* Derive into a CALLER-SUPPLIED buffer, never straight into the station.
+ * msg2 used to run this against st.ptk and only then check the MIC, so a
+ * forged msg2 - and the replay counter it has to quote is readable from
+ * cleartext msg1 - overwrote a station's in-flight key material before
+ * anything authenticated it. A legitimate msg2 re-derived the right key, so
+ * the damage was a stallable handshake rather than disclosure, but mutating
+ * state ahead of its authentication is the wrong shape regardless. */
+static void compute_ptk_into(const uint8_t own[6], const uint8_t anonce[32],
+                             const uint8_t snonce[32], uint8_t out_ptk[48]) {
+  const uint8_t *aa = kBssid, *sa = own;
   uint8_t b[76]; int p = 0;
   const uint8_t* mn = memcmp(aa,sa,6) < 0 ? aa : sa;
   const uint8_t* mx = memcmp(aa,sa,6) < 0 ? sa : aa;
   memcpy(b+p, mn, 6); p+=6; memcpy(b+p, mx, 6); p+=6;
-  const uint8_t* nn = memcmp(st.anonce,st.snonce,32) < 0 ? st.anonce : st.snonce;
-  const uint8_t* nx = memcmp(st.anonce,st.snonce,32) < 0 ? st.snonce : st.anonce;
+  const uint8_t* nn = memcmp(anonce,snonce,32) < 0 ? anonce : snonce;
+  const uint8_t* nx = memcmp(anonce,snonce,32) < 0 ? snonce : anonce;
   memcpy(b+p, nn, 32); p+=32; memcpy(b+p, nx, 32); p+=32;
   uint8_t pmk[32];
   PKCS5_PBKDF2_HMAC(g_psk, strlen(g_psk), (const unsigned char*)kSsid,
                     strlen(kSsid), 4096, EVP_sha1(), 32, pmk);
-  prf(pmk, 32, "Pairwise key expansion", b, p, st.ptk, 48);
+  prf(pmk, 32, "Pairwise key expansion", b, p, out_ptk, 48);
 }
 // MIC over the EAPOL frame with the MIC field (offset 81, 16 bytes) zeroed.
 static void set_mic(std::vector<uint8_t>& e, const devourer::sta::Station& st) {
@@ -247,14 +255,42 @@ static void set_mic(std::vector<uint8_t>& e, const devourer::sta::Station& st) {
   HMAC(EVP_sha1(), st.ptk, 16 /*KCK*/, e.data(), e.size(), d, &l);
   memcpy(e.data()+81, d, 16);
 }
-static bool check_mic(const uint8_t* e, int len,
-                      const devourer::sta::Station& st) {
+/* Takes the KCK explicitly, so a candidate key can be verified BEFORE it is
+ * committed to the station. */
+static bool check_mic_kck(const uint8_t* e, int len, const uint8_t kck[16]) {
   std::vector<uint8_t> t(e, e+len);
   uint8_t got[16]; memcpy(got, t.data()+81, 16);
   memset(t.data()+81, 0, 16);
   unsigned int l; uint8_t d[20];
-  HMAC(EVP_sha1(), st.ptk, 16, t.data(), t.size(), d, &l);
+  HMAC(EVP_sha1(), kck, 16, t.data(), t.size(), d, &l);
   return memcmp(got, d, 16) == 0;
+}
+static bool check_mic(const uint8_t* e, int len,
+                      const devourer::sta::Station& st) {
+  return check_mic_kck(e, len, st.ptk);
+}
+
+/* THE KEY REPLAY COUNTER IS A WINDOW, NOT A VALUE.
+ *
+ * send_msg1/send_msg3 bump the counter on EVERY transmission, retransmissions
+ * included - deliberately, so the station can tell copies apart. The first
+ * version of this check then demanded exact equality with the current value,
+ * which fights that machinery: msg1 goes out as 1, the station's reply is
+ * delayed past kHsTimeout, hs_tick retransmits as 2, and the legitimate msg2
+ * quoting 1 is dropped. On a lossy link a station that answers only the first
+ * copy never associates, and 4way_state stops being usable evidence.
+ *
+ * hostapd keeps a short history for exactly this reason. This is that history:
+ * the counter only ever increments by one per transmission, so "one of the
+ * last kHsMaxTries values" is a range check. */
+static uint64_t replay_ctr(const uint8_t c[8]) {
+  uint64_t v = 0;
+  for (int i = 0; i < 8; i++) v = (v << 8) | c[i];
+  return v;
+}
+static bool replay_ctr_recent(const uint8_t got[8], const uint8_t cur[8]) {
+  const uint64_t g = replay_ctr(got), c = replay_ctr(cur);
+  return g <= c && (c - g) < (uint64_t)kHsMaxTries;
 }
 // AES key wrap (RFC 3394) with the KEK (PTK bytes 16..31), for msg3 key data.
 static int aes_wrap(const uint8_t* kek, const uint8_t* in, int inlen, uint8_t* out) {
@@ -354,10 +390,20 @@ static void hs_tick() {
       if (st->hs_tries == kHsMaxTries) {
         ++st->hs_tries;   // latch, so this prints once per station
         fprintf(stderr, "  WPA2: gave up after %d transmissions of msg%d"
-                        " to %02x:%02x:%02x:%02x:%02x:%02x\n",
+                        " to %02x:%02x:%02x:%02x:%02x:%02x - slot freed\n",
                 kHsMaxTries, st->state == HsState::WaitMsg2 ? 1 : 3,
                 st->addr[0],st->addr[1],st->addr[2],
                 st->addr[3],st->addr[4],st->addr[5]);
+        /* FREE IT. The deauth handler only covers the polite departure, which
+         * was never the problem: seven associations that never finish a
+         * four-way - a wrong PSK, a client that walks out of range, an
+         * attacker sending association requests - filled the table
+         * permanently, and nothing timed a record out. That was a regression
+         * this phase introduced; before the table, a single g_sta was simply
+         * overwritten and the AP could not wedge. */
+        uint8_t gone[6];
+        std::memcpy(gone, st->addr, 6);
+        g_stas.remove(gone);
       }
       continue;
     }
@@ -402,6 +448,13 @@ static std::atomic<uint64_t> g_to_elsewhere{0}; /* DA is off-BSS entirely */
 static std::atomic<uint64_t> g_relayed{0};      /* ...and actually forwarded */
 static std::atomic<uint64_t> g_relay_drop{0};   /* ...dropped: peer not keyed, or cipher refused */
 static std::atomic<uint64_t> g_group_tx{0};     /* group-addressed frames aired under the GTK */
+static std::atomic<uint64_t> g_to_group{0};     /* received with a GROUP destination */
+static std::atomic<uint64_t> g_to_ap{0};        /* received for the AP's own address */
+/* Frames refused before they could be relayed, because relaying them would
+ * corrupt them. See the fragmentation / A-MSDU note in the data branch. */
+static std::atomic<uint64_t> g_frag_drop{0};
+static std::atomic<uint64_t> g_amsdu_drop{0};
+static std::atomic<uint64_t> g_group_drop{0};   /* group flood the cipher refused */
 
 static uint16_t csum16(const uint8_t* d, int len) {
   uint32_t s = 0; for (int i=0;i+1<len;i+=2) s += (d[i]<<8)|d[i+1];
@@ -771,8 +824,36 @@ static void on_rx(const Packet& p) {
            * tree read before 2b.3. A group DA - a station's broadcast ARP, its
            * DHCP DISCOVER - still reaches the local responders, because those
            * are exactly the requests this AP answers. */
+          /* REFUSE WHAT WE CANNOT FORWARD INTACT (2b.7's stated position).
+           *
+           * CCMP is per-MPDU, so a fragment decrypts and passes the replay
+           * window on its own - and then fragment 0's plaintext is parsed as
+           * a whole MSDU and relayed with More Fragments CLEARED, while
+           * fragments 1..n carry no LLC/SNAP at all. The peer receives
+           * corruption and every counter reads success. An A-MSDU frame is
+           * the same story: its first subframe header is misread as LLC/SNAP
+           * and the relayed copy loses the bit that said otherwise.
+           *
+           * Neither can reach this AP today - it advertises neither WMM nor
+           * HT - but nothing rejected them and nothing wrote the refusal
+           * down. A reassembler is not the minimal complete answer here; two
+           * counters and a documented refusal are. */
+          if (fc1 & devourer::sta::kFcMoreFrag) {
+            g_frag_drop.fetch_add(1);
+            return;
+          }
+          if (devourer::sta::is_qos_data(fc0)) {
+            const bool four = (fc1 & (devourer::sta::kFcToDs |
+                                      devourer::sta::kFcFromDs)) ==
+                              (devourer::sta::kFcToDs | devourer::sta::kFcFromDs);
+            if (d[four ? 30 : 24] & 0x80) {     /* A-MSDU Present */
+              g_amsdu_drop.fetch_add(1);
+              return;
+            }
+          }
           const uint8_t* da = devourer::sta::data_da(d, fc1);
           if (devourer::sta::data_da_is_group(d, fc1)) {
+            g_to_group.fetch_add(1);
             /* Answer it locally AND flood it to the BSS. A station's broadcast
              * is both a request this AP may answer (ARP for the AP's own
              * address, DHCP DISCOVER) and traffic its peers are entitled to
@@ -787,9 +868,12 @@ static void on_rx(const Packet& p) {
               if (!f.empty()) {
                 enqueue(std::move(f));
                 g_group_tx.fetch_add(1);
+              } else {
+                g_group_drop.fetch_add(1);
               }
             }
           } else if (std::memcmp(da, kBssid, 6) == 0) {
+            g_to_ap.fetch_add(1);
             handle_plain(sta, pt.data(), (int)ptlen);    // decrypted -> ARP/ICMP
           } else if (g_stas.find(da)) {
             /* Destined for another station on this BSS: relay it. */
@@ -847,13 +931,19 @@ static void on_rx(const Packet& p) {
        * station could and this AP could not. Pre-existing, not introduced by
        * the per-station rewiring: the single-g_sta code did not check it
        * either. */
-      if (memcmp(e+9, st->eapol_replay, 8) != 0) {
-        fprintf(stderr, "  WPA2: msg2 key replay counter mismatch - dropped\n");
+      if (!replay_ctr_recent(e+9, st->eapol_replay)) {
+        fprintf(stderr, "  WPA2: msg2 key replay counter out of window - dropped\n");
         return;
       }
-      memcpy(st->snonce, e+17, 32);
-      compute_ptk(*st);
-      if (!check_mic(e, elen, *st)) { fprintf(stderr, "  WPA2: msg2 MIC FAIL\n"); return; }
+      /* Derive and verify against a CANDIDATE key; commit only after the MIC
+       * holds. Nothing about this station changes until then. */
+      uint8_t cand_snonce[32], cand_ptk[48];
+      memcpy(cand_snonce, e+17, 32);
+      compute_ptk_into(st->addr, st->anonce, cand_snonce, cand_ptk);
+      if (!check_mic_kck(e, elen, cand_ptk)) {
+        fprintf(stderr, "  WPA2: msg2 MIC FAIL\n"); return; }
+      memcpy(st->snonce, cand_snonce, 32);
+      memcpy(st->ptk, cand_ptk, 48);
       fprintf(stderr, "  WPA2: msg2 OK (SNonce, MIC verified) — PTK derived\n");
       // The PN space belongs to the KEY, so the replay window resets where a
       // new PTK is derived - here - and nowhere else. It used to reset on
@@ -868,9 +958,10 @@ static void on_rx(const Packet& p) {
     } else if ((ki & 0x0100) && (ki & 0x0200)) {        // msg4: MIC + secure
       std::lock_guard<std::mutex> l(g_hs_mu);
       devourer::sta::Station* st = g_stas.find(sta);
-      /* 12.7.6.5: msg4 must echo msg3's counter. Same gap as msg2 above. */
-      if (st && memcmp(e+9, st->eapol_replay, 8) != 0) {
-        fprintf(stderr, "  WPA2: msg4 key replay counter mismatch - dropped\n");
+      /* 12.7.6.5: msg4 must echo msg3's counter - or one of the recent ones,
+       * for the retransmission reason above. */
+      if (st && !replay_ctr_recent(e+9, st->eapol_replay)) {
+        fprintf(stderr, "  WPA2: msg4 key replay counter out of window - dropped\n");
         return;
       }
       if (st && st->state == devourer::sta::HsState::WaitMsg4 &&
@@ -963,17 +1054,30 @@ int main(int argc, char** argv) {
    * frame is 4 bytes long and would be counted here as a MIC failure rather
    * than as the length bug it is. Fix the trim before trusting this ledger on
    * anything but MediaTek. */
+  /* COUNTED, NOT INFERRED. "to this AP" used to be computed as
+   * g_enc_rx - g_to_peer - g_to_elsewhere, but g_enc_rx counts every protected
+   * frame - group frames, MIC failures and replay rejections included - and
+   * none of those increments the two it subtracted. The figure overstated
+   * itself by at least the group traffic, and it is the line the plan quotes
+   * as this phase's acceptance evidence. Each destination class now has its
+   * own counter. */
   fprintf(stderr,
-          "  addressing: to this AP=%llu, to a peer station=%llu"
+          "  addressing: to this AP=%llu, group=%llu, to a peer station=%llu"
           " (relayed=%llu dropped=%llu), off-BSS=%llu,"
           " group frames aired=%llu\n",
-          (unsigned long long)(g_enc_rx.load() - g_to_peer.load()
-                               - g_to_elsewhere.load()),
+          (unsigned long long)g_to_ap.load(),
+          (unsigned long long)g_to_group.load(),
           (unsigned long long)g_to_peer.load(),
           (unsigned long long)g_relayed.load(),
           (unsigned long long)g_relay_drop.load(),
           (unsigned long long)g_to_elsewhere.load(),
           (unsigned long long)g_group_tx.load());
+  fprintf(stderr,
+          "  refused before relay: fragmented=%llu, A-MSDU=%llu,"
+          " group flood cipher-refused=%llu\n",
+          (unsigned long long)g_frag_drop.load(),
+          (unsigned long long)g_amsdu_drop.load(),
+          (unsigned long long)g_group_drop.load());
   fprintf(stderr,
           "  data plane: encrypted frames received=%llu, MIC failures=%llu, "
           "replays rejected=%llu, frames sent=%llu\n",

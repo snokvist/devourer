@@ -763,6 +763,25 @@ static void test_relay_addressing() {
   check(!devourer::sta::data_da_is_group(up.data(), up[1]),
         "a unicast relay's DA is not a group address");
 
+  /* --- IBSS (ToDS=0, FromDS=0): DA is addr1, SA is addr2 ----------------- */
+  uint8_t ibss[24] = {0};
+  ibss[0] = 0x08; ibss[1] = 0x00;
+  std::memcpy(ibss + 4,  B, 6);        /* addr1 = DA */
+  std::memcpy(ibss + 10, A, 6);        /* addr2 = SA */
+  std::memcpy(ibss + 16, BSSID, 6);    /* addr3 = BSSID */
+  check(std::memcmp(devourer::sta::data_da(ibss, ibss[1]), B, 6) == 0,
+        "IBSS DA is addr1");
+  check(std::memcmp(devourer::sta::data_sa(ibss, ibss[1]), A, 6) == 0,
+        "IBSS SA is addr2");
+  check(!devourer::sta::data_da_is_group(ibss, ibss[1]),
+        "an IBSS unicast DA is not a group address");
+
+  /* --- a from-DS frame whose DA (addr1) is the group address ------------- */
+  std::vector<uint8_t> flood = devourer::sta::data_hdr_from_ds(GRP, BSSID, A,
+                                                               /*protect=*/false, 0);
+  check(devourer::sta::data_da_is_group(flood.data(), flood[1]),
+        "a from-DS flood reads its group DA from addr1, not addr3");
+
   /* --- 4-address: SA moves to addr4 -------------------------------------- */
   uint8_t four[30] = {0};
   four[0] = 0x08;

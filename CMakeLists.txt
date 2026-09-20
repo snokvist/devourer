@@ -968,9 +968,11 @@ if(OpenSSL_FOUND)
     target_link_libraries(CcmpSwBench PRIVATE OpenSSL::Crypto)
     add_test(NAME ccmp_software_roundtrip COMMAND CcmpSwBench --self-test)
 
-    # src/sta/Ccmp.h - the 802.11 CCMP framing both roles share - against
-    # vectors from a third implementation (tests/ccmp_gen_vectors.py, which
-    # transcribes 802.11-2016 12.5.3.3 independently of the header it checks).
+    # src/sta/Ccmp.h - the 802.11 CCMP framing both roles share. The vectors
+    # (tests/ccmp_gen_vectors.py) pin the CIPHER against a third
+    # implementation; they do NOT independently pin the framing, because
+    # generator and header share one author's reading - which is how a wrong
+    # CCM nonce stayed green. See the note atop tests/ccmp_selftest.cpp.
     # Also pins the AAD masking rules, the 48-bit PN packing, and the replay
     # gate's `<=`, which PR #335 shipped as `<` - a KRACK-class defect its
     # review caught. Header-only; no libusb, no device.

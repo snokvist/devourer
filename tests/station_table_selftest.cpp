@@ -228,12 +228,13 @@ void test_churn_does_not_exhaust_the_table() {
   /* Now churn far past capacity: each new address only fits because the
    * previous one was freed. Forty rounds through a seven-slot table. */
   for (int round = 0; round < 40; round++) {
-    uint8_t old_addr[6] = {0x02, 0xcc, 0x00, 0x00,
-                           (uint8_t)(round >> 8), (uint8_t)(round + 1)};
-    if (round == 0) { old_addr[4] = 0; old_addr[5] = 1; }
     /* Free whatever currently holds the lowest slot, then admit a new MAC. */
     Station* victim = t.at(0);
     check(victim != nullptr, "a full table has an occupant to evict");
+    /* check() reports and carries on, so this has to return rather than
+     * dereference - a regression in the fill above would otherwise segfault
+     * the suite instead of failing it. */
+    if (!victim) return;
     uint8_t v[6];
     std::memcpy(v, victim->addr, 6);
     check(t.remove(v), "the occupant is removed");

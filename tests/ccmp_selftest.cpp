@@ -1,11 +1,19 @@
 /* Headless guard for src/sta/Ccmp.h — the 802.11 CCMP framing both the AP and
  * the station roles share.
  *
- * WHAT THIS IS. The vectors in ccmp_vectors.h come from a third
- * implementation: python-cryptography's AESCCM for the cipher, and the 802.11
- * framing transcribed in tests/ccmp_gen_vectors.py straight from
- * 802.11-2016 12.5.3.3, independently of the header under test. So a failure
- * here is two independent readings of the standard disagreeing.
+ * WHAT THIS IS, CORRECTED. The vectors pin the CIPHER PLUMBING against a
+ * third implementation - python-cryptography's AESCCM against OpenSSL. They
+ * do NOT pin the 802.11 framing rules, and this comment claimed they did
+ * until 2026-09-20: it said the framing was "transcribed ... independently of
+ * the header under test", so "a failure here is two independent readings of
+ * the standard disagreeing".
+ *
+ * That was false, and the CCM nonce proved it. tests/ccmp_gen_vectors.py
+ * built the same wrong Flags octet as src/sta/Ccmp.h, because the same author
+ * read the clause once and wrote it twice. Independence of IMPLEMENTATION is
+ * not independence of INTERPRETATION. The framing rules are pinned only by
+ * the direct assertion cells below - test_nonce_flags, test_qos_aad,
+ * test_aad_masking - and by nothing else.
  *
  * WHAT IT IS NOT. Not the official IEEE Annex J vector — that would be
  * strictly better and is a drop-in replacement when someone has it to hand.
@@ -292,7 +300,11 @@ void test_aad_masking() {
 
   std::memset(hdr, 0, sizeof hdr);
   hdr[0] = 0x88;                    /* QoS data, subtype bits set */
-  hdr[1] = 0x08 | 0x10 | 0x20;      /* retry | pwr mgmt | more data */
+  /* ToDS SET, so the DS-bit check below can actually fail. This was
+   * 0x08|0x10|0x20 - ToDS and FromDS both clear - which made the assertion
+   * `(aad[1] & 0x03) == (hdr[1] & 0x03)` read `0 == 0` and survive any
+   * mutation that cleared the DS bits. */
+  hdr[1] = devourer::sta::kFcToDs | 0x08 | 0x10 | 0x20;      /* retry | pwr mgmt | more data */
   hdr[22] = 0x35;                   /* frag 5, seq low bits */
   hdr[23] = 0x12;                   /* seq high */
 
