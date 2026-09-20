@@ -441,11 +441,42 @@ static std::vector<uint8_t> ccmp_tx(const uint8_t* sta, uint16_t eth,
   return m;
 }
 // DHCP OFFER/ACK payload (IP+UDP+BOOTP) leasing 192.168.99.2 — encrypted by ccmp_tx.
-static const uint8_t kLeaseIp[4] = {192,168,99,2};
-static std::vector<uint8_t> dhcp_payload(const uint8_t* sta, const uint8_t* xid, uint8_t mt) {
+/* THE ADDRESS POOL (Phase 2b.4).
+ *
+ * A station's address is derived from its AID: 192.168.99.(1 + aid), so AIDs
+ * 1..7 map to .2 .. .8 and the AP keeps .1. There is deliberately no separate
+ * allocator and no parallel binding table - the station table IS the binding
+ * table. That means an address cannot outlive its lease, cannot be
+ * double-allocated, and is freed by the same deauth path that frees the key
+ * material, with no second structure to keep in sync.
+ *
+ * Before this, kLeaseIp was the single hardcoded 192.168.99.2 handed to
+ * whoever asked, so a second station was offered an address the first one was
+ * already using. The two-station cell worked around it with static
+ * addressing; it does not need to now. */
+static void sta_ip(const devourer::sta::Station& st, uint8_t out[4]) {
+  out[0] = 192; out[1] = 168; out[2] = 99;
+  out[3] = (uint8_t)(1 + st.aid);
+}
+
+/* Reverse lookup for the ARP responder. Caller holds g_hs_mu. */
+static devourer::sta::Station* sta_by_ip(const uint8_t ip[4]) {
+  if (ip[0] != 192 || ip[1] != 168 || ip[2] != 99) return nullptr;
+  for (int i = 0; i < g_stas.capacity(); i++) {
+    devourer::sta::Station* st = g_stas.at(i);
+    if (!st) continue;
+    uint8_t a[4];
+    sta_ip(*st, a);
+    if (std::memcmp(a, ip, 4) == 0) return st;
+  }
+  return nullptr;
+}
+
+static std::vector<uint8_t> dhcp_payload(const uint8_t* sta, const uint8_t* xid,
+                                         uint8_t mt, const uint8_t lease[4]) {
   std::vector<uint8_t> b(236, 0);
   b[0]=2; b[1]=1; b[2]=6; memcpy(&b[4],xid,4);
-  memcpy(&b[16],kLeaseIp,4); memcpy(&b[20],kApIp,4); memcpy(&b[28],sta,6);
+  memcpy(&b[16],lease,4); memcpy(&b[20],kApIp,4); memcpy(&b[28],sta,6);
   const uint8_t opt[]={0x63,0x82,0x53,0x63, 53,1,mt, 54,4,kApIp[0],kApIp[1],kApIp[2],kApIp[3],
       51,4,0,1,0x51,0x80, 1,4,255,255,255,0, 3,4,kApIp[0],kApIp[1],kApIp[2],kApIp[3],
       6,4,kApIp[0],kApIp[1],kApIp[2],kApIp[3], 255};
@@ -464,11 +495,35 @@ static void handle_plain(const uint8_t* sta, const uint8_t* d, int len) {
   if (len < 8 || d[0]!=0xaa) return;                    // not LLC/SNAP (e.g. IPv6 ND)
   uint16_t eth = (d[6]<<8)|d[7]; const uint8_t* pl = d+8; int pllen = len-8;
   if (eth==0x0806 && pllen>=28) {                        // ARP
-    if (((pl[6]<<8)|pl[7])==1 && memcmp(pl+24,kApIp,4)==0) {
-      uint8_t a[28]={0,1,8,0,6,4,0,2, kBssid[0],kBssid[1],kBssid[2],kBssid[3],kBssid[4],kBssid[5],
-        kApIp[0],kApIp[1],kApIp[2],kApIp[3], pl[8],pl[9],pl[10],pl[11],pl[12],pl[13],
-        pl[14],pl[15],pl[16],pl[17]};
-      enqueue(ccmp_tx(sta,0x0806,a,28));
+    if (((pl[6]<<8)|pl[7])==1) {                         // request
+      /* AN ARP RESPONDER KEYED ON THE ASSOCIATION TABLE (Phase 2b.5).
+       *
+       * It answers for the AP's own address as before, and now also for any
+       * associated station's address - WITH THAT STATION'S REAL MAC.
+       *
+       * That last detail is the whole point. RFC 1027 proxy ARP answers with
+       * the PROXY's MAC, which would make this AP an L3 next hop: the
+       * requester would address B's traffic to the AP itself, and an L2 relay
+       * could never see it. Answering with B's own MAC keeps the traffic
+       * layer 2, which is what the relay in 2b.7 needs.
+       *
+       * This is also why the pool had to land first: without a binding table
+       * there is nothing to answer FROM. */
+      const uint8_t* tip = pl + 24;
+      const uint8_t* rmac = nullptr;
+      if (memcmp(tip, kApIp, 4) == 0) {
+        rmac = kBssid;
+      } else if (devourer::sta::Station* t = sta_by_ip(tip)) {
+        /* Never answer a station's query about itself - it would look like an
+         * address conflict to the requester. */
+        if (memcmp(t->addr, sta, 6) != 0) rmac = t->addr;
+      }
+      if (rmac) {
+        uint8_t a[28]={0,1,8,0,6,4,0,2, rmac[0],rmac[1],rmac[2],rmac[3],rmac[4],rmac[5],
+          tip[0],tip[1],tip[2],tip[3], pl[8],pl[9],pl[10],pl[11],pl[12],pl[13],
+          pl[14],pl[15],pl[16],pl[17]};
+        enqueue(ccmp_tx(sta,0x0806,a,28));
+      }
     }
   } else if (eth==0x0800 && pllen>=28) {                 // IPv4/ICMP
     const uint8_t* ip=pl; int ihl=(ip[0]&0x0f)*4;
@@ -486,8 +541,18 @@ static void handle_plain(const uint8_t* sta, const uint8_t* d, int len) {
         for (const uint8_t* o=dh+240; o+1<end && *o!=0xff; ) {
           if (*o==0){o++;continue;} if (*o==53 && o+2<end) m=o[2]; o+=2+o[1]; }
         uint8_t reply = (m==1)?2 : (m==3)?5 : 0;
-        if (reply) { auto dp=dhcp_payload(sta, dh+4, reply);
-          enqueue(ccmp_tx(sta,0x0800,dp.data(),(int)dp.size())); }
+        if (reply) {
+          /* The lease is this station's own address, not a shared constant. */
+          devourer::sta::Station* me = g_stas.find(sta);
+          if (!me) return;
+          uint8_t lease[4];
+          sta_ip(*me, lease);
+          auto dp = dhcp_payload(sta, dh+4, reply, lease);
+          enqueue(ccmp_tx(sta,0x0800,dp.data(),(int)dp.size()));
+          fprintf(stderr, "  DHCP: %s %u.%u.%u.%u to aid=%u\n",
+                  reply == 2 ? "OFFER" : "ACK",
+                  lease[0], lease[1], lease[2], lease[3], me->aid);
+        }
       }
     }
   }
