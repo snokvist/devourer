@@ -233,10 +233,42 @@ inline bool ccmp_decrypt(CryptoOps& crypto, const uint8_t tk[16],
  * and its review called it KRACK-class: an equal-counter replay passed, which
  * is exactly how a group-key reinstallation attack lands. Keep the equality.
  */
+/* CCMP replay protection: a sliding window per TID, not a bare counter.
+ *
+ * 802.11-2016 12.5.3.4.4 requires a receiver to discard an MPDU whose PN is
+ * not greater than the replay counter for its TID. Implemented as a strict
+ * `pn > last` test that is correct ONLY while frames cannot arrive out of
+ * order - and that is an assumption about the peer, not about the standard.
+ * The moment a BlockAck agreement exists, an A-MPDU can deliver
+ * PN 5, 7, 6 legitimately, and a strict counter drops frame 6 as a replay:
+ * silent, unattributable data loss that looks like a radio problem.
+ *
+ * The AP harnesses this ships with decline ADDBA, so the strict form was safe
+ * there and was documented as such. A STATION does not get to choose - it
+ * associates with whatever the AP offers - so the assumption has to go before
+ * Phase 3 relies on it.
+ *
+ * The window is the standard anti-replay bitmap (the shape IPsec RFC 4303
+ * appendix B and every 802.11 driver use): `last_` is the highest PN
+ * accepted, and bit i of `mask_` records whether PN (last_ - i) has already
+ * been seen. So a frame is accepted exactly once whether it arrives early,
+ * on time, or late but still inside the window.
+ *
+ * kWindow = 64 because that is the largest BlockAck buffer a peer can
+ * negotiate, so anything the reorder buffer can legitimately hold fits. A PN
+ * older than that is not reordering - it is a replay, or a peer that has lost
+ * its way - and is refused.
+ *
+ * What this deliberately does NOT do: tolerate a PN that jumps forward and
+ * then asks for the skipped values later beyond the window. A forward jump of
+ * more than 64 clears the mask, so the skipped PNs can never be accepted
+ * afterwards. That is the safe direction - an attacker who can inject one
+ * frame with a huge PN can deny the window, but cannot replay anything. */
 class CcmpReplay {
 public:
   static constexpr int kNonQosTid = 16;
   static constexpr int kSlots = 17;
+  static constexpr int kWindow = 64;
 
   /* True when this PN is acceptable AND records it. A rejected PN leaves the
    * window untouched - accepting a frame's PN before its MIC verifies would
@@ -248,15 +280,36 @@ public:
   bool accept(uint64_t pn, int tid = kNonQosTid) {
     if (pn == 0) return false;
     if (tid < 0 || tid >= kSlots) return false;
-    if (seen_[tid] && pn <= last_[tid]) return false;
-    last_[tid] = pn;
-    seen_[tid] = true;
+
+    if (!seen_[tid]) {
+      seen_[tid] = true;
+      last_[tid] = pn;
+      mask_[tid] = 1;                       /* bit 0 == last_ itself */
+      return true;
+    }
+    if (pn > last_[tid]) {
+      const uint64_t shift = pn - last_[tid];
+      /* A jump of kWindow or more leaves nothing in the old window
+       * reachable, and shifting a uint64_t by >= 64 is undefined - which is
+       * exactly the kind of gap a hostile peer would aim for. */
+      mask_[tid] = (shift >= (uint64_t)kWindow) ? 1u
+                                                : ((mask_[tid] << shift) | 1u);
+      last_[tid] = pn;
+      return true;
+    }
+    const uint64_t behind = last_[tid] - pn;
+    if (behind >= (uint64_t)kWindow) return false;   /* too old to judge */
+    const uint64_t bit = 1ull << behind;
+    if (mask_[tid] & bit) return false;              /* already seen */
+    mask_[tid] |= bit;
     return true;
   }
+
   /* Every rekey resets every counter: a new key means a new PN space. */
   void reset() {
     for (int i = 0; i < kSlots; i++) {
       last_[i] = 0;
+      mask_[i] = 0;
       seen_[i] = false;
     }
   }
@@ -266,6 +319,7 @@ public:
 
 private:
   uint64_t last_[kSlots] = {0};
+  uint64_t mask_[kSlots] = {0};
   bool seen_[kSlots] = {false};
 };
 

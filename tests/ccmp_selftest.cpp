@@ -272,9 +272,18 @@ void test_header_pn() {
         "the maximum PN round-trips");
 }
 
-/* The replay gate. PR #335 shipped `<` here and its review called it
- * KRACK-class: an equal-counter replay passed, which is how a group-key
- * reinstallation lands. This is the regression test for that specific bug. */
+/* The replay gate.
+ *
+ * PR #335 shipped `<` here and its review called it KRACK-class: an
+ * equal-counter replay passed, which is how a group-key reinstallation lands.
+ * That regression test is the first block below and it stays.
+ *
+ * The rest covers the sliding window that replaced the bare counter. A
+ * counter is only correct while frames cannot arrive out of order, which is
+ * an assumption about the PEER: the moment a BlockAck agreement exists an
+ * A-MPDU can deliver PN 5, 7, 6 legitimately and a counter drops 6 as a
+ * replay. The AP harnesses decline ADDBA so it never bit there; a station
+ * does not get to choose. */
 void test_replay() {
   devourer::sta::CcmpReplay r;
 
@@ -287,11 +296,98 @@ void test_replay() {
   check(!r.accept(2), "the advanced counter still rejects its equal");
 
   /* A rejected PN must not advance the window; otherwise a forged high PN
-   * would lock out the legitimate peer. */
+   * would lock out the legitimate peer. The rejected value here is one that
+   * is genuinely out of range - an earlier version of this test used PN 50
+   * after 100, which a bare counter rejected and a sliding window correctly
+   * ACCEPTS, because 50 frames of reordering is not a replay. */
   devourer::sta::CcmpReplay r2;
   check(r2.accept(100), "setup");
-  check(!r2.accept(50), "setup");
+  check(!r2.accept(100 - devourer::sta::CcmpReplay::kWindow),
+        "a PN exactly one window behind is too old to judge");
   check(r2.last() == 100, "a rejected PN does not move the window");
+
+  /* --- REORDERING, which a bare counter got wrong ------------------------
+   *
+   * A BlockAck agreement lets an A-MPDU deliver PNs out of order. The strict
+   * `pn > last` rule drops the late ones as replays: silent data loss that
+   * looks like a radio problem. The AP harnesses decline ADDBA so it never
+   * bit there, but a station does not get to choose. */
+  devourer::sta::CcmpReplay w;
+  check(w.accept(10), "window: first frame");
+  check(w.accept(12), "window: a gap is fine");
+  check(w.accept(11), "window: THE LATE FRAME IN THE GAP IS ACCEPTED");
+  check(!w.accept(11), "window: but only once");
+  check(!w.accept(12), "window: and the one that arrived early is not replayable");
+  check(w.last() == 12, "window: a late frame does not move the head backwards");
+
+  /* Fill a whole window out of order, then prove every one of them is a
+   * replay on a second pass. */
+  devourer::sta::CcmpReplay f;
+  check(f.accept(1000), "window: head");
+  for (int i = 1; i < devourer::sta::CcmpReplay::kWindow; i++)
+    if (!f.accept(1000 - (uint64_t)i))
+      check(false, "window: every PN inside the window is accepted once");
+  {
+    bool any = false;
+    for (int i = 0; i < devourer::sta::CcmpReplay::kWindow; i++)
+      if (f.accept(1000 - (uint64_t)i)) any = true;
+    check(!any, "window: and every one of them is a replay the second time");
+  }
+
+  /* The edges. One inside is accepted, one outside is refused - off by one
+   * here is either a dropped frame or an admitted replay. */
+  devourer::sta::CcmpReplay e;
+  check(e.accept(1000), "edge: head");
+  check(e.accept(1000 - (devourer::sta::CcmpReplay::kWindow - 1)),
+        "edge: the oldest PN still inside the window is accepted");
+  check(!e.accept(1000 - devourer::sta::CcmpReplay::kWindow),
+        "edge: one past the window is refused");
+
+  /* A forward jump larger than the window must clear it, and must not shift
+   * a uint64_t by >= 64 on the way - undefined behaviour, and exactly the
+   * gap a hostile peer would choose. Everything behind becomes unreachable,
+   * which is the safe direction: no replay can be admitted afterwards. */
+  devourer::sta::CcmpReplay j;
+  check(j.accept(10), "jump: head");
+  check(j.accept(10 + devourer::sta::CcmpReplay::kWindow + 5), "jump: a big skip");
+  check(!j.accept(11), "jump: the skipped PNs are gone, not replayable");
+  check(!j.accept(10), "jump: including the one already seen");
+  check(j.accept(10 + devourer::sta::CcmpReplay::kWindow + 4),
+        "jump: but a frame inside the NEW window is still accepted");
+
+  /* THE SHIFT GUARD, and it needs a carefully chosen jump to be visible.
+   *
+   * Shifting a uint64_t by >= 64 is undefined, and on x86 the count is taken
+   * modulo 64 - so an UNGUARDED `mask << shift` with shift == kWindow + 1
+   * becomes `mask << 1`, and the head's own bit survives as bit 1 of the new
+   * window. That marks a PN the receiver has NEVER SEEN as already seen, and
+   * the next legitimate frame at that PN is dropped as a replay.
+   *
+   * So the symptom is a LOST FRAME, not an admitted one, and it only appears
+   * for a jump that lands a stale bit inside the new window. A jump of
+   * kWindow + 5 does not: everything behind it falls outside the window and
+   * is refused for that reason instead, which is why an earlier version of
+   * this test passed with the guard removed. */
+  devourer::sta::CcmpReplay sh;
+  check(sh.accept(10), "shift: head at 10");
+  check(sh.accept(10 + devourer::sta::CcmpReplay::kWindow + 1),
+        "shift: jump one past the window");
+  check(sh.accept(10 + devourer::sta::CcmpReplay::kWindow),
+        "shift: THE PN JUST BEHIND THE NEW HEAD WAS NEVER SEEN - accept it");
+
+  /* An enormous jump - the same shift, at the top of the PN space. */
+  devourer::sta::CcmpReplay h2;
+  check(h2.accept(1), "huge: head");
+  check(h2.accept(0xffffffffffffULL), "huge: the maximum PN is accepted");
+  check(!h2.accept(1), "huge: the old PN is not replayable");
+  check(h2.last() == 0xffffffffffffULL, "huge: the head moved");
+
+  /* NOT TESTABLE HERE, stated rather than implied: the `behind >= kWindow`
+   * bound. Relaxing it to `>` lets `behind == kWindow` through to a
+   * `1ull << 64`, which is undefined - but on x86 that evaluates to 1, and
+   * bit 0 is the head, which is always set, so the frame is refused anyway
+   * and the defect is invisible. The guard is there by construction, not
+   * because a test on this ISA can distinguish it. */
 
   /* ONE COUNTER PER TID. A single shared counter drops legitimate frames as
    * soon as two TIDs interleave, which is routine the moment voice or video
