@@ -641,6 +641,36 @@ configured with power save off, exchanging encrypted unicast through the AP,
 plus a group-addressed frame that both decrypt. And per rule 2, two adversarial
 reviews with every finding resolved.
 
+### Phase 2b review ledger
+
+Rule 2 requires two adversarial reviews per phase with every finding resolved,
+and the cadence set in this document requires one Flash reviewer per gate. The
+per-gate tier was run on the 2b.1/2b.2 pair and at the boundary; it was **not**
+run on 2b.3–2b.7 individually, which is a gap in the process rather than in the
+code, and is recorded here rather than glossed.
+
+| # | Reviewer | Angle | Outcome |
+|---|---|---|---|
+| R1 | Flash | Surface bugs in 3ea0d4e / a76bde4 / StationTable.h, weighted to concurrency | 4 substantive: the table never emptied, the EAPOL replay counter was unchecked, an HT-Control bound, a fresh ANonce on re-assoc. Two accepted, two rejected with reasons. Lock discipline came back clean |
+| R2 | Flash | What one station can do to another | PTK committed before MIC verification (fixed); unauthenticated deauth frees a slot AND an identity, because the IP derives from a reusable AID; unauthenticated assoc fills the table. Four categories explicitly yielded nothing, including relay SA spoofing |
+| R3 | Flash | Do the tests test what they claim | `ap_wpa2.cpp` is in no test target; the false independence claim still live in two code-facing places; a tautological AAD cell; two defects in cells written that day; IBSS row untested |
+| R4 | Opus | Continuity at the boundary, and correctness of relay/GTK | 10 findings. Blockers: the table never emptied, the replay counter fought retransmission, the plan contradicted itself, fragmentation/A-MSDU silently corrupted. **Corrected my premise**: duplicate detection exists by construction. Crypto, locking, loop/amplification and group replay all explicitly clean |
+
+**ff85aca shipped three behaviour changes with no row and no gate** — deauth
+frees the slot, the EAPOL replay counter, the real AID in the association
+response. One was security-relevant. That is the rule-4 miss this section
+exists to correct, committed while correcting it.
+
+**Resolved from the boundary review** in `873dff0`: the replay-counter window,
+the PTK-before-MIC ordering, the give-up path freeing its record, the
+fragmentation and A-MSDU refusal, the ledger arithmetic, and four test
+defects. **Carried forward, not resolved:** `ap_wpa2.cpp` has no ctest target
+at all, so 2b.4–2b.7 rest on narrated bench runs; the relay decision should
+move into a pure function in `src/sta/` so it can be tested headlessly and so
+2b.8 can reuse it rather than writing a second copy; and the AID→IP derivation
+couples identity to a reusable slot index, which makes an unauthenticated
+deauth cost more here than on a normal AP.
+
 ### Phase 2b acceptance — MET 2026-09-20, with 2b.8 still open
 
 The bar was "two associated stations, both configured with power save off,
@@ -706,28 +736,33 @@ are the discriminating evidence, not decoration:
   same integers A already used, so a single window would reject all of them and
   the counter would be non-zero while B showed total loss.
 
-**What this cell does NOT show**, and none of it is incidental:
+**What this cell did NOT show, AS IT STOOD ON 2026-09-20.** Three of these
+were superseded within hours by 2b.4, 2b.6 and 2b.7, and the list is kept in
+the past tense rather than deleted because it is the record of what that
+particular run established:
 
-- Both stations were given **static** addresses. The DHCP server still leases
-  one hardcoded `192.168.99.2` to whoever asks, so two stations over DHCP would
-  collide — that is item 2b.4, unbuilt.
-- **No station-to-station traffic.** Both pinged the AP, not each other; the
-  relay is 2b.7 and does not exist.
-- **No group-addressed traffic.** The GTK transmit path is 2b.6 and does not
-  exist, so the second half of the phase's acceptance bar is untouched.
+- Both stations were given **static** addresses. ~~The DHCP server still leases
+  one hardcoded `192.168.99.2`~~ — superseded by 2b.4: the pool derives each
+  address from the AID and two stations now lease `.2` and `.3`.
+- **No station-to-station traffic.** Both pinged the AP, not each other.
+  ~~The relay does not exist.~~ Superseded by 2b.7.
+- **No group-addressed traffic.** ~~The GTK transmit path does not exist.~~
+  Superseded by 2b.6.
 - **Non-QoS only.** The AP advertises neither WMM nor HT, so this says nothing
-  about the 2b.1 nonce fix, which remains interop-unproven.
+  about the 2b.1 nonce fix, which remains interop-unproven. **Still true.**
 - **Two stations, not seven**, and no churn: no station deauthenticated and
-  re-associated while another held a key.
+  re-associated while another held a key. **Still true.**
 
 **Structural property to hold, stated because Phase 1's equivalent is what made
 that phase checkable:** none of 2b.1-2b.7 may add a backend branch. All of it
 is `src/sta/` or harness code. Only 2b.8 is allowed to be OS-specific, and that
 is why it lives outside the library.
 
-**Status:** not started. Decision recorded 2026-09-20; reviewed by two Flash
-reviewers and one Opus continuity review the same day, whose findings are in
-the scope document's own correction table and in the ledger below.
+**Status:** 2b.1–2b.7 implemented and device-verified 2026-09-20; **2b.8 not
+started**. The acceptance bar above is met. This line said "not started" while
+sitting under that acceptance section, which is the contradiction the boundary
+review's continuity angle caught — the same pattern rule 4 exists to prevent,
+repeated inside the section written to correct it.
 
 ## Phase 3 — pure station logic, offline
 

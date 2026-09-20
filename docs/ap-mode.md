@@ -113,14 +113,18 @@ end to end. What is out of scope *for these harnesses as they stand* (AP-*stack*
 not driver parity): multiple concurrent clients, GTK broadcast/rekey,
 routing/NAT, and a real DHCP address pool.
 
-**Three of those four are now targets, not permanent exclusions.**
-`docs/station-mode-scope.md`'s "The target: an ordinary BSS, with the AP
-bridging" (decided 2026-09-20) makes multiple concurrent clients the goal, and
-a GTK transmit path and a real DHCP address pool prerequisites for it — ARP is
-broadcast, so station-to-station IP does not work without the first, and the
-ARP responder cannot answer without the second. Routing/NAT remains out of
+**Three of those four are now IMPLEMENTED, not merely targets.**
+Phase 2b landed all three on 2026-09-20: multiple concurrent clients (a
+seven-slot station table), a GTK transmit path (key id 1, one key per BSS, its
+own PN space) and an address pool derived from the AID. Two stations now
+exchange encrypted unicast through the AP and both decrypt a group frame —
+`docs/station-mode-plan.md` has the measurements. Routing/NAT remains out of
 scope, and whether the AP stays a gateway or becomes a transparent bridge is
-explicitly undecided there.
+still undecided in `docs/station-mode-scope.md`.
+
+Note that the single-lease and single-client statements elsewhere in this file
+describe `tests/ap_responder.cpp`, which was NOT rewired onto the station
+table; only `tests/ap_wpa2.cpp` was.
 
 **802.11 power save is out of scope too, and this is the one that bites.**
 Nothing is buffered for a dozing peer — every reply is enqueued the moment the
