@@ -252,7 +252,10 @@ inline const uint8_t* find_ie(const uint8_t* body, size_t body_len, uint8_t eid,
  * station skips BSSes it could have joined perfectly well.
  */
 struct RsnInfo {
-  bool valid = false;           /* the element parsed without running short */
+  /* Version 1, and no suite count that overruns the element. NOT "complete":
+   * every field after the version is individually optional, so a version-only
+   * or group-cipher-only element is `valid` with its later flags false. */
+  bool valid = false;
   uint16_t version = 0;
   bool group_ccmp = false;
   bool pairwise_ccmp = false;   /* CCMP is AMONG the offered pairwise suites */
@@ -285,7 +288,7 @@ inline bool parse_rsn(const uint8_t* p, size_t len, RsnInfo* out) {
   if (len < 2) return false;
   out->version = get_le16(p);
   i = 2;
-  if (out->version != 1) return false; /* nothing else is defined */
+  if (out->version != 1) { *out = RsnInfo{}; return false; } /* nothing else defined */
 
   if (i + 4 <= len) {
     out->group_ccmp = rsn_suite_is(p + i, 4);
@@ -296,17 +299,23 @@ inline bool parse_rsn(const uint8_t* p, size_t len, RsnInfo* out) {
     i += 2;
     /* A count that overruns the element is malformed, not merely unsupported.
      * Refuse rather than walk off the end. */
-    if (i + (size_t)out->pairwise_count * 4 > len) return false;
+    if (i + (size_t)out->pairwise_count * 4 > len) { *out = RsnInfo{}; return false; }
     for (uint16_t n = 0; n < out->pairwise_count; n++, i += 4)
       if (rsn_suite_is(p + i, 4)) out->pairwise_ccmp = true;
   }
   if (i + 2 <= len) {
     out->akm_count = get_le16(p + i);
     i += 2;
-    if (i + (size_t)out->akm_count * 4 > len) return false;
+    if (i + (size_t)out->akm_count * 4 > len) { *out = RsnInfo{}; return false; }
     for (uint16_t n = 0; n < out->akm_count; n++, i += 4)
       if (rsn_suite_is(p + i, 2)) out->akm_psk = true;
   }
+  /* An element may legitimately stop before RSN Capabilities, and an absent
+   * field means MFPR=0 - which is what hostap assumes too. An earlier version
+   * refused such an element outright ("cannot be judged safe to join"); that
+   * was changed here deliberately, and the test below pins the new direction
+   * so a future flip in either direction is visible rather than silent. An AP
+   * that really requires MFP refuses the association regardless. */
   if (i + 2 <= len) {
     out->capabilities = get_le16(p + i);
     out->mfp_required = (out->capabilities & 0x0040) != 0;

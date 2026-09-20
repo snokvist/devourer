@@ -319,9 +319,15 @@ on `rtw_8812au`, 2.4 GHz:
 ```
 
 Zero MIC failures across ~250 encrypted frames over two successful runs, so
-the promoted CCMP module decrypts a real station's traffic correctly. The
-replay window rejected one genuine on-air replay, which makes it a deployed
-control rather than a test fixture.
+the promoted CCMP module decrypts a real station's traffic correctly.
+
+**Correction, from review:** an earlier revision of this section said the
+window "rejected one genuine on-air replay". That is not supported — a
+retransmitted MPDU carries the same PN as the original, so a strict counter
+cannot tell an attack from a MAC retransmission, and a retransmission is by
+far the more probable explanation for a single rejection. What the `1` shows
+is that the window is *reached and exercised* on air, which is still the point
+worth making: it is deployed rather than a test fixture.
 
 **The earlier 100% loss was ours, not the rig's.** The leading hypothesis in
 the previous revision — that the Realtek station sends QoS data the

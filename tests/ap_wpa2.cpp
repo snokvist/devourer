@@ -208,11 +208,12 @@ static std::vector<uint8_t> eapol_frame(uint16_t keyinfo, const uint8_t* nonce,
   if (keydata && kdlen) e.insert(e.end(), keydata, keydata+kdlen);
   if (mic) set_mic(e);
   // wrap in 802.11 data (from-DS) + LLC/SNAP ethertype 0x888e
-  std::vector<uint8_t> m = {0x08,0x02,0,0,
-      g_sta[0],g_sta[1],g_sta[2],g_sta[3],g_sta[4],g_sta[5],
-      kBssid[0],kBssid[1],kBssid[2],kBssid[3],kBssid[4],kBssid[5],
-      kBssid[0],kBssid[1],kBssid[2],kBssid[3],kBssid[4],kBssid[5], 0,0,
-      0xaa,0xaa,0x03,0x00,0x00,0x00, 0x88,0x8e};
+  // Sequence-numbered like every other data frame. These carry the handshake
+  // and a retransmission of one feeds the station's duplicate detector; they
+  // were missed when the data planes were fixed.
+  std::vector<uint8_t> m = devourer::sta::data_hdr_from_ds(
+      g_sta, kBssid, kBssid, /*protect=*/false, g_seq.next());
+  devourer::sta::append_llc_snap(m, 0x888e);
   m.insert(m.end(), e.begin(), e.end());
   return m;
 }
@@ -438,12 +439,19 @@ static void on_rx(const Packet& p) {
       compute_ptk();
       if (!check_mic(e, elen)) { fprintf(stderr, "  WPA2: msg2 MIC FAIL\n"); return; }
       fprintf(stderr, "  WPA2: msg2 OK (SNonce, MIC verified) — PTK derived\n");
+      // The PN space belongs to the KEY, so the replay window resets where a
+      // new PTK is derived - here - and nowhere else. It used to reset on
+      // msg4, which is a MIC-only cleartext frame an attacker can capture and
+      // replay at will: the MIC still verifies under the same PTK, the window
+      // resets mid-session, and every captured data frame becomes admissible
+      // again. That defeats the control entirely. A legitimate msg4
+      // retransmission did the same thing by accident.
+      g_ccmp_replay.reset();
       send_msg3();
     } else if ((ki & 0x0100) && (ki & 0x0200)) {        // msg4: MIC + secure
       if (check_mic(e, elen)) {
         g_state = 2;
-        g_ccmp_replay.reset();
-      fprintf(stderr, "  WPA2: msg4 OK — 4-WAY HANDSHAKE COMPLETE (station keyed)\n");
+        fprintf(stderr, "  WPA2: msg4 OK — 4-WAY HANDSHAKE COMPLETE (station keyed)\n");
       }
     }
   }
@@ -503,6 +511,12 @@ int main(int argc, char** argv) {
    * RECEIVED an encrypted frame from one that received and failed to decrypt
    * them, because nothing counted either - so a 100%-ping-loss result had no
    * diagnosis attached. Printed unconditionally, at every exit. */
+  /* CAVEAT for a Realtek AP: Packet::Data carries a trailing FCS whenever
+   * RxAttrib.fcs_present is set, which every Realtek generation sets and
+   * MT7612U clears. on_rx does not trim it, so on Realtek every protected
+   * frame is 4 bytes long and would be counted here as a MIC failure rather
+   * than as the length bug it is. Fix the trim before trusting this ledger on
+   * anything but MediaTek. */
   fprintf(stderr,
           "  data plane: encrypted frames received=%llu, MIC failures=%llu, "
           "replays rejected=%llu, frames sent=%llu\n",

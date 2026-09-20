@@ -465,6 +465,48 @@ void test_rsn_real_world() {
   check(!parse_rsn(akm_overrun.data(), akm_overrun.size(), &r),
         "an AKM count that overruns the element is refused");
 
+  /* An element that stops BEFORE RSN Capabilities. An earlier version refused
+   * this outright; it is accepted now, with MFPR defaulting to 0. Pinned in
+   * both directions so the verdict cannot flip silently again. */
+  auto no_caps = rsn::build(1, {4}, {4}, {2}, false, 0);
+  check(no_caps.size() == 18, "the no-capabilities element is 18 bytes");
+  check(parse_rsn(no_caps.data(), no_caps.size(), &r),
+        "an RSN element without capabilities parses");
+  check(r.group_ccmp && r.pairwise_ccmp && r.akm_psk,
+        "its suites are still read");
+  check(!r.mfp_required && !r.mfp_capable,
+        "absent capabilities mean MFPR=0, not unknown");
+  {
+    std::vector<uint8_t> m = mgmt_hdr(kFcBeacon,
+                                      (const uint8_t*)"\xff\xff\xff\xff\xff\xff",
+                                      kOwn, kBssid);
+    for (int i = 0; i < 8; i++) m.push_back(0);
+    put_le16(m, 100); put_le16(m, 0x0011);
+    append_ssid(m, "ap");
+    append_ie(m, kEidRsn, no_caps.data(), no_caps.size());
+    BssInfo b;
+    check(parse_beacon(m.data(), m.size(), &b), "parses");
+    check(b.rsn_ccmp_psk,
+          "a BSS whose RSN element omits capabilities IS joinable");
+  }
+
+  /* A count landing exactly on the element boundary is legal; one byte past
+   * is not. `>` vs `>=` in the overrun check is the difference. */
+  auto exact = rsn::build(1, {4}, {4}, {2}, false, 0);
+  check(parse_rsn(exact.data(), exact.size(), &r),
+        "a count reaching exactly the element end is accepted");
+  check(!parse_rsn(exact.data(), exact.size() - 1, &r),
+        "one byte short of that same count is refused");
+
+  /* A refused element must leave NO partial state behind. */
+  std::vector<uint8_t> ov = plain;
+  ov[6] = 0xff; ov[7] = 0xff;
+  check(!parse_rsn(ov.data(), ov.size(), &r), "setup: refused");
+  check(r.pairwise_count == 0 && !r.pairwise_ccmp && !r.group_ccmp,
+        "a refused element leaves no partial state");
+
+  check(!parse_rsn(nullptr, 20, &r), "a null body is refused");
+
   /* A short-but-legal element stops early and leaves later flags false. */
   auto group_only = rsn::build(1, {4}, {}, {}, false, 0);
   check(parse_rsn(group_only.data(), group_only.size(), &r),
