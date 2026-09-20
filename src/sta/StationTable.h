@@ -92,8 +92,15 @@ public:
   StationTable() { clear(); }
 
   void clear() {
-    std::memset(slots_, 0, sizeof slots_);
-    for (int i = 0; i < kMaxStations; i++) used_[i] = false;
+    /* Value-initialise rather than memset: Station holds a CcmpReplay, which
+     * has default member initialisers, so it is not trivially copyable and
+     * memset on it is -Wclass-memaccess. `Station{}` is also correct by
+     * construction instead of correct because the all-zero pattern happens to
+     * be a reset replay window. */
+    for (int i = 0; i < kMaxStations; i++) {
+      slots_[i] = Station{};
+      used_[i] = false;
+    }
   }
 
   int count() const {
@@ -136,13 +143,12 @@ public:
 
     Station& s = slots_[slot];
     /* Deliberately redundant with remove()'s wipe: every unused slot is
-     * already zeroed, since remove() and clear() are the only routes to
-     * unused and both zero. Kept anyway, because this is key material and
-     * because it makes add() correct on its own terms rather than on
-     * remove()'s. The cost is that a mutation deleting this line survives
-     * the selftest - see the note on test_removal_wipes_key_material. */
-    std::memset(&s, 0, sizeof s);
-    s.rx_replay.reset();
+     * already clean, since remove() and clear() are the only routes to unused
+     * and both reset. Kept anyway, because this is key material and because it
+     * makes add() correct on its own terms rather than on remove()'s. The cost
+     * is that a mutation deleting this line survives the selftest - see the
+     * note on test_removal_wipes_key_material. */
+    s = Station{};
     std::memcpy(s.addr, addr, 6);
     s.aid = lowest_free_aid();
     s.state = HsState::Idle;
@@ -159,7 +165,7 @@ public:
     if (!addr) return false;
     for (int i = 0; i < kMaxStations; i++) {
       if (used_[i] && std::memcmp(slots_[i].addr, addr, 6) == 0) {
-        std::memset(&slots_[i], 0, sizeof slots_[i]);
+        slots_[i] = Station{};   /* key material must not linger in a free slot */
         used_[i] = false;
         return true;
       }

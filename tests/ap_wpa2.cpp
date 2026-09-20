@@ -47,6 +47,7 @@
 #include <openssl/rand.h>
 #include "RadiotapBuilder.h"
 #include "sta/Ccmp.h"
+#include "sta/StationTable.h"
 #include "sta/Dot11.h"
 #include "RxPacket.h"
 #include "SelectedChannel.h"
@@ -104,20 +105,29 @@ static const std::vector<uint8_t>& rsn_ie() {
 //     the MIC recomputed over it, so the station can tell copies apart.
 // Hence the `first` flag: it selects "generate fresh material" and nothing
 // else. Everything after it is rebuilt per transmission.
-static uint8_t g_anonce[32], g_snonce[32], g_ptk[48], g_gtk[16];
-static uint8_t g_replay[8];
-static uint8_t g_sta[6];
-// 0 idle, 1 sent msg1 awaiting msg2, 2 sent msg3 awaiting msg4, 3 complete.
-// State 2 already has the PTK, and a station that received msg3 installs its
-// keys and may send protected data BEFORE its msg4 reaches us - so the data
-// path accepts from state 2 onward, not only when the handshake is complete.
-static int g_state = 0;
-enum { HS_IDLE = 0, HS_WAIT_MSG2 = 1, HS_WAIT_MSG4 = 2, HS_DONE = 3 };
+// Per-station state lives in the table now (Phase 2b.2). Everything that was
+// a file-scope singleton here - g_sta, g_anonce, g_snonce, g_ptk, g_replay,
+// g_state, g_txpn and the CCMP receive window - is a field of
+// devourer::sta::Station, one record per associated station.
+static devourer::sta::StationTable g_stas;   // guarded by g_hs_mu
+
+// The GTK is NOT per-station, and this line is why the distinction matters.
+// It used to sit on the same declaration as g_anonce/g_snonce/g_ptk and was
+// regenerated inside send_msg3(first=true) - once per four-way. With one
+// station that was invisible. With two, the second station's handshake
+// silently revoked the first station's group key. It is generated ONCE, for
+// the BSS, before the radio comes up.
+static uint8_t g_gtk[16];
 // Guards every field above. The RX callback and the main loop's retransmit
 // tick both touch them now; before the timer existed only the RX thread did.
 static std::mutex g_hs_mu;
-static std::chrono::steady_clock::time_point g_hs_tx;   // last (re)transmission
-static int g_hs_tries = 0;
+// src/sta/Station holds its retransmission timestamp as a plain double so the
+// table stays free of <chrono> and of any OS notion of time; the harness owns
+// the clock.
+static double now_ms() {
+  return std::chrono::duration<double, std::milli>(
+             std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 static constexpr int kHsMaxTries = 4;                   // 1 + 3 retransmissions
 static constexpr auto kHsTimeout = std::chrono::milliseconds(250);
 
@@ -216,33 +226,34 @@ static void prf(const uint8_t* key, int klen, const char* label,
     int c = (olen-gen < 20) ? olen-gen : 20; memcpy(out+gen, d, c);
   }
 }
-static void compute_ptk() {
-  const uint8_t *aa = kBssid, *sa = g_sta;
+static void compute_ptk(devourer::sta::Station& st) {
+  const uint8_t *aa = kBssid, *sa = st.addr;
   uint8_t b[76]; int p = 0;
   const uint8_t* mn = memcmp(aa,sa,6) < 0 ? aa : sa;
   const uint8_t* mx = memcmp(aa,sa,6) < 0 ? sa : aa;
   memcpy(b+p, mn, 6); p+=6; memcpy(b+p, mx, 6); p+=6;
-  const uint8_t* nn = memcmp(g_anonce,g_snonce,32) < 0 ? g_anonce : g_snonce;
-  const uint8_t* nx = memcmp(g_anonce,g_snonce,32) < 0 ? g_snonce : g_anonce;
+  const uint8_t* nn = memcmp(st.anonce,st.snonce,32) < 0 ? st.anonce : st.snonce;
+  const uint8_t* nx = memcmp(st.anonce,st.snonce,32) < 0 ? st.snonce : st.anonce;
   memcpy(b+p, nn, 32); p+=32; memcpy(b+p, nx, 32); p+=32;
   uint8_t pmk[32];
   PKCS5_PBKDF2_HMAC(g_psk, strlen(g_psk), (const unsigned char*)kSsid,
                     strlen(kSsid), 4096, EVP_sha1(), 32, pmk);
-  prf(pmk, 32, "Pairwise key expansion", b, p, g_ptk, 48);
+  prf(pmk, 32, "Pairwise key expansion", b, p, st.ptk, 48);
 }
 // MIC over the EAPOL frame with the MIC field (offset 81, 16 bytes) zeroed.
-static void set_mic(std::vector<uint8_t>& e) {
+static void set_mic(std::vector<uint8_t>& e, const devourer::sta::Station& st) {
   memset(e.data()+81, 0, 16);
   unsigned int l; uint8_t d[20];
-  HMAC(EVP_sha1(), g_ptk, 16 /*KCK*/, e.data(), e.size(), d, &l);
+  HMAC(EVP_sha1(), st.ptk, 16 /*KCK*/, e.data(), e.size(), d, &l);
   memcpy(e.data()+81, d, 16);
 }
-static bool check_mic(const uint8_t* e, int len) {
+static bool check_mic(const uint8_t* e, int len,
+                      const devourer::sta::Station& st) {
   std::vector<uint8_t> t(e, e+len);
   uint8_t got[16]; memcpy(got, t.data()+81, 16);
   memset(t.data()+81, 0, 16);
   unsigned int l; uint8_t d[20];
-  HMAC(EVP_sha1(), g_ptk, 16, t.data(), t.size(), d, &l);
+  HMAC(EVP_sha1(), st.ptk, 16, t.data(), t.size(), d, &l);
   return memcmp(got, d, 16) == 0;
 }
 // AES key wrap (RFC 3394) with the KEK (PTK bytes 16..31), for msg3 key data.
@@ -259,47 +270,52 @@ static int aes_wrap(const uint8_t* kek, const uint8_t* in, int inlen, uint8_t* o
 
 // Build an EAPOL-Key data frame (from-DS) to the station.
 static std::vector<uint8_t> eapol_frame(uint16_t keyinfo, const uint8_t* nonce,
-                                        const uint8_t* keydata, int kdlen, bool mic) {
+                                        const uint8_t* keydata, int kdlen, bool mic,
+                                        const devourer::sta::Station& st) {
   std::vector<uint8_t> e(99, 0);
   e[0]=2; e[1]=3;                                       // EAPOL v2, type Key
   int blen = 95 + kdlen; e[2]=blen>>8; e[3]=blen&0xff;
   e[4]=2;                                               // RSN key descriptor
   e[5]=keyinfo>>8; e[6]=keyinfo&0xff;
   e[7]=0; e[8]=16;                                      // key length 16
-  memcpy(e.data()+9, g_replay, 8);
+  memcpy(e.data()+9, st.eapol_replay, 8);
   if (nonce) memcpy(e.data()+17, nonce, 32);
   e[97]=kdlen>>8; e[98]=kdlen&0xff;
   if (keydata && kdlen) e.insert(e.end(), keydata, keydata+kdlen);
-  if (mic) set_mic(e);
+  if (mic) set_mic(e, st);
   // wrap in 802.11 data (from-DS) + LLC/SNAP ethertype 0x888e
   // Sequence-numbered like every other data frame. These carry the handshake
   // and a retransmission of one feeds the station's duplicate detector; they
   // were missed when the data planes were fixed.
   std::vector<uint8_t> m = devourer::sta::data_hdr_from_ds(
-      g_sta, kBssid, kBssid, /*protect=*/false, g_seq.next());
+      st.addr, kBssid, kBssid, /*protect=*/false, g_seq.next());
   devourer::sta::append_llc_snap(m, 0x888e);
   m.insert(m.end(), e.begin(), e.end());
   return m;
 }
 /* Caller holds g_hs_mu. `first` = generate a fresh ANonce; a retransmission
  * must reuse it or the station's PTK will not match ours. */
-static void send_msg1(bool first) {
-  if (first) { RAND_bytes(g_anonce, 32); g_hs_tries = 0; }
-  for (int i=7;i>=0;--i) if (++g_replay[i]) break;      // bump replay counter
-  enqueue(eapol_frame(0x008a, g_anonce, nullptr, 0, false));  // ver2|pair|ack
-  g_state = HS_WAIT_MSG2;
-  g_hs_tx = std::chrono::steady_clock::now();
-  ++g_hs_tries;
+static void send_msg1(devourer::sta::Station& st, bool first) {
+  if (first) { RAND_bytes(st.anonce, 32); st.hs_tries = 0; }
+  for (int i=7;i>=0;--i) if (++st.eapol_replay[i]) break;   // bump replay counter
+  enqueue(eapol_frame(0x008a, st.anonce, nullptr, 0, false, st)); // ver2|pair|ack
+  st.state = devourer::sta::HsState::WaitMsg2;
+  st.hs_tx_ms = now_ms();
+  ++st.hs_tries;
   fprintf(stderr, "  WPA2: sent msg1 (ANonce) to %02x:%02x:%02x:%02x:%02x:%02x%s\n",
-          g_sta[0],g_sta[1],g_sta[2],g_sta[3],g_sta[4],g_sta[5],
+          st.addr[0],st.addr[1],st.addr[2],st.addr[3],st.addr[4],st.addr[5],
           first ? "" : " [retransmit]");
 }
-/* Caller holds g_hs_mu. `first` = generate a fresh GTK; a retransmission must
- * reuse it, or the station installs a group key this AP will not encrypt
- * with. The replay counter still advances and the MIC is recomputed, which is
- * what 802.11-2016 12.7.6.4 asks for. */
-static void send_msg3(bool first) {
-  if (first) { RAND_bytes(g_gtk, 16); g_hs_tries = 0; }
+/* Caller holds g_hs_mu.
+ *
+ * `first` no longer touches the GTK. It used to run RAND_bytes(g_gtk) here,
+ * which was correct-looking for one station and wrong for two: the second
+ * station's handshake handed it a fresh group key and silently revoked the
+ * first station's. The BSS generates its GTK once, before the radio comes up.
+ * The replay counter still advances and the MIC is recomputed on every
+ * transmission, which is what 802.11-2016 12.7.6.4 asks for. */
+static void send_msg3(devourer::sta::Station& st, bool first) {
+  if (first) { st.hs_tries = 0; }
   // key data = RSN IE + GTK KDE, padded to /8, then AES-wrapped with the KEK.
   std::vector<uint8_t> kd(rsn_ie().begin(), rsn_ie().end());
   uint8_t gtkkde[24] = {0xdd,0x16,0x00,0x0f,0xac,0x01,0x01,0x00};
@@ -310,12 +326,12 @@ static void send_msg3(bool first) {
     while (kd.size() % 8) kd.push_back(0x00);
   }
   std::vector<uint8_t> wrapped(kd.size()+8);
-  int wl = aes_wrap(g_ptk+16, kd.data(), kd.size(), wrapped.data());
-  for (int i=7;i>=0;--i) if (++g_replay[i]) break;
-  enqueue(eapol_frame(0x13ca, g_anonce, wrapped.data(), wl, true));  // install|ack|mic|secure|enc
-  g_state = HS_WAIT_MSG4;
-  g_hs_tx = std::chrono::steady_clock::now();
-  ++g_hs_tries;
+  int wl = aes_wrap(st.ptk+16, kd.data(), kd.size(), wrapped.data());
+  for (int i=7;i>=0;--i) if (++st.eapol_replay[i]) break;
+  enqueue(eapol_frame(0x13ca, st.anonce, wrapped.data(), wl, true, st));  // install|ack|mic|secure|enc
+  st.state = devourer::sta::HsState::WaitMsg4;
+  st.hs_tx_ms = now_ms();
+  ++st.hs_tries;
   fprintf(stderr, "  WPA2: sent msg3 (GTK, MIC) — 4-way in progress%s\n",
           first ? "" : " [retransmit]");
 }
@@ -323,19 +339,31 @@ static void send_msg3(bool first) {
 /* Called from the main loop. Resends whichever message this side is still
  * waiting on, up to kHsMaxTries transmissions in total. */
 static void hs_tick() {
+  using devourer::sta::HsState;
+  const double timeout_ms =
+      std::chrono::duration<double, std::milli>(kHsTimeout).count();
   std::lock_guard<std::mutex> l(g_hs_mu);
-  if (g_state != HS_WAIT_MSG2 && g_state != HS_WAIT_MSG4) return;
-  if (std::chrono::steady_clock::now() - g_hs_tx < kHsTimeout) return;
-  if (g_hs_tries >= kHsMaxTries) {
-    if (g_hs_tries == kHsMaxTries) {
-      ++g_hs_tries;   // latch, so this prints once
-      fprintf(stderr, "  WPA2: gave up after %d transmissions of msg%d\n",
-              kHsMaxTries, g_state == HS_WAIT_MSG2 ? 1 : 3);
+  /* Every station retransmits on its own schedule. A single shared deadline
+   * would let one station's handshake reset another's timer. */
+  for (int i = 0; i < g_stas.capacity(); i++) {
+    devourer::sta::Station* st = g_stas.at(i);
+    if (!st) continue;
+    if (st->state != HsState::WaitMsg2 && st->state != HsState::WaitMsg4) continue;
+    if (now_ms() - st->hs_tx_ms < timeout_ms) continue;
+    if (st->hs_tries >= kHsMaxTries) {
+      if (st->hs_tries == kHsMaxTries) {
+        ++st->hs_tries;   // latch, so this prints once per station
+        fprintf(stderr, "  WPA2: gave up after %d transmissions of msg%d"
+                        " to %02x:%02x:%02x:%02x:%02x:%02x\n",
+                kHsMaxTries, st->state == HsState::WaitMsg2 ? 1 : 3,
+                st->addr[0],st->addr[1],st->addr[2],
+                st->addr[3],st->addr[4],st->addr[5]);
+      }
+      continue;
     }
-    return;
+    if (st->state == HsState::WaitMsg2) send_msg1(*st, false);
+    else                                send_msg3(*st, false);
   }
-  if (g_state == HS_WAIT_MSG2) send_msg1(false);
-  else                         send_msg3(false);
 }
 
 // --- CCMP data plane (software AES-CCM) so the station pings encrypted --------
@@ -360,12 +388,10 @@ struct HarnessCrypto : devourer::sta::CryptoOps {
 static HarnessCrypto g_crypto;
 // The replay window is now a deployed control rather than a tested fixture.
 // It is reset on every fresh PTK install: a new key is a new PN space.
-static devourer::sta::CcmpReplay g_ccmp_replay;
 // Data-plane visibility. The one thing the on-air runs could not answer was
 // whether encrypted frames were arriving at all, because nothing counted them.
 static std::atomic<uint64_t> g_enc_rx{0}, g_mic_fail{0}, g_replayed{0};
 
-static uint64_t g_txpn = 1;                              // AP outbound packet number
 static uint16_t csum16(const uint8_t* d, int len) {
   uint32_t s = 0; for (int i=0;i+1<len;i+=2) s += (d[i]<<8)|d[i+1];
   if (len&1) s += d[len-1]<<8; while (s>>16) s=(s&0xffff)+(s>>16); return (uint16_t)~s;
@@ -374,8 +400,14 @@ static uint16_t csum16(const uint8_t* d, int len) {
 // tested against vectors from a third implementation (ctest ccmp_framing).
 // They used to be inline here and in nobody's test.
 // Encrypt an AP->STA payload (LLC/SNAP+eth+data) into a CCMP data frame.
+/* Caller holds g_hs_mu: every path into here runs inside the RX callback's
+ * data branch, which takes the lock to look the station up in the first
+ * place. An unkeyed or unknown destination emits nothing rather than airing a
+ * frame under someone else's key. */
 static std::vector<uint8_t> ccmp_tx(const uint8_t* sta, uint16_t eth,
                                     const uint8_t* pl, int plen) {
+  devourer::sta::Station* st = g_stas.find(sta);
+  if (!st || !st->keyed()) return {};
   std::vector<uint8_t> pt = {0xaa,0xaa,0x03,0,0,0,(uint8_t)(eth>>8),(uint8_t)(eth&0xff)};
   pt.insert(pt.end(), pl, pl+plen);
   // The data plane carries a sequence number now. The management-frame fix was
@@ -384,14 +416,14 @@ static std::vector<uint8_t> ccmp_tx(const uint8_t* sta, uint16_t eth,
   // AP's downlink and a station's uplink cannot disagree about the layout.
   std::vector<uint8_t> hdr = devourer::sta::data_hdr_from_ds(
       sta, kBssid, kBssid, /*protect=*/true, g_seq.next());
-  uint64_t pn = g_txpn++;
+  uint64_t pn = st->tx_pn++;   /* one PN space per station */
   // Non-QoS AAD (qos_tid defaults to -1): this AP airs plain data frames, and
   // that is what has been validated on air. A station sending QoS data needs
   // the other form - the two are not interchangeable, and ctest ccmp_framing
   // asserts that a frame built under one does not verify under the other.
   std::vector<uint8_t> m(devourer::sta::ccmp_encrypted_len(hdr.size(),
                                                            pt.size()));
-  size_t n = devourer::sta::ccmp_encrypt(g_crypto, g_ptk + 32, hdr.data(),
+  size_t n = devourer::sta::ccmp_encrypt(g_crypto, st->ptk + 32, hdr.data(),
                                          hdr.size(), kBssid, pn, 0, pt.data(),
                                          pt.size(), m.data(), m.size());
   // A zero return means the cipher refused. The old code ignored the result
@@ -485,8 +517,18 @@ static void on_rx(const Packet& p) {
             sta[0],sta[1],sta[2],sta[3],sta[4],sta[5]);
     {
       std::lock_guard<std::mutex> l(g_hs_mu);
-      memcpy(g_sta, sta, 6); memset(g_replay, 0, 8); g_state = HS_IDLE;
-      send_msg1(true);
+      /* add() returns the existing record for a re-association, so a station
+       * that loops back through assoc restarts its handshake instead of
+       * consuming a second AID. */
+      devourer::sta::Station* st = g_stas.add(sta);
+      if (!st) {
+        fprintf(stderr, "  ASSOC refused: the station table is full (%d)\n",
+                g_stas.capacity());
+      } else {
+        memset(st->eapol_replay, 0, 8);
+        st->state = devourer::sta::HsState::Idle;
+        send_msg1(*st, true);
+      }
     }
   } else if ((fc0 == 0x08 || devourer::sta::is_qos_data(fc0)) &&
              (fc1 & 0x01) && to_us) {                   // data to-DS
@@ -496,11 +538,19 @@ static void on_rx(const Packet& p) {
     // is_qos_data() used for the TID and an exact test for the length, the two
     // would actively disagree.
     int hlen = (int)devourer::sta::data_hdr_len(fc0, fc1);
-    // >= HS_WAIT_MSG4, not == done: the PTK exists once msg3 has been sent,
-    // and a station that received msg3 installs its keys and can put
-    // protected data on the air before its msg4 reaches us. Gating on the
-    // completed handshake dropped those frames.
-    if ((fc1 & 0x40) && g_state >= HS_WAIT_MSG4) {      // PROTECTED (CCMP) data
+    // The lock is held across the whole protected-data branch: it guards the
+    // table the sender is looked up in, the key the frame is decrypted with,
+    // that station's replay window, and - through handle_plain -> ccmp_tx -
+    // its TX PN. hs_tick() takes the same lock and then enqueues, so the
+    // order is always g_hs_mu before g_q_mu and there is no inversion.
+    std::unique_lock<std::mutex> dl(g_hs_mu, std::defer_lock);
+    // Station::keyed() is WaitMsg4 or Done, NOT Done alone: the PTK exists
+    // once msg3 has been sent, and a station that received msg3 installs its
+    // keys and can put protected data on the air before its msg4 reaches us.
+    // Gating on the completed handshake dropped those frames.
+    devourer::sta::Station* sender = nullptr;
+    if (fc1 & 0x40) { dl.lock(); sender = g_stas.find(sta); }
+    if ((fc1 & 0x40) && sender && sender->keyed()) {    // PROTECTED (CCMP) data
       int len = (int)mlen;
       if (len < hlen + 8 + 8) return;                   // hdr + CCMP hdr + MIC
       const uint8_t* d = p.Data.data();
@@ -515,7 +565,7 @@ static void on_rx(const Packet& p) {
       std::vector<uint8_t> pt(len);
       size_t ptlen = 0;
       uint64_t pn = 0;
-      if (devourer::sta::ccmp_decrypt(g_crypto, g_ptk + 32, d, (size_t)len,
+      if (devourer::sta::ccmp_decrypt(g_crypto, sender->ptk + 32, d, (size_t)len,
                                       (size_t)hlen, sta, pt.data(), &ptlen,
                                       &pn)) {
         // Replay check, AFTER the MIC verifies and never before: admitting a
@@ -538,7 +588,7 @@ static void on_rx(const Packet& p) {
         const int tid = devourer::sta::is_qos_data(fc0)
                             ? (d[qoff] & 0x0f)
                             : devourer::sta::CcmpReplay::kNonQosTid;
-        if (g_ccmp_replay.accept(pn, tid))
+        if (sender->rx_replay.accept(pn, tid))
           handle_plain(sta, pt.data(), (int)ptlen);      // decrypted -> ARP/ICMP
         else
           g_replayed.fetch_add(1);
@@ -548,6 +598,14 @@ static void on_rx(const Packet& p) {
       g_enc_rx.fetch_add(1);
       return;
     }
+    /* RELEASE BEFORE FALLING THROUGH. A protected frame from a station we
+     * hold no key for skips the block above with the lock still held, and the
+     * EAPOL path below takes g_hs_mu itself. std::mutex is not recursive, so
+     * keeping it here self-deadlocks on any ciphertext whose first eight
+     * bytes happen to look like an EAPOL LLC/SNAP header. Unlikely, reachable,
+     * and introduced by the Phase 2b.2 rewiring - caught in self-review
+     * because the on-air gate could not run. */
+    if (dl.owns_lock()) dl.unlock();
     if ((int)mlen < hlen + 8) return;
     const uint8_t* llc = p.Data.data() + hlen;
     if (!(llc[0]==0xaa && llc[6]==0x88 && llc[7]==0x8e)) return;  // EAPOL
@@ -557,10 +615,14 @@ static void on_rx(const Packet& p) {
     if ((ki & 0x0008) && (ki & 0x0100) && !(ki & 0x0040) && !(ki & 0x0200)) {
       // msg2: pairwise + MIC, no install/secure -> SNonce + MIC
       std::lock_guard<std::mutex> l(g_hs_mu);
-      if (g_state != HS_WAIT_MSG2) return;   // a duplicate msg2 must not re-run this
-      memcpy(g_snonce, e+17, 32);
-      compute_ptk();
-      if (!check_mic(e, elen)) { fprintf(stderr, "  WPA2: msg2 MIC FAIL\n"); return; }
+      devourer::sta::Station* st = g_stas.find(sta);
+      // Not associated, or not waiting on msg2: a duplicate msg2 must not
+      // re-run this, and an EAPOL frame from a station with no record is not
+      // a handshake at all.
+      if (!st || st->state != devourer::sta::HsState::WaitMsg2) return;
+      memcpy(st->snonce, e+17, 32);
+      compute_ptk(*st);
+      if (!check_mic(e, elen, *st)) { fprintf(stderr, "  WPA2: msg2 MIC FAIL\n"); return; }
       fprintf(stderr, "  WPA2: msg2 OK (SNonce, MIC verified) — PTK derived\n");
       // The PN space belongs to the KEY, so the replay window resets where a
       // new PTK is derived - here - and nowhere else. It used to reset on
@@ -569,12 +631,15 @@ static void on_rx(const Packet& p) {
       // resets mid-session, and every captured data frame becomes admissible
       // again. That defeats the control entirely. A legitimate msg4
       // retransmission did the same thing by accident.
-      g_ccmp_replay.reset();
-      send_msg3(true);
+      st->rx_replay.reset();
+      st->tx_pn = 1;          // a new key is a new PN space, both directions
+      send_msg3(*st, true);
     } else if ((ki & 0x0100) && (ki & 0x0200)) {        // msg4: MIC + secure
       std::lock_guard<std::mutex> l(g_hs_mu);
-      if (g_state == HS_WAIT_MSG4 && check_mic(e, elen)) {
-        g_state = HS_DONE;
+      devourer::sta::Station* st = g_stas.find(sta);
+      if (st && st->state == devourer::sta::HsState::WaitMsg4 &&
+          check_mic(e, elen, *st)) {
+        st->state = devourer::sta::HsState::Done;
         fprintf(stderr, "  WPA2: msg4 OK — 4-WAY HANDSHAKE COMPLETE (station keyed)\n");
       }
     }
@@ -589,6 +654,10 @@ int main(int argc, char** argv) {
     append_ies(pr, true);
     if (!tim_wiring_ok(b, pr)) return 1;
   }
+  /* One GTK for the BSS, before the radio comes up. Generating it inside the
+   * four-way - which is what this harness did until Phase 2b.2 - hands the
+   * second station a fresh group key and revokes the first station's. */
+  RAND_bytes(g_gtk, 16);
   if (const char* c = std::getenv("DEVOURER_CHANNEL")) g_chan = (uint8_t)atoi(c);
   if (const char* k = std::getenv("DEVOURER_WPA2_PSK")) g_psk = k;
   if (const char* p = std::getenv("DEVOURER_CCMP_PROFILE"))
@@ -625,7 +694,17 @@ int main(int argc, char** argv) {
     for (auto& f : batch) if (g_dev->send_packet(f.data(), f.size())) g_sent.fetch_add(1);
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
-  fprintf(stderr, "sent=%llu 4way_state=%d\n", (unsigned long long)g_sent.load(), g_state);
+  {
+    std::lock_guard<std::mutex> l(g_hs_mu);
+    fprintf(stderr, "sent=%llu stations=%d", (unsigned long long)g_sent.load(),
+            g_stas.count());
+    for (int i = 0; i < g_stas.capacity(); i++)
+      if (devourer::sta::Station* st = g_stas.at(i))
+        fprintf(stderr, " [aid=%u %02x:%02x:%02x:%02x:%02x:%02x 4way_state=%d]",
+                st->aid, st->addr[0],st->addr[1],st->addr[2],
+                st->addr[3],st->addr[4],st->addr[5], (int)st->state);
+    fprintf(stderr, "\n");
+  }
   if (g_ccmp_profile) {
     fprintf(stderr,
             "{\"ev\":\"ccmp.profile\",\"path\":\"software\","
