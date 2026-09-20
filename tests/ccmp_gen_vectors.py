@@ -106,9 +106,23 @@ def ccmp_aad(hdr):
     return aad
 
 
-def ccmp_nonce(a2, pn):
-    return bytes([0]) + bytes(a2) + bytes((pn >> (8 * (5 - i))) & 0xFF
-                                          for i in range(6))
+def ccmp_nonce(hdr, a2, pn):
+    """802.11-2016 12.5.3.3.4: Nonce Flags | A2 | PN(6, big-endian).
+
+    The flags octet is Priority (b0..b3) | Management (b4) - NOT zero. This
+    function returned bytes([0]) until 2026-09-20, the same misreading as
+    src/sta/Ccmp.h, which is why these vectors were green against the defect:
+    independence of implementation (python-cryptography vs OpenSSL) is not
+    independence of interpretation.
+    """
+    four_addr = (hdr[1] & 0x03) == 0x03
+    flags = 0
+    if is_qos(hdr[0]):
+        flags = hdr[30 if four_addr else 24] & 0x0F
+    if (hdr[0] & 0x0C) == 0x00:          # type 0 = management
+        flags |= 0x10
+    return bytes([flags]) + bytes(a2) + bytes((pn >> (8 * (5 - i))) & 0xFF
+                                              for i in range(6))
 
 
 def ccmp_hdr(pn, key_id):
@@ -212,7 +226,7 @@ for label, tk, a2, pn, kid, hdr, plain in CASES:
     hl = hdr_len_of(hdr)
     assert len(hdr) == hl, (label, len(hdr), hl)
     aad = ccmp_aad(hdr)
-    nonce = ccmp_nonce(a2, pn)
+    nonce = ccmp_nonce(hdr, a2, pn)
     blob = AESCCM(tk, tag_length=8).encrypt(nonce, plain, aad)
     prot = bytearray(hdr)
     prot[1] |= 0x40

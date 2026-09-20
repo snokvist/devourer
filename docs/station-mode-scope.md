@@ -353,7 +353,34 @@ simple, unfragmented, non-aggregated MSDU:
 
 Each needs an implementation or an explicit, documented refusal.
 
-### A CCMP defect this design would inherit
+### A CCMP defect this design would have inherited — FIXED 2026-09-20
+
+**Fixed as Phase 2b.1.** `ccmp_nonce()` now takes the header, exactly as
+`ccmp_aad()` does, and derives the Flags octet from it: Priority (the QoS TID)
+in b0..b3, Management in b4. Both call sites fail closed on a header too short
+for what its frame control claims. `tests/ccmp_gen_vectors.py` carried the
+identical misreading and was fixed with it.
+
+**Evidence, and its limit.** Regenerating the vectors changed **only** the two
+QoS vectors (`qos_tid5`, `four_addr_qos`) — every non-QoS vector is
+byte-identical, so the change is confined to the frames the defect touched.
+Reintroducing `nonce[0] = 0` as a mutation fails eight checks: four vector
+cells and four direct assertions in the new `test_nonce_flags()`. The
+round-trip cell passes under the mutation, which is the point — encrypt and
+decrypt share the wrong nonce, so a round trip is structurally blind to this.
+
+**What is NOT proven: interop.** The fix is verified by construction and by
+mutation, not against another implementation. The honest reason is worth
+recording, because it is also why the defect survived: **this AP advertises
+neither WMM nor HT** (no WMM IE anywhere in `tests/ap_responder.cpp` or
+`tests/ap_wpa2.cpp`, and `kEidHtCaps` is defined in `src/sta/Dot11.h:72` but
+never used), so a conforming station associates non-QoS and never sends a QoS
+frame. The one test that could have caught this independently cannot run
+against this AP at all. Until WMM is advertised, the Annex J vectors are the
+only available independent check, and an on-air cell with a station sending
+TID 1..7 is the gate that should be attached to the WMM work.
+
+### The defect, as originally recorded
 
 Found by the protocol review, pre-existing and **not** introduced by this
 decision, but load-bearing for it:

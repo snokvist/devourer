@@ -588,7 +588,7 @@ after it; nothing in Phase 3 depends on it.
 
 | # | Item | Gate |
 |---|---|---|
-| 2b.1 | Fix the CCMP nonce flags octet; re-source vectors from IEEE Annex J | A ctest cell that FAILS against the current `nonce[0] = 0` and passes after. Vectors must not come from `ccmp_gen_vectors.py` — that file shares the misreading |
+| 2b.1 | ~~Fix the CCMP nonce flags octet~~ **DONE 2026-09-20** | Gate met: mutation reintroducing `nonce[0] = 0` fails 8 checks (4 vector cells + 4 direct assertions in `test_nonce_flags()`); regeneration changed only the two QoS vectors. **Not met:** vectors still come from `ccmp_gen_vectors.py` (fixed in the same pass, so they are a regression gate, not an independent one), and interop is unproven because this AP advertises neither WMM nor HT, so no station sends it QoS. Annex J, and an on-air TID 1..7 cell, ride with the WMM work |
 | 2b.2 | Per-station table in `src/sta/` (assoc state, AID, PTK, TX PN, per-station `CcmpReplay`) | ctest, pure and backend-agnostic; a two-station fixture the old single-`g_sta` code cannot satisfy |
 | 2b.3 | Pass the real SA; read addr3 | ctest on the frame builders; a relayed header byte-compared against Table 9-26 |
 | 2b.4 | Real DHCP address pool + binding table | Two stations lease two distinct addresses on air |

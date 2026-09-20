@@ -105,15 +105,49 @@ inline size_t ccmp_aad(const uint8_t* hdr, size_t hdr_len, uint8_t* aad) {
   return n;
 }
 
-/* CCM nonce: flag octet 0, then A2, then the 48-bit PN BIG-endian
+/* CCM nonce: the Nonce Flags octet, then A2, then the 48-bit PN BIG-endian
  * (802.11-2016 12.5.3.3.4). Big-endian here and little-endian in the CCMP
  * header below — they genuinely differ, and reusing one for the other is the
- * classic way to produce a frame only your own implementation can read. */
-inline void ccmp_nonce(const uint8_t a2[6], uint64_t pn, uint8_t* nonce) {
-  nonce[0] = 0;
+ * classic way to produce a frame only your own implementation can read.
+ *
+ * THE FLAGS OCTET IS NOT ZERO. It is Priority (b0..b3) | Management (b4),
+ * where Priority is the QoS TID for a QoS data frame and 0 otherwise. Linux
+ * builds the same byte as `qos_tid | (ieee80211_is_mgmt(fc) << 4)`
+ * (net/mac80211/wpa.c).
+ *
+ * This function hardcoded `nonce[0] = 0` until 2026-09-20, and so did the
+ * vector generator in tests/ccmp_gen_vectors.py, so the KATs were
+ * self-consistent with the defect and could never catch it. It survived
+ * because the AP airs non-QoS data and ordinary client traffic is TID 0, for
+ * which zero is coincidentally correct — it broke exactly on TID 1..7, the
+ * video and voice access categories. Phase 1 had already fixed the *AAD* half
+ * of this same bug (the TID reaches the AAD, see ccmp_aad above); the nonce
+ * half was missed.
+ *
+ * Takes the header rather than a priority argument on purpose: ccmp_aad
+ * derives the same facts from the same bytes, and a caller that had to pass
+ * the TID separately is a caller that can pass a different one to each.
+ *
+ * Returns false if `hdr_len` is too short for what the frame control claims,
+ * matching ccmp_aad's zero return. */
+inline bool ccmp_nonce(const uint8_t* hdr, size_t hdr_len,
+                       const uint8_t a2[6], uint64_t pn, uint8_t* nonce) {
+  const bool four_addr =
+      (hdr[1] & (kFcToDs | kFcFromDs)) == (kFcToDs | kFcFromDs);
+  const bool qos = is_qos_data(hdr[0]);
+  const bool mgmt = (hdr[0] & 0x0c) == 0x00; /* type 0 = management */
+  const size_t need = 24 + (four_addr ? 6 : 0) + (qos ? 2 : 0);
+  uint8_t flags = 0;
+
+  if (hdr_len < need) return false;
+  if (qos) flags = (uint8_t)(hdr[four_addr ? 30 : 24] & 0x0f);
+  if (mgmt) flags |= 0x10;
+
+  nonce[0] = flags;
   std::memcpy(nonce + 1, a2, 6);
   for (int i = 0; i < 6; i++)
     nonce[7 + i] = (uint8_t)((pn >> (8 * (5 - i))) & 0xff);
+  return true;
 }
 
 /* The 8-byte CCMP header: PN0, PN1, a reserved byte, then the key-id octet
@@ -169,7 +203,7 @@ inline size_t ccmp_encrypt(CryptoOps& crypto, const uint8_t tk[16],
   if (out_cap < ccmp_encrypted_len(hdr_len, plain_len)) return 0;
   aad_len = ccmp_aad(hdr, hdr_len, aad);
   if (aad_len == 0) return 0;
-  ccmp_nonce(a2, pn, nonce);
+  if (!ccmp_nonce(hdr, hdr_len, a2, pn, nonce)) return 0;
   std::memcpy(out, hdr, hdr_len);
   out[1] |= 0x40; /* Protected, in the frame we actually air */
   ccmp_header(pn, key_id, out + hdr_len);
@@ -211,7 +245,7 @@ inline bool ccmp_decrypt(CryptoOps& crypto, const uint8_t tk[16],
   pn = ccmp_header_pn(mpdu + hdr_len);
   aad_len = ccmp_aad(mpdu, hdr_len, aad);
   if (aad_len == 0) return false;
-  ccmp_nonce(a2, pn, nonce);
+  if (!ccmp_nonce(mpdu, hdr_len, a2, pn, nonce)) return false;
   std::memcpy(tag, mpdu + hdr_len + kCcmpHdrLen + body, kCcmpMicLen);
   if (!crypto.aes_ccm(false, tk, nonce, aad, aad_len,
                       mpdu + hdr_len + kCcmpHdrLen, body, out, tag))

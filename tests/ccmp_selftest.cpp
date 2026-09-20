@@ -198,6 +198,74 @@ void test_qos_aad() {
         "a QoS header declared as 24 bytes is refused");
 }
 
+/* The nonce's Flags octet, asserted DIRECTLY rather than through a vector.
+ *
+ * This test exists because the vectors could not catch the bug it guards.
+ * ccmp_nonce() hardcoded `nonce[0] = 0` and so did the generator in
+ * tests/ccmp_gen_vectors.py, so every vector was self-consistent with the
+ * defect - and test_qos_aad above checked that the TID reached the AAD while
+ * nothing ever looked at the nonce. Independence of implementation
+ * (python-cryptography vs OpenSSL) was not independence of interpretation.
+ *
+ * 802.11-2016 12.5.3.3.4: Flags = Priority (b0..b3) | Management (b4).
+ * Priority is the QoS TID for a QoS data frame, 0 otherwise. Linux builds the
+ * identical byte as `qos_tid | (ieee80211_is_mgmt(fc) << 4)`
+ * (net/mac80211/wpa.c) - that is the independent reading this pins against,
+ * and the real interop proof is an on-air cell with a station sending TID
+ * 1..7, because a round trip against ourselves cannot see this at all. */
+void test_nonce_flags() {
+  const uint8_t a2[6] = {0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0x01};
+  uint8_t nonce[devourer::sta::kCcmpNonceLen];
+  uint8_t hdr[32];
+
+  std::memset(hdr, 0, sizeof hdr);
+
+  /* Non-QoS data, to-DS: priority 0, not management. */
+  hdr[0] = 0x08; hdr[1] = 0x01;
+  check(devourer::sta::ccmp_nonce(hdr, 24, a2, 1, nonce),
+        "a 24-byte non-QoS header is accepted");
+  check(nonce[0] == 0x00, "non-QoS data has a zero Flags octet");
+  check(std::memcmp(nonce + 1, a2, 6) == 0, "the nonce carries A2");
+  check(nonce[7] == 0 && nonce[12] == 1, "the nonce PN is big-endian");
+
+  /* QoS data, TID 5 - the case the old code got wrong and the reason this
+   * matters: TID 5 is the video access category. */
+  hdr[0] = 0x88; hdr[1] = 0x01; hdr[24] = 0x05;
+  check(devourer::sta::ccmp_nonce(hdr, 26, a2, 1, nonce),
+        "a 26-byte QoS header is accepted");
+  check(nonce[0] == 0x05, "QoS TID 5 puts 5 in the Flags octet");
+
+  /* The ack-policy / EOSP / A-MSDU bits in the QoS Control must be masked
+   * out, exactly as the AAD masks them. */
+  hdr[24] = 0xf5;
+  devourer::sta::ccmp_nonce(hdr, 26, a2, 1, nonce);
+  check(nonce[0] == 0x05, "only the TID's low nibble reaches the Flags octet");
+
+  /* Four-address QoS: the QoS Control moves to offset 30. Reading it at 24
+   * would take an address byte as the TID. */
+  std::memset(hdr, 0, sizeof hdr);
+  hdr[0] = 0x88; hdr[1] = 0x03; hdr[30] = 0x07;
+  check(devourer::sta::ccmp_nonce(hdr, 32, a2, 1, nonce),
+        "a 32-byte four-address QoS header is accepted");
+  check(nonce[0] == 0x07, "four-address QoS reads its TID at offset 30");
+
+  /* Management: bit 4 set, priority 0. */
+  std::memset(hdr, 0, sizeof hdr);
+  hdr[0] = 0xd0; /* type 0 (management), subtype 13 (action) */
+  check(devourer::sta::ccmp_nonce(hdr, 24, a2, 1, nonce),
+        "a management header is accepted");
+  check(nonce[0] == 0x10, "management sets bit 4 of the Flags octet");
+
+  /* Fails CLOSED on a header too short for what the frame control claims,
+   * matching ccmp_aad's zero return rather than reading past the buffer. */
+  hdr[0] = 0x88; hdr[1] = 0x01;
+  check(!devourer::sta::ccmp_nonce(hdr, 24, a2, 1, nonce),
+        "a QoS header declared as 24 bytes is refused");
+  hdr[1] = 0x03;
+  check(!devourer::sta::ccmp_nonce(hdr, 30, a2, 1, nonce),
+        "a four-address QoS header declared as 30 bytes is refused");
+}
+
 /* A 4-address frame's AAD includes A4. Nothing in the tree builds one yet,
  * which is why the branch needs a vector - it would otherwise be dead code
  * that nobody would notice was broken. */
@@ -415,6 +483,7 @@ int main() {
   test_short_output_refused();
   test_mic_rejected();
   test_qos_aad();
+  test_nonce_flags();
   test_four_address_aad();
   test_aad_masking();
   test_header_pn();
