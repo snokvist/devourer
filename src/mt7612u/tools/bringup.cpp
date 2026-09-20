@@ -2335,13 +2335,36 @@ static int gate_txs(uint8_t chan, int frames, const char *peer_str)
 	static struct ucast_ack_count ctr;
 	int rx_on;
 
+	/*
+	 * Arms e-h attack what is left of the open question.
+	 *
+	 * The receiver-OFF No-Ack arm (c) settles at 0.0 retries and 100%
+	 * success and STILL costs ~20 ms a frame, so whatever that cost is, it
+	 * is not the retry engine (docs/mt7612u-tx-retry.md). The candidates
+	 * that can be separated with a register write and a txwi bit are: the
+	 * no-station WCID index, the transmit queue the frame is filed into,
+	 * and aggregation. Each gets an arm against the same reference.
+	 *
+	 * `wcid` 1 means a real station-table entry installed with
+	 * mt_wcid_setup() - the plumbing exists and tools/bringup.cpp's rate-LUT
+	 * gate is its only caller anywhere; no library path installs a station.
+	 * The published bisect measured wcid=1 as WORSE than 0xff against a dead
+	 * peer, which is itself unexplained, so this is a re-measurement under
+	 * known-good accounting rather than a repeat.
+	 */
 	static const struct {
-		char tag; int own_sa; int bcast_a1; int no_ack; const char *what;
+		char tag; int own_sa; int bcast_a1; int no_ack;
+		uint8_t wcid; unsigned opts; const char *what;
 	} arms[] = {
-		{ 'a', 0, 1, 1, "broadcast,       No Ack" },
-		{ 'b', 0, 0, 0, "ucast peer,      Normal" },
-		{ 'c', 0, 0, 1, "ucast peer,      No Ack" },
-		{ 'd', 1, 0, 0, "ucast peer ownSA Normal" },
+		{ 'a', 0, 1, 1, 0xff, 0, "broadcast,       No Ack" },
+		{ 'b', 0, 0, 0, 0xff, 0, "ucast peer,      Normal" },
+		{ 'c', 0, 0, 1, 0xff, 0, "ucast peer,      No Ack" },
+		{ 'd', 1, 0, 0, 0xff, 0, "ucast peer ownSA Normal" },
+		{ 'e', 1, 0, 1, 0x01, 0, "ucast peer ownSA NoAck wcid1" },
+		{ 'f', 1, 0, 1, 0xff, MT_TXOPT_QSEL_MGMT, "ucast NoAck QSEL_MGMT" },
+		{ 'g', 1, 0, 1, 0xff, MT_TXOPT_AMPDU | MT_TXOPT_QSEL_MGMT,
+		  "ucast NoAck AMPDU+MGMT" },
+		{ 'h', 0, 1, 1, 0x01, 0, "broadcast, wcid1 control" },
 	};
 
 	if (frames <= 0) {
@@ -2387,8 +2410,13 @@ static int gate_txs(uint8_t chan, int frames, const char *peer_str)
 			mt7612u_set_monitor_rx(&dev, 0);
 		}
 
+		/* A WCID entry has to exist before an arm can select it; without
+		 * this, wcid 1 names an empty slot and the arm measures nothing
+		 * it claims to. */
+		mt_wcid_setup(&dev, 1, peer);
+
 		printf("\n  MAC receiver %s\n", rx_on ? "ON" : "OFF");
-		printf("  arm  %-24s %7s %9s %8s %9s %6s\n", "configuration",
+		printf("  arm  %-28s %7s %9s %8s %9s %6s\n", "configuration",
 		       "fps", "entr/sent", "success", "mean rtry", "max");
 
 		for (a = 0; a < sizeof arms / sizeof arms[0]; a++) {
@@ -2422,8 +2450,9 @@ static int gate_txs(uint8_t chan, int frames, const char *peer_str)
 			while (n < frames && !g_stop) {
 				frame[22] = (uint8_t)((n & 0xf) << 4);
 				frame[23] = (uint8_t)(n >> 4);
-				if (mt_tx_raw(&dev, frame, flen, &rate, 0xff,
-				              MT_TXOPT_TXS) == 0)
+				if (mt_tx_raw(&dev, frame, flen, &rate,
+				              arms[a].wcid,
+				              MT_TXOPT_TXS | arms[a].opts) == 0)
 					n++;
 				txs_drain(&dev, &sum);
 			}
@@ -2456,7 +2485,7 @@ static int gate_txs(uint8_t chan, int frames, const char *peer_str)
 			 * is NOT the steady-state figure gate_ucast reports -
 			 * `frames` is small by design and the ring absorbs most
 			 * of it. The retry columns are the point of this gate. */
-			printf("  %c    %-24s %7.0f %4ld/%-4ld %8ld %9.1f %6ld%s\n",
+			printf("  %c    %-28s %7.0f %4ld/%-4ld %8ld %9.1f %6ld%s\n",
 			       arms[a].tag, arms[a].what, n * 1000.0 / wall,
 			       sum.entries, n, sum.success,
 			       sum.entries ? (double)sum.retry_total / sum.entries : 0.0,

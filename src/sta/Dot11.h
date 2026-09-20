@@ -140,20 +140,38 @@ private:
 
 /* ---- information elements --------------------------------------------- */
 
-inline void append_ie(std::vector<uint8_t>& m, uint8_t eid, const uint8_t* body,
+/* Returns false and emits NOTHING when the body will not fit an 8-bit length.
+ * The truncating form silently wrote a length shorter than the bytes that
+ * followed it, which corrupts every element after it in the frame - a
+ * whole-frame corruption with no local symptom. */
+inline bool append_ie(std::vector<uint8_t>& m, uint8_t eid, const uint8_t* body,
                       size_t len) {
+  if (len > 255) return false;
   m.push_back(eid);
   m.push_back((uint8_t)len);
   m.insert(m.end(), body, body + len);
+  return true;
 }
 
-inline void append_ssid(std::vector<uint8_t>& m, const std::string& ssid) {
-  append_ie(m, kEidSsid, (const uint8_t*)ssid.data(), ssid.size());
+/* An SSID is at most 32 octets (802.11-2016 9.4.2.2). Longer is a caller bug,
+ * refused here rather than aired as a corrupt element. */
+inline bool append_ssid(std::vector<uint8_t>& m, const std::string& ssid) {
+  if (ssid.size() > 32) return false;
+  return append_ie(m, kEidSsid, (const uint8_t*)ssid.data(), ssid.size());
 }
 
-/* The basic-rate set both harnesses air, byte for byte: 1/2/5.5/11 CCK marked
- * basic, then 9/12/18/24/36/48/54 OFDM. Kept as one function so the AP and a
- * station advertise the same thing and a mismatch cannot appear between them. */
+/* The 2.4 GHz rate set both AP harnesses air, byte for byte: 1/2/5.5/11 CCK
+ * marked BASIC, then 18/24/36/54 OFDM non-basic. Kept as one function so the
+ * AP and a station advertise the same thing and a mismatch cannot appear
+ * between them.
+ *
+ * Note what is NOT here: 6, 9, 12 and 48 Mbps. For an AP's advertised basic
+ * set that is a deliberate, on-air-validated choice inherited unchanged. For a
+ * STATION's probe and association request it is questionable - a station that
+ * omits 6/12/24 is claiming it cannot do the mandatory OFDM rates. Left as-is
+ * because Phase 1's contract is zero behaviour change for the AP; a station
+ * that needs a fuller set should get its own builder rather than widening this
+ * one underneath a validated AP. */
 inline void append_supported_rates(std::vector<uint8_t>& m) {
   static const uint8_t r[] = {0x82, 0x84, 0x8b, 0x96, 0x24, 0x30, 0x48, 0x6c};
   append_ie(m, kEidSupportedRates, r, sizeof r);
@@ -225,6 +243,13 @@ struct BssInfo {
   bool privacy = false;    /* capability bit 4 */
   bool has_rsn = false;
   bool rsn_ccmp_psk = false; /* the only suite this project speaks */
+  /* RSN Capabilities bit 6 (MFPR). A BSS that REQUIRES management-frame
+   * protection will refuse an association from a station that does not
+   * implement 802.11w - which this project does not. Surfaced so a scan can
+   * skip it, rather than associating and failing the handshake with no
+   * diagnostic. */
+  bool rsn_mfp_required = false;
+  uint16_t rsn_capabilities = 0;
 };
 
 /* A beacon/probe-response body is a 12-byte fixed part (timestamp, beacon
@@ -236,6 +261,11 @@ inline bool parse_beacon(const uint8_t* frame, size_t len, BssInfo* out) {
   size_t body_len, ie_len;
 
   if (!frame || !out || len < fixed) return false;
+  /* A scan loop reuses one BssInfo across beacons. Without this, a frame that
+   * omits the SSID, DS Parameter Set or RSN element leaves the PREVIOUS BSS's
+   * values in place and the caller reads them as this BSS's - including when a
+   * hostile frame truncates an element so find_ie declines it. */
+  *out = BssInfo{};
   std::memcpy(out->bssid, frame + 16, 6); /* addr3 */
   out->beacon_interval_tu = get_le16(frame + 24 + 8);
   out->capability = get_le16(frame + 24 + 10);
@@ -256,8 +286,14 @@ inline bool parse_beacon(const uint8_t* frame, size_t len, BssInfo* out) {
     static const uint8_t want[] = {0x01, 0x00, 0x00, 0x0f, 0xac, 0x04,
                                    0x01, 0x00, 0x00, 0x0f, 0xac, 0x04,
                                    0x01, 0x00, 0x00, 0x0f, 0xac, 0x02};
+    /* >= 20, not >= 18: the RSN Capabilities field is what carries MFPR, and
+     * an element that stops before it cannot be judged safe to join. */
     out->rsn_ccmp_psk =
-        ie_len >= sizeof want && std::memcmp(p, want, sizeof want) == 0;
+        ie_len >= sizeof want + 2 && std::memcmp(p, want, sizeof want) == 0;
+    if (ie_len >= sizeof want + 2) {
+      out->rsn_capabilities = get_le16(p + sizeof want);
+      out->rsn_mfp_required = (out->rsn_capabilities & 0x0040) != 0;
+    }
   }
   return true;
 }
@@ -403,13 +439,25 @@ inline std::vector<uint8_t> data_hdr_from_ds(const uint8_t sta[6],
   return m;
 }
 
-/* A QoS data frame carries two extra bytes after the 24-byte header, so every
- * offset into its body shifts. Getting this wrong reads the LLC header two
- * bytes early and silently drops every QoS frame. */
+/* True for EVERY QoS data subtype, not just QoS Data itself.
+ *
+ * Data frames are type 2 (fc0 bits 3:2 == 10) and the QoS subtypes are those
+ * with bit 7 set - QoS Data, QoS Null, QoS Data+CF-Ack and the rest. An exact
+ * `fc0 == 0x88` test misses QoS Null (0xc8), which a real station sends, and
+ * then reads its body two bytes early. */
+inline bool is_qos_data(uint8_t fc0) { return (fc0 & 0x8c) == 0x88; }
+
+/* Bytes before the frame body: 24 base, +2 for the QoS Control field, +6 for a
+ * 4-address frame, +4 for HT Control when the Order bit is set
+ * (802.11-2016 9.2.4.1.10). Getting this wrong reads the LLC header at the
+ * wrong offset and silently drops the frame. */
 inline size_t data_hdr_len(uint8_t fc0, uint8_t fc1) {
   size_t n = 24;
-  if (fc0 == kFcQosData) n += 2;
+  if (is_qos_data(fc0)) n += 2;
   if ((fc1 & (kFcToDs | kFcFromDs)) == (kFcToDs | kFcFromDs)) n += 6; /* 4-addr */
+  /* HT Control rides only QoS data frames; the Order bit means something else
+   * on a non-QoS frame and must not add four bytes there. */
+  if (is_qos_data(fc0) && (fc1 & 0x80)) n += 4;
   return n;
 }
 

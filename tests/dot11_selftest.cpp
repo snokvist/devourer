@@ -108,6 +108,47 @@ void test_ie_walk() {
 
 /* The RSN element's exact bytes matter in both directions: an AP advertises
  * them and a station echoes them back. */
+/* Golden bytes. The rate sets and the RSN element are what two on-air
+ * validated AP harnesses emit; the refactor's whole claim is that these bytes
+ * did not change, and until now that rested on review rather than a test. */
+void test_golden_bytes() {
+  static const uint8_t k24[] = {0x01, 0x08, 0x82, 0x84, 0x8b,
+                                0x96, 0x24, 0x30, 0x48, 0x6c};
+  static const uint8_t k5[] = {0x01, 0x08, 0x8c, 0x12, 0x98,
+                               0x24, 0xb0, 0x48, 0x60, 0x6c};
+  static const uint8_t kSsidIe[] = {0x00, 0x0a, 'd', 'e', 'v', 'o',
+                                    'u', 'r', 'e', 'r', 'A', 'P'};
+  static const uint8_t kDs[] = {0x03, 0x01, 0x24};
+  std::vector<uint8_t> m;
+
+  append_supported_rates(m);
+  check(m.size() == sizeof k24 && std::memcmp(m.data(), k24, sizeof k24) == 0,
+        "2.4 GHz Supported Rates bytes are unchanged");
+  m.clear();
+  append_supported_rates_5g(m);
+  check(m.size() == sizeof k5 && std::memcmp(m.data(), k5, sizeof k5) == 0,
+        "5 GHz Supported Rates bytes are unchanged");
+  m.clear();
+  check(append_ssid(m, "devourerAP"), "the SSID element builds");
+  check(m.size() == sizeof kSsidIe &&
+            std::memcmp(m.data(), kSsidIe, sizeof kSsidIe) == 0,
+        "SSID element bytes are unchanged");
+  m.clear();
+  append_ds_params(m, 36);
+  check(m.size() == sizeof kDs && std::memcmp(m.data(), kDs, sizeof kDs) == 0,
+        "DS Parameter Set bytes are unchanged");
+
+  /* Over-length bodies must be refused, not truncated into a corrupt frame. */
+  m.clear();
+  check(!append_ssid(m, std::string(33, 'x')), "a 33-byte SSID is refused");
+  check(m.empty(), "a refused element emits nothing at all");
+  m.clear();
+  std::vector<uint8_t> big(256, 0);
+  check(!append_ie(m, kEidSsid, big.data(), big.size()),
+        "an IE body over 255 bytes is refused");
+  check(m.empty(), "a refused IE emits nothing at all");
+}
+
 void test_rsn() {
   std::vector<uint8_t> m;
   size_t len = 0;
@@ -121,12 +162,23 @@ void test_rsn() {
         "group cipher is CCMP");
   check(p[10] == 0xac && p[11] == 0x04, "pairwise cipher is CCMP");
   check(p[16] == 0xac && p[17] == 0x02, "AKM is PSK");
+  /* The COUNT fields. A swapped count makes parse_beacon reject real APs, and
+   * a build/parse round-trip would not notice because both sides share it. */
+  check(p[6] == 0x01 && p[7] == 0x00, "exactly one pairwise cipher suite");
+  check(p[12] == 0x01 && p[13] == 0x00, "exactly one AKM suite");
+  check(p[8] == 0x00 && p[9] == 0x0f, "pairwise suite OUI 00-0F-AC");
+  check(p[14] == 0x00 && p[15] == 0x0f, "AKM suite OUI 00-0F-AC");
+  check(p[18] == 0x00 && p[19] == 0x00, "RSN capabilities are zero (no MFP)");
 }
 
 /* Build a beacon the way an AP does, parse it the way a station will. */
 void test_beacon_roundtrip() {
+  // SA deliberately DIFFERENT from the BSSID. With both set to kBssid the
+  // "BSSID comes from addr3" assertion below passed even if the parser read
+  // addr2 - it pinned nothing, which the review caught.
+  static const uint8_t kOtherSa[6] = {0x06, 0x06, 0x06, 0x06, 0x06, 0x06};
   std::vector<uint8_t> m = mgmt_hdr(kFcBeacon, (const uint8_t*)"\xff\xff\xff\xff\xff\xff",
-                                    kBssid, kBssid);
+                                    kOtherSa, kBssid);
   for (int i = 0; i < 8; i++) m.push_back(0); /* timestamp */
   put_le16(m, 100);                            /* beacon interval */
   put_le16(m, 0x0011);                         /* ESS | Privacy */
@@ -138,6 +190,8 @@ void test_beacon_roundtrip() {
   BssInfo b;
   check(parse_beacon(m.data(), m.size(), &b), "a beacon parses");
   check(std::memcmp(b.bssid, kBssid, 6) == 0, "BSSID comes from addr3");
+  check(std::memcmp(b.bssid, kOtherSa, 6) != 0,
+        "BSSID is NOT addr2 (the test can tell them apart)");
   check(b.ssid == "devourerAP", "SSID round-trips");
   check(b.beacon_interval_tu == 100, "beacon interval round-trips");
   check(b.capability == 0x0011, "capability round-trips");
@@ -164,6 +218,39 @@ void test_beacon_roundtrip() {
   /* Too short to hold the fixed body. */
   BssInfo b3;
   check(!parse_beacon(m.data(), 30, &b3), "a truncated beacon is refused");
+
+  /* A REUSED BssInfo must not carry the previous BSS's fields. A scan loop
+   * does exactly this, and a frame missing the SSID/DS/RSN elements would
+   * otherwise report the last BSS's values as this one's. */
+  std::vector<uint8_t> bare = mgmt_hdr(kFcBeacon,
+                                       (const uint8_t*)"\xff\xff\xff\xff\xff\xff",
+                                       kOtherSa, kOwn);
+  for (int i = 0; i < 8; i++) bare.push_back(0);
+  put_le16(bare, 200);
+  put_le16(bare, 0x0001); /* ESS, no Privacy, and no IEs at all */
+  check(parse_beacon(bare.data(), bare.size(), &b), "a bare beacon parses");
+  check(b.ssid.empty(), "a reused BssInfo does not keep the old SSID");
+  check(b.channel == 0, "a reused BssInfo does not keep the old channel");
+  check(!b.has_rsn, "a reused BssInfo does not keep the old RSN flag");
+  check(!b.rsn_ccmp_psk, "a reused BssInfo does not keep the old RSN verdict");
+  check(!b.privacy, "a reused BssInfo does not keep the old Privacy bit");
+  check(b.beacon_interval_tu == 200, "the new beacon's own fields are set");
+
+  /* An RSN element that stops before the Capabilities field cannot be judged
+   * safe to join, and an MFP-required BSS must be surfaced rather than
+   * associated with and failed later. */
+  std::vector<uint8_t> mfp = m;
+  size_t ml = 0;
+  uint8_t* mr = const_cast<uint8_t*>(find_ie(mfp.data() + 36, mfp.size() - 36,
+                                             kEidRsn, &ml));
+  check(mr && ml == 20, "setup: RSN element found");
+  if (mr && ml == 20) {
+    mr[18] = 0x40; /* RSN Capabilities: MFPR */
+    BssInfo b4;
+    check(parse_beacon(mfp.data(), mfp.size(), &b4), "setup: parses");
+    check(b4.rsn_mfp_required,
+          "a BSS that REQUIRES management-frame protection is flagged");
+  }
 }
 
 void test_station_builders() {
@@ -249,6 +336,28 @@ void test_data_frames() {
   check(std::memcmp(down.data() + 10, kBssid, 6) == 0,
         "downlink addr2 is the BSSID");
 
+  /* The builders and the length function must not drift apart. */
+  check(up.size() == data_hdr_len(up[0], up[1]),
+        "data_hdr_to_ds's size matches data_hdr_len");
+  check(down.size() == data_hdr_len(down[0], down[1]),
+        "data_hdr_from_ds's size matches data_hdr_len");
+
+  /* Every QoS data subtype, not just QoS Data. A real station sends QoS Null
+   * (0xc8); an exact fc0 == 0x88 test reads its body two bytes early. */
+  check(is_qos_data(0x88), "QoS Data is QoS");
+  check(is_qos_data(0xc8), "QoS Null is QoS");
+  check(is_qos_data(0x98), "QoS Data+CF-Ack is QoS");
+  check(!is_qos_data(0x08), "plain Data is not QoS");
+  check(!is_qos_data(0x48), "Null (non-QoS) is not QoS");
+  check(!is_qos_data(0x80), "a Beacon is not QoS data");
+  check(data_hdr_len(0xc8, kFcToDs) == 26, "QoS Null carries the QoS field");
+  /* HT Control rides the Order bit on a QoS frame, and means something else
+   * on a non-QoS one. */
+  check(data_hdr_len(kFcQosData, kFcToDs | 0x80) == 30,
+        "QoS + Order adds the 4-byte HT Control field");
+  check(data_hdr_len(kFcData, kFcToDs | 0x80) == 24,
+        "Order on a non-QoS frame adds nothing");
+
   check(data_hdr_len(kFcData, kFcToDs) == 24, "a 3-address data header is 24");
   check(data_hdr_len(kFcQosData, kFcToDs) == 26, "QoS data adds 2 bytes");
   check(data_hdr_len(kFcData, kFcToDs | kFcFromDs) == 30,
@@ -269,6 +378,7 @@ int main() {
   test_mgmt_hdr();
   test_seq();
   test_ie_walk();
+  test_golden_bytes();
   test_rsn();
   test_beacon_roundtrip();
   test_station_builders();

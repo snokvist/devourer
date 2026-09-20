@@ -72,9 +72,18 @@ static std::mutex g_q_mu;
 static std::vector<std::vector<uint8_t>> g_q;
 
 // WPA2-PSK / CCMP RSN IE (group=CCMP, pairwise=CCMP, akm=PSK).
-static const uint8_t kRsn[] = {0x30, 0x14, 0x01,0x00,
-    0x00,0x0f,0xac,0x04, 0x01,0x00, 0x00,0x0f,0xac,0x04,
-    0x01,0x00, 0x00,0x0f,0xac,0x02, 0x00,0x00};
+// The RSN element, built once by src/sta/Dot11.h and reused for both the
+// beacon/probe advertisement and the msg3 key data. It used to be a literal
+// here AND a builder there; the bytes agreed, but nothing enforced that, and a
+// drift would only have shown up as a station refusing its own AP.
+static const std::vector<uint8_t>& rsn_ie() {
+  static const std::vector<uint8_t> ie = [] {
+    std::vector<uint8_t> v;
+    devourer::sta::append_rsn_ccmp_psk(v);
+    return v;
+  }();
+  return ie;
+}
 
 // Per-station 4-way state (single client for the demo).
 static uint8_t g_anonce[32], g_snonce[32], g_ptk[48], g_gtk[16];
@@ -127,7 +136,7 @@ static void append_ies(std::vector<uint8_t>& m, bool ssid) {
   if (g_chan <= 14) devourer::sta::append_supported_rates(m);
   else devourer::sta::append_supported_rates_5g(m);
   devourer::sta::append_ds_params(m, (uint8_t)g_chan);
-  m.insert(m.end(), kRsn, kRsn+sizeof(kRsn));           // RSN IE -> advertise WPA2
+  m.insert(m.end(), rsn_ie().begin(), rsn_ie().end());   // RSN IE -> advertise WPA2
 }
 
 // --- WPA2 crypto (openssl) --------------------------------------------------
@@ -218,7 +227,7 @@ static void send_msg1() {
 static void send_msg3() {
   RAND_bytes(g_gtk, 16);
   // key data = RSN IE + GTK KDE, padded to /8, then AES-wrapped with the KEK.
-  std::vector<uint8_t> kd(kRsn, kRsn+sizeof(kRsn));
+  std::vector<uint8_t> kd(rsn_ie().begin(), rsn_ie().end());
   uint8_t gtkkde[24] = {0xdd,0x16,0x00,0x0f,0xac,0x01,0x01,0x00};
   memcpy(gtkkde+8, g_gtk, 16);
   kd.insert(kd.end(), gtkkde, gtkkde+24);
@@ -281,6 +290,9 @@ static std::vector<uint8_t> ccmp_tx(const uint8_t* sta, uint16_t eth,
   size_t n = devourer::sta::ccmp_encrypt(g_crypto, g_ptk + 32, hdr.data(),
                                          kBssid, pn, 0, pt.data(), pt.size(),
                                          m.data());
+  // A zero return means the cipher refused. The old code ignored the result
+  // and aired a frame with an uninitialised MIC; emitting nothing is the
+  // honest failure, and the caller drops an empty vector.
   m.resize(n);
   return m;
 }
