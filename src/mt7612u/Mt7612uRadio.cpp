@@ -898,6 +898,32 @@ void Mt7612uRadio::ClearAckResponder() {
     mt7612u_clear_ack_responder(_dev);
 }
 
+/* Thin, like the rest of the control plane, and thin for a reason the HAL
+ * side documents: on this part a station identity is a check, not a
+ * configuration. See docs/mt7612u-station-identity.md and station.cpp.
+ *
+ * Note what this does NOT do about IRadio's ordering clause. The contract
+ * says call after the RX loop is running, because a backend may reprogram the
+ * receive filter there; MT7612U does (StartRxLoop rewrites it after
+ * mt7612u_start()). This implementation writes no filter and no identity, so
+ * it is order-independent in fact - but it cannot detect being called early
+ * either, and it must not pretend the ordering does not matter for the
+ * interface. A future revision that starts writing registers here has to
+ * revisit that. */
+bool Mt7612uRadio::SetStationIdentity(const devourer::MacAddr &own,
+                                      const devourer::MacAddr &bssid) {
+  std::lock_guard<std::recursive_mutex> lock(_mu);
+  if (!_dev)
+    return false;
+  return mt7612u_set_station_identity(_dev, own.data(), bssid.data()) == 0;
+}
+
+void Mt7612uRadio::ClearStationIdentity() {
+  std::lock_guard<std::recursive_mutex> lock(_mu);
+  if (_dev)
+    mt7612u_clear_station_identity(_dev);
+}
+
 /* The beacon plane. Thin on purpose: the sequence these wrap is the one the
  * bring-up harness's Stage A and Stage B gates run, device-verified on
  * 2026-09-08 - beacon on air on both bands, hardware TSF and sequence, and a
@@ -1119,6 +1145,35 @@ devourer::AdapterCaps Mt7612uRadio::GetAdapterCaps() {
   c.tsf_write_ok = hw.tsf_write;
   /* Measured on air: 0 frames at the stimulus radio unarmed, 3500+ armed. */
   c.ack_responder_ok = true;
+  /*
+   * station_mode_ok stays FALSE, and it is worth writing down exactly how
+   * close it is, because the remaining gap is one cell rather than a body of
+   * work. docs/mt7612u-station-identity.md has the measurements.
+   *
+   * MEASURED, on air, against hostapd on independent silicon:
+   *   - a station-configured MT7612U receives the AP's traffic, including
+   *     unicast addressed to its own address (3884 frames), and programming
+   *     the BSSID registers correctly, wrongly, or not at all changes none of
+   *     it;
+   *   - it auto-ACKs that unicast with nothing armed - 0.8% of the AP's
+   *     responses arrive retried, against 98.0% in the control arm where
+   *     MT_MAC_ADDR is retargeted away;
+   *   - `bringup staid` checks the seam's own contract on hardware, 9/9,
+   *     including that it REFUSES while an ACK responder holds the port
+   *     identity.
+   *
+   * And SetStationIdentity writes no register at all on this part, so the
+   * hardware state those numbers were taken in is byte-identical to the state
+   * a successful arm leaves behind. The evidence is therefore about the right
+   * configuration.
+   *
+   * NOT MEASURED: the other half of this flag's documented bar - that the AP
+   * ACKs what this station TRANSMITS. Nothing here has read the chip's own
+   * retry count for a station's uplink; `bringup txs` and MT_TX_STAT_FIFO are
+   * the instrument for it and that cell has not been run. Until it has, the
+   * flag reports what was established rather than what is expected.
+   */
+  c.station_mode_ok = false;
   /* Unmeasured, so false rather than optimistic - nothing here drives the
    * hardware retry counter. */
   c.tx_retry_limit_ok = false;

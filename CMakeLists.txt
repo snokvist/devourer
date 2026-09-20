@@ -387,6 +387,7 @@ if(DEVOURER_MT7612U)
         src/mt7612u/phy.cpp
         src/mt7612u/radiotap.cpp
         src/mt7612u/rx.cpp
+        src/mt7612u/station.cpp
         src/mt7612u/tx.cpp
         src/mt7612u/usb.cpp
         src/mt7612u/Mt7612uRadio.cpp src/mt7612u/Mt7612uRadio.h

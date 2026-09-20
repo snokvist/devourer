@@ -2771,6 +2771,88 @@ static int gate_staack(uint8_t chan, int secs, const char *bssid_str)
 	return 2;
 }
 
+/* -------------------------------------------------------------- gate_staid
+ *
+ * The SetStationIdentity contract, checked against real hardware. No AP and
+ * no peer: every property here is about what this MAC holds and what the
+ * function refuses, which is the whole of the job on this part.
+ *
+ * The case that matters is 5. mt7612u_set_ack_responder() retargets
+ * MT_MAC_ADDR, and gate_staack measured what that does to a station - 0.8%
+ * retried downlink frames becomes 98.0%. So a station identity armed while an
+ * ACK responder holds the port identity would be a station that cannot
+ * acknowledge anything, silently. It must be REFUSED, and this checks that it
+ * is, on the hardware, rather than trusting the branch to be right.
+ *
+ *   bringup staid
+ */
+static int gate_staid(void)
+{
+	static const uint8_t bssid[6]   = { 0x02, 0x42, 0x75, 0x05, 0xd6, 0xaa };
+	static const uint8_t foreign[6] = { 0x02, 0x00, 0x00, 0xac, 0x1d, 0x01 };
+	static const uint8_t mcast[6]   = { 0x01, 0x00, 0x5e, 0x00, 0x00, 0x01 };
+	uint8_t own[6], got[6];
+	int pass = 0, fail = 0;
+
+	if (mt_eeprom_init(&dev)) return 1;
+	if (mt_init_hardware(&dev, NULL)) return 1;
+
+	memcpy(own, dev.macaddr, 6);
+	printf("=== GATE STAID: the SetStationIdentity contract on hardware ===\n");
+	printf("own %02x:%02x:%02x:%02x:%02x:%02x   bssid %02x:%02x:%02x:%02x:%02x:%02x\n\n",
+	       own[0], own[1], own[2], own[3], own[4], own[5],
+	       bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
+
+#define CHK(cond, what) do {                                            \
+		if (cond) { pass++; printf("  ok    %s\n", what); }     \
+		else      { fail++; printf("  FAIL  %s\n", what); }     \
+	} while (0)
+
+	/* 1. the ordinary case */
+	CHK(mt7612u_set_station_identity(&dev, own, bssid) == 0,
+	    "arms with the factory address as own");
+	CHK(mt7612u_station_bssid(&dev, got) == 0 && memcmp(got, bssid, 6) == 0,
+	    "records the BSSID it was given");
+
+	/* 2. an address this MAC is not holding */
+	CHK(mt7612u_set_station_identity(&dev, foreign, bssid) != 0,
+	    "refuses an `own` that is not the port identity");
+
+	/* 3. malformed arguments */
+	CHK(mt7612u_set_station_identity(&dev, mcast, bssid) != 0,
+	    "refuses a multicast own");
+	CHK(mt7612u_set_station_identity(&dev, own, mcast) != 0,
+	    "refuses a multicast bssid");
+	CHK(mt7612u_set_station_identity(&dev, own, own) != 0,
+	    "refuses own == bssid");
+
+	/* 4. clear */
+	mt7612u_clear_station_identity(&dev);
+	CHK(mt7612u_station_bssid(&dev, got) != 0,
+	    "reports no BSSID once cleared");
+
+	/*
+	 * 5. THE ONE THAT MATTERS. Arm an ACK responder on a foreign address -
+	 * which moves MT_MAC_ADDR - and the station arm must refuse, because a
+	 * station whose port identity points elsewhere acknowledges nothing.
+	 */
+	if (mt7612u_set_ack_responder(&dev, foreign) == 0) {
+		CHK(mt7612u_set_station_identity(&dev, own, bssid) != 0,
+		    "REFUSES while an ACK responder holds the port identity");
+		mt7612u_clear_ack_responder(&dev);
+		CHK(mt7612u_set_station_identity(&dev, own, bssid) == 0,
+		    "arms again once the responder has given it back");
+	} else {
+		printf("  SKIP  could not arm an ACK responder - case 5 not run\n");
+		fail++;   /* the most important case did not run; do not pass. */
+	}
+	mt7612u_clear_station_identity(&dev);
+
+#undef CHK
+	printf("\nGATE STAID: %d passed, %d failed\n", pass, fail);
+	return fail ? 1 : 0;
+}
+
 static int gate_txs(uint8_t chan, int frames, const char *peer_str)
 {
 	static const uint8_t src[6]   = { 0x02, 0x4d, 0x54, 0x76, 0x12, 0x01 };
@@ -4897,6 +4979,8 @@ int main(int argc, char **argv)
 		rc = gate_txs(argc > 2 ? (uint8_t)atoi(argv[2]) : 149,
 		              argc > 3 ? atoi(argv[3]) : 40,
 		              argc > 4 ? argv[4] : NULL);
+	} else if (!strcmp(cmd, "staid")) {
+		rc = gate_staid();
 	} else if (!strcmp(cmd, "staack")) {
 		rc = gate_staack(argc > 2 ? (uint8_t)atoi(argv[2]) : 6,
 		                 argc > 3 ? atoi(argv[3]) : 20,

@@ -100,6 +100,9 @@ public:
   devourer::TxStats GetTxStats() override;
   devourer::ChannelBusy GetChannelBusy() override;
   bool SetAckResponder(const devourer::MacAddr &mac) override;
+  bool SetStationIdentity(const devourer::MacAddr &own,
+                          const devourer::MacAddr &bssid) override;
+  void ClearStationIdentity() override;
   bool StartBeacon(const uint8_t *beacon, size_t len, int interval_tu) override;
   bool UpdateBeaconPayload(const uint8_t *beacon, size_t len) override;
   bool StopBeacon() override;
