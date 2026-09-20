@@ -107,13 +107,34 @@ outcome is visible per frame.
 
 `sudo tests/mt7612u_sta_autoack.sh`
 
+Re-taken 2026-09-20 under the corrected harness, where **every** arm runs the
+same `norsp` code path with the same managed filter and the arms differ by one
+variable each. These numbers supersede the first table, which is kept below.
+
 | arm | reports | ok | retries (mean) |
 |---|---|---|---|
-| **A** — DUT receiving, **nothing armed** | 887 | **100.0%** | **0.10** |
+| **A** — DUT receiving, **nothing armed** | 1279 | **100.0%** | **0.45** |
+| B — destination nobody holds | 400 | 0.0% | 12.00 |
+| C — DUT not running | 400 | 0.0% | 12.00 |
+| **D** — DUT receiving, `MT_AUTO_RSP_EN` **cleared** | 400 | 0.0% | 12.00 |
+| **E** — DUT receiving, **wrong BSSID in an ENABLED APC slot** | 1279 | **100.0%** | **0.30** |
+
+*(The report counts are not equal across arms and are not meant to be: an
+acknowledged frame retires immediately while an unacknowledged one occupies
+the descriptor for 12 retries, so the same fixed window fits 1279 of the
+former and 400 of the latter. The comparison is on `ok`, a ratio, which that
+does not disturb. The 3.2× split is itself a second, redundant signature of
+the same result.)*
+
+Superseded first table, from the run whose arm A used the monitor filter:
+
+| arm | reports | ok | retries (mean) |
+|---|---|---|---|
+| A — DUT receiving, nothing armed | 887 | 100.0% | 0.10 |
 | B — destination nobody holds | 272 | 0.0% | 12.00 |
 | C — DUT not running | 262 | 0.0% | 12.00 |
-| **D** — DUT receiving, `MT_AUTO_RSP_EN` **cleared** | 273 | 0.0% | 12.00 |
-| **E** — DUT receiving, **wrong BSSID in an ENABLED APC slot** | 863 | **100.0%** | **0.14** |
+| D — DUT receiving, `MT_AUTO_RSP_EN` cleared | 273 | 0.0% | 12.00 |
+| E — DUT receiving, wrong BSSID in an ENABLED APC slot | 863 | 100.0% | 0.14 |
 
 **A against B and C** establishes the claim: with nothing armed at all, this
 MAC acknowledges unicast addressed to its own address. B holds the
@@ -121,24 +142,41 @@ transmitter, rate, channel and timing fixed and changes only the destination,
 so it also shows the match is address-specific rather than promiscuous
 answering. C removes the DUT entirely.
 
-**D was NOT single-variable as run, and the table above predates the fix.**
-Arm A ran `bringup arx`, which installs the **monitor** filter at the top of
-`gate_arx`; arm D ran `norsp`, which leaves the managed one. So the comparison
-varied the receive filter *and* the init path as well as the bit under test,
-in a section that called it single-variable. Same defect class as the R5 gate
-overwriting its own filter, caught in review rather than on the bench.
+**D is now single-variable, and it was not in the first table.** There, arm A
+ran `bringup arx`, which installs the **monitor** filter at the top of
+`gate_arx`, while arm D ran `norsp`, which leaves the managed one — so the
+comparison varied the receive filter *and* the init path as well as the bit
+under test, in a section that called it single-variable. Same defect class as
+the R5 gate overwriting its own filter, caught in review rather than on the
+bench. Both arms now run `norsp`, which takes the bit as an argument, so they
+share one code path and differ by exactly one bit. A at 100% against D at 0%
+is therefore the isolated result the text always claimed it was.
 
-The harness is fixed — both arms now run `norsp`, which takes the bit as an
-argument, so they share one code path and differ by exactly one bit — **but
-the numbers above have not been re-taken under it.** Treat D as indicative,
-not as the single-variable result it is described as, until a re-run.
+### Three harness defects found on the way to that re-run
 
-What survives regardless: **arm E** ran the managed filter with the bit SET
-and reads 100%, and **arm D** ran the managed filter with it CLEAR and reads
-0%. Those two are both managed, so the filter is not what separates them —
-they differ in the bit *and* in the BSSID programming, which E itself shows is
-inert. So the conclusion that `MT_AUTO_RSP_EN` gates acknowledgement is
-supported; the claim that any one arm pair isolated it is not.
+Recorded because each one produced a *confident* wrong answer rather than an
+error, and the first re-run attempt returned INCONCLUSIVE on all five arms.
+
+1. **`timeout -s INT` with no `-k` does not guarantee the peer stops.** A
+   `timeout -s INT 12 txdemo` was found alive **six minutes** later, still
+   holding its USB lock. Now `timeout -s INT -k 3`.
+2. **A peer overrun was reported as a DUT death.** The DUT is given `SECS+14`
+   s and the peer `SECS`, so a blocked peer lets the DUT reach the end of its
+   *own* window and exit normally — whereupon the post-window liveness check
+   printed `ABORTED the DUT died DURING the measurement window: GATE NORSP:
+   done (restored)`, quoting the DUT's **success line** as evidence of its
+   death. The harness now times the peer's window and, when it overruns, names
+   the peer. A clean completion is not a death.
+3. **An orphaned peer poisons the *next* run.** The leftover from (1) failed
+   the following run's peer open with "adapter already in use", which yields
+   zero reports — and zero is a control's *passing* value. Cleanup now sweeps
+   `txdemo` within its own process group (`pkill -g $$`), so a concurrent
+   session's peer is not collateral.
+
+A fourth, smaller one: the three station harnesses resolve firmware relative to
+the working directory but never pinned it, so running one from anywhere but
+the repo root failed with `could not read the DUT's MAC` — a message naming
+neither cause nor cure. They now `cd "$ROOT"`.
 
 **E closes R5.** It programs a deliberately wrong BSSID into both
 `MT_MAC_BSSID` and the derived APC slot, sets mt76's per-slot enable bit,
@@ -172,7 +210,7 @@ one.
 The common flaw: both asked the DUT, or a device that could not see the
 answer. The third method asks the transmitter.
 
-### And the separate thing arm C of the R5 gate established
+### And the separate thing the auto-ACK gate's arm C established
 
 Under the managed filter, moving `MT_MAC_ADDR` takes the DUT's *reception* of
 the AP's unicast from 103 frames to **zero**. The port identity gates what a
@@ -182,15 +220,16 @@ reception one is the larger failure.
 
 ## What this means for `SetStationIdentity` on MT7612U
 
-- It **must not** move `MT_MAC_ADDR`. Established by arm C above (reception),
-  not by the auto-ACK story (unmeasured).
+- It **must not** move `MT_MAC_ADDR`. Established by the auto-ACK gate's own
+  arm C — the DUT running with the port identity retargeted, which under the
+  managed filter received nothing at all.
 - It does **not** need to program the BSSID, and a wrong value there is
   harmless for receive. Established by R5.
 - It **must** refuse when `MT_AUTO_RSP_EN` is clear. Measured: clearing that
   bit stops acknowledgement dead (arm D), so the refusal is not defensive
   programming.
 - Auto-ACK needs no call: with nothing armed, 100% of the peer's frames are
-  acknowledged at 0.06 mean retries.
+  acknowledged at 0.45 mean retries (the R6 table above).
 
 ## The uplink — what this station transmits is acknowledged
 
@@ -233,7 +272,8 @@ success*.
 
 ## What is not established
 
-- **The R6 table needs a re-run** under the corrected harness — see the note
+- ~~The R6 table needs a re-run under the corrected harness~~ — **done
+  2026-09-20**, table above. See the note
   under arm D. The conclusion is supported by the D/E pair; the single-
   variable claim for A/D is withdrawn.
 - **THE LIBRARY'S OWN STATION PATH DOES NOT USE THE MANAGED FILTER.**

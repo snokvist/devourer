@@ -39,6 +39,12 @@
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD="${BUILD:-$ROOT/build}"
+# The bring-up tool resolves its firmware directory RELATIVE TO THE WORKING
+# DIRECTORY ("firmware/mt7662_rom_patch.bin"), and the symlink below is created
+# at $ROOT. Running this script from anywhere else therefore fails the DUT's
+# firmware load, which surfaces as "could not read the DUT's MAC" - a message
+# that names neither the cause nor the cure. Pin the directory instead.
+cd "$ROOT" || exit 1
 PEER_VID="${PEER_VID:-0x0bda}"
 PEER_PID="${PEER_PID:-0xc812}"
 PEER_SYSFS="${PEER_SYSFS:-5-1}"
@@ -62,7 +68,18 @@ ok()  { pass=$((pass+1)); printf '  PASS  %s\n' "$*"; }
 bad() { fail=$((fail+1)); printf '  FAIL  %s\n' "$*"; }
 
 DUT_PID=""
-cleanup() { [ -n "$DUT_PID" ] && kill "$DUT_PID" 2>/dev/null; }
+cleanup() {
+  [ -n "$DUT_PID" ] && kill "$DUT_PID" 2>/dev/null
+  # ...and the one an interrupted arm() left behind in its subshell.
+  [ -f "$OUT/.dutpid" ] && kill "$(cat "$OUT/.dutpid")" 2>/dev/null
+  rm -f "$OUT/.dutpid"
+  # ...and any peer THIS run started that is still holding its USB lock. An
+  # orphan here is not this run's problem, it is the next run's: it fails that
+  # run's peer open with "adapter already in use", which yields zero reports.
+  # -g $$ keeps the sweep inside this run's process group, so a concurrent
+  # session's txdemo is not collateral.
+  pkill -INT -g $$ -f "$BUILD/txdemo" 2>/dev/null
+}
 trap cleanup EXIT INT TERM
 
 echo "$DUT_SYSFS:1.0" > /sys/bus/usb/drivers/mt76x2u/unbind 2>/dev/null
@@ -101,6 +118,11 @@ arm() {
           >"$OUT/dut_$tag.log" 2>&1 &
     fi
     DUT_PID=$!
+    # arm() runs inside a command substitution, so this assignment is invisible
+    # to the parent's EXIT trap. Record it where cleanup can find it, or a
+    # Ctrl-C mid-arm leaves a bringup holding the adapter - which is exactly
+    # the "another process claimed it" cause of a vanished netdev.
+    echo "$DUT_PID" > "$OUT/.dutpid"
     sleep 8
     # `arm` runs inside a command substitution, so `exit` here would only kill
     # the subshell and the caller would carry on with an EMPTY result - which
@@ -112,6 +134,7 @@ arm() {
       return 1; }
   fi
 
+  tx_start=$(date +%s)
   env DEVOURER_VID="$PEER_VID" DEVOURER_PID="$PEER_PID" \
       DEVOURER_USB_BUS="${PEER_SYSFS%%-*}" DEVOURER_USB_PORT="${PEER_SYSFS#*-}" \
       DEVOURER_CHANNEL="$CH" \
@@ -120,11 +143,54 @@ arm() {
       DEVOURER_TX_GAP_US=5000 DEVOURER_TX_REPORT=1 \
       DEVOURER_TX_RETRY_LIMIT="$RETRY_LIMIT" \
       DEVOURER_TX_WITH_RX=thread DEVOURER_LOG_LEVEL=warn \
-      timeout -s INT "$SECS" "$BUILD/txdemo" \
+      timeout -s INT -k 3 "$SECS" "$BUILD/txdemo" \
       >"$OUT/tx_$tag.jsonl" 2>"$OUT/tx_$tag.err"
+  tx_end=$(date +%s)
 
+  # -k 3 IS LOAD-BEARING. Without it a peer that does not act on SIGINT blocks
+  # this arm indefinitely: a `timeout -s INT 12` was found alive SIX MINUTES
+  # later, still holding its USB lock, after the run around it was killed. That
+  # single orphan then failed the NEXT run's peer open with "adapter already in
+  # use", which produced zero reports - and zero is a control's passing value.
+
+  # Did the PEER stay inside its own window? Ask this BEFORE asking anything
+  # about the DUT, because a peer that overran is the one explanation under
+  # which the DUT's apparent death is not a death at all.
+  #
+  # The DUT gets SECS+14 s and the peer SECS, so the DUT outlives any peer that
+  # behaves. If the peer blocks, the DUT reaches the end of its OWN window and
+  # exits NORMALLY - and the liveness check below then reports "the DUT died
+  # during the measurement window" while quoting the DUT's own success line as
+  # the evidence. That is verbatim what arms A and B printed on the first run
+  # of this version: "ABORTED the DUT died DURING ... GATE NORSP: done
+  # (restored)". A clean completion is not a death and must not be reported as
+  # one; the fault was the peer's, and it is now named as the peer's.
+  # SECS+5, not SECS+8: with -k 3 a well-behaved peer is done by SECS+3, and
+  # the DUT's own window expires SECS+16 s after ITS launch, i.e. SECS+8 s
+  # after the peer started. A threshold of SECS+8 would sit exactly on that
+  # boundary and let the misfire back in on a tie.
+  if [ $((tx_end - tx_start)) -gt $((SECS + 5)) ]; then
+    printf '%s ABORTED the PEER overran its %ss window (took %ss) - nothing about the DUT can be read from this arm' \
+           "$tag" "$SECS" "$((tx_end - tx_start))"
+    [ -n "$DUT_PID" ] && { kill "$DUT_PID" 2>/dev/null; wait "$DUT_PID" 2>/dev/null; }
+    DUT_PID=""; rm -f "$OUT/.dutpid"; return 1
+  fi
+
+  # LIVENESS AFTER THE WINDOW, not only before it.
+  #
+  # The 8 s probe above only proves the arm STARTED. If the DUT wedges at
+  # second 9 - a documented failure mode on this part - the peer keeps
+  # injecting at an address nobody answers, ok_pct reads ~0, and for a CONTROL
+  # arm that is the PASSING value. Arm D would then print "MT_AUTO_RSP_EN is
+  # the gate" on the strength of a dead device. Arms A and E fail closed, so
+  # this matters for the controls specifically, which is the worse direction.
+  if [ -n "$DUT_PID" ] && ! kill -0 "$DUT_PID" 2>/dev/null; then
+    printf '%s ABORTED the DUT died DURING the measurement window: %s' \
+           "$tag" "$(tail -1 "$OUT/dut_$tag.log" 2>/dev/null)"
+    DUT_PID=""; rm -f "$OUT/.dutpid"; return 1
+  fi
   [ -n "$DUT_PID" ] && { kill "$DUT_PID" 2>/dev/null; wait "$DUT_PID" 2>/dev/null; }
-  DUT_PID=""
+  DUT_PID=""; rm -f "$OUT/.dutpid"
 
   python3 - "$OUT/tx_$tag.jsonl" "$tag" <<'PYEOF'
 import json, sys

@@ -25,6 +25,12 @@
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD="${BUILD:-$ROOT/build}"
+# The bring-up tool resolves its firmware directory RELATIVE TO THE WORKING
+# DIRECTORY ("firmware/mt7662_rom_patch.bin"), and the symlink below is created
+# at $ROOT. Running this script from anywhere else therefore fails the DUT's
+# firmware load, which surfaces as "could not read the DUT's MAC" - a message
+# that names neither the cause nor the cure. Pin the directory instead.
+cd "$ROOT" || exit 1
 AP_SYSFS="${AP_SYSFS:-1-1}"
 DUT_SYSFS="${DUT_SYSFS:-7-1}"
 CH="${CH:-6}"

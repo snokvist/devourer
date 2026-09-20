@@ -138,11 +138,47 @@ static void append_rates(std::vector<uint8_t>& m) {
   if (g_chan <= 14) devourer::sta::append_supported_rates(m);
   else devourer::sta::append_supported_rates_5g(m);
 }
+/* Refuse to run if the TIM wiring is wrong.
+ *
+ * tests/dot11_selftest.cpp covers append_tim() itself and MODELS this wiring
+ * with a local lambda - so deleting the `beacon` flag here would leave that
+ * test green. This reads what THIS harness builds. Same drift that let
+ * `fc0 == 0x88` survive being fixed in the shared module, and that let the
+ * ap_onair witness selftest diverge from the harness it guards.
+ *
+ * Runs BEFORE the USB open, deliberately: the first version ran after it and
+ * an injected defect went uncaught on a host with no adapter, which is the
+ * only place a wiring check is cheap to run.
+ *
+ * The TIM belongs in the BEACON ONLY (802.11-2016 9.4.2.6); in a probe
+ * response it is a malformed frame some stations reject outright. */
+static bool tim_wiring_ok(const std::vector<uint8_t>& beacon_ies,
+                          const std::vector<uint8_t>& probe_ies) {
+  size_t n = 0;
+  const bool in_beacon = devourer::sta::find_ie(
+      beacon_ies.data(), beacon_ies.size(), devourer::sta::kEidTim, &n) != nullptr;
+  const bool in_probe = devourer::sta::find_ie(
+      probe_ies.data(), probe_ies.size(), devourer::sta::kEidTim, &n) != nullptr;
+  if (!in_beacon)
+    fprintf(stderr, "FATAL: the beacon carries no TIM element\n");
+  if (in_probe)
+    fprintf(stderr, "FATAL: a TIM leaked into the probe response\n");
+  return in_beacon && !in_probe;
+}
+
 // Common: [SSID + rates + DS] IE tail for probe/assoc responses.
 static void append_ies(std::vector<uint8_t>& m, bool with_ssid) {
   if (with_ssid) devourer::sta::append_ssid(m, kSsid);
   append_rates(m);
   devourer::sta::append_ds_params(m, (uint8_t)g_chan);
+}
+// The beacon's tail: the same elements plus the TIM, which is beacon-only
+// (802.11-2016 9.4.2.6). Factored out of main()'s inline construction so the
+// startup check below reads the SAME bytes the beacon airs, rather than a
+// model of them.
+static void append_beacon_ies(std::vector<uint8_t>& m) {
+  append_ies(m, true);
+  devourer::sta::append_tim(m);
 }
 static void enqueue(std::vector<uint8_t> mpdu) {
   std::vector<uint8_t> f; f.reserve(g_rt.size() + mpdu.size());
@@ -266,6 +302,12 @@ static void on_rx(const Packet& p) {
 
 int main(int argc, char** argv) {
   int sec = argc > 1 ? atoi(argv[1]) : 60;
+  {   /* before the radio - see tim_wiring_ok's note */
+    std::vector<uint8_t> b, pr;
+    append_beacon_ies(b);
+    append_ies(pr, true);
+    if (!tim_wiring_ok(b, pr)) return 1;
+  }
   if (const char* c = std::getenv("DEVOURER_CHANNEL")) g_chan = (uint8_t)atoi(c);
   auto logger = std::make_shared<Logger>();
   apply_logging_env(*logger);
@@ -289,14 +331,7 @@ int main(int argc, char** argv) {
       kBssid[0],kBssid[1],kBssid[2],kBssid[3],kBssid[4],kBssid[5],
       kBssid[0],kBssid[1],kBssid[2],kBssid[3],kBssid[4],kBssid[5],
       0x00,0x00, 0,0,0,0,0,0,0,0, 0x64,0x00, 0x01,0x00};
-  { const char* s = kSsid; bcn.insert(bcn.end(), {0x00,0x0a});
-    bcn.insert(bcn.end(), s, s + 10);
-    append_rates(bcn);
-    bcn.insert(bcn.end(), {0x03,0x01,g_chan});
-    /* The TIM, which every conforming beacon carries and this one did not.
-     * Beacon only - 802.11-2016 9.4.2.6 - so append_ies(), which also builds
-     * probe and assoc responses, does not get it. See src/sta/Dot11.h. */
-    devourer::sta::append_tim(bcn); }
+  append_beacon_ies(bcn);
   int bcn_tu = 100;
   if (const char* iv = std::getenv("DEVOURER_BCN_TU")) bcn_tu = atoi(iv);
   bool bok = g_dev->StartBeacon(bcn.data(), bcn.size(), bcn_tu);

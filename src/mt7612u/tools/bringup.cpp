@@ -2604,7 +2604,15 @@ static int gate_sta(uint8_t chan, int secs, const char *bssid_str)
 		       ctr.beacons.load(), ctr.to_us.load());
 		printf("       bssid_dw0=%08x dw1=%08x  filtr=%08x%s  to_us_data=%lu\n",
 		       dw0, dw1, filtr,
-		       (filtr & MT_RX_FILTR_CFG_PROMISC) ? "" : " PROMISC-OFF!",
+		       /* The label reads the way the BIT does, not the way the
+		        * word sounds: these are DROP bits, so PROMISC SET means
+		        * "drop frames not addressed here" - the managed state we
+		        * want. Clear means promiscuous, which is the monitor
+		        * filter and the thing that voided two earlier gates. The
+		        * first version of this alarm said "PROMISC-OFF!", which
+		        * reads as reassurance for exactly the failure case. */
+		       (filtr & MT_RX_FILTR_CFG_PROMISC)
+		           ? "" : "  *** MONITOR FILTER - THIS ARM IS PROMISCUOUS ***",
 		       ctr.to_us_data.load());
 		if (wrote_slot >= 0) {
 			if (!apc_ok)
@@ -2927,8 +2935,12 @@ static int gate_staack(uint8_t chan, int secs, const char *bssid_str)
  * function refuses, which is the whole of the job on this part.
  *
  * The case that matters is 5. mt7612u_set_ack_responder() retargets
- * MT_MAC_ADDR, and gate_staack measured what that does to a station - 0.8%
- * retried downlink frames becomes 98.0%. So a station identity armed while an
+ * MT_MAC_ADDR, which is the register the auto-response engine matches address
+ * 1 against - and under the managed receive filter gate_staack measured
+ * reception itself going to zero when it moves. (An earlier revision of this
+ * header quoted "0.8% retried becomes 98.0%"; that control ran with the
+ * monitor filter and is withdrawn - gate_staack's own body says so.) So a
+ * station identity armed while an
  * ACK responder holds the port identity would be a station that cannot
  * acknowledge anything, silently. It must be REFUSED, and this checks that it
  * is, on the hardware, rather than trusting the branch to be right.
@@ -3036,7 +3048,7 @@ static int gate_staid(void)
  * tests/mt7612u_sta_autoack.sh.
  *
  * That harness establishes that this MAC acknowledges unicast addressed to it
- * with nothing armed (100% ok, retries 0.03) against two controls that pin at
+ * with nothing armed (100% ok, retries 0.45) against three controls that pin at
  * the retry limit. What it does not establish is WHICH mechanism answers, and
  * SetStationIdentity refuses to arm when MT_AUTO_RSP_EN is clear - a branch
  * shipped on the assumption that the bit matters. This is that assumption's

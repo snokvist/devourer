@@ -38,12 +38,13 @@ station bound to `rtw88` runs `iw scan` and lists devourer, parsing every elemen
     Supported rates: 1.0* 2.0* 5.5* 11.0* 18.0 24.0 36.0 54.0
     DS Parameter set: channel 6   TIM: DTIM Count 0 Period 1   ERP: <no flags>
 
-**The `TIM` in that capture is not reproducible from the harnesses in this
-tree today.** None of `tests/ap_responder.cpp`, `tests/ap_wpa2.cpp` or
-`tests/mt7612u_beacon_stop_check.cpp` appends a TIM element — checked by
-reading all three beacon builders — although `src/sta/Dot11.h` defines
-`kEidTim`. Whatever produced that line, it was not any of them. Do not read
-this scan as evidence that power save is handled: see the scope note below.
+**That `TIM` line is now reproducible**, and was not when this note was first
+written: `tests/ap_responder.cpp` and `tests/ap_wpa2.cpp` emit one via
+`devourer::sta::append_tim()`, and `DTIM Count 0 Period 1` is byte-for-byte
+what its default produces — confirmed on air by a passive scan.
+`tests/mt7612u_beacon_stop_check.cpp` still emits none. Do NOT read the
+element as evidence that power save is handled: it advertises "nothing
+buffered", which is true, and nothing is buffered — see the scope note.
 
 Confirmed on **both bands** — ch6 (2437 MHz) and ch36 (5180 MHz).
 
@@ -107,10 +108,11 @@ end to end. What is intentionally out of scope (AP-*stack* breadth, not driver
 parity): multiple concurrent clients, GTK broadcast/rekey, routing/NAT, and a real
 DHCP address pool.
 
-**802.11 power save is out of scope too, and this is the one that bites.** The
-beacons carry no TIM element, so a station has no DTIM schedule to wake on,
-and nothing is buffered for a dozing peer — every reply is enqueued the moment
-the request is parsed and airs whether or not the station is listening. A
+**802.11 power save is out of scope too, and this is the one that bites.**
+Nothing is buffered for a dozing peer — every reply is enqueued the moment the
+request is parsed and airs whether or not the station is listening. The
+beacons do now carry a TIM, which closed a conformance gap and gave a station
+a DTIM schedule; it did NOT fix the loss, because the loss is the buffering. A
 station in power save therefore loses most of what the AP sends it. Measured
 on the MT7612U bench, open network, 60 pings at 1/s, changing only the
 station's setting: `power_save on` gave 0/60 received and the link dropped

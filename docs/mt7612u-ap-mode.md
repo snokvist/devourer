@@ -279,8 +279,9 @@ default `BCN_TU=100`. That is the stronger witness this document's own
 the AP.
 
 Its conditions, which belong in the same breath as the score: station power
-save **forced off** (these harnesses have no TIM element and buffer nothing,
-so they cannot serve a power-saving station, which is what Linux defaults to);
+save **forced off** (these harnesses buffer nothing, so they cannot serve a
+power-saving station, which is what Linux defaults to — the beacons do carry
+a TIM now, but that is conformance, not buffering);
 one AP unit; one station unit; near field; n=2 per band; nothing soaked
 (longest run ~2 min); and the 5 GHz open cell's data-plane check failed once
 in three runs on a single lost ping, being 6 packets at 0% loss on a channel

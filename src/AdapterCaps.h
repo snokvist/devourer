@@ -231,16 +231,19 @@ struct AdapterCaps {
   bool ack_responder_ok = false;
   bool tx_retry_limit_ok = false;
 
-  /* station_mode_ok: IRadio::SetStationIdentity programs this MAC for the
-   * STATION half of an infrastructure BSS and the arm was READ BACK. Gate
+  /* station_mode_ok: IRadio::SetStationIdentity can program this MAC for the
+   * STATION half of an infrastructure BSS, and the behaviour a station needs
+   * from the silicon has been measured on air. Gate
    * station-mode callers on this rather than on SetStationIdentity's return
    * value alone, so a caller can refuse before it starts a handshake it
    * cannot finish.
    *
    * False means "not ported / not measured", never "the silicon cannot". Do
    * not set it from a code-reading: the bar is an on-air cell showing this
-   * adapter receiving an AP's unicast traffic and being ACKed for its own -
-   * the same shape of evidence ack_responder_ok carries, measured per die.
+   * adapter receiving unicast addressed to it and being ACKed for what it
+   * sends - the same shape of evidence ack_responder_ok carries, measured per
+   * die. (The cells that exist use a raw injector and an armed ACK responder
+   * as the peer, not an AP; the hostapd-based gates measured other things.)
    *
    * TRUE on MT7612U only, and read docs/mt7612u-station-identity.md - its
    * retraction section first - before quoting a number from it. Both halves

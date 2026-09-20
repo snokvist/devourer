@@ -1158,14 +1158,21 @@ devourer::AdapterCaps Mt7612uRadio::GetAdapterCaps() {
    * earlier attempts at the acknowledgement half produced confident-looking
    * non-results.
    *
-   * DOWNLINK - the AP's unicast reaches this station and is acknowledged by
-   * it, with NOTHING armed. A Realtek peer injects at the DUT and reads its
-   * own per-frame CCX reports: 887 frames, 100% acknowledged, 0.10 mean
-   * retries. Three controls, all pinned at the 12-retry descriptor limit with
+   * DOWNLINK - unicast addressed to this station is acknowledged by it, with
+   * NOTHING armed. A Realtek peer injects at the DUT and reads its own
+   * per-frame CCX reports: 1279 frames, 100% acknowledged, 0.45 mean retries,
+   * against three controls all pinned at the 12-retry descriptor limit with
    * 0% acknowledged - a destination nobody holds, the DUT not running, and
-   * (single-variable) the DUT running with MT_AUTO_RSP_EN cleared. The last
-   * one also settles the mechanism, and is why SetStationIdentity refuses to
-   * arm when that bit is clear.
+   * the DUT running with MT_AUTO_RSP_EN cleared. Every arm runs one code path
+   * under one receive filter, so each control differs from the claim by one
+   * variable.
+   *
+   * ONE QUALIFIER THAT BELONGS WITH THOSE NUMBERS: the peer is a raw
+   * injector, not an AP. No cell here involved an AP.
+   *
+   * An earlier revision quoted 887/0.10 from a run whose claim arm ran the
+   * MONITOR filter while its MT_AUTO_RSP_EN control ran the managed one -
+   * not single-variable, and superseded by the numbers above.
    *
    * UPLINK - what this station transmits is acknowledged by its peer. The
    * DUT's own MT_TX_STAT_FIFO, receiver ON, transmitting from its own address
@@ -1179,10 +1186,18 @@ devourer::AdapterCaps Mt7612uRadio::GetAdapterCaps() {
    * per-slot enable bit is SET: reception and acknowledgement are unchanged.
    * So SetStationIdentity writing no register is a measured decision.
    *
-   * WHAT THIS FLAG STILL DOES NOT CERTIFY: everything above is an
-   * unassociated station receiving traffic it did not negotiate. Power save,
-   * TIM parsing, cross-BSS duplicate detection and hardware key lookup are
-   * untested. One AP, one DUT, one channel, near field.
+   * WHAT THIS FLAG STILL DOES NOT CERTIFY:
+   *   - everything above is an UNASSOCIATED station receiving traffic it did
+   *     not negotiate. Power save, TIM parsing, cross-BSS duplicate detection
+   *     and hardware key lookup are untested.
+   *   - no cell drove SetStationIdentity itself. The seam writes no register
+   *     here, so the state measured IS the state a successful arm leaves -
+   *     but the literal end-to-end path is unexercised.
+   *   - THE LIBRARY'S OWN STATION RX PATH IS PROMISCUOUS. StartRxLoop calls
+   *     mt7612u_set_monitor_rx() unconditionally, so a station driven through
+   *     IRadio does not run the managed filter these results describe. Phase
+   *     3 has to decide which filter a station should use.
+   *   - one DUT, one peer, one channel, near field, no soak.
    */
   c.station_mode_ok = true;
   /* Unmeasured, so false rather than optimistic - nothing here drives the

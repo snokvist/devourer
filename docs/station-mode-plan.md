@@ -415,10 +415,13 @@ builds on.
 ### What the first run found: station power save
 
 Neither AP harness implements 802.11 power save. Verified by reading all three
-beacon builders: **none of them appends a TIM element**, though
+beacon builders at the time: **none of them appended a TIM element** (two
+now do — see the note below), though
 `src/sta/Dot11.h` defines `kEidTim`. A beacon with no TIM is not a conforming
 AP beacon (802.11-2016 9.4.2.6) and gives a dozing station no DTIM schedule;
 nothing is buffered either. Open network, 60 pings at 1/s:
+
+**Superseded:** the AP harness beacons now carry a TIM (`append_tim`, `src/sta/Dot11.h`); `tests/mt7612u_beacon_stop_check.cpp` still does not. Buffering is still absent, so power save is still unsupported — that half stands.
 
 | | received | RTT |
 |---|---|---|
@@ -511,8 +514,10 @@ disarms, and proves the registers returned to their pre-arm values.
 half unmet, and the measurement it assumed has been inverted.**
 
 Landed: the `IRadio` seam with its contract, `AdapterCaps::station_mode_ok`
-(false), the MT7612U implementation, and three bring-up gates (`sta`,
-`staack`, `staid`) plus `tests/mt7612u_sta_identity.sh`.
+(**true** for MT7612U), the MT7612U implementation, five bring-up gates
+(`sta`, `staack`, `staid`, `norsp`, `bssen`), a headless selftest
+(`tests/mt7612u_station_selftest.cpp`), and three harnesses
+(`mt7612u_sta_identity.sh`, `_autoack.sh`, `_uplink.sh`).
 
 What R5 and R6 actually returned — `docs/mt7612u-station-identity.md`, and
 read its retraction section first:
@@ -520,10 +525,13 @@ read its retraction section first:
 - **R5 answered.** The BSSID registers do not gate a managed station's
   receive: 5877 unicast frames with both registers deliberately wrong against
   6250 with nothing programmed. So `SetStationIdentity` writes neither.
-- **R6 withdrawn, not answered.** Whether this MAC auto-ACKs is unmeasured;
-  the gate's single-variable control does not move, so the method is void. An
-  earlier revision claimed 0.8% vs a 98% control — that control ran
-  promiscuous and is retracted.
+- **R6 ANSWERED** by a third method, after two failed: ask the transmitter.
+  A Realtek peer injects unicast at the DUT and reads its own CCX reports —
+  100% acknowledged at 0.45 mean retries with nothing armed, against three
+  controls pinned at the retry limit. The 0.8%/98% figures from the second
+  method are retracted. The table was re-taken 2026-09-20 under a corrected
+  single-variable harness — the first one's claim arm ran the monitor filter —
+  and the conclusion is unchanged.
 - **The prohibition on moving `MT_MAC_ADDR` stands on better evidence than
   it was written with.** Under the managed filter it takes reception from 103
   frames to zero: the port identity gates what a station *receives*.
@@ -539,16 +547,17 @@ bit **2** is the one that matters and it is set.
 
 Still open against the original acceptance text:
 
-- **No headless selftest of the ownership hand-off.** `ctest` is unchanged at
-  72; the hand-off is covered only by `bringup staid` (10/10 on hardware),
-  which needs a device.
+- ~~No headless selftest of the ownership hand-off.~~ Added in `55f23da`:
+  `tests/mt7612u_station_selftest.cpp`, `ctest` now 73. The policy was split
+  out of `station.cpp` into `StationIdentity.h` so it could be tested at all.
 - **No register round-trip proof**, because the implementation writes no
   registers — the criterion assumed an arm that programs the APC slot, and
   the measurement says it should not. The criterion is stale, not merely
   unmet, but it has not been rewritten and nothing yet reads the APC slot
   back, which R5's own text asked for.
-- `station_mode_ok` stays false: auto-ACK is open, and nothing has read the
-  chip's own retry count for a station's uplink.
+- `station_mode_ok` is now **true** for MT7612U: both halves of its bar are
+  measured — see `docs/mt7612u-station-identity.md` for the arms, the controls
+  and the four limits that travel with it.
 
 ## Phase 3 — pure station logic, offline
 

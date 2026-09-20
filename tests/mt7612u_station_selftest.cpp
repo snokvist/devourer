@@ -21,8 +21,8 @@
  *
  * What this does NOT cover: anything about the silicon. Whether the MAC
  * actually receives or acknowledges with a given identity is measured on
- * hardware - docs/mt7612u-station-identity.md, and note that the auto-ACK
- * half of that is currently UNMEASURED, not confirmed. */
+ * hardware - docs/mt7612u-station-identity.md, whose retraction section is
+ * worth reading before quoting any number from it. */
 #include <cstdint>
 #include <cstdio>
 #include <cstring>

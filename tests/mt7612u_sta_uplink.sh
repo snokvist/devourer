@@ -28,6 +28,12 @@
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD="${BUILD:-$ROOT/build}"
+# The bring-up tool resolves its firmware directory RELATIVE TO THE WORKING
+# DIRECTORY ("firmware/mt7662_rom_patch.bin"), and the symlink below is created
+# at $ROOT. Running this script from anywhere else therefore fails the DUT's
+# firmware load, which surfaces as "could not read the DUT's MAC" - a message
+# that names neither the cause nor the cure. Pin the directory instead.
+cd "$ROOT" || exit 1
 PEER_VID="${PEER_VID:-0x0bda}"
 PEER_PID="${PEER_PID:-0xc812}"
 PEER_SYSFS="${PEER_SYSFS:-5-1}"
@@ -50,7 +56,11 @@ ok()  { pass=$((pass+1)); printf '  PASS  %s\n' "$*"; }
 bad() { fail=$((fail+1)); printf '  FAIL  %s\n' "$*"; }
 
 RESP=""
-cleanup() { [ -n "$RESP" ] && kill "$RESP" 2>/dev/null; rm -f "$ROOT/firmware"; }
+cleanup() {
+  [ -n "$RESP" ] && kill "$RESP" 2>/dev/null
+  [ -f "$OUT/.resppid" ] && kill "$(cat "$OUT/.resppid")" 2>/dev/null
+  rm -f "$OUT/.resppid" "$ROOT/firmware"
+}
 trap cleanup EXIT INT TERM
 
 echo "$DUT_SYSFS:1.0" > /sys/bus/usb/drivers/mt76x2u/unbind 2>/dev/null
@@ -68,6 +78,9 @@ arm() {
       DEVOURER_LOG_LEVEL=info \
       "$BUILD/rxdemo" >"$OUT/resp_$tag.jsonl" 2>"$OUT/resp_$tag.err" &
   RESP=$!
+  # Same subshell trap as the autoack harness: record the pid where the
+  # parent's cleanup can reach it.
+  echo "$RESP" > "$OUT/.resppid"
   sleep 10
   if ! kill -0 "$RESP" 2>/dev/null; then
     printf '%s ABORTED the peer exited: %s' "$tag" "$(tail -1 "$OUT/resp_$tag.err")"
@@ -83,7 +96,18 @@ arm() {
 
   "$BUILD/mt7612uprobe" txs "$CH" "$FRAMES" "$TARGET" \
       >"$OUT/dut_$tag.txt" 2>&1
+
+  # LIVENESS AFTER THE WINDOW. The 10 s probe proves the peer started; if it
+  # dies mid-dwell the DUT's frames go unanswered, arm B reads 0/200 at the
+  # retry limit, and that is the CONTROL's passing value - so a dead peer
+  # would be scored as a working control.
+  if ! kill -0 "$RESP" 2>/dev/null; then
+    printf '%s ABORTED the peer died DURING the measurement window: %s' \
+           "$tag" "$(tail -1 "$OUT/resp_$tag.err" 2>/dev/null)"
+    RESP=""; rm -f "$OUT/.resppid"; return 1
+  fi
   kill "$RESP" 2>/dev/null; wait "$RESP" 2>/dev/null; RESP=""
+  rm -f "$OUT/.resppid"
 
   # `bringup txs` prints the arm table TWICE - once with the MAC receiver OFF
   # and once with it ON. That A/B is Phase 0's result built into the gate: with

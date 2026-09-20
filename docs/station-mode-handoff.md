@@ -44,7 +44,7 @@ that tree up; nothing here depends on it any more.
 |---|---|
 | 0 — can the part carry a station? | **PASS.** The 40× unicast cliff is a property of TX-only injection with the MAC receiver disabled, not of the part. Station-shaped TX runs at 2084 fps / 99.9% ACK. |
 | 1 — shared frame + crypto layer | **DONE, GATE CLOSED.** 14/14 twice on each band against independent silicon. See below. |
-| 2 — the `IRadio` seam | **Implemented, gate open.** Seam + caps flag + MT7612U implementation + three bring-up gates. R5 measured, R6 withdrawn as unmeasured, `station_mode_ok` still false. `docs/mt7612u-station-identity.md` — read its retraction section before quoting a number. |
+| 2 — the `IRadio` seam | **Implemented.** Seam + caps flag + MT7612U implementation + five bring-up gates + a headless selftest. R5 and R6 both measured; `station_mode_ok` is **true** for MT7612U. `docs/mt7612u-station-identity.md` — read its retraction section before quoting any number. The R6 table was re-taken 2026-09-20 under the corrected single-variable harness and holds. |
 | 3 — pure station logic | Not started. BSS table, association state machine, 4-way supplicant. |
 | 4–6 | Not started. |
 
@@ -121,7 +121,7 @@ The adversarial counterpart, in the same breath, because this tree's rules
 require it:
 
 - **Power save is forced off, and this AP cannot serve a power-saving station
-  at all.** None of the three beacon builders appends a TIM element. Linux
+  at all.** None of the three beacon builders appends a TIM element. **Superseded:** the AP harness beacons now carry a TIM (`append_tim`, `src/sta/Dot11.h`); `tests/mt7612u_beacon_stop_check.cpp` still does not. Buffering is still absent, so power save is still unsupported — that half stands. Linux
   defaults to `power_save on`, so 14/14 does *not* certify this AP against a
   default-configured Linux client.
 - The 5 GHz open cell's data-plane check **failed once in three runs** on a
@@ -133,9 +133,10 @@ require it:
 ## What to distrust
 
 - **Power save is the single biggest caveat on the 14/14.** It is forced off,
-  and this AP has no TIM element in any beacon and buffers nothing, so it
-  cannot serve a power-saving station — which is what Linux defaults to. The
-  score is real and its scope is narrower than it looks.
+  and this AP buffers nothing, so it cannot serve a power-saving station —
+  which is what Linux defaults to. The score is real and its scope is narrower
+  than it looks. (The beacons DO carry a TIM now; that fixed the conformance
+  gap, not the buffering one, and the 0/60 measurement predates it.)
 - **"The link is unstable" and "RTT is poor" (524 ms mean, 1729 ms max) were
   probably power save, and that is inference from ONE ordered pair of runs.**
   PS on gave 0/60 pings, PS off gave 60/60 at 0.735/1.530/7.644 ms. Note what

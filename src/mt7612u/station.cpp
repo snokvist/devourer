@@ -26,14 +26,14 @@
  * deafen it. A station must leave MT_MAC_ADDR exactly where MAC bring-up put
  * it.
  *
- * NOTE what is NOT among the reasons: whether this MAC auto-ACKs. The scope
- * document asserts it does, from a register reading, and an earlier revision
- * of this header quoted "0.8% vs 98.0% retried" as measurement of it. That
- * control turned out to have run with the MONITOR filter installed by
- * mistake and is withdrawn; the clean single-variable control (clear
- * MT_AUTO_RSP_EN, hold reception constant) does not move, so the method is
- * void and auto-ACK is UNMEASURED. Nothing here depends on the answer - this
- * function makes no call either way - but do not repeat the claim.
+ * AUTO-ACK IS MEASURED, by a later method than the one this header used to
+ * describe. tests/mt7612u_sta_autoack.sh asks the TRANSMITTER, which is the
+ * only party that knows whether its frame was acknowledged: a Realtek peer
+ * injects unicast at this MAC and reads its own CCX reports. With nothing
+ * armed, 100% acknowledged at 0.45 mean retries, against controls pinned at
+ * the retry limit. Nothing in this function depends on the answer - it makes
+ * no call either way - but the earlier "UNMEASURED" note is superseded, as
+ * is the "0.8% vs 98.0%" figure it replaced.
  *
  * So the useful work here is refusal and verification, not configuration.
  */
@@ -154,9 +154,10 @@ void mt7612u_clear_station_identity(struct mt7612u_dev *dev)
  * SetStationIdentity's check is one-shot: it verifies the port identity at
  * arm time and then has no further say. Nothing stopped an ACK responder or a
  * beacon armed AFTERWARDS from moving the register out from under a live
- * station, which is the measured 0.8% -> 98% failure with no diagnostic at
- * all - and it is the ordering a real caller is more likely to hit than the
- * one gate_staid checks.
+ * station, with no diagnostic at all - and it is the ordering a real caller
+ * is more likely to hit than the one gate_staid checks. (An earlier revision
+ * quoted "0.8% -> 98%" here; that measurement ran with the wrong receive
+ * filter and is withdrawn.)
  *
  * This does not refuse. The beacon and responder paths are older, have their
  * own callers, and a station arm is not entitled to veto them. What it does

@@ -161,6 +161,34 @@ static std::vector<uint8_t> mgmt_hdr(uint8_t fc, const uint8_t* sta) {
  * frame body only, and a TIM in a probe response is a malformed frame that
  * some stations will reject outright. The element order below is the
  * standard's: SSID, Supported Rates, DS Parameter Set, TIM, then RSN. */
+/* Refuse to run if the TIM wiring is wrong.
+ *
+ * tests/dot11_selftest.cpp covers append_tim() itself and MODELS this wiring
+ * with a local lambda - so deleting the `beacon` flag here would leave that
+ * test green. This reads what THIS harness builds. Same drift that let
+ * `fc0 == 0x88` survive being fixed in the shared module, and that let the
+ * ap_onair witness selftest diverge from the harness it guards.
+ *
+ * Runs BEFORE the USB open, deliberately: the first version ran after it and
+ * an injected defect went uncaught on a host with no adapter, which is the
+ * only place a wiring check is cheap to run.
+ *
+ * The TIM belongs in the BEACON ONLY (802.11-2016 9.4.2.6); in a probe
+ * response it is a malformed frame some stations reject outright. */
+static bool tim_wiring_ok(const std::vector<uint8_t>& beacon_ies,
+                          const std::vector<uint8_t>& probe_ies) {
+  size_t n = 0;
+  const bool in_beacon = devourer::sta::find_ie(
+      beacon_ies.data(), beacon_ies.size(), devourer::sta::kEidTim, &n) != nullptr;
+  const bool in_probe = devourer::sta::find_ie(
+      probe_ies.data(), probe_ies.size(), devourer::sta::kEidTim, &n) != nullptr;
+  if (!in_beacon)
+    fprintf(stderr, "FATAL: the beacon carries no TIM element\n");
+  if (in_probe)
+    fprintf(stderr, "FATAL: a TIM leaked into the probe response\n");
+  return in_beacon && !in_probe;
+}
+
 static void append_ies(std::vector<uint8_t>& m, bool ssid, bool beacon = false) {
   if (ssid) devourer::sta::append_ssid(m, kSsid);
   // Band-correct Supported Rates: CCK+OFDM on 2.4 GHz, OFDM-only on 5 GHz. CCK
@@ -555,6 +583,12 @@ static void on_rx(const Packet& p) {
 
 int main(int argc, char** argv) {
   int sec = argc > 1 ? atoi(argv[1]) : 60;
+  {   /* before the radio: a wiring check that needs one is no check at all */
+    std::vector<uint8_t> b, pr;
+    append_ies(b, true, /*beacon=*/true);
+    append_ies(pr, true);
+    if (!tim_wiring_ok(b, pr)) return 1;
+  }
   if (const char* c = std::getenv("DEVOURER_CHANNEL")) g_chan = (uint8_t)atoi(c);
   if (const char* k = std::getenv("DEVOURER_WPA2_PSK")) g_psk = k;
   if (const char* p = std::getenv("DEVOURER_CCMP_PROFILE"))
