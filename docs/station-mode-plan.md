@@ -51,6 +51,35 @@ favourable measurement without its adversarial counterpart in the same breath.
 | Scope | `docs/station-mode-scope.md` | Flash (`deepseek-v4.1-flash`) | changes required | 17 (F1–F17) | yes — see below |
 | Phase 0 | `docs/station-mode-phase0.md` + `gate_ucast` | Flash (`deepseek-v4.1-flash`) | changes required | 9 (F1–F9) | yes |
 | Phase 0 | `docs/station-mode-phase0.md` + `gate_ucast` | Opus subagent | **verdict overturned** | 9 (S1–S9) | yes |
+| Phase 1 | `src/sta/*` + harness switch | Flash (Dot11 vs the standard) | changes required | 9 | yes |
+| Phase 1 | `src/sta/*` + harness switch | Flash (byte-equivalence) | claim upheld | 5 | yes |
+| Phase 1 | `src/sta/*` + harness switch | Opus subagent | **API defect found** | 13 | yes |
+
+### Round 3 — Phase 1, 2026-09-20
+
+Three reviewers, one checkpoint. The byte-equivalence reviewer traced every
+emitted byte and **upheld** the refactor's claim: AAD, nonce, CCMP header,
+ciphertext placement and both IE encodings identical, and the QoS erase exact
+with no off-by-two. The other two found real defects.
+
+The one that mattered: `ccmp_encrypt` copied 24 header bytes and
+`ccmp_decrypt` hardcoded 24, while both accepted a `qos_tid` argument — so a
+real 26-byte QoS header would have had its QoS Control octets silently
+overwritten by the CCMP header. **A station's data plane is QoS against any
+802.11n AP, so this would have broken Phase 2 with no diagnostic.** Both now
+take an explicit header length and derive the TID from the frame.
+
+The one that was most uncomfortable: the known-answer vectors claimed to be an
+*independent* transcription of the standard. They were not — same author, same
+reading, matching idioms — and the consequence was concrete: three of four
+vectors encoded frame shapes that were non-conformant or impossible on air,
+with generator and implementation agreeing. One vector's comment claimed it
+carried every masked bit while Retry was clear in it. All rebuilt as real
+frames; the generator now states plainly that it pins the cipher plumbing and
+not the framing rules.
+
+Nothing was rejected. Every critical finding was verified against the source
+by hand before being accepted.
 
 ### Round 1 — Flash, 2026-09-20
 
@@ -253,15 +282,46 @@ Done:
   classic AAD slip (forgetting to mask Retry) turns it red, reverting turns it
   green. 70/70 ctest green.
 
-Not done, and the gate stays open until it is:
-- `Dot11Mgmt` extraction, and switching `ap_responder.cpp` / `ap_wpa2.cpp` onto
-  the shared module. Until that lands the AP harnesses still open-code their
-  builders and still carry their own inline CCMP, so the "shared" half of
-  Phase 1 is unproven.
-- The on-air regression gate (`tests/mt7612u_ap_onair.sh` 14/14 on both bands).
-  Nothing has re-run it since the CCMP promotion, so "behaviour change of
-  exactly zero" is an intention, not a measurement.
-- Two adversarial reviews.
+Also done since:
+- `src/sta/Dot11.h` — the management-frame module, and **both AP harnesses
+  switched onto it**. That switch is the part that proves the module is
+  role-neutral rather than a station module with AP-shaped holes.
+- Three adversarial reviews (round 3 above), all findings resolved.
+- On-air, against an **RTL8812AU station on `rtw_8812au`** — independent
+  silicon, which is a stronger witness than the same-MediaTek station
+  `docs/mt7612u-ap-mode.md` used and states as its own weakness:
+  - beacon aired and **scannable** (`SSID: devourerAP`, `BSS 02:42:75:05:d6:00`);
+  - **open auth + assoc complete** — `connected to 02:42:75:05:d6:00`, with
+    the AP logging `AUTH req` and `ASSOC req`;
+  - **WPA2 4-way complete** — `WPA: Key negotiation completed … [PTK=CCMP
+    GTK=CCMP]`, `CTRL-EVENT-CONNECTED`, AP side `msg2 OK (MIC verified) →
+    msg3 → msg4 OK`.
+
+**The encrypted data plane did not carry on this rig, and it is not the
+refactor.** The station disconnects on inactivity (reason 4) after a completed
+handshake, and ping is 100% lost. The control settles it: the **pre-refactor**
+`ap_wpa2`, built from `1139782` and run against the same station in the same
+session, fails identically — same completed 4-way, same reason-4 disconnect,
+same 100% loss. So the failure predates Phase 1 and belongs to this rig's
+station, which has never been used with these harnesses (the validated runs
+used an MT7612U kernel station). Without that control the run would have read
+as a refactor regression.
+
+Gate still open until:
+- The encrypted data plane is demonstrated on *some* rig — either by restoring
+  an MT7612U station, or by finding what this Realtek station needs. The
+  leading hypothesis is that it associates 802.11n and sends QoS data, which
+  the pre-refactor AP could never have decrypted (22-byte AAD for a QoS frame);
+  if so the fix is already in, and what is missing is a station that gets far
+  enough to prove it. `tests/mt7612u_ap_onair.sh`'s 14/14 on both bands remains
+  the acceptance bar and has NOT been re-run.
+- The remaining review findings judged low-priority and deliberately deferred,
+  recorded here rather than dropped: the harness data planes still air
+  sequence 0 (only management frames got the counter); `CcmpReplay` is
+  implemented and tested but **no production path calls it**; `parse_beacon`
+  rejects mixed-mode WPA/WPA2 and WPA3-transition APs because it byte-compares
+  a canonical RSN layout instead of searching the suite lists — that one will
+  bite a real station and should be fixed before Phase 3 ships.
 
 **A caveat that belongs in the record:** the vectors are cross-implementation,
 not official. The IEEE 802.11-2016 Annex J CCMP vector would be strictly better
