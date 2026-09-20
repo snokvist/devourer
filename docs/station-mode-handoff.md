@@ -44,7 +44,7 @@ that tree up; nothing here depends on it any more.
 |---|---|
 | 0 — can the part carry a station? | **PASS.** The 40× unicast cliff is a property of TX-only injection with the MAC receiver disabled, not of the part. Station-shaped TX runs at 2084 fps / 99.9% ACK. |
 | 1 — shared frame + crypto layer | **DONE, GATE CLOSED.** 14/14 twice on each band against independent silicon. See below. |
-| 2 — the `IRadio` seam | Not started. `SetStationIdentity` / `ClearStationIdentity`, MT7612U implementation, caps flag. |
+| 2 — the `IRadio` seam | **Implemented, gate open.** Seam + caps flag + MT7612U implementation + three bring-up gates. R5 measured, R6 withdrawn as unmeasured, `station_mode_ok` still false. `docs/mt7612u-station-identity.md` — read its retraction section before quoting a number. |
 | 3 — pure station logic | Not started. BSS table, association state machine, 4-way supplicant. |
 | 4–6 | Not started. |
 

@@ -502,12 +502,53 @@ implementation, and the `AdapterCaps` flag. The risk is register ownership:
 explicit hand-off on both paths, and station arming is a third writer — the one
 that must *not* move it (`docs/station-mode-scope.md` R6).
 
-**Acceptance.** A headless selftest of the ownership hand-off in the style of
-`tests/ack_responder_selftest.cpp`; an on-air regcheck that arms, reads the APC
-slot back (R5 — a wrong slot is silent), disarms, and proves the registers
-returned to their pre-arm values.
+**Acceptance, as originally written.** A headless selftest of the ownership
+hand-off in the style of `tests/ack_responder_selftest.cpp`; an on-air
+regcheck that arms, reads the APC slot back (R5 — a wrong slot is silent),
+disarms, and proves the registers returned to their pre-arm values.
 
-**Status:** not started. Blocked on Phase 0.
+**Status: implemented, gate NOT closed. The acceptance criterion above is
+half unmet, and the measurement it assumed has been inverted.**
+
+Landed: the `IRadio` seam with its contract, `AdapterCaps::station_mode_ok`
+(false), the MT7612U implementation, and three bring-up gates (`sta`,
+`staack`, `staid`) plus `tests/mt7612u_sta_identity.sh`.
+
+What R5 and R6 actually returned — `docs/mt7612u-station-identity.md`, and
+read its retraction section first:
+
+- **R5 answered.** The BSSID registers do not gate a managed station's
+  receive: 5877 unicast frames with both registers deliberately wrong against
+  6250 with nothing programmed. So `SetStationIdentity` writes neither.
+- **R6 withdrawn, not answered.** Whether this MAC auto-ACKs is unmeasured;
+  the gate's single-variable control does not move, so the method is void. An
+  earlier revision claimed 0.8% vs a 98% control — that control ran
+  promiscuous and is retracted.
+- **The prohibition on moving `MT_MAC_ADDR` stands on better evidence than
+  it was written with.** Under the managed filter it takes reception from 103
+  frames to zero: the port identity gates what a station *receives*.
+
+Why the first run of these measurements was worthless, because it is the
+lesson rather than the result: the gate called `mt7612u_set_monitor_rx()`
+under a comment reading "managed filter, not monitor". It is the opposite —
+that call clears every address and BSS drop bit — so six identical arms were
+guaranteed before a frame arrived. Phase 0's defect, in a gate whose own
+comment congratulated it for not repeating Phase 0. Round 1's "correction" to
+R5 (bit 3 is clear, so the filter is not in play) is what made it invisible;
+bit **2** is the one that matters and it is set.
+
+Still open against the original acceptance text:
+
+- **No headless selftest of the ownership hand-off.** `ctest` is unchanged at
+  72; the hand-off is covered only by `bringup staid` (10/10 on hardware),
+  which needs a device.
+- **No register round-trip proof**, because the implementation writes no
+  registers — the criterion assumed an arm that programs the APC slot, and
+  the measurement says it should not. The criterion is stale, not merely
+  unmet, but it has not been rewritten and nothing yet reads the APC slot
+  back, which R5's own text asked for.
+- `station_mode_ok` stays false: auto-ACK is open, and nothing has read the
+  chip's own retry count for a station's uplink.
 
 ## Phase 3 — pure station logic, offline
 

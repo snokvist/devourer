@@ -178,32 +178,47 @@ belongs in the Phase 0 estimate. The same document notes the shipping Jaguar1
 path produces 8 TSan reports under the same stress, so this is a shared gap
 rather than a MediaTek regression.
 
-### R5 — the APC BSSID slot: an open question, not a known failure mode
+### R5 — ANSWERED: the BSSID registers do not gate a station's receive
 
-*Corrected after review round 1 — the first draft of this section asserted a
-mechanism the register value contradicts. The corrected version is weaker and
-more honest.*
+*Measured in Phase 2 — `docs/mt7612u-station-identity.md`. Arm F, with both
+`MT_MAC_BSSID` and the APC slot deliberately WRONG, receives 5877 unicast
+frames against 6250 with nothing programmed, under the managed filter. A wrong
+value is harmless for receive on this part.*
+
+*Twice-corrected. The first draft asserted a mechanism the register value
+contradicts. Review round 1's "correction" then asserted a SECOND wrong
+mechanism — preserved below with its error marked, because it is the reason
+the first measurement was taken in the wrong configuration and believed.*
 
 `docs/mt7612u-ap-mode.md` finding 2: under `MBSS_MODE=3` mt76 derives the APC
 slot index from the address — `idx = 1 + (((mbss_base[0] ^ addr[0]) >> 2) & 7)`
 for a locally-administered address, 0 otherwise — and on the AP side getting it
 wrong was **silent**: "beacons perfectly, acknowledges nobody."
 
-What this does *not* license is the obvious extrapolation. The managed-station
-filter `mt_mac_start()` leaves is `0x00015f97` (`src/mt7612u/init.cpp:290`), and
-these are **drop** bits: bit 3 `MT_RX_FILTR_CFG_OTHER_BSS` is **clear**, so
-other-BSS frames are *accepted*, not dropped. `src/mt7612u/tools/bringup.cpp`
-says so in as many words, and notes mt76 clears `OTHER_BSS` for every mode. A
-wrong APC slot therefore cannot deafen a station by that route.
+~~What this does not license is the obvious extrapolation. The managed-station
+filter `mt_mac_start()` leaves is `0x00015f97`, and these are drop bits: bit 3
+`MT_RX_FILTR_CFG_OTHER_BSS` is clear, so other-BSS frames are accepted, not
+dropped. A wrong APC slot therefore cannot deafen a station by that route.~~
 
-So the honest statement is: **it is not known what the APC BSSID slot does for
-a managed station on this MAC.** On the AP side it gated the auto-response
-engine's BSS match. Whether a station needs it programmed at all — and if so
-whether a wrong slot is silent, harmless, or fatal — is unmeasured. Phase 2
-must answer that by measurement before it writes a regcheck, not assume a
-failure mode. The one thing that is certain is that the derivation rule is
-address-dependent and easy to get wrong, so whatever the arm path does it
-should read the slot back.
+**That reasoning is wrong, and it did damage.** Bit **2** (`PROMISC`) is SET in
+`0x00015f97`, and in mt76 bit 2 is the one mapped to `FIF_OTHER_BSS`. Reading
+only bit 3 and concluding the filter was not in play is why the Phase 2 gate
+was allowed to overwrite that filter with the monitor value and why six
+identical arms read as an answer. Two wrong mechanisms in a row on the same
+register, the second introduced by a review round correcting the first.
+
+**The measured answer** (`docs/mt7612u-station-identity.md`): with
+`0x00015f97` genuinely in force, programming the BSSID correctly, wrongly, or
+not at all makes no difference to what a managed station receives — broadcast
+or unicast. So a station does not need the APC slot, and `SetStationIdentity`
+on MT7612U does not write it.
+
+Two gaps remain, and they are the reason this is "measured" rather than
+"closed": the gate still does **not read the APC slot back** (the original
+version of this section asked for exactly that), and upstream mt76 carries a
+per-slot enable bit at BIT(16) of the slot-0 high register that this tree does
+not define and no arm sets. If that enable is real here, arms C–F may never
+have enabled the slot they wrote.
 
 ### R6 — MT_MAC_ADDR would gain a third co-owner
 
@@ -221,9 +236,22 @@ the seam below is `SetStationIdentity` and not a reuse of `SetAckResponder` —
 calling `SetAckResponder(bssid)` on a station would move `MT_MAC_ADDR` to the
 AP's address and break ACK for its own traffic.
 
-Good news in the same finding: because the engine matches on the port identity
-and `MT_AUTO_RSP_EN` is on from init, **an MT7612U station auto-ACKs the AP's
-unicast frames with no call at all.** The Realtek arm has to work for that.
+~~Good news in the same finding: because the engine matches on the port
+identity and `MT_AUTO_RSP_EN` is on from init, an MT7612U station auto-ACKs
+the AP's unicast frames with no call at all.~~
+
+**Still a register reading, and Phase 2 failed to measure it.** The gate's
+single-variable control — clear `MT_AUTO_RSP_EN`, hold reception constant —
+does not move the retried-copy count, so that method is void on this rig and
+auto-ACK is **unmeasured**. An earlier Phase 2 revision claimed to have
+measured it at 0.8% against a 98% control; that control ran promiscuous and is
+withdrawn. `docs/mt7612u-station-identity.md` has the detail.
+
+What Phase 2 *did* establish is stronger for this risk than the auto-ACK
+claim was: under the managed filter, moving `MT_MAC_ADDR` takes a station's
+reception from 103 frames to **zero**. The port identity gates what a station
+receives, not merely whether it acknowledges — so the prohibition on moving it
+stands, on better evidence than it was written with.
 
 ### R8 — the work items the first draft missed
 

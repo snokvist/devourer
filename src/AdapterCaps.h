@@ -243,9 +243,12 @@ struct AdapterCaps {
    * AP's unicast traffic and being ACKed for its own - the same shape of
    * evidence ack_responder_ok carries, measured per die. Two MT7612U-specific
    * unknowns are written up as R5 and R6 in docs/station-mode-scope.md; the
-   * relevant one for anyone setting this flag is that it is NOT known what
-   * the APC BSSID slot does for a managed station on that MAC, so no failure
-   * mode should be assumed until a bring-up gate has measured it. */
+   * relevant one for anyone setting this flag has changed since it was
+   * written: R5 is now measured on MT7612U (the BSSID registers do not gate a
+   * managed station's receive), and R6 is not (whether that MAC auto-ACKs is
+   * open - the gate's control for it does not move, so the method is void).
+   * docs/mt7612u-station-identity.md, and read its retraction section before
+   * quoting any number from it. */
   bool station_mode_ok = false;
 
   /* --- feature flags --- */
