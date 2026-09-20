@@ -206,6 +206,50 @@ void test_removal_wipes_key_material() {
         "a reused slot's replay window does not reject from the old high-water mark");
 }
 
+/* Churn: the failure mode an adversarial review found in the AP harness, which
+ * had no deauth handler at all, so StationTable::remove() had no caller outside
+ * this file and the table only ever grew. Seven distinct addresses filled it
+ * permanently. Android randomises its MAC per network by default, so that is
+ * ordinary client behaviour rather than an attack.
+ *
+ * The table itself was never the defect - this cell proves the container
+ * supports indefinite churn - but a container whose free path is never called
+ * is a leak, so the property is pinned here and the caller was added. */
+void test_churn_does_not_exhaust_the_table() {
+  StationTable t;
+  uint8_t addr[6] = {0x02, 0xcc, 0x00, 0x00, 0x00, 0x00};
+
+  /* Fill it. */
+  for (int i = 0; i < StationTable::kMaxStations; i++) {
+    addr[5] = (uint8_t)(i + 1);
+    check(t.add(addr) != nullptr, "the table fills");
+  }
+
+  /* Now churn far past capacity: each new address only fits because the
+   * previous one was freed. Forty rounds through a seven-slot table. */
+  for (int round = 0; round < 40; round++) {
+    uint8_t old_addr[6] = {0x02, 0xcc, 0x00, 0x00,
+                           (uint8_t)(round >> 8), (uint8_t)(round + 1)};
+    if (round == 0) { old_addr[4] = 0; old_addr[5] = 1; }
+    /* Free whatever currently holds the lowest slot, then admit a new MAC. */
+    Station* victim = t.at(0);
+    check(victim != nullptr, "a full table has an occupant to evict");
+    uint8_t v[6];
+    std::memcpy(v, victim->addr, 6);
+    check(t.remove(v), "the occupant is removed");
+
+    uint8_t fresh[6] = {0x02, 0xdd, 0x00, 0x00,
+                        (uint8_t)(round >> 8), (uint8_t)(round & 0xff)};
+    Station* s = t.add(fresh);
+    check(s != nullptr, "a fresh address is admitted after an eviction");
+    if (!s) return;
+    check(s->aid >= 1 && s->aid <= 7, "its AID stays inside the TIM range");
+    check(s->tx_pn == 1, "its PN space starts fresh");
+  }
+  check(t.count() == StationTable::kMaxStations,
+        "the table is still exactly full after 40 rounds of churn");
+}
+
 /* WaitMsg4 must count as keyed: a station that received msg3 installs its
  * keys and can send protected data before its msg4 arrives. Accepting only at
  * Done drops those frames. */
@@ -229,6 +273,7 @@ int main() {
   test_malformed_addresses_refused();
   test_two_stations_are_independent();
   test_removal_wipes_key_material();
+  test_churn_does_not_exhaust_the_table();
   test_keyed_accepts_wait_msg4();
 
   if (failures) {

@@ -510,26 +510,51 @@ static void on_rx(const Packet& p) {
     fprintf(stderr, "  AUTH from %02x:%02x:%02x:%02x:%02x:%02x\n",
             sta[0],sta[1],sta[2],sta[3],sta[4],sta[5]);
   } else if ((fc0 == 0x00 || fc0 == 0x20) && to_us) {   // (re)assoc
-    auto m = mgmt_hdr(0x10, sta);
-    m.insert(m.end(), {0x11,0x00, 0x00,0x00, 0x01,0xc0});
-    append_ies(m, false); enqueue(std::move(m));
-    fprintf(stderr, "  ASSOC from %02x:%02x:%02x:%02x:%02x:%02x -> start 4-way\n",
-            sta[0],sta[1],sta[2],sta[3],sta[4],sta[5]);
-    {
-      std::lock_guard<std::mutex> l(g_hs_mu);
-      /* add() returns the existing record for a re-association, so a station
-       * that loops back through assoc restarts its handshake instead of
-       * consuming a second AID. */
-      devourer::sta::Station* st = g_stas.add(sta);
-      if (!st) {
-        fprintf(stderr, "  ASSOC refused: the station table is full (%d)\n",
-                g_stas.capacity());
-      } else {
-        memset(st->eapol_replay, 0, 8);
-        st->state = devourer::sta::HsState::Idle;
-        send_msg1(*st, true);
-      }
+    /* Allocate BEFORE answering, because the association response has to carry
+     * the AID we allocated. It used to hardcode `0x01,0xc0` - AID 1 - which
+     * was true by accident while the AP served one station and tells every
+     * station it is AID 1 now that it serves several. The AID is what a TIM
+     * bitmap indexes, so two stations sharing one is not cosmetic the moment
+     * power save stops being off by policy.
+     *
+     * One lock for the whole branch. enqueue() takes g_q_mu underneath it,
+     * which is the same g_hs_mu -> g_q_mu order hs_tick uses. */
+    std::lock_guard<std::mutex> l(g_hs_mu);
+    /* add() returns the existing record for a re-association, so a station
+     * that loops back through assoc restarts its handshake instead of
+     * consuming a second AID. */
+    devourer::sta::Station* st = g_stas.add(sta);
+    if (!st) {
+      fprintf(stderr, "  ASSOC refused: the station table is full (%d)\n",
+              g_stas.capacity());
+      return;
     }
+    auto m = mgmt_hdr(0x10, sta);
+    const uint16_t aid_field = (uint16_t)(0xc000 | st->aid);   /* AID | the two reserved top bits */
+    m.insert(m.end(), {0x11,0x00, 0x00,0x00,
+                       (uint8_t)(aid_field & 0xff), (uint8_t)(aid_field >> 8)});
+    append_ies(m, false); enqueue(std::move(m));
+    fprintf(stderr, "  ASSOC from %02x:%02x:%02x:%02x:%02x:%02x (aid=%u) -> start 4-way\n",
+            sta[0],sta[1],sta[2],sta[3],sta[4],sta[5], st->aid);
+    memset(st->eapol_replay, 0, 8);
+    st->state = devourer::sta::HsState::Idle;
+    send_msg1(*st, true);
+  } else if ((fc0 == 0xc0 || fc0 == 0xa0) && to_us) {   // deauth / disassoc
+    /* WITHOUT THIS THE TABLE ONLY EVER GROWS. StationTable::remove() had no
+     * caller outside its own selftest, so seven distinct addresses filled the
+     * table permanently and every station after them got "the station table is
+     * full". That is not an attack - Android randomises its MAC per network by
+     * default, so it is ordinary client behaviour - and it was an effective
+     * regression: before the table, an eighth station simply overwrote the
+     * single g_sta.
+     *
+     * Freeing the record also wipes its key material, which is the other half
+     * of what a deauth should mean. */
+    std::lock_guard<std::mutex> l(g_hs_mu);
+    if (g_stas.remove(sta))
+      fprintf(stderr, "  %s from %02x:%02x:%02x:%02x:%02x:%02x -> slot freed (%d left)\n",
+              fc0 == 0xc0 ? "DEAUTH" : "DISASSOC",
+              sta[0],sta[1],sta[2],sta[3],sta[4],sta[5], g_stas.count());
   } else if ((fc0 == 0x08 || devourer::sta::is_qos_data(fc0)) &&
              (fc1 & 0x01) && to_us) {                   // data to-DS
     // data_hdr_len(), not `fc0 == 0x88`: QoS Null (0xc8) is a frame real
@@ -620,6 +645,19 @@ static void on_rx(const Packet& p) {
       // re-run this, and an EAPOL frame from a station with no record is not
       // a handshake at all.
       if (!st || st->state != devourer::sta::HsState::WaitMsg2) return;
+      /* THE KEY REPLAY COUNTER, CHECKED. 802.11-2016 12.7.6.3: msg2 must echo
+       * the counter this AP put in msg1. Until now neither this branch nor the
+       * msg4 one read the field at all (it is at e+9..e+16, which is where
+       * eapol_frame writes it) - acceptance rested on the key-info bits and
+       * the MIC alone. The comment above this handshake claims the counter
+       * lets copies be told apart; that was only ever half-wired, because the
+       * station could and this AP could not. Pre-existing, not introduced by
+       * the per-station rewiring: the single-g_sta code did not check it
+       * either. */
+      if (memcmp(e+9, st->eapol_replay, 8) != 0) {
+        fprintf(stderr, "  WPA2: msg2 key replay counter mismatch - dropped\n");
+        return;
+      }
       memcpy(st->snonce, e+17, 32);
       compute_ptk(*st);
       if (!check_mic(e, elen, *st)) { fprintf(stderr, "  WPA2: msg2 MIC FAIL\n"); return; }
@@ -637,6 +675,11 @@ static void on_rx(const Packet& p) {
     } else if ((ki & 0x0100) && (ki & 0x0200)) {        // msg4: MIC + secure
       std::lock_guard<std::mutex> l(g_hs_mu);
       devourer::sta::Station* st = g_stas.find(sta);
+      /* 12.7.6.5: msg4 must echo msg3's counter. Same gap as msg2 above. */
+      if (st && memcmp(e+9, st->eapol_replay, 8) != 0) {
+        fprintf(stderr, "  WPA2: msg4 key replay counter mismatch - dropped\n");
+        return;
+      }
       if (st && st->state == devourer::sta::HsState::WaitMsg4 &&
           check_mic(e, elen, *st)) {
         st->state = devourer::sta::HsState::Done;

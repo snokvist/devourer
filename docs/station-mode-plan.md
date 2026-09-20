@@ -45,6 +45,45 @@ a different agent, given the artifact and the repo, asked to attack it rather
 than confirm it. A review that returns no findings is evidence about the
 reviewer, not about the artifact — rerun it with a sharper prompt.
 
+### Review cadence (set 2026-09-20)
+
+Two tiers, because they catch different things and cost different amounts:
+
+- **Every gate, including a sub-item like 2b.3: one adversarial Flash
+  reviewer**, pointed at the specific diff and asked for *concrete defects with
+  a failure scenario*, not design opinions. This is the surface-bug pass — use-
+  after-unlock, a lock taken twice on one path, an off-by-one, a caller that
+  ignores a new return value. Cheap enough to run on every item, and the
+  failures it catches are the ones that survive a clean ctest.
+- **End of a larger gate (a whole phase, or a decision document): an Opus-led
+  review batch.** Several reviewers with *different angles* — protocol
+  correctness, architecture and internal consistency, and continuity with what
+  the repo already decided. The continuity angle is the one that is easy to
+  forget and has found the most: a correct decision recorded in a document
+  whose neighbours still say the opposite.
+
+Prompt both tiers to state explicitly when a category yields nothing, rather
+than padding — a reviewer that always finds something is as uninformative as
+one that never does.
+
+### Performance measurement in a gate
+
+Throughput does **not** belong on every gate. Near-field RF variance on this
+bench swamps the regressions worth catching, so a per-gate throughput number
+would either miss a real one or cry wolf, and a gauge that cannot tell a
+regression from its own noise gets ignored. What belongs on a gate is the
+**deterministic** part:
+
+- the per-frame CCMP cost the AP already emits under `DEVOURER_CCMP_PROFILE`
+  (`ccmp_tx_ns_per_frame` / `ccmp_rx_ns_per_frame`), which is CPU work per
+  frame and barely moves with RF conditions;
+- the headless `ccmp_sw_bench`, which has no radio in it at all.
+
+The on-air `bench` cell of `tests/mt7612u_ap_onair.sh` stays what it is: an
+occasional measurement run deliberately, not a gate. And note what it is not —
+a flood ping is round-trip bound, so `reply_pps` is a *latency* figure, not
+link throughput. Nothing in this tree measures throughput yet.
+
 Standing rules inherited from the repo that a reviewer should check against:
 the library reads no environment; two-plane logging; no key material in logs;
 `std::thread` not `std::jthread` (#426); MSVC and mingw are first-class; no
