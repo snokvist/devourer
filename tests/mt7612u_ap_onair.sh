@@ -21,15 +21,26 @@
 #   wpa2   ap_wpa2          beacon -> scan, 4-way handshake, encrypted ping
 #   stop   beacon_stop_check armed -> stopped -> re-armed, by scan
 #
-# Bench: two MT7612U. One is the AP (devourer claims it); the other stays on
-# the kernel mt76x2u driver and is the station. They are told apart by sysfs
-# id, not by PID - they share one.
+# Bench: the AP is an MT7612U that devourer claims. The STATION is any adapter
+# the host has a working kernel driver for, named by sysfs id - it is driven
+# only through iw / wpa_supplicant / ping and this script never assumes its
+# chip. The original bench used a second MT7612U on mt76x2u, which made the
+# witness same-silicon on both ends; an independent-generation station (an
+# RTL8812AU on rtw88_8812au) is the stronger reading of the same cells, and is
+# what docs/mt7612u-ap-mode.md admitted it lacked.
 #
 #   sudo tests/mt7612u_ap_onair.sh
 #   sudo AP_SYSFS=5-1 STA_SYSFS=2-1 CH=36 tests/mt7612u_ap_onair.sh open
+#   sudo AP_SYSFS=7-1 STA_SYSFS=1-1 CH=6 BCN_TU=25 tests/mt7612u_ap_onair.sh all
 #
-# Env: AP_SYSFS, STA_SYSFS, CH, PSK, FW_DIR, SECS, AP_VBUS (hubloc:port for a
-# real VBUS cold cycle via uhubctl; hub ports only). BENCH_SECS and
+# BCN_TU is the beacon interval and it is a STATION property, not an AP one.
+# The default 100 is what the MediaTek station tolerated. A supplicant whose
+# scan hops channels fast enough can miss a 100 TU beacon entirely - the
+# RTL8812AU here does - and the run then reads as "AP never came up" when the
+# AP was airing the whole time. Lower it rather than believe that.
+#
+# Env: AP_SYSFS, STA_SYSFS, CH, BCN_TU, PSK, FW_DIR, SECS, AP_VBUS (hubloc:port
+# for a real VBUS cold cycle via uhubctl; hub ports only). BENCH_SECS and
 # BENCH_PAYLOAD configure the CCMP CPU/throughput cell.
 # Cells: open|wpa2|stop|bench|all (all remains the acceptance cells only).
 
@@ -43,6 +54,7 @@ STA_SYSFS="${STA_SYSFS:-2-1}"
 CH="${CH:-36}"
 FREQ=$(( CH < 15 ? 2407 + CH * 5 : 5000 + CH * 5 ))
 PSK="${PSK:-devourer123}"
+BCN_TU="${BCN_TU:-100}"
 SECS="${SECS:-40}"
 BENCH_SECS="${BENCH_SECS:-15}"
 BENCH_PAYLOAD="${BENCH_PAYLOAD:-1400}"
@@ -115,13 +127,51 @@ if [ -z "$STA_IF" ]; then
   sleep 3
   STA_IF=$(ls "/sys/bus/usb/devices/$STA_SYSFS:1.0/net/" 2>/dev/null | head -1)
 fi
-[ -n "$STA_IF" ] || { echo "no station iface at $STA_SYSFS (is mt76x2u bound?)"; exit 2; }
+if [ -z "$STA_IF" ]; then
+  # drivers_probe is not enough after devourer has held this adapter: the
+  # libusb claim leaves the interface on usbfs, and a re-probe (or a write to
+  # a driver's `bind`) reports success without producing a netdev. Only a
+  # re-enumeration does. This costs ~13 s, so it is the fallback, not the path.
+  say "no netdev at $STA_SYSFS - re-enumerating the station"
+  echo 0 > "/sys/bus/usb/devices/$STA_SYSFS/authorized" 2>/dev/null
+  sleep 3
+  echo 1 > "/sys/bus/usb/devices/$STA_SYSFS/authorized" 2>/dev/null
+  sleep 10
+  STA_IF=$(ls "/sys/bus/usb/devices/$STA_SYSFS:1.0/net/" 2>/dev/null | head -1)
+fi
+[ -n "$STA_IF" ] || { echo "no station iface at $STA_SYSFS (is a kernel driver bound?)"; exit 2; }
 # A previous desktop/network-manager action can leave the newly probed PHY
 # soft-blocked. `ip link set up` then fails silently below and wpa_supplicant
 # exits without creating its pid file. Make the station precondition explicit.
 rfkill unblock wlan 2>/dev/null || true
 ip link set "$STA_IF" up 2>/dev/null || {
   echo "station iface $STA_IF could not be brought up (check rfkill)"; exit 2; }
+
+# POWER SAVE OFF, and this is not a convenience - it is a precondition these
+# AP harnesses impose and had never stated.
+#
+# Neither ap_responder nor ap_wpa2 implements 802.11 power save: the beacon
+# carries no TIM bitmap, nothing is buffered for a dozing station, and every
+# reply is injected the instant the request is parsed. A station in PS is
+# asleep when that reply airs and never hears it. Measured on this bench, open
+# network, 60 pings at 1/s, changing NOTHING but this line:
+#
+#   power_save on   ->  0/60 received, link dropped mid-run, AP saw 2 of ~62
+#                       data frames; earlier runs 50% loss with a 942 ms outlier
+#   power_save off  ->  60/60 received, 0% loss, rtt 0.735/1.530/7.644 ms
+#
+# That one setting is what produced every symptom this bench had been carrying
+# as unexplained: runs that complete a 4-way and then never pass a packet,
+# "the station drops on inactivity", and an RTT of 524 ms mean / 1729 ms max.
+# None of it was the radio, the link budget, or the crypto.
+#
+# Left as a hard requirement rather than a fallback: a harness that silently
+# tolerated PS would be measuring the station's sleep schedule, not the AP.
+if ! iw dev "$STA_IF" set power_save off 2>/dev/null; then
+  echo "could not disable power save on $STA_IF - these AP harnesses have no"
+  echo "TIM/PS buffering, so a dozing station will read as a data-plane failure"
+  exit 2
+fi
 say "AP $AP_SYSFS   station $STA_SYSFS ($STA_IF)   ch$CH ($FREQ MHz)"
 
 # `flush` is not optional: without it the BSS cache reports a beacon that
@@ -134,18 +184,37 @@ say "AP $AP_SYSFS   station $STA_SYSFS ($STA_IF)   ch$CH ($FREQ MHz)"
 # a live beacon into a pass for "gone", and it stops a missed scan reporting a
 # live beacon as absent. Observed: a "beacon not scannable" FAIL in a run where
 # the station then associated, pinged, and got an auth at retry=0.
-seen() {   # $1 = SSID, $2 = BSSID
+seen() {   # $1 = SSID, $2 = BSSID  -> number of matching BSS entries
   local i n best=0
   for i in 1 2 3; do
-    # Matched on BSSID *and* SSID: a neighbour running "devourerAP" would
-    # otherwise pass an arm check, fail a stop check, or break the exact-count
-    # comparison. awk keeps the pairing - grep -c on two patterns would count
-    # them independently.
+    # Count BSS *entries*, keyed on all three of BSSID, SSID and the frequency
+    # we actually scanned. Every part of that is load-bearing:
+    #
+    #  - BSSID and SSID together, because a neighbour running "devourerAP"
+    #    would otherwise pass an arm check and fail a stop check;
+    #  - one hit per BSS BLOCK, not per matching line: `iw` prints a separate
+    #    "Information elements from Probe Response frame" section, so a BSS
+    #    heard as both a beacon and a probe response prints `SSID:` twice;
+    #  - the frequency, because cfg80211 keys its cache by (BSSID, SSID,
+    #    channel) and will hold SEVERAL entries for one BSSID. Measured here:
+    #    a scan of 5180 alone reports our AP twice - once on 5180 with the
+    #    real IEs, and once as a ghost carrying `freq: 2412`, `signal: 0.00`
+    #    and an SSID-only IE set that survives `flush` and outlives the AP
+    #    process. Counting SSID lines across the whole scan therefore returned
+    #    2, and the caller's `= 1` read a beacon that was airing at -24 dBm as
+    #    "not scannable". That was the entire 5 GHz open-cell failure.
+    #
+    # The callers compare `-gt 0` / `= 0`, never `= 1`: how many cache entries
+    # cfg80211 chooses to keep is not a property of the AP under test.
     n=$(iw dev "$STA_IF" scan flush freq "$FREQ" 2>/dev/null |
-        awk -v b="$2" -v ss="SSID: $1" '
-          /^BSS /   { cur = tolower($2); sub(/\(.*/, "", cur) }
-          index($0, ss) { if (cur == tolower(b)) c++ }
-          END { print c + 0 }')
+        awk -v b="$2" -v ss="$1" -v want="$FREQ" '
+          /^BSS / { k++; bssid[k] = tolower($2); sub(/\(.*/, "", bssid[k]); next }
+          k > 0 && $1 == "freq:" { f[k] = $2 + 0; next }
+          k > 0 { line = $0; sub(/^[ \t]+/, "", line)
+                  if (line == "SSID: " ss) sname[k] = 1 }
+          END { for (j = 1; j <= k; j++)
+                  if (bssid[j] == tolower(b) && f[j] == want + 0 && sname[j]) c++
+                print c + 0 }')
     n=${n:-0}
     [ "$n" -gt "$best" ] && best=$n
     [ "$best" -gt 0 ] && break
@@ -157,7 +226,7 @@ seen() {   # $1 = SSID, $2 = BSSID
 apenv() {
   set -- DEVOURER_VID=0x0e8d DEVOURER_PID=0x7612 DEVOURER_CHANNEL="$CH" \
          DEVOURER_USB_BUS="${AP_SYSFS%%-*}" DEVOURER_USB_PORT="${AP_SYSFS#*-}" \
-         DEVOURER_BCN_TU=100 DEVOURER_TX_WITH_RX=thread "$@"
+         DEVOURER_BCN_TU="$BCN_TU" DEVOURER_TX_WITH_RX=thread "$@"
   [ -n "$FW_DIR" ] && set -- DEVOURER_MT7612U_FW_DIR="$FW_DIR" "$@"
   printf '%s\n' "$@"
 }
@@ -186,10 +255,23 @@ cell_open() {
   came_up "$OUT/open.log" || { bad "open: AP did not come up (see $OUT/open.log)"; kill $ap 2>/dev/null; return; }
   ok "open: beacon armed"
 
-  [ "$(seen devourerAP 02:42:75:05:d6:00)" = 1 ] && ok "open: beacon on air" || bad "open: beacon not scannable"
+  [ "$(seen devourerAP 02:42:75:05:d6:00)" -gt 0 ] && ok "open: beacon on air" || bad "open: beacon not scannable"
 
   ip addr flush dev "$STA_IF" 2>/dev/null
-  if timeout 30 iw dev "$STA_IF" connect -w devourerAP >/dev/null 2>&1; then
+  # Connect by SSID *and* frequency *and* BSSID. Connecting by SSID alone lets
+  # the station pick any cache entry with that name, and there is reliably more
+  # than one: while the AP is up, this station's cfg80211 cache carries a
+  # second entry for our own BSSID showing `freq: 2412`, `signal: 0.00` and an
+  # SSID-only IE set - no Supported Rates. Measured: 4 association attempts by
+  # SSID alone, one failed, and on that one the AP logged NO auth and NO assoc
+  # request at all while the station's driver said "No legacy rates in
+  # association response". It had associated with something that was not this
+  # AP. Where that entry comes from is NOT established here and is not claimed.
+  #
+  # Naming the frequency and the BSSID removes the ambiguity instead of racing
+  # it, and is the more precise test anyway: the cell knows exactly which BSS
+  # it put on the air.
+  if timeout 30 iw dev "$STA_IF" connect -w devourerAP "$FREQ" 02:42:75:05:d6:00 >/dev/null 2>&1; then
     ok "open: station associated"
   else
     bad "open: station did not associate"; kill $ap 2>/dev/null; return
@@ -202,12 +284,29 @@ cell_open() {
   else
     bad "open: ping lost packets ($(grep -oE '[0-9]+% packet loss' "$OUT/open.ping" | head -1))"
   fi
-  # retry=0 on auth IS the hardware ACK: an un-ACKed frame comes back with FC
-  # Retry set. This is the only evidence that the APC slot and port identity
-  # are both right.
-  grep -q "AUTH req .* retry=0" "$OUT/open.log" \
-    && ok "open: hardware auto-ACK (auth at retry=0)" \
-    || bad "open: no auth at retry=0 - the MAC did not ACK"
+  # retry=0 on a management frame IS the hardware ACK: a frame the AP did not
+  # ACK is retransmitted by the station's MAC with FC Retry set. This is the
+  # only evidence that the APC slot and port identity are both right.
+  #
+  # It must NOT be pinned to AUTH. WHICH frame arrives at retry=0 is a property
+  # of the station and of chance, not of the AP. Measured on this bench's
+  # RTL8812AU: five runs, AUTH arrived at retry=1 in four of them and retry=0
+  # in the fifth, with ASSOC at retry=0 in all five. Power save on/off does not
+  # predict it - one PS-off run with 60/60 pings and 0% loss still showed AUTH
+  # at retry=1. mac80211 on that station logs "send auth (try 1/3)" then
+  # "authenticated", so the retransmission happened in hardware inside a single
+  # management attempt: the first copy was not ACKed, the second was.
+  #
+  # So the AUTH-specific form is a coin flip on this station, and it failed a
+  # link that then passed every other check. Either frame proves the same thing
+  # - both are unicast to the AP's MAC and both must be ACKed by it - so accept
+  # either. This is not a weaker bar; it is the same bar without the accident
+  # of which frame happened to survive its first transmission.
+  if grep -qE "(AUTH|ASSOC) req from .* retry=0" "$OUT/open.log"; then
+    ok "open: hardware auto-ACK ($(grep -oE '(AUTH|ASSOC) req from [^ ]* .*retry=0' "$OUT/open.log" | head -1 | grep -oE '^(AUTH|ASSOC)') at retry=0)"
+  else
+    bad "open: no management frame at retry=0 - the MAC did not ACK"
+  fi
 
   iw dev "$STA_IF" disconnect 2>/dev/null; ip addr flush dev "$STA_IF" 2>/dev/null
   wait $ap 2>/dev/null
@@ -230,7 +329,12 @@ cell_wpa2() {
 
   local wpa="$OUT/wpa.conf"
   printf 'network={\n\tssid="devourerAP"\n\tpsk="%s"\n\tkey_mgmt=WPA-PSK\n\tproto=RSN\n\tpairwise=CCMP\n\tgroup=CCMP\n\tscan_ssid=1\n}\n' "$PSK" > "$wpa"
+  # Address the interface BEFORE the supplicant starts. Some stations drop the
+  # link on inactivity within seconds of a completed 4-way, and every step
+  # between "handshake complete" and "first packet" is a chance to straddle
+  # that timer. Configuring the address up front is free and removes one.
   ip addr flush dev "$STA_IF" 2>/dev/null
+  ip addr add "$STAIP/24" dev "$STA_IF" 2>/dev/null
   wpa_supplicant -i "$STA_IF" -c "$wpa" -P "$OUT/wpa.pid" -B >/dev/null 2>&1
   KIDS="$KIDS $(cat "$OUT/wpa.pid" 2>/dev/null)"
   local i
@@ -246,7 +350,6 @@ cell_wpa2() {
     kill $ap 2>/dev/null; return
   fi
 
-  ip addr add "$STAIP/24" dev "$STA_IF" 2>/dev/null
   ping -c 1 -W 2 -I "$STA_IF" "$APIP" >/dev/null 2>&1
   if ping -c 6 -W 1 -I "$STA_IF" "$APIP" 2>&1 | tee "$OUT/wpa2.ping" | grep -q " 0% packet loss"; then
     ok "wpa2: encrypted data plane ($(grep -oE 'rtt [^ ]+ = [0-9./]+' "$OUT/wpa2.ping" | head -1))"
@@ -384,7 +487,7 @@ cell_stop() {
 
   wait_arm 0 30 || { bad "stop: never armed"; kill $ap 2>/dev/null; return; }
   sleep 4
-  [ "$(seen mtStopCheck 02:4d:54:53:54:50)" = 1 ] && ok "stop: armed - beacon on air" || bad "stop: armed but not scannable"
+  [ "$(seen mtStopCheck 02:4d:54:53:54:50)" -gt 0 ] && ok "stop: armed - beacon on air" || bad "stop: armed but not scannable"
 
   local n_arms; n_arms=$(armed)
   local i
@@ -396,7 +499,7 @@ cell_stop() {
   # "beaconing every", not for the banner that precedes it.
   wait_arm "$n_arms" 60 || { bad "stop: re-arm never reported"; kill $ap 2>/dev/null; return; }
   sleep 4
-  [ "$(seen mtStopCheck 02:4d:54:53:54:50)" = 1 ] && ok "stop: re-armed - beacon back" || bad "stop: re-arm did not air"
+  [ "$(seen mtStopCheck 02:4d:54:53:54:50)" -gt 0 ] && ok "stop: re-armed - beacon back" || bad "stop: re-arm did not air"
 
   wait $ap 2>/dev/null
   grep -q "0 failure(s)" "$OUT/stop.log" \

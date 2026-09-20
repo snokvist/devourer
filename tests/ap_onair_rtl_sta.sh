@@ -77,16 +77,22 @@ sta_up() {
   return 0
 }
 
-start_ap() { # $1 = binary, $2.. = extra env
-  ( DEVOURER_VID=0x0e8d DEVOURER_PID=0x7612 \
-    DEVOURER_USB_BUS="$AP_BUS" DEVOURER_USB_PORT="$AP_PORT" \
-    DEVOURER_MT7612U_FW_DIR="$FW_DIR" \
-    DEVOURER_CHANNEL="$CH" DEVOURER_BCN_TU=25 \
-    DEVOURER_TX_WITH_RX=thread "$@" \
-    "/tmp/$1" "$SECS" > "$OUT/$1.jsonl" 2> "$OUT/$1.log" ) &
+# `env`, not a bare assignment list: the extra-env arguments arrive through
+# "$@", and a shell does NOT treat a word that EXPANDS to NAME=VALUE as an
+# assignment - it treats it as the command. The first form of this ran the
+# binary's NAME as a command ("apr_rtl: not found") and reported it as "the AP
+# did not come up", which is the same text a real bring-up failure produces.
+start_ap() { # $1 = binary, $2.. = extra NAME=VALUE env
+  bin="$1"; shift
+  ( env DEVOURER_VID=0x0e8d DEVOURER_PID=0x7612 \
+        DEVOURER_USB_BUS="$AP_BUS" DEVOURER_USB_PORT="$AP_PORT" \
+        DEVOURER_MT7612U_FW_DIR="$FW_DIR" \
+        DEVOURER_CHANNEL="$CH" DEVOURER_BCN_TU=25 \
+        DEVOURER_TX_WITH_RX=thread "$@" \
+        "/tmp/$bin" "$SECS" > "$OUT/$bin.jsonl" 2> "$OUT/$bin.log" ) &
   AP=$!
   sleep 25
-  grep -qE 'up on ch|ap_wpa2 up' "$OUT/$1.log"
+  grep -qE 'up on ch|ap_wpa2 up' "$OUT/$bin.log"
 }
 
 cell_open() {
