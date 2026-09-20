@@ -989,7 +989,10 @@ endif()
 # MediaTek MAC does not assign for anything but a beacon.
 add_executable(Dot11Selftest tests/dot11_selftest.cpp)
 target_include_directories(Dot11Selftest PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+# rx_mpdu.h pulls in RxPacket.h, which uses std::span.
+target_compile_features(Dot11Selftest PRIVATE cxx_std_20)
 add_test(NAME dot11_frames COMMAND Dot11Selftest)
 
 # Headless guard for the TX quiesce seam (ITransport::quiesce_tx via

@@ -57,6 +57,7 @@
 #include "logger.h"
 #include "usb_select.h"
 #include "ccmp_software.h"
+#include "rx_mpdu.h"
 
 static const uint8_t kBssid[6] = {0x02, 0x42, 0x75, 0x05, 0xd6, 0x00};
 static const char* kSsid = "devourerAP";
@@ -419,7 +420,13 @@ static void handle_plain(const uint8_t* sta, const uint8_t* d, int len) {
 }
 
 static void on_rx(const Packet& p) {
-  if (p.Data.size() < 24 || p.RxAtrib.crc_err) return;
+  /* NOT p.Data.size(): on every Realtek generation that buffer still carries
+   * the four trailing FCS bytes, and feeding that length to a CCMP decrypt
+   * puts the expected MIC four bytes late so EVERY frame fails to
+   * authenticate - which this harness's ledger would then report as MIC
+   * failures, i.e. as an attack. See tests/rx_mpdu.h. */
+  const size_t mlen = devourer::test::mpdu_len(p);
+  if (mlen < 24 || p.RxAtrib.crc_err) return;
   const uint8_t fc0 = p.Data[0], fc1 = p.Data[1];
   const uint8_t* a1 = p.Data.data() + 4;
   const uint8_t* sta = p.Data.data() + 10;
@@ -460,7 +467,7 @@ static void on_rx(const Packet& p) {
     // protected data on the air before its msg4 reaches us. Gating on the
     // completed handshake dropped those frames.
     if ((fc1 & 0x40) && g_state >= HS_WAIT_MSG4) {      // PROTECTED (CCMP) data
-      int len = (int)p.Data.size();
+      int len = (int)mlen;
       if (len < hlen + 8 + 8) return;                   // hdr + CCMP hdr + MIC
       const uint8_t* d = p.Data.data();
       // The header length is passed explicitly, so a QoS frame's AAD includes
@@ -494,10 +501,10 @@ static void on_rx(const Packet& p) {
       g_enc_rx.fetch_add(1);
       return;
     }
-    if ((int)p.Data.size() < hlen + 8) return;
+    if ((int)mlen < hlen + 8) return;
     const uint8_t* llc = p.Data.data() + hlen;
     if (!(llc[0]==0xaa && llc[6]==0x88 && llc[7]==0x8e)) return;  // EAPOL
-    const uint8_t* e = llc + 8; int elen = (int)p.Data.size() - (hlen + 8);
+    const uint8_t* e = llc + 8; int elen = (int)mlen - (hlen + 8);
     if (elen < 99 || e[1] != 3) return;                 // EAPOL-Key
     uint16_t ki = (e[5]<<8) | e[6];
     if ((ki & 0x0008) && (ki & 0x0100) && !(ki & 0x0040) && !(ki & 0x0200)) {

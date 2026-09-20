@@ -58,6 +58,7 @@
 #include "env_config.h"
 #include "logger.h"
 #include "usb_select.h"
+#include "rx_mpdu.h"
 
 // BSSID MUST be UNICAST — the first octet's I/G bit (bit 0) must be 0. The
 // canonical test SA 0x57... has that bit SET (multicast), which is invalid as a
@@ -166,7 +167,12 @@ static std::vector<uint8_t> mgmt_hdr(uint8_t subtype_fc, const uint8_t* sta) {
 }
 
 static void on_rx(const Packet& p) {
-  if (p.Data.size() < 24 || p.RxAtrib.crc_err) return;
+  /* NOT p.Data.size() - see the note in ap_wpa2.cpp's on_rx and
+   * tests/rx_mpdu.h. This harness has no MIC to get wrong, but it slices
+   * ARP and ICMP out of the payload by length, and four phantom bytes at the
+   * end would be answered as if they were data. */
+  const size_t mlen = devourer::test::mpdu_len(p);
+  if (mlen < 24 || p.RxAtrib.crc_err) return;
   const uint8_t fc0 = p.Data[0], fc1 = p.Data[1];
   const uint8_t* a1 = p.Data.data() + 4;             // addr1 (RA)
   const uint8_t* sta = p.Data.data() + 10;           // addr2 (TA = station)
@@ -203,12 +209,12 @@ static void on_rx(const Packet& p) {
     // Every QoS subtype, not just QoS Data - a QoS Null read as a 24-byte
     // header finds its LLC/SNAP two bytes early and is silently dropped.
     int hlen = (int)devourer::sta::data_hdr_len(fc0, fc1);
-    if ((int)p.Data.size() < hlen + 8) return;
+    if ((int)mlen < hlen + 8) return;
     const uint8_t* llc = p.Data.data() + hlen;
     if (!(llc[0] == 0xaa && llc[1] == 0xaa && llc[2] == 0x03)) return;
     uint16_t eth = (llc[6] << 8) | llc[7];
     const uint8_t* pl = llc + 8;
-    int pllen = (int)p.Data.size() - (hlen + 8);
+    int pllen = (int)mlen - (hlen + 8);
     if (eth == 0x0806 && pllen >= 28) {                  // ARP
       uint16_t oper = (pl[6] << 8) | pl[7];
       const uint8_t* sha = pl + 8; const uint8_t* spa = pl + 14; const uint8_t* tpa = pl + 24;

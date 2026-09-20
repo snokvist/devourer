@@ -547,7 +547,7 @@ cell_open() {
   set -- $sta_tx
   tx_pkts="${1:--}"; tx_retries="${2:--}"; tx_failed="${3:--}"
   if [ "$tx_pkts" = "-" ] || [ "$tx_retries" = "-" ] || [ "$tx_failed" = "-" ]; then
-    bad "open: station exports no tx_retries/tx_failed - no auto-ACK witness available"
+    bad "open: station exports no tx_retries/tx_failed - no auto-ACK witness on this station driver (in-tree rtw88 exports them; the out-of-tree rtl88x2cu does not). The link may be fine - the data-plane check above is the one to read."
   elif [ "$tx_pkts" -le 0 ]; then
     bad "open: station reported 0 transmitted frames - nothing to judge"
   elif [ "$tx_failed" -gt 0 ]; then

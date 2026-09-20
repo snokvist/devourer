@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "sta/Dot11.h"
+#include "rx_mpdu.h"
 
 namespace {
 
@@ -559,7 +560,50 @@ void test_data_seq() {
 
 }  // namespace
 
+/* The FCS trim (tests/rx_mpdu.h).
+ *
+ * Packet::Data keeps the four trailing FCS bytes on every Realtek generation
+ * and drops them on MT7612U. A consumer that uses the raw size feeds a length
+ * four bytes too long into CCMP decrypt, which puts the expected MIC four
+ * bytes late - so every frame fails to authenticate, and the AP harness
+ * ledger reports that as MIC FAILURES, i.e. as an attack. The harnesses have
+ * only ever run on MT7612U, where fcs_present is false and the bug is
+ * dormant; it would have woken at Phase 6 against the Realtek arm, as a flood
+ * of MIC failures on a link that was working.
+ */
+void test_fcs_trim() {
+  using devourer::test::mpdu_len;
+
+  /* MediaTek: the MAC already stripped it, so there is nothing to take off. */
+  check(mpdu_len(100, false) == 100, "fcs: no trim when absent");
+  check(mpdu_len(24, false) == 24, "fcs: no trim at the header minimum");
+  check(mpdu_len(0, false) == 0, "fcs: no trim on an empty buffer");
+
+  /* Realtek: four of those bytes are not the frame. */
+  check(mpdu_len(100, true) == 96, "fcs: trims four when present");
+  check(mpdu_len(28, true) == 24, "fcs: a 24-byte header survives the trim");
+
+  /* A buffer that is exactly an FCS is an empty MPDU, not a negative one. */
+  check(mpdu_len(4, true) == 0, "fcs: exactly an FCS is empty");
+
+  /* THE ONE THAT MATTERS. `raw` is unsigned, so a naive `raw - 4` on a runt
+   * wraps to an enormous length - and every downstream bounds check compares
+   * against that length, so they all PASS and the parse walks off the end of
+   * the buffer. A truncated frame is something a radio delivers. */
+  check(mpdu_len(3, true) == 0, "fcs: a 3-byte runt does not underflow");
+  check(mpdu_len(1, true) == 0, "fcs: a 1-byte runt does not underflow");
+  check(mpdu_len(0, true) == 0, "fcs: an empty buffer does not underflow");
+  check(mpdu_len(3, true) < 100, "fcs: runt is not the wrapped value");
+  check(mpdu_len(0, true) < 100, "fcs: empty is not the wrapped value");
+
+  /* The trim is exactly four, and applying it to an already-trimmed length
+   * must not take another four. */
+  check(mpdu_len(100, true) + 4 == 100, "fcs: the trim is exactly four");
+  check(mpdu_len(mpdu_len(100, true), false) == 96, "fcs: not trimmed twice");
+}
+
 int main() {
+  test_fcs_trim();
   test_mgmt_hdr();
   test_seq();
   test_ie_walk();
