@@ -399,6 +399,8 @@ static std::atomic<uint64_t> g_enc_rx{0}, g_mic_fail{0}, g_replayed{0};
  * how that gate will be read. */
 static std::atomic<uint64_t> g_to_peer{0};      /* DA is another associated station */
 static std::atomic<uint64_t> g_to_elsewhere{0}; /* DA is off-BSS entirely */
+static std::atomic<uint64_t> g_relayed{0};      /* ...and actually forwarded */
+static std::atomic<uint64_t> g_relay_drop{0};   /* ...dropped: peer not keyed, or cipher refused */
 
 static uint16_t csum16(const uint8_t* d, int len) {
   uint32_t s = 0; for (int i=0;i+1<len;i+=2) s += (d[i]<<8)|d[i+1];
@@ -408,6 +410,40 @@ static uint16_t csum16(const uint8_t* d, int len) {
 // tested against vectors from a third implementation (ctest ccmp_framing).
 // They used to be inline here and in nobody's test.
 // Encrypt an AP->STA payload (LLC/SNAP+eth+data) into a CCMP data frame.
+/* INTRA-BSS RELAY (Phase 2b.7).
+ *
+ * Take a frame station A sent for station B, and air it to B. The MSDU is
+ * already decrypted and still carries its LLC/SNAP header, so it passes
+ * through untouched - only the 802.11 header is rebuilt and only the key
+ * changes.
+ *
+ * You cannot forward the ciphertext. A's frame is encrypted under A's PTK,
+ * and the CCMP AAD authenticates addr1/addr2/addr3 while the nonce carries
+ * A2, so rewriting the header invalidates both. It has to be decrypted under
+ * A's key and re-encrypted under B's, with a fresh PN in B's own space.
+ *
+ * addr2 stays the BSSID because the AP is the transmitter, which is also why
+ * the nonce's A2 is unchanged; only addr3 becomes A rather than the AP. That
+ * is the one thing data_hdr_from_ds already took a parameter for and every
+ * caller was passing kBssid to.
+ *
+ * Caller holds g_hs_mu. */
+static std::vector<uint8_t> ccmp_relay(const uint8_t* dst, const uint8_t* src,
+                                       const uint8_t* msdu, int len) {
+  devourer::sta::Station* st = g_stas.find(dst);
+  if (!st || !st->keyed()) return {};
+  std::vector<uint8_t> hdr = devourer::sta::data_hdr_from_ds(
+      dst, kBssid, src, /*protect=*/true, g_seq.next());
+  const uint64_t pn = st->tx_pn++;              /* B's PN space, not A's */
+  std::vector<uint8_t> m(devourer::sta::ccmp_encrypted_len(hdr.size(),
+                                                           (size_t)len));
+  const size_t n = devourer::sta::ccmp_encrypt(
+      g_crypto, st->ptk + 32, hdr.data(), hdr.size(), kBssid, pn, 0,
+      msdu, (size_t)len, m.data(), m.size());
+  m.resize(n);                                   /* 0 means the cipher refused */
+  return m;
+}
+
 /* Caller holds g_hs_mu: every path into here runs inside the RX callback's
  * data branch, which takes the lock to look the station up in the first
  * place. An unkeyed or unknown destination emits nothing rather than airing a
@@ -696,11 +732,18 @@ static void on_rx(const Packet& p) {
               std::memcmp(da, kBssid, 6) == 0) {
             handle_plain(sta, pt.data(), (int)ptlen);    // decrypted -> ARP/ICMP
           } else if (g_stas.find(da)) {
-            /* Destined for another station on this BSS. 2b.7 will relay it;
-             * for now it is dropped, which is what the old code did too - it
-             * just did it by accident, inside responders that ignore anything
-             * not addressed to the AP's own IP. */
+            /* Destined for another station on this BSS: relay it. */
             g_to_peer.fetch_add(1);
+            std::vector<uint8_t> f = ccmp_relay(da, sta, pt.data(), (int)ptlen);
+            if (!f.empty()) {
+              enqueue(std::move(f));
+              g_relayed.fetch_add(1);
+            } else {
+              /* The peer is associated but has no usable key yet, or the
+               * cipher refused. Dropping is right - airing it in the clear or
+               * under the wrong key would be worse than losing it. */
+              g_relay_drop.fetch_add(1);
+            }
           } else {
             g_to_elsewhere.fetch_add(1);
           }
@@ -862,10 +905,12 @@ int main(int argc, char** argv) {
    * anything but MediaTek. */
   fprintf(stderr,
           "  addressing: to this AP=%llu, to a peer station=%llu"
-          " (relay is 2b.7), off-BSS=%llu\n",
+          " (relayed=%llu dropped=%llu), off-BSS=%llu\n",
           (unsigned long long)(g_enc_rx.load() - g_to_peer.load()
                                - g_to_elsewhere.load()),
           (unsigned long long)g_to_peer.load(),
+          (unsigned long long)g_relayed.load(),
+          (unsigned long long)g_relay_drop.load(),
           (unsigned long long)g_to_elsewhere.load());
   fprintf(stderr,
           "  data plane: encrypted frames received=%llu, MIC failures=%llu, "
