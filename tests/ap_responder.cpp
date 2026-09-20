@@ -30,7 +30,7 @@
 // show as repeated retries; here retry=0).
 //
 // Build: g++ -std=c++20 -O2 -Isrc -Iexamples/common tests/ap_responder.cpp \
-//   examples/common/env_config.cpp build/libdevourer.a \
+//   examples/common/env_config.cpp examples/common/usb_select.cpp build/libdevourer.a \
 //   $(pkg-config --cflags --libs libusb-1.0) -lpthread -o build/ap_responder
 // Run: sudo DEVOURER_PID=0xc812 DEVOURER_CHANNEL=6 DEVOURER_TX_WITH_RX=thread \
 //   build/ap_responder [sec]
@@ -56,6 +56,7 @@
 #include "WiFiDriver.h"
 #include "env_config.h"
 #include "logger.h"
+#include "usb_select.h"
 
 // BSSID MUST be UNICAST — the first octet's I/G bit (bit 0) must be 0. The
 // canonical test SA 0x57... has that bit SET (multicast), which is invalid as a
@@ -248,11 +249,9 @@ int main(int argc, char** argv) {
   apply_logging_env(*logger);
   libusb_context* ctx = nullptr; libusb_init(&ctx);
   libusb_set_option(ctx, LIBUSB_OPTION_LOG_LEVEL, LIBUSB_LOG_LEVEL_WARNING);
-  uint16_t vid = 0x0bda, pid = 0xc812;
-  if (const char* v = std::getenv("DEVOURER_VID")) vid = (uint16_t)strtoul(v, 0, 0);
-  if (const char* p = std::getenv("DEVOURER_PID")) pid = (uint16_t)strtoul(p, 0, 0);
-  auto* h = libusb_open_device_with_vid_pid(ctx, vid, pid);
-  if (!h) { fprintf(stderr, "open %04x:%04x fail\n", vid, pid); return 1; }
+  static const uint16_t pids[] = {0xc812};
+  auto* h = open_selected_usb(ctx, logger, pids, 1);
+  if (!h) return 1;
   std::shared_ptr<devourer::UsbDeviceLock> lk;
   if (devourer::claim_interface_then_reset(h, devourer::find_wifi_interface(h), logger, true, lk) != 0) return 1;
   WiFiDriver wifi(logger);

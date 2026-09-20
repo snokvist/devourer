@@ -166,6 +166,9 @@ key interface is a much larger contract than a feature flag — key lifetime, GT
 vs PTK, rekey, who owns the replay counter — and expensive to undo once callers
 exist.
 
+The measurement plan and the non-throughput reasons for (and against) doing
+the work are in [MT7612U CCMP offload benchmark](mt7612u-ccmp-benchmark.md).
+
 ## Limitations and shortfalls of a userspace AP on MediaTek — and workarounds
 
 1. **Power-save / TIM is the real fight — USB has no pre-TBTT interrupt.**

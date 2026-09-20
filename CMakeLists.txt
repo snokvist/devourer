@@ -955,6 +955,19 @@ if(DEVOURER_MT7612U)
     add_test(NAME mt7612u_tsf_api COMMAND Mt7612uTsfApiSelftest)
 endif()
 
+# The exact userspace CCMP primitive used by tests/ap_wpa2.cpp, isolated from
+# USB and airtime.  This is the CPU-ceiling half of the MT7612U hardware-offload
+# decision (#425); the executable's normal mode is a benchmark, while ctest
+# only runs its roundtrip + bad-tag guard.  OpenSSL is optional for the main
+# library and for platforms on which this AP harness is not built.
+find_package(OpenSSL QUIET)
+if(OpenSSL_FOUND)
+    add_executable(CcmpSwBench tests/ccmp_sw_bench.cpp)
+    target_include_directories(CcmpSwBench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(CcmpSwBench PRIVATE OpenSSL::Crypto)
+    add_test(NAME ccmp_software_roundtrip COMMAND CcmpSwBench --self-test)
+endif()
+
 # Headless guard for the TX quiesce seam (ITransport::quiesce_tx via
 # RtlAdapter): the explicit "stop TX and wait it out" call every device makes
 # before anything is released. UsbTransport's cancel/drain is validated on

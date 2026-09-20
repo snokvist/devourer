@@ -48,6 +48,7 @@
 #include "WiFiDriver.h"
 #include "env_config.h"
 #include "logger.h"
+#include "usb_select.h"
 
 namespace {
 
@@ -101,11 +102,9 @@ int main(int argc, char **argv) {
   libusb_init(&ctx);
   libusb_set_option(ctx, LIBUSB_OPTION_LOG_LEVEL, LIBUSB_LOG_LEVEL_WARNING);
 
-  uint16_t vid = 0x0e8d, pid = 0x7612;
-  if (const char *v = std::getenv("DEVOURER_VID")) vid = (uint16_t)strtoul(v, 0, 0);
-  if (const char *p = std::getenv("DEVOURER_PID")) pid = (uint16_t)strtoul(p, 0, 0);
-  auto *h = libusb_open_device_with_vid_pid(ctx, vid, pid);
-  if (!h) { std::fprintf(stderr, "open %04x:%04x fail\n", vid, pid); return 1; }
+  static const uint16_t pids[] = {0x7612};
+  auto *h = open_selected_usb(ctx, logger, pids, 1);
+  if (!h) return 1;
 
   std::shared_ptr<devourer::UsbDeviceLock> lk;
   if (devourer::claim_interface_then_reset(

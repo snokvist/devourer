@@ -29,7 +29,9 @@
 #   sudo AP_SYSFS=5-1 STA_SYSFS=2-1 CH=36 tests/mt7612u_ap_onair.sh open
 #
 # Env: AP_SYSFS, STA_SYSFS, CH, PSK, FW_DIR, SECS, AP_VBUS (hubloc:port for a
-# real VBUS cold cycle via uhubctl; hub ports only). Cells: open|wpa2|stop|all.
+# real VBUS cold cycle via uhubctl; hub ports only). BENCH_SECS and
+# BENCH_PAYLOAD configure the CCMP CPU/throughput cell.
+# Cells: open|wpa2|stop|bench|all (all remains the acceptance cells only).
 
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -42,6 +44,8 @@ CH="${CH:-36}"
 FREQ=$(( CH < 15 ? 2407 + CH * 5 : 5000 + CH * 5 ))
 PSK="${PSK:-devourer123}"
 SECS="${SECS:-40}"
+BENCH_SECS="${BENCH_SECS:-15}"
+BENCH_PAYLOAD="${BENCH_PAYLOAD:-1400}"
 FW_DIR="${FW_DIR:-}"
 APIP=192.168.99.1
 STAIP=192.168.99.2
@@ -112,7 +116,12 @@ if [ -z "$STA_IF" ]; then
   STA_IF=$(ls "/sys/bus/usb/devices/$STA_SYSFS:1.0/net/" 2>/dev/null | head -1)
 fi
 [ -n "$STA_IF" ] || { echo "no station iface at $STA_SYSFS (is mt76x2u bound?)"; exit 2; }
-ip link set "$STA_IF" up 2>/dev/null
+# A previous desktop/network-manager action can leave the newly probed PHY
+# soft-blocked. `ip link set up` then fails silently below and wpa_supplicant
+# exits without creating its pid file. Make the station precondition explicit.
+rfkill unblock wlan 2>/dev/null || true
+ip link set "$STA_IF" up 2>/dev/null || {
+  echo "station iface $STA_IF could not be brought up (check rfkill)"; exit 2; }
 say "AP $AP_SYSFS   station $STA_SYSFS ($STA_IF)   ch$CH ($FREQ MHz)"
 
 # `flush` is not optional: without it the BSS cache reports a beacon that
@@ -147,6 +156,7 @@ seen() {   # $1 = SSID, $2 = BSSID
 
 apenv() {
   set -- DEVOURER_VID=0x0e8d DEVOURER_PID=0x7612 DEVOURER_CHANNEL="$CH" \
+         DEVOURER_USB_BUS="${AP_SYSFS%%-*}" DEVOURER_USB_PORT="${AP_SYSFS#*-}" \
          DEVOURER_BCN_TU=100 DEVOURER_TX_WITH_RX=thread "$@"
   [ -n "$FW_DIR" ] && set -- DEVOURER_MT7612U_FW_DIR="$FW_DIR" "$@"
   printf '%s\n' "$@"
@@ -156,6 +166,7 @@ build() { # $1 = source stem, $2 = output name, $3.. = extra libs
   local src="$1" out="$2"; shift 2
   g++ -std=c++20 -O2 -I"$ROOT/src" -I"$ROOT/examples/common" \
       "$ROOT/tests/$src.cpp" "$ROOT/examples/common/env_config.cpp" \
+      "$ROOT/examples/common/usb_select.cpp" \
       "$BUILD/libdevourer.a" $(pkg-config --cflags --libs libusb-1.0) \
       "$@" -lpthread -o "/tmp/$out" || return 1
 }
@@ -252,6 +263,98 @@ cell_wpa2() {
     || bad "wpa2: beacon STILL AIRING after exit"
 }
 
+# --- cell: software CCMP cost under real MediaTek RX/TX load ----------------
+# This is intentionally not called a software/hardware A/B yet. An open AP is
+# not a hardware-CCMP proxy; a genuine hardware arm must keep this traffic and
+# measurement cell unchanged and swap only key/WCID + descriptor/RX handling.
+cell_bench() {
+  say "== software CCMP benchmark (${BENCH_PAYLOAD}B ping payload, ${BENCH_SECS}s) =="
+  case "$BENCH_PAYLOAD" in
+    ''|*[!0-9]*) bad "bench: BENCH_PAYLOAD must be an integer"; return ;;
+  esac
+  [ "$BENCH_PAYLOAD" -ge 0 ] && [ "$BENCH_PAYLOAD" -le 1400 ] || {
+    bad "bench: BENCH_PAYLOAD must be 0..1400 (avoid IP fragmentation)"; return; }
+  build ap_wpa2 apw_bench -lcrypto || { bad "bench: build"; return; }
+  local run_secs=$((BENCH_SECS * 2 + 45))
+  env $(apenv) DEVOURER_WPA2_PSK="$PSK" DEVOURER_CCMP_PROFILE=1 \
+      timeout $((run_secs + 20)) /tmp/apw_bench "$run_secs" \
+      >"$OUT/bench.jsonl" 2>"$OUT/bench.log" &
+  local ap=$!; KIDS="$KIDS $ap"
+  sleep 12
+  came_up "$OUT/bench.log" || { bad "bench: AP did not come up"; kill $ap 2>/dev/null; return; }
+  # `$ap` is coreutils timeout; CPU belongs to its direct apw_bench child.
+  local ap_cpu_pid
+  ap_cpu_pid=$(pgrep -P "$ap" -x apw_bench | head -1)
+  [ -n "$ap_cpu_pid" ] || {
+    bad "bench: cannot find apw_bench child of timeout"; kill $ap 2>/dev/null; return; }
+
+  local wpa="$OUT/bench-wpa.conf"
+  printf 'network={\n\tssid="devourerAP"\n\tpsk="%s"\n\tkey_mgmt=WPA-PSK\n\tproto=RSN\n\tpairwise=CCMP\n\tgroup=CCMP\n\tscan_ssid=1\n}\n' "$PSK" > "$wpa"
+  ip addr flush dev "$STA_IF" 2>/dev/null
+  wpa_supplicant -i "$STA_IF" -c "$wpa" -P "$OUT/bench-wpa.pid" \
+      -f "$OUT/bench-wpa.log" -B >/dev/null 2>&1 || {
+    bad "bench: wpa_supplicant did not start (see $OUT/bench-wpa.log)";
+    kill $ap 2>/dev/null; return; }
+  local wp; wp=$(cat "$OUT/bench-wpa.pid" 2>/dev/null); KIDS="$KIDS $wp"
+  local i
+  for i in $(seq 1 25); do
+    grep -q "4-WAY HANDSHAKE COMPLETE" "$OUT/bench.log" && break
+    sleep 1
+  done
+  grep -q "4-WAY HANDSHAKE COMPLETE" "$OUT/bench.log" || {
+    bad "bench: 4-way did not complete"; kill "$wp" $ap 2>/dev/null; return; }
+  ip addr add "$STAIP/24" dev "$STA_IF" 2>/dev/null
+  ping -c 1 -W 2 -I "$STA_IF" "$APIP" >/dev/null 2>&1
+
+  # Paired idle window removes beacon/RX-loop and host background CPU from the
+  # system-wide number. /proc/<pid>/stat gives the AP itself; /proc/stat keeps
+  # usbfs/xHCI softirq and worker work which process CPU would hide.
+  proc_ticks() { awk '{print $14+$15}' "/proc/$1/stat" 2>/dev/null; }
+  sys_busy() { awk '/^cpu / { idle=$5+$6; for(i=2;i<=NF;i++) total+=$i; print total-idle }' /proc/stat; }
+  local hz; hz=$(getconf CLK_TCK)
+  local ib0 ib1 wb0 wb1 ip0 ip1 wp0 wp1
+  ib0=$(sys_busy); ip0=$(proc_ticks "$ap_cpu_pid"); sleep "$BENCH_SECS"
+  ib1=$(sys_busy); ip1=$(proc_ticks "$ap_cpu_pid")
+  wb0=$(sys_busy); wp0=$(proc_ticks "$ap_cpu_pid")
+  ping -f -q -s "$BENCH_PAYLOAD" -w "$BENCH_SECS" -I "$STA_IF" "$APIP" \
+      >"$OUT/bench.ping" 2>&1 || true
+  wb1=$(sys_busy); wp1=$(proc_ticks "$ap_cpu_pid")
+
+  local tx rx loss ap_core sys_cores
+  tx=$(sed -n 's/^\([0-9][0-9]*\) packets transmitted.*/\1/p' "$OUT/bench.ping" | tail -1)
+  rx=$(sed -n 's/.* \([0-9][0-9]*\) received.*/\1/p' "$OUT/bench.ping" | tail -1)
+  loss=$(sed -n 's/.* \([0-9.][0-9.]*%\) packet loss.*/\1/p' "$OUT/bench.ping" | tail -1)
+  tx=${tx:-0}; rx=${rx:-0}; loss=${loss:-unknown}
+  ap_core=$(awk -v w="$((wp1-wp0))" -v i="$((ip1-ip0))" -v h="$hz" -v s="$BENCH_SECS" \
+      'BEGIN { v=(w-i)/h/s*100; if(v<0)v=0; printf "%.2f",v }')
+  sys_cores=$(awk -v w="$((wb1-wb0))" -v i="$((ib1-ib0))" -v h="$hz" -v s="$BENCH_SECS" \
+      'BEGIN { v=(w-i)/h/s; if(v<0)v=0; printf "%.3f",v }')
+  ok "bench: $rx/$tx replies, loss=$loss, AP=${ap_core}% core, system_increment=${sys_cores} cores"
+
+  kill "$wp" 2>/dev/null
+  ip addr flush dev "$STA_IF" 2>/dev/null
+  wait $ap 2>/dev/null
+  local profile; profile=$(grep '"ev":"ccmp.profile"' "$OUT/bench.log" | tail -1)
+  [ -n "$profile" ] || { bad "bench: missing ccmp.profile"; return; }
+  printf '%s\n' "$profile"
+  python3 - "$profile" "$BENCH_PAYLOAD" "$BENCH_SECS" "$tx" "$rx" "$ap_core" "$sys_cores" <<'PYEOF'
+import json, sys
+p = json.loads(sys.argv[1])
+def ns_per(which):
+    n = p[f"{which}_frames"]
+    return p[f"{which}_ns"] / n if n else 0
+row = {"ev":"mt7612u.ccmp_bench", "path":p["path"],
+       "ping_payload":int(sys.argv[2]), "seconds":int(sys.argv[3]),
+       "requests":int(sys.argv[4]), "replies":int(sys.argv[5]),
+       "reply_pps":int(sys.argv[5])/int(sys.argv[3]),
+       "ap_incremental_core_pct":float(sys.argv[6]),
+       "system_incremental_cores":float(sys.argv[7]),
+       "ccmp_tx_ns_per_frame":ns_per("tx"),
+       "ccmp_rx_ns_per_frame":ns_per("rx")}
+print(json.dumps(row, separators=(",",":")))
+PYEOF
+}
+
 # --- cell: the beacon lifecycle -------------------------------------------
 cell_stop() {
   say "== beacon lifecycle (StartBeacon / StopBeacon / re-arm) =="
@@ -305,8 +408,9 @@ case "$CELLS" in
   open) cell_open ;;
   wpa2) cell_wpa2 ;;
   stop) cell_stop ;;
+  bench) cell_bench ;;
   all)  cell_open; cleanup; cell_wpa2; cleanup; cell_stop ;;
-  *)    echo "usage: $0 [open|wpa2|stop|all]"; exit 2 ;;
+  *)    echo "usage: $0 [open|wpa2|stop|bench|all]"; exit 2 ;;
 esac
 
 say ""

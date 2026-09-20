@@ -24,7 +24,7 @@
 // number (keep frag); the nonce is 0|A2|PN(6, big-endian).
 //
 // Build: g++ -std=c++20 -O2 -Isrc -Iexamples/common tests/ap_wpa2.cpp \
-//   examples/common/env_config.cpp build/libdevourer.a \
+//   examples/common/env_config.cpp examples/common/usb_select.cpp build/libdevourer.a \
 //   $(pkg-config --cflags --libs libusb-1.0) -lcrypto -lpthread -o build/ap_wpa2
 // Run: sudo DEVOURER_VID=0x2357 DEVOURER_PID=0x012d DEVOURER_CHANNEL=6 \
 //   DEVOURER_WPA2_PSK=devourer123 DEVOURER_BCN_TU=25 DEVOURER_TX_WITH_RX=thread \
@@ -53,6 +53,8 @@
 #include "WiFiDriver.h"
 #include "env_config.h"
 #include "logger.h"
+#include "usb_select.h"
+#include "ccmp_software.h"
 
 static const uint8_t kBssid[6] = {0x02, 0x42, 0x75, 0x05, 0xd6, 0x00};
 static const char* kSsid = "devourerAP";
@@ -61,6 +63,9 @@ static std::vector<uint8_t> g_rt;
 static uint8_t g_chan = 6;
 static const char* g_psk = "devourer123";
 static std::atomic<uint64_t> g_sent{0};
+static bool g_ccmp_profile = false;
+static std::atomic<uint64_t> g_ccmp_tx_frames{0}, g_ccmp_tx_bytes{0}, g_ccmp_tx_ns{0};
+static std::atomic<uint64_t> g_ccmp_rx_frames{0}, g_ccmp_rx_bytes{0}, g_ccmp_rx_ns{0};
 static std::mutex g_q_mu;
 static std::vector<std::vector<uint8_t>> g_q;
 
@@ -74,6 +79,26 @@ static uint8_t g_anonce[32], g_snonce[32], g_ptk[48], g_gtk[16];
 static uint8_t g_replay[8];
 static uint8_t g_sta[6];
 static int g_state = 0;  // 0 idle, 1 sent msg1, 2 done
+
+static bool profiled_ccmp(bool encrypt, const uint8_t* key, const uint8_t* nonce,
+                          const uint8_t* aad, int aadlen, const uint8_t* input,
+                          int input_len, uint8_t* output, uint8_t* tag) {
+  if (!g_ccmp_profile)
+    return devourer::test::ccmp_software(encrypt, key, nonce, aad, aadlen,
+                                         input, input_len, output, tag);
+  const auto before = std::chrono::steady_clock::now();
+  bool ok = devourer::test::ccmp_software(encrypt, key, nonce, aad, aadlen,
+                                          input, input_len, output, tag);
+  uint64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - before).count();
+  auto& frames = encrypt ? g_ccmp_tx_frames : g_ccmp_rx_frames;
+  auto& bytes = encrypt ? g_ccmp_tx_bytes : g_ccmp_rx_bytes;
+  auto& elapsed = encrypt ? g_ccmp_tx_ns : g_ccmp_rx_ns;
+  frames.fetch_add(1, std::memory_order_relaxed);
+  bytes.fetch_add(static_cast<uint64_t>(input_len), std::memory_order_relaxed);
+  elapsed.fetch_add(ns, std::memory_order_relaxed);
+  return ok;
+}
 
 static void enqueue(std::vector<uint8_t> mpdu) {
   std::vector<uint8_t> f; f.reserve(g_rt.size() + mpdu.size());
@@ -223,27 +248,6 @@ static void ccmp_aad_nonce(const uint8_t* hdr, uint64_t pn, const uint8_t* a2,
   nonce[0]=0; memcpy(nonce+1, a2, 6);
   for (int i=0;i<6;i++) nonce[7+i] = (pn >> (8*(5-i))) & 0xff;
 }
-static bool ccm(bool enc, const uint8_t* key, const uint8_t* nonce, const uint8_t* aad,
-                int aadlen, const uint8_t* in, int inlen, uint8_t* out, uint8_t* tag) {
-  EVP_CIPHER_CTX* c = EVP_CIPHER_CTX_new(); int l; bool ok=true;
-  if (enc) {
-    EVP_EncryptInit_ex(c, EVP_aes_128_ccm(), 0,0,0);
-    EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_AEAD_SET_IVLEN, 13, 0);
-    EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_AEAD_SET_TAG, 8, 0);
-    EVP_EncryptInit_ex(c, 0,0,key,nonce);
-    EVP_EncryptUpdate(c, 0,&l,0,inlen); EVP_EncryptUpdate(c,0,&l,aad,aadlen);
-    EVP_EncryptUpdate(c, out,&l,in,inlen); EVP_EncryptFinal_ex(c,out+l,&l);
-    EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_AEAD_GET_TAG, 8, tag);
-  } else {
-    EVP_DecryptInit_ex(c, EVP_aes_128_ccm(), 0,0,0);
-    EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_AEAD_SET_IVLEN, 13, 0);
-    EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_AEAD_SET_TAG, 8, tag);
-    EVP_DecryptInit_ex(c, 0,0,key,nonce);
-    EVP_DecryptUpdate(c, 0,&l,0,inlen); EVP_DecryptUpdate(c,0,&l,aad,aadlen);
-    ok = EVP_DecryptUpdate(c, out,&l,in,inlen) > 0;
-  }
-  EVP_CIPHER_CTX_free(c); return ok;
-}
 // Encrypt an AP->STA payload (LLC/SNAP+eth+data) into a CCMP data frame.
 static std::vector<uint8_t> ccmp_tx(const uint8_t* sta, uint16_t eth,
                                     const uint8_t* pl, int plen) {
@@ -257,7 +261,8 @@ static std::vector<uint8_t> ccmp_tx(const uint8_t* sta, uint16_t eth,
   uint8_t aad[32], nonce[13], mic[8]; int aadlen;
   ccmp_aad_nonce(hdr.data(), pn, kBssid, aad, &aadlen, nonce);
   std::vector<uint8_t> ct(pt.size());
-  ccm(true, g_ptk+32, nonce, aad, aadlen, pt.data(), pt.size(), ct.data(), mic);
+  profiled_ccmp(true, g_ptk+32, nonce, aad, aadlen,
+                pt.data(), pt.size(), ct.data(), mic);
   uint8_t ch8[8] = {(uint8_t)(pn&0xff),(uint8_t)((pn>>8)&0xff),0,0x20,
       (uint8_t)((pn>>16)&0xff),(uint8_t)((pn>>24)&0xff),(uint8_t)((pn>>32)&0xff),(uint8_t)((pn>>40)&0xff)};
   std::vector<uint8_t> m = hdr;
@@ -359,7 +364,8 @@ static void on_rx(const Packet& p) {
       ccmp_aad_nonce(d, pn, sta, aad, &aadlen, nonce);   // A2 = station
       memcpy(tag, mic, 8);
       std::vector<uint8_t> pt(ctlen);
-      if (ccm(false, g_ptk+32, nonce, aad, aadlen, ct, ctlen, pt.data(), tag))
+      if (profiled_ccmp(false, g_ptk+32, nonce, aad, aadlen,
+                        ct, ctlen, pt.data(), tag))
         handle_plain(sta, pt.data(), ctlen);             // decrypted -> ARP/ICMP
       return;
     }
@@ -389,14 +395,14 @@ int main(int argc, char** argv) {
   int sec = argc > 1 ? atoi(argv[1]) : 60;
   if (const char* c = std::getenv("DEVOURER_CHANNEL")) g_chan = (uint8_t)atoi(c);
   if (const char* k = std::getenv("DEVOURER_WPA2_PSK")) g_psk = k;
+  if (const char* p = std::getenv("DEVOURER_CCMP_PROFILE"))
+    g_ccmp_profile = std::strcmp(p, "0") != 0;
   auto logger = std::make_shared<Logger>(); apply_logging_env(*logger);
   libusb_context* ctx = nullptr; libusb_init(&ctx);
   libusb_set_option(ctx, LIBUSB_OPTION_LOG_LEVEL, LIBUSB_LOG_LEVEL_WARNING);
-  uint16_t vid = 0x0bda, pid = 0xc812;
-  if (const char* v = std::getenv("DEVOURER_VID")) vid = (uint16_t)strtoul(v, 0, 0);
-  if (const char* p = std::getenv("DEVOURER_PID")) pid = (uint16_t)strtoul(p, 0, 0);
-  auto* h = libusb_open_device_with_vid_pid(ctx, vid, pid);
-  if (!h) { fprintf(stderr, "open %04x:%04x fail\n", vid, pid); return 1; }
+  static const uint16_t pids[] = {0xc812};
+  auto* h = open_selected_usb(ctx, logger, pids, 1);
+  if (!h) return 1;
   std::shared_ptr<devourer::UsbDeviceLock> lk;
   if (devourer::claim_interface_then_reset(h, devourer::find_wifi_interface(h), logger, true, lk) != 0) return 1;
   WiFiDriver wifi(logger);
@@ -423,6 +429,18 @@ int main(int argc, char** argv) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
   fprintf(stderr, "sent=%llu 4way_state=%d\n", (unsigned long long)g_sent.load(), g_state);
+  if (g_ccmp_profile) {
+    fprintf(stderr,
+            "{\"ev\":\"ccmp.profile\",\"path\":\"software\","
+            "\"tx_frames\":%llu,\"tx_bytes\":%llu,\"tx_ns\":%llu,"
+            "\"rx_frames\":%llu,\"rx_bytes\":%llu,\"rx_ns\":%llu}\n",
+            (unsigned long long)g_ccmp_tx_frames.load(),
+            (unsigned long long)g_ccmp_tx_bytes.load(),
+            (unsigned long long)g_ccmp_tx_ns.load(),
+            (unsigned long long)g_ccmp_rx_frames.load(),
+            (unsigned long long)g_ccmp_rx_bytes.load(),
+            (unsigned long long)g_ccmp_rx_ns.load());
+  }
   /* Retried, and the failure reported. StopBeacon can now genuinely fail (an
    * EP0 stall during teardown), IRadio.h says such a failure "must be retried
    * ... before its shared port is reused", and `_exit(0)` below means there is
