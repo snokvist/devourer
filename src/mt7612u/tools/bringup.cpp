@@ -2542,6 +2542,235 @@ static int gate_sta(uint8_t chan, int secs, const char *bssid_str)
 	return 0;
 }
 
+/* ------------------------------------------------------------- gate_staack
+ *
+ * R6's ACK half, measured from the DUT alone.
+ *
+ * docs/station-mode-scope.md asserts, as "good news", that because the
+ * auto-response engine matches address 1 against MT_MAC_ADDR and
+ * MT_AUTO_RSP_EN is on from init, an MT7612U station auto-ACKs the AP's
+ * unicast with NO call at all. That is load-bearing for SetStationIdentity -
+ * it is the reason the seam must NOT move MT_MAC_ADDR - and it was asserted
+ * from a register reading, never measured.
+ *
+ * WHY THIS IS HARD, AND WHAT DOES NOT WORK. To know whether we acknowledged a
+ * frame, somebody must observe the ACK. The transmitting AP cannot: the ACK
+ * arrives a SIFS after its own transmission, and its monitor vif does not
+ * hand it up. Injecting at ourselves from a monitor vif on the AP's phy and
+ * capturing ACKs there was tried and produced ZERO in both the DUT-present
+ * and DUT-absent arms - the control said the method was void, which is the
+ * only reason that non-result is not written up as "the station does not
+ * ACK". Monitor-injected frames also default to no-ack in mac80211, so they
+ * never solicited one in the first place.
+ *
+ * WHAT WORKS. Make the AP send US something through its NORMAL transmit path,
+ * with retries, and count the copies. A directed probe request from our own
+ * address makes hostapd answer with a unicast probe response addressed to us.
+ * Then:
+ *
+ *   - if we ACK it, the AP is done: we see ONE copy, FC Retry clear.
+ *   - if we do not, the AP's MAC retransmits until its limit, and we see the
+ *     SAME response again with FC Retry SET.
+ *
+ * So `retried` is the signal, and it is the sound form of the auto-ACK test -
+ * the same "count the retried copies" the AP harness's own bring-up row used
+ * and its on-air script never did. No second observer, no third radio.
+ *
+ * A high retried fraction is evidence we are NOT acknowledging. A low one,
+ * with responses actually arriving, is evidence we are.
+ *
+ *   bringup staack <chan> <secs> <ap-bssid>
+ */
+struct staack_count {
+	std::atomic<unsigned long> resp{0};      /* probe responses to us      */
+	std::atomic<unsigned long> resp_retry{0};/* ... with FC Retry set      */
+	std::atomic<unsigned long> other_to_us{0};
+	std::atomic<unsigned long> other_retry{0};
+	uint8_t own[6];
+	uint8_t bssid[6];
+};
+
+static void staack_rx_cb(void *user, const void *frame, size_t len,
+                         const struct mt7612u_rx_info *info)
+{
+	struct staack_count *c = (struct staack_count *)user;
+	const uint8_t *f = (const uint8_t *)frame;
+	int retry;
+
+	(void)info;
+	if (len < 24) return;
+	if (memcmp(f + 4, c->own, 6) != 0) return;       /* addr1 must be us */
+	if (memcmp(f + 10, c->bssid, 6) != 0) return;    /* from the AP      */
+
+	retry = (f[1] & 0x08) ? 1 : 0;                   /* FC Retry */
+	if (f[0] == 0x50) {                              /* probe response */
+		c->resp.fetch_add(1, std::memory_order_relaxed);
+		if (retry) c->resp_retry.fetch_add(1, std::memory_order_relaxed);
+	} else {
+		c->other_to_us.fetch_add(1, std::memory_order_relaxed);
+		if (retry) c->other_retry.fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
+static int gate_staack(uint8_t chan, int secs, const char *bssid_str)
+{
+	static struct staack_count ctr;
+	struct mt7612u_tx_rate rate = { };
+	uint8_t bssid[6];
+	static uint8_t probe[128];
+	size_t plen;
+	double t0, a_frac = -1.0, b_frac = -1.0;
+	unsigned long sent = 0, resp = 0, retried = 0, a_resp = 0, b_resp = 0;
+
+	if (parse_mac6(bssid_str, bssid)) {
+		printf("GATE STAACK: FAIL - need the AP's BSSID\n");
+		return 2;
+	}
+
+	if (mt_eeprom_init(&dev)) return 1;
+	if (mt_init_hardware(&dev, NULL)) return 1;
+	if (mt_set_channel(&dev, chan, MT7612U_BW_20)) return 1;
+
+	memcpy(ctr.own, dev.macaddr, 6);
+	memcpy(ctr.bssid, bssid, 6);
+	ctr.resp = 0; ctr.resp_retry = 0; ctr.other_to_us = 0; ctr.other_retry = 0;
+
+	/* Directed probe request: addr1 = addr3 = the AP, addr2 = US. Addressed
+	 * to the AP rather than broadcast so the response comes back unicast to
+	 * our address, which is the frame whose acknowledgement we are testing. */
+	memset(probe, 0, sizeof probe);
+	probe[0] = 0x40;                       /* probe request */
+	memcpy(probe + 4,  bssid, 6);
+	memcpy(probe + 10, dev.macaddr, 6);
+	memcpy(probe + 16, bssid, 6);
+	plen = 24;
+	probe[plen++] = 0x00;                  /* SSID element, wildcard */
+	probe[plen++] = 0x00;
+	probe[plen++] = 0x01;                  /* supported rates */
+	probe[plen++] = 0x04;
+	probe[plen++] = 0x82; probe[plen++] = 0x84;
+	probe[plen++] = 0x8b; probe[plen++] = 0x96;
+
+	rate.phy = MT7612U_PHY_OFDM;
+	rate.mcs = 0;                          /* 6 Mbit/s - robust */
+	rate.nss = 1;
+	rate.bw = MT7612U_BW_20;
+	rate.no_ack = 0;
+
+	printf("=== GATE STAACK: does this MAC auto-ACK unicast to its own address? ===\n");
+	printf("chan %u, %d s per arm, AP %02x:%02x:%02x:%02x:%02x:%02x, own %02x:%02x:%02x:%02x:%02x:%02x\n",
+	       chan, secs, bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5],
+	       dev.macaddr[0], dev.macaddr[1], dev.macaddr[2],
+	       dev.macaddr[3], dev.macaddr[4], dev.macaddr[5]);
+	printf("\n");
+
+	/*
+	 * TWO ARMS, and the second is what makes the first mean anything.
+	 *
+	 * Arm A is the claim: nothing armed, MT_MAC_ADDR as init left it. A low
+	 * retried fraction there is only evidence of acknowledgement if a high
+	 * one is REACHABLE - otherwise "few retries" might just be what this AP
+	 * always does, and the gate would be unable to fail.
+	 *
+	 * Arm B reaches it, by doing precisely the thing R6 warns against:
+	 * mt7612u_set_ack_responder() retargets MT_MAC_ADDR to a foreign
+	 * address, so the auto-response engine no longer matches our own. The
+	 * AP's probe responses to us should then go unacknowledged and be
+	 * retransmitted. If arm B does NOT rise, this method measures nothing
+	 * and arm A's number must not be quoted.
+	 *
+	 * Arm B is also the R6 hazard demonstrated rather than asserted: it is
+	 * what SetAckResponder(bssid) would do to a station.
+	 */
+	for (int armi = 0; armi < 2; armi++) {
+		static const uint8_t foreign[6] =
+			{ 0x02, 0x00, 0x00, 0xac, 0x1d, 0x01 };
+		double frac;
+
+		ctr.resp = 0; ctr.resp_retry = 0;
+		ctr.other_to_us = 0; ctr.other_retry = 0;
+		sent = 0;
+
+		if (mt_mac_start(&dev, MT_RX_DRAIN_NONE)) return 1;
+		if (mt_async_start(&dev, staack_rx_cb, &ctr)) { mt_mac_stop(&dev); return 1; }
+		if (mt_mac_start(&dev, MT_RX_DRAIN_RING)) {
+			mt_async_stop(&dev); mt_mac_stop(&dev); return 1;
+		}
+		mt7612u_set_monitor_rx(&dev, 0);       /* managed filter */
+
+		if (armi == 1 && mt7612u_set_ack_responder(&dev, foreign)) {
+			printf("  B  could not retarget MT_MAC_ADDR - no control arm\n");
+			mt_async_stop(&dev); mt_mac_stop(&dev);
+			return 2;
+		}
+
+		printf("  %c  %s\n", armi ? 'B' : 'A',
+		       armi ? "MT_MAC_ADDR RETARGETED away (the R6 hazard)"
+		            : "nothing armed - MT_MAC_ADDR as init left it");
+
+		t0 = now_ms();
+		while (now_ms() - t0 < secs * 1000.0 && !g_stop) {
+			probe[22] = (uint8_t)((sent & 0xf) << 4);
+			probe[23] = (uint8_t)(sent >> 4);
+			if (mt_tx_raw(&dev, probe, plen, &rate, 0xff, 0) == 0)
+				sent++;
+			usleep(200000);            /* 5/s - inside any AP's rate */
+		}
+
+		resp = ctr.resp.load();
+		retried = ctr.resp_retry.load();
+		frac = resp ? 100.0 * (double)retried / (double)resp : -1.0;
+
+		if (armi == 1)
+			mt7612u_clear_ack_responder(&dev);
+		mt_async_stop(&dev);
+		mt_mac_stop(&dev);
+
+		printf("     sent %lu, responses to us %lu, retried %lu",
+		       sent, resp, retried);
+		if (frac >= 0.0) printf("  -> %.1f%% retried\n", frac);
+		else             printf("  -> no responses\n");
+		printf("     other unicast to us %lu (retried %lu)\n",
+		       ctr.other_to_us.load(), ctr.other_retry.load());
+
+		if (armi == 0) { a_resp = resp; a_frac = frac; }
+		else           { b_resp = resp; b_frac = frac; }
+		if (g_stop) break;
+	}
+
+	printf("\n");
+	if (a_resp == 0) {
+		printf("Arm A got no probe response at all. Either the AP is not on this\n"
+		       "channel/BSSID or our probe requests are not reaching it. This says\n"
+		       "NOTHING about acknowledgement - do not read it as a failure to ACK.\n"
+		       "GATE STAACK: INCONCLUSIVE\n");
+		return 2;
+	}
+	if (b_resp == 0) {
+		printf("Arm B got no probe response, so the control could not run: with\n"
+		       "MT_MAC_ADDR moved we may simply have stopped being answered.\n"
+		       "Arm A's %.1f%% is therefore UNCONTROLLED - do not quote it.\n"
+		       "GATE STAACK: INCONCLUSIVE\n", a_frac);
+		return 2;
+	}
+	printf("A (nothing armed)      : %.1f%% retried over %lu responses\n", a_frac, a_resp);
+	printf("B (MT_MAC_ADDR moved)  : %.1f%% retried over %lu responses\n", b_frac, b_resp);
+	if (b_frac > a_frac + 10.0) {
+		printf("\nB rose. The method can distinguish, so A is meaningful: this MAC\n"
+		       "DOES auto-ACK unicast to its own address with nothing armed (R6),\n"
+		       "and moving MT_MAC_ADDR breaks that - which is exactly what\n"
+		       "SetAckResponder(bssid) would do to a station.\n");
+		printf("GATE STAACK: PASS\n");
+		return 0;
+	}
+	printf("\nB did NOT rise above A. Either this MAC keeps acknowledging after\n"
+	       "the retarget, or the retried-copy signal does not track acknowledgement\n"
+	       "on this rig. Either way the method did not demonstrate that it can\n"
+	       "fail, so A's number proves nothing.\n");
+	printf("GATE STAACK: INCONCLUSIVE\n");
+	return 2;
+}
+
 static int gate_txs(uint8_t chan, int frames, const char *peer_str)
 {
 	static const uint8_t src[6]   = { 0x02, 0x4d, 0x54, 0x76, 0x12, 0x01 };
@@ -4668,6 +4897,10 @@ int main(int argc, char **argv)
 		rc = gate_txs(argc > 2 ? (uint8_t)atoi(argv[2]) : 149,
 		              argc > 3 ? atoi(argv[3]) : 40,
 		              argc > 4 ? argv[4] : NULL);
+	} else if (!strcmp(cmd, "staack")) {
+		rc = gate_staack(argc > 2 ? (uint8_t)atoi(argv[2]) : 6,
+		                 argc > 3 ? atoi(argv[3]) : 20,
+		                 argc > 4 ? argv[4] : NULL);
 	} else if (!strcmp(cmd, "sta")) {
 		rc = gate_sta(argc > 2 ? (uint8_t)atoi(argv[2]) : 6,
 		              argc > 3 ? atoi(argv[3]) : 15,
