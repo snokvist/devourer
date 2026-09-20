@@ -120,9 +120,33 @@ Two things follow:
    reason the seam is `SetStationIdentity` and not a reuse of
    `SetAckResponder`.
 
-Arm B's 23082 received copies from 125 probe requests — ~184 copies per
-response — is the AP's retry ladder running to exhaustion, visible from the
-receive side.
+### Arm B changes two things, and the raw count says so
+
+Arm B received **23082** responses to 125 probe requests. An earlier revision
+of this document called that "the AP's retry ladder running to exhaustion,
+~184 copies per response". That cannot be right: no 802.11 retry limit is
+anywhere near 184.
+
+Moving `MT_MAC_ADDR` has a second consequence, and this tree already documents
+it — `src/mt7612u/tools/bringup.cpp` notes that this MAC matches an **inbound**
+ACK's address 1 against `MT_MAC_ADDR` as well. So in arm B:
+
+1. the AP's ACKs to **our** probe requests are rejected by our own MAC, so our
+   MAC retransmits each request through its ladder; and
+2. each copy that reaches the AP draws a fresh probe response, each of which we
+   then fail to acknowledge, so the AP retransmits that too.
+
+Two ladders multiplying, which is the right order of magnitude for 23082 from
+125. **That is inference from the arithmetic plus a documented property of this
+MAC, not a separate measurement**, and it is written here as inference.
+
+It matters for how much arm B is allowed to prove. The arm is not a clean
+single-variable change — it stops us acknowledging *and* stops us accepting
+acknowledgement. But the **retried fraction** is unharmed in the direction
+that counts: our own retransmissions make the AP emit *fresh* responses, which
+arrive with Retry **clear** and so push the fraction DOWN. The measured 98% is
+therefore conservative, and the conclusion — that we stopped acknowledging —
+is the one reading the fraction supports.
 
 ## What this means for `SetStationIdentity` on MT7612U
 
