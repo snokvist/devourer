@@ -73,7 +73,8 @@ void test_vectors() {
     std::snprintf(label, sizeof label, "encrypt vector '%s'", v.name);
     size_t n = devourer::sta::ccmp_encrypt(crypto, v.tk, v.hdr, v.hdr_len,
                                            v.a2, v.pn, v.key_id, v.plain,
-                                           v.plain_len, out.data());
+                                           v.plain_len, out.data(),
+                                           out.size());
     {
       uint8_t aad[devourer::sta::kCcmpAadMax];
       check(devourer::sta::ccmp_aad(v.hdr, v.hdr_len, aad) == v.aad_len,
@@ -106,6 +107,24 @@ void test_vectors() {
 
 /* A corrupted MIC must be rejected. Without this the decrypt path could ignore
  * the tag entirely and every other test above would still pass. */
+/* A short output buffer must be refused rather than overflowed. */
+void test_short_output_refused() {
+  OpenSslCcm crypto;
+  const CcmpVector& v = kCcmpVectors[0];
+  const size_t need = devourer::sta::ccmp_encrypted_len(v.hdr_len, v.plain_len);
+  std::vector<uint8_t> out(need);
+
+  check(need == v.mpdu_len, "ccmp_encrypted_len matches the vector");
+  check(devourer::sta::ccmp_encrypt(crypto, v.tk, v.hdr, v.hdr_len, v.a2, v.pn,
+                                    v.key_id, v.plain, v.plain_len, out.data(),
+                                    need) == need,
+        "an exactly-sized buffer is accepted");
+  check(devourer::sta::ccmp_encrypt(crypto, v.tk, v.hdr, v.hdr_len, v.a2, v.pn,
+                                    v.key_id, v.plain, v.plain_len, out.data(),
+                                    need - 1) == 0,
+        "a buffer one byte short is REFUSED, not overflowed");
+}
+
 void test_mic_rejected() {
   OpenSslCcm crypto;
   const CcmpVector& v = kCcmpVectors[0];
@@ -297,6 +316,7 @@ void test_replay() {
 
 int main() {
   test_vectors();
+  test_short_output_refused();
   test_mic_rejected();
   test_qos_aad();
   test_four_address_aad();

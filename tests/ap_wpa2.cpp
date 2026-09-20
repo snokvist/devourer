@@ -293,11 +293,11 @@ static std::vector<uint8_t> ccmp_tx(const uint8_t* sta, uint16_t eth,
   // that is what has been validated on air. A station sending QoS data needs
   // the other form - the two are not interchangeable, and ctest ccmp_framing
   // asserts that a frame built under one does not verify under the other.
-  std::vector<uint8_t> m(24 + devourer::sta::kCcmpHdrLen + pt.size() +
-                         devourer::sta::kCcmpMicLen);
-  size_t n = devourer::sta::ccmp_encrypt(g_crypto, g_ptk + 32, hdr.data(), 24,
-                                         kBssid, pn, 0, pt.data(), pt.size(),
-                                         m.data());
+  std::vector<uint8_t> m(devourer::sta::ccmp_encrypted_len(hdr.size(),
+                                                           pt.size()));
+  size_t n = devourer::sta::ccmp_encrypt(g_crypto, g_ptk + 32, hdr.data(),
+                                         hdr.size(), kBssid, pn, 0, pt.data(),
+                                         pt.size(), m.data(), m.size());
   // A zero return means the cipher refused. The old code ignored the result
   // and aired a frame with an uninitialised MIC; emitting nothing is the
   // honest failure, and the caller drops an empty vector.

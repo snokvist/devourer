@@ -145,18 +145,29 @@ inline uint64_t ccmp_header_pn(const uint8_t* ccmp_hdr) {
  * 4-address frame puts it elsewhere and silently reading the wrong one would
  * produce frames that only decrypt locally.
  *
- * Writes hdr_len + 8 + plain_len + 8 bytes to `out`, which the caller must
- * size accordingly. Returns the length written, or 0 on failure.
+ * Writes hdr_len + 8 + plain_len + 8 bytes to `out`. `out_cap` is that
+ * buffer's size and is CHECKED - the first version took no capacity at all,
+ * so a caller who sized `out` wrong got a heap overflow with no diagnostic,
+ * in a function whose whole job is handling frames from the air.
+ * `ccmp_encrypted_len()` computes the size to allocate.
+ *
+ * Returns the length written, or 0 on failure (including a short buffer).
  */
+inline size_t ccmp_encrypted_len(size_t hdr_len, size_t plain_len) {
+  return hdr_len + kCcmpHdrLen + plain_len + kCcmpMicLen;
+}
+
 inline size_t ccmp_encrypt(CryptoOps& crypto, const uint8_t tk[16],
                            const uint8_t* hdr, size_t hdr_len,
                            const uint8_t a2[6], uint64_t pn, uint8_t key_id,
                            const uint8_t* plain, size_t plain_len,
-                           uint8_t* out) {
+                           uint8_t* out, size_t out_cap) {
   uint8_t aad[kCcmpAadMax];
   uint8_t nonce[kCcmpNonceLen];
-  size_t aad_len = ccmp_aad(hdr, hdr_len, aad);
+  size_t aad_len;
 
+  if (out_cap < ccmp_encrypted_len(hdr_len, plain_len)) return 0;
+  aad_len = ccmp_aad(hdr, hdr_len, aad);
   if (aad_len == 0) return 0;
   ccmp_nonce(a2, pn, nonce);
   std::memcpy(out, hdr, hdr_len);
