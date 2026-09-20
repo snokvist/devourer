@@ -96,12 +96,12 @@ than one transmission, which is the ladder, measured.
   the MAC could not terminate the ladder either way. F only becomes meaningful
   in arm T's configuration, where it is one of the things that changed.
 - **C and E (No Ack): 41 and 56 fps.** `txwi.ack_ctl` REQ is cleared
-  (`src/mt7612u/tx.cpp:168`) and the QoS policy says No Ack, yet these sit at
-  ~11–13 rungs of the same ladder rather than at the ceiling. Either the txwi
-  bit does not reach the retry engine or the MAC derives ack policy from a
-  unicast RA regardless. **Unexplained, and a concrete devourer-side defect
-  candidate** — it is the reason `docs/mt7612u.md` records that No Ack "does
-  not help".
+  (`src/mt7612u/tx.cpp:168`) and the QoS policy says No Ack, yet these sit far
+  below the ceiling. This document first guessed "~11–13 rungs of the same
+  ladder"; reading the chip's own TX status later **refuted that** — the MAC
+  completes these on the first attempt with 0 retries and 100% success, and
+  they still cost ~20 ms each. See `docs/mt7612u-tx-retry.md`; the remaining
+  cost is not the retry engine.
 
 ### Rig validation
 
@@ -148,15 +148,19 @@ the mechanism is understood and the arithmetic is closed.
    then the monitor filter. That is the same ordering constraint Phase 2's
    `SetStationIdentity` inherits, and `docs/station-mode-scope.md` already
    carries it.
-4. **Open, and now the most interesting question:** why do arms C/E (No Ack)
-   not reach the ceiling? A station does not care, but an injector does, and it
-   is the difference between the current broadcast-only guidance and a usable
-   one-way unicast link.
-5. `MT_TX_STAT_FIFO` (mt76x02 0x1718) is not declared in
-   `src/mt7612u/regs.h` and `txwi[19]` is always 0 (`src/mt7612u/tx.cpp:194`),
-   so the driver cannot observe its own retry count. Both sides of this
-   argument had to *infer* the ladder. Declaring that register would make it
-   observable and is cheap.
+4. **Both open items below are now closed by measurement** —
+   `docs/mt7612u-tx-retry.md`. `MT_TX_STAT_FIFO` / `MT_TX_STAT_FIFO_EXT` are
+   declared and `MT_TXOPT_TXS` opts a frame into per-MPDU status, so the chip
+   reports its own retry count. It confirms the ladder at **16 retries, zero
+   successes** for every unacknowledged unicast arm, and — the clean A/B —
+   **40/40 successes at 0.0 retries** for the same frame with the receiver on.
+   The arithmetic above is no longer an inference.
+
+   It also **refutes** this document's own guess about arms C/E. They are not
+   "~11–13 rungs of the same ladder": with No Ack the MAC completes them on the
+   first attempt with **0 retries and 100% success**, and they still cost
+   ~20 ms each. The remaining cost is somewhere other than the retry engine,
+   and that is now the narrowed open question.
 
 ## Follow-ups this run generated
 
@@ -167,6 +171,8 @@ the mechanism is understood and the arithmetic is closed.
 - `bringup rx` reports `GATE F: FAIL - no frames received` in conditions where
   `bringup arx` receives 12879. It warns that it blocks the only EP 4 drainer
   but still prints a hardware verdict; it should refuse to grade.
+- The No-Ack residual and the missing TX-status register are both resolved in
+  `docs/mt7612u-tx-retry.md`; see consequence 4 above.
 - Kernel monitor injection via `AF_PACKET` measured 690k fps, i.e. the socket
   queue, not the radio — mac80211 injection does not backpressure. Any kernel
   A/B has to be witness-counted. Phase 0b as originally specified is the wrong

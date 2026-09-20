@@ -2274,6 +2274,216 @@ static int gate_ucast(uint8_t chan, int secs, const char *peer_str, int bytes)
 	return 3;
 }
 
+/*
+ * gate_txs - read the retry count off the chip instead of arguing about it.
+ *
+ * docs/station-mode-phase0.md closed its argument with arithmetic: 15 retries
+ * from MT_TX_RETRY_CFG, CWmin 15 / CWmax 1023 from MT_WMM_CWMIN/CWMAX, a 9 us
+ * slot, summing to ~46 ms against 45.5 ms measured. That is a good fit, and it
+ * is still an inference. The MAC counts the retries itself; nothing in this
+ * tree had ever asked it.
+ *
+ * Two questions this answers directly:
+ *
+ *  1. Does the ladder run to exhaustion when no ACK can arrive? Expect a retry
+ *     count near the 15 limit with SUCCESS clear.
+ *  2. Why do the No-Ack arms (txwi ACK_CTL_REQ clear AND QoS Ack Policy = No
+ *     Ack) still sit far below the broadcast ceiling instead of at it? If their
+ *     entries show retries, the no-ack request is not reaching the retry engine
+ *     - a devourer-side defect. If they show retry 0, the cost is elsewhere and
+ *     the ladder is not the explanation for those arms.
+ *
+ * Frames go out ONE AT A TIME with the FIFO drained between them. At the
+ * ~20-60 fps these configurations run, a drain costs nothing next to a 45 ms
+ * frame, and an entry cannot be attributed to the wrong arm. The status FIFO is
+ * shallow and mt76 polls it, so batch-then-drain would lose most of it.
+ */
+struct txs_sum {
+	long entries, success, retry_total, retry_max;
+};
+
+static void txs_drain(struct mt7612u_dev *d, struct txs_sum *o)
+{
+	int guard;
+
+	/* Bounded: a stuck VALID bit must not become an infinite loop inside a
+	 * gate holding the only USB lock for this adapter. */
+	for (guard = 0; guard < 64; guard++) {
+		uint32_t st = 0, ext = 0;
+		long r;
+
+		if (mt_rr_chk(d, MT_TX_STAT_FIFO, &st)) return;
+		if (!(st & MT_TX_STAT_FIFO_VALID)) return;
+		/* Read order matters: the EXT half describes the entry the main
+		 * read just popped (mt76x02_mac_load_tx_status). */
+		if (mt_rr_chk(d, MT_TX_STAT_FIFO_EXT, &ext)) return;
+		o->entries++;
+		if (st & MT_TX_STAT_FIFO_SUCCESS) o->success++;
+		r = (long)FIELD_GET(MT_TX_STAT_FIFO_EXT_RETRY, ext);
+		o->retry_total += r;
+		if (r > o->retry_max) o->retry_max = r;
+	}
+}
+
+static int gate_txs(uint8_t chan, int frames, const char *peer_str)
+{
+	static const uint8_t src[6]   = { 0x02, 0x4d, 0x54, 0x76, 0x12, 0x01 };
+	static const uint8_t bcast[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+	uint8_t peer[6] = { 0x02, 0x4d, 0x54, 0x76, 0x12, 0x0a };
+	static uint8_t frame[1600];
+	const size_t flen = 1400;
+	static struct ucast_ack_count ctr;
+	int rx_on;
+
+	static const struct {
+		char tag; int own_sa; int bcast_a1; int no_ack; const char *what;
+	} arms[] = {
+		{ 'a', 0, 1, 1, "broadcast,       No Ack" },
+		{ 'b', 0, 0, 0, "ucast peer,      Normal" },
+		{ 'c', 0, 0, 1, "ucast peer,      No Ack" },
+		{ 'd', 1, 0, 0, "ucast peer ownSA Normal" },
+	};
+
+	if (frames <= 0) {
+		printf("GATE TXS: FAIL - frames must be positive\n");
+		return 2;
+	}
+	if (peer_str && parse_mac6(peer_str, peer)) {
+		printf("GATE TXS: FAIL - bad peer MAC '%s'\n", peer_str);
+		return 2;
+	}
+
+	if (mt_eeprom_init(&dev)) return 1;
+	if (mt_init_hardware(&dev, NULL)) return 1;
+	if (mt_set_channel(&dev, chan, MT7612U_BW_20)) return 1;
+
+	printf("chan %u, HT MCS7 BW20, %zu-byte QoS data, wcid 0xff, %d frames/arm\n",
+	       chan, flen, frames);
+	printf("peer %02x:%02x:%02x:%02x:%02x:%02x\n",
+	       peer[0], peer[1], peer[2], peer[3], peer[4], peer[5]);
+
+	/* Both halves of the Phase 0 finding in one session: the same arms with
+	 * the MAC receiver off, then on. The receiver decides whether an ACK can
+	 * terminate the ladder, so it is the variable under test, not a setting. */
+	for (rx_on = 0; rx_on <= 1; rx_on++) {
+		unsigned a;
+
+		memcpy(ctr.ta, dev.macaddr, 6);
+		ctr.acks.store(0);
+		ctr.frames.store(0);
+
+		if (mt_mac_start(&dev, MT_RX_DRAIN_NONE)) return 1;
+		if (mt_async_start(&dev, rx_on ? ucast_rx_cb : NULL,
+		                   rx_on ? (void *)&ctr : NULL)) {
+			mt_mac_stop(&dev);
+			return 1;
+		}
+		if (rx_on) {
+			if (mt_mac_start(&dev, MT_RX_DRAIN_RING)) {
+				mt_async_stop(&dev);
+				mt_mac_stop(&dev);
+				return 1;
+			}
+			mt7612u_set_monitor_rx(&dev, 0);
+		}
+
+		printf("\n  MAC receiver %s\n", rx_on ? "ON" : "OFF");
+		printf("  arm  %-24s %7s %9s %8s %9s %6s\n", "configuration",
+		       "fps", "entr/sent", "success", "mean rtry", "max");
+
+		for (a = 0; a < sizeof arms / sizeof arms[0]; a++) {
+			struct mt7612u_tx_rate rate = { };
+			struct txs_sum sum = { 0, 0, 0, 0 };
+			const uint8_t *sa = arms[a].own_sa ? dev.macaddr : src;
+			const uint8_t *a1 = arms[a].bcast_a1 ? bcast : peer;
+			double t0, wall;
+			long n = 0;
+			int settled = 0;
+
+			rate.phy = MT7612U_PHY_HT;
+			rate.mcs = 7;
+			rate.nss = 1;
+			rate.bw = MT7612U_BW_20;
+			rate.no_ack = (unsigned)arms[a].no_ack;
+
+			memset(frame, 0, sizeof frame);
+			frame[0] = 0x88;
+			memcpy(frame + 4, a1, 6);
+			memcpy(frame + 10, sa, 6);
+			memcpy(frame + 16, sa, 6);
+			frame[24] = arms[a].no_ack ? 0x20 : 0x00;
+			memcpy(frame + 26, "MT7612U-TXS", 11);
+
+			txs_drain(&dev, &sum);   /* discard the previous arm's tail */
+			sum.entries = 0; sum.success = 0;
+			sum.retry_total = 0; sum.retry_max = 0;
+
+			t0 = now_ms();
+			while (n < frames && !g_stop) {
+				frame[22] = (uint8_t)((n & 0xf) << 4);
+				frame[23] = (uint8_t)(n >> 4);
+				if (mt_tx_raw(&dev, frame, flen, &rate, 0xff,
+				              MT_TXOPT_TXS) == 0)
+					n++;
+				txs_drain(&dev, &sum);
+			}
+			/*
+			 * Wait for the status the MAC still owes us before
+			 * moving on. A 16-slot ring plus a 45 ms-per-frame
+			 * ladder means the last frames of an arm are still in
+			 * flight when the send loop ends, and their entries
+			 * would otherwise be counted against the NEXT arm -
+			 * which is exactly what the first run of this gate
+			 * did, reporting 0 entries for one arm and 3 for
+			 * another at rates that could not be real.
+			 *
+			 * Bounded by the worst case that matters: `frames` at
+			 * the full 16-rung ladder, ~50 ms each, plus slack.
+			 */
+			{
+				double deadline = now_ms() + frames * 60.0 + 2000.0;
+
+				while (sum.entries < n && now_ms() < deadline
+				       && !g_stop) {
+					mt_usleep(2000);
+					txs_drain(&dev, &sum);
+				}
+				settled = (sum.entries >= n);
+			}
+			wall = now_ms() - t0;
+
+			/* fps here is submit-and-settle over the whole arm, so it
+			 * is NOT the steady-state figure gate_ucast reports -
+			 * `frames` is small by design and the ring absorbs most
+			 * of it. The retry columns are the point of this gate. */
+			printf("  %c    %-24s %7.0f %4ld/%-4ld %8ld %9.1f %6ld%s\n",
+			       arms[a].tag, arms[a].what, n * 1000.0 / wall,
+			       sum.entries, n, sum.success,
+			       sum.entries ? (double)sum.retry_total / sum.entries : 0.0,
+			       sum.retry_max, settled ? "" : "  UNSETTLED");
+			if (g_stop) break;
+			mt_usleep(100000);
+		}
+		if (rx_on)
+			printf("  (receiver saw %lu frames, %lu ACKs to our TA)\n",
+			       (unsigned long)ctr.frames.load(),
+			       (unsigned long)ctr.acks.load());
+
+		mt_async_stop(&dev);
+		mt_mac_stop(&dev);
+		if (g_stop) break;
+	}
+
+	if (g_stop) {
+		printf("\nGATE TXS: INTERRUPTED\n");
+		return 3;
+	}
+	printf("\nGATE TXS: reported. A zero entry count means the MAC filed no\n"
+	       "status at all - check MT_TXOPT_TXS reached the txwi pktid before\n"
+	       "reading anything into the retry columns.\n");
+	return 0;
+}
+
 /* Somebody has to read EP 4 whenever MAC RX is on; this gate does not care
  * what arrives, only that the endpoint keeps being drained. */
 static void drain_cb(void *user, const void *frame, size_t len,
@@ -4208,6 +4418,10 @@ int main(int argc, char **argv)
 	} else if (!strcmp(cmd, "ampdu")) {
 		rc = gate_ampdu(argc > 2 ? (uint8_t)atoi(argv[2]) : 149,
 		                argc > 3 ? atoi(argv[3]) : 400);
+	} else if (!strcmp(cmd, "txs")) {
+		rc = gate_txs(argc > 2 ? (uint8_t)atoi(argv[2]) : 149,
+		              argc > 3 ? atoi(argv[3]) : 40,
+		              argc > 4 ? argv[4] : NULL);
 	} else if (!strcmp(cmd, "ucast")) {
 		rc = gate_ucast(argc > 2 ? (uint8_t)atoi(argv[2]) : 149,
 		                argc > 3 ? atoi(argv[3]) : 5,

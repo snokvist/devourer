@@ -345,6 +345,7 @@ int mt_hdrlen_from_fc(const uint8_t *frame);
 #define MT_TXOPT_AMPDU     0x02  /* AMPDU flag + density + BA window */
 #define MT_TXOPT_QSEL_MGMT 0x04  /* mt76 uses MT_QSEL_MGMT for aggregated TX */
 #define MT_TXOPT_BEACON    0x08  /* HW timestamp (FLAGS_TS) + HW sequence (ACK_CTL_NSEQ) */
+#define MT_TXOPT_TXS       0x10  /* non-zero txwi pktid: file a MT_TX_STAT_FIFO entry */
 int mt_tx_build(struct mt7612u_dev *d, uint8_t *buf, size_t bufsz,
                 const void *frame, size_t len,
                 const struct mt7612u_tx_rate *rate, uint8_t wcid, unsigned opts,
