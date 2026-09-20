@@ -1469,6 +1469,22 @@ add_executable(ChanMigGateSelftest tests/chanmig_gate_selftest.cpp)
 target_link_libraries(ChanMigGateSelftest PRIVATE devourer)
 add_test(NAME chanmig_gate_policy COMMAND ChanMigGateSelftest)
 
+# The AP on-air acceptance harness (tests/mt7612u_ap_onair.sh) needs root, a
+# claimed MT7612U and a second station adapter, so none of it can run in CI.
+# Its two verdict functions are pure text processing, though, and both of them
+# replaced a check that could not fail - so those get a headless guard here.
+# Unix-only: it is a bash script driving awk.
+if(UNIX)
+    find_program(BASH_EXECUTABLE bash)
+    if(BASH_EXECUTABLE)
+        add_test(
+            NAME ap_onair_witness
+            COMMAND ${BASH_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/ap_onair_witness_selftest.sh
+        )
+    endif()
+endif()
+
 # ChanMigReplay: replay a recorded gate-input trace through the SHIPPING
 # MigGate policy (no re-implementation), for the #279 shadow / metrics runs.
 add_executable(ChanMigReplay tests/chanmig_replay_main.cpp)

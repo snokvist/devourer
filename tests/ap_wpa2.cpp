@@ -86,10 +86,39 @@ static const std::vector<uint8_t>& rsn_ie() {
 }
 
 // Per-station 4-way state (single client for the demo).
+//
+// THE AUTHENTICATOR RETRANSMITS. It used to send msg1 and msg3 exactly once,
+// which means a single frame lost in the air stalled the handshake forever:
+// the station waits for a message that will never come again, and this side
+// sits in "4-way in progress" until the run times out. On a real link that is
+// not an edge case - it is what the acceptance harness's wpa2 cell failed on,
+// and 802.11-2016 12.7.6.4 requires the retransmission that was missing.
+//
+// Two rules the retransmission has to obey, both of which a naive "just call
+// send_msg1() again" gets wrong:
+//   - msg1 must carry the SAME ANonce, and msg3 the SAME GTK. Regenerating
+//     either would derive a different PTK from the one the station already
+//     installed, or install a group key this AP will not use.
+//   - the Key Replay Counter must be INCREMENTED on every retransmission, and
+//     the MIC recomputed over it, so the station can tell copies apart.
+// Hence the `first` flag: it selects "generate fresh material" and nothing
+// else. Everything after it is rebuilt per transmission.
 static uint8_t g_anonce[32], g_snonce[32], g_ptk[48], g_gtk[16];
 static uint8_t g_replay[8];
 static uint8_t g_sta[6];
-static int g_state = 0;  // 0 idle, 1 sent msg1, 2 done
+// 0 idle, 1 sent msg1 awaiting msg2, 2 sent msg3 awaiting msg4, 3 complete.
+// State 2 already has the PTK, and a station that received msg3 installs its
+// keys and may send protected data BEFORE its msg4 reaches us - so the data
+// path accepts from state 2 onward, not only when the handshake is complete.
+static int g_state = 0;
+enum { HS_IDLE = 0, HS_WAIT_MSG2 = 1, HS_WAIT_MSG4 = 2, HS_DONE = 3 };
+// Guards every field above. The RX callback and the main loop's retransmit
+// tick both touch them now; before the timer existed only the RX thread did.
+static std::mutex g_hs_mu;
+static std::chrono::steady_clock::time_point g_hs_tx;   // last (re)transmission
+static int g_hs_tries = 0;
+static constexpr int kHsMaxTries = 4;                   // 1 + 3 retransmissions
+static constexpr auto kHsTimeout = std::chrono::milliseconds(250);
 
 static bool profiled_ccmp(bool encrypt, const uint8_t* key, const uint8_t* nonce,
                           const uint8_t* aad, int aadlen, const uint8_t* input,
@@ -217,16 +246,25 @@ static std::vector<uint8_t> eapol_frame(uint16_t keyinfo, const uint8_t* nonce,
   m.insert(m.end(), e.begin(), e.end());
   return m;
 }
-static void send_msg1() {
-  RAND_bytes(g_anonce, 32);
+/* Caller holds g_hs_mu. `first` = generate a fresh ANonce; a retransmission
+ * must reuse it or the station's PTK will not match ours. */
+static void send_msg1(bool first) {
+  if (first) { RAND_bytes(g_anonce, 32); g_hs_tries = 0; }
   for (int i=7;i>=0;--i) if (++g_replay[i]) break;      // bump replay counter
   enqueue(eapol_frame(0x008a, g_anonce, nullptr, 0, false));  // ver2|pair|ack
-  g_state = 1;
-  fprintf(stderr, "  WPA2: sent msg1 (ANonce) to %02x:%02x:%02x:%02x:%02x:%02x\n",
-          g_sta[0],g_sta[1],g_sta[2],g_sta[3],g_sta[4],g_sta[5]);
+  g_state = HS_WAIT_MSG2;
+  g_hs_tx = std::chrono::steady_clock::now();
+  ++g_hs_tries;
+  fprintf(stderr, "  WPA2: sent msg1 (ANonce) to %02x:%02x:%02x:%02x:%02x:%02x%s\n",
+          g_sta[0],g_sta[1],g_sta[2],g_sta[3],g_sta[4],g_sta[5],
+          first ? "" : " [retransmit]");
 }
-static void send_msg3() {
-  RAND_bytes(g_gtk, 16);
+/* Caller holds g_hs_mu. `first` = generate a fresh GTK; a retransmission must
+ * reuse it, or the station installs a group key this AP will not encrypt
+ * with. The replay counter still advances and the MIC is recomputed, which is
+ * what 802.11-2016 12.7.6.4 asks for. */
+static void send_msg3(bool first) {
+  if (first) { RAND_bytes(g_gtk, 16); g_hs_tries = 0; }
   // key data = RSN IE + GTK KDE, padded to /8, then AES-wrapped with the KEK.
   std::vector<uint8_t> kd(rsn_ie().begin(), rsn_ie().end());
   uint8_t gtkkde[24] = {0xdd,0x16,0x00,0x0f,0xac,0x01,0x01,0x00};
@@ -240,7 +278,29 @@ static void send_msg3() {
   int wl = aes_wrap(g_ptk+16, kd.data(), kd.size(), wrapped.data());
   for (int i=7;i>=0;--i) if (++g_replay[i]) break;
   enqueue(eapol_frame(0x13ca, g_anonce, wrapped.data(), wl, true));  // install|ack|mic|secure|enc
-  fprintf(stderr, "  WPA2: sent msg3 (GTK, MIC) — 4-way in progress\n");
+  g_state = HS_WAIT_MSG4;
+  g_hs_tx = std::chrono::steady_clock::now();
+  ++g_hs_tries;
+  fprintf(stderr, "  WPA2: sent msg3 (GTK, MIC) — 4-way in progress%s\n",
+          first ? "" : " [retransmit]");
+}
+
+/* Called from the main loop. Resends whichever message this side is still
+ * waiting on, up to kHsMaxTries transmissions in total. */
+static void hs_tick() {
+  std::lock_guard<std::mutex> l(g_hs_mu);
+  if (g_state != HS_WAIT_MSG2 && g_state != HS_WAIT_MSG4) return;
+  if (std::chrono::steady_clock::now() - g_hs_tx < kHsTimeout) return;
+  if (g_hs_tries >= kHsMaxTries) {
+    if (g_hs_tries == kHsMaxTries) {
+      ++g_hs_tries;   // latch, so this prints once
+      fprintf(stderr, "  WPA2: gave up after %d transmissions of msg%d\n",
+              kHsMaxTries, g_state == HS_WAIT_MSG2 ? 1 : 3);
+    }
+    return;
+  }
+  if (g_state == HS_WAIT_MSG2) send_msg1(false);
+  else                         send_msg3(false);
 }
 
 // --- CCMP data plane (software AES-CCM) so the station pings encrypted --------
@@ -380,10 +440,13 @@ static void on_rx(const Packet& p) {
     auto m = mgmt_hdr(0x10, sta);
     m.insert(m.end(), {0x11,0x00, 0x00,0x00, 0x01,0xc0});
     append_ies(m, false); enqueue(std::move(m));
-    memcpy(g_sta, sta, 6); memset(g_replay, 0, 8); g_state = 0;
     fprintf(stderr, "  ASSOC from %02x:%02x:%02x:%02x:%02x:%02x -> start 4-way\n",
             sta[0],sta[1],sta[2],sta[3],sta[4],sta[5]);
-    send_msg1();
+    {
+      std::lock_guard<std::mutex> l(g_hs_mu);
+      memcpy(g_sta, sta, 6); memset(g_replay, 0, 8); g_state = HS_IDLE;
+      send_msg1(true);
+    }
   } else if ((fc0 == 0x08 || devourer::sta::is_qos_data(fc0)) &&
              (fc1 & 0x01) && to_us) {                   // data to-DS
     // data_hdr_len(), not `fc0 == 0x88`: QoS Null (0xc8) is a frame real
@@ -392,7 +455,11 @@ static void on_rx(const Packet& p) {
     // is_qos_data() used for the TID and an exact test for the length, the two
     // would actively disagree.
     int hlen = (int)devourer::sta::data_hdr_len(fc0, fc1);
-    if ((fc1 & 0x40) && g_state == 2) {                 // PROTECTED (CCMP) data
+    // >= HS_WAIT_MSG4, not == done: the PTK exists once msg3 has been sent,
+    // and a station that received msg3 installs its keys and can put
+    // protected data on the air before its msg4 reaches us. Gating on the
+    // completed handshake dropped those frames.
+    if ((fc1 & 0x40) && g_state >= HS_WAIT_MSG4) {      // PROTECTED (CCMP) data
       int len = (int)p.Data.size();
       if (len < hlen + 8 + 8) return;                   // hdr + CCMP hdr + MIC
       const uint8_t* d = p.Data.data();
@@ -435,6 +502,8 @@ static void on_rx(const Packet& p) {
     uint16_t ki = (e[5]<<8) | e[6];
     if ((ki & 0x0008) && (ki & 0x0100) && !(ki & 0x0040) && !(ki & 0x0200)) {
       // msg2: pairwise + MIC, no install/secure -> SNonce + MIC
+      std::lock_guard<std::mutex> l(g_hs_mu);
+      if (g_state != HS_WAIT_MSG2) return;   // a duplicate msg2 must not re-run this
       memcpy(g_snonce, e+17, 32);
       compute_ptk();
       if (!check_mic(e, elen)) { fprintf(stderr, "  WPA2: msg2 MIC FAIL\n"); return; }
@@ -447,10 +516,11 @@ static void on_rx(const Packet& p) {
       // again. That defeats the control entirely. A legitimate msg4
       // retransmission did the same thing by accident.
       g_ccmp_replay.reset();
-      send_msg3();
+      send_msg3(true);
     } else if ((ki & 0x0100) && (ki & 0x0200)) {        // msg4: MIC + secure
-      if (check_mic(e, elen)) {
-        g_state = 2;
+      std::lock_guard<std::mutex> l(g_hs_mu);
+      if (g_state == HS_WAIT_MSG4 && check_mic(e, elen)) {
+        g_state = HS_DONE;
         fprintf(stderr, "  WPA2: msg4 OK — 4-WAY HANDSHAKE COMPLETE (station keyed)\n");
       }
     }
@@ -489,6 +559,7 @@ int main(int argc, char** argv) {
           kSsid, g_psk, g_chan, bok ? "OK" : "FAIL");
   auto end = std::chrono::steady_clock::now() + std::chrono::seconds(sec);
   while (std::chrono::steady_clock::now() < end) {
+    hs_tick();                                   // 4-way retransmissions
     std::vector<std::vector<uint8_t>> batch;
     { std::lock_guard<std::mutex> l(g_q_mu); batch.swap(g_q); }
     for (auto& f : batch) if (g_dev->send_packet(f.data(), f.size())) g_sent.fetch_add(1);
