@@ -121,11 +121,24 @@ transmitter, rate, channel and timing fixed and changes only the destination,
 so it also shows the match is address-specific rather than promiscuous
 answering. C removes the DUT entirely.
 
-**D is single-variable and it settles the mechanism.** Same receiver, same
-port identity, same managed filter, one bit different — and acknowledgement
-stops dead. So `MT_AUTO_RSP_EN` *is* the gate on this part, which retroactively
-justifies `SetStationIdentity` refusing to arm when that bit is clear: a branch
-that shipped on an assumption now has a measurement behind it.
+**D was NOT single-variable as run, and the table above predates the fix.**
+Arm A ran `bringup arx`, which installs the **monitor** filter at the top of
+`gate_arx`; arm D ran `norsp`, which leaves the managed one. So the comparison
+varied the receive filter *and* the init path as well as the bit under test,
+in a section that called it single-variable. Same defect class as the R5 gate
+overwriting its own filter, caught in review rather than on the bench.
+
+The harness is fixed — both arms now run `norsp`, which takes the bit as an
+argument, so they share one code path and differ by exactly one bit — **but
+the numbers above have not been re-taken under it.** Treat D as indicative,
+not as the single-variable result it is described as, until a re-run.
+
+What survives regardless: **arm E** ran the managed filter with the bit SET
+and reads 100%, and **arm D** ran the managed filter with it CLEAR and reads
+0%. Those two are both managed, so the filter is not what separates them —
+they differ in the bit *and* in the BSSID programming, which E itself shows is
+inert. So the conclusion that `MT_AUTO_RSP_EN` gates acknowledgement is
+supported; the claim that any one arm pair isolated it is not.
 
 **E closes R5.** It programs a deliberately wrong BSSID into both
 `MT_MAC_BSSID` and the derived APC slot, sets mt76's per-slot enable bit,
@@ -220,6 +233,22 @@ success*.
 
 ## What is not established
 
+- **The R6 table needs a re-run** under the corrected harness — see the note
+  under arm D. The conclusion is supported by the D/E pair; the single-
+  variable claim for A/D is withdrawn.
+- **THE LIBRARY'S OWN STATION PATH DOES NOT USE THE MANAGED FILTER.**
+  `Mt7612uRadio::StartRxLoop` calls `mt7612u_set_monitor_rx()`
+  unconditionally after `mt7612u_start()`, so a station driven through
+  `IRadio` runs PROMISCUOUS. Every "managed station" result here therefore
+  describes a configuration this library does not currently enter, and the
+  "moving `MT_MAC_ADDR` makes a station deaf" half of the rationale is a
+  property of the managed filter specifically. Under the monitor filter the
+  station would still RECEIVE with the port identity moved — it would simply
+  stop acknowledging. The prohibition stands either way; the reason differs
+  by filter, and Phase 3 has to decide which filter a station should run.
+- **No cell drove `SetStationIdentity` itself.** The seam writes no register,
+  so the measured hardware state is the state a successful arm leaves behind
+  — but the literal "arm the seam, then measure" path is unexercised.
 - **Everything is an unassociated station** receiving traffic it did not
   negotiate. Power save, TIM parsing, cross-BSS duplicate detection and
   hardware key lookup are untested; Phase 3 should expect to revisit this.

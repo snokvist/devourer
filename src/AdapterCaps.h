@@ -237,18 +237,25 @@ struct AdapterCaps {
    * value alone, so a caller can refuse before it starts a handshake it
    * cannot finish.
    *
-   * FALSE EVERYWHERE TODAY, and false here means "not ported / not measured",
-   * never "the silicon cannot". Do not set it from a code-reading: the bar is
-   * an on-air cell showing this adapter, armed as a station, receiving an
-   * AP's unicast traffic and being ACKed for its own - the same shape of
-   * evidence ack_responder_ok carries, measured per die. Two MT7612U-specific
-   * unknowns are written up as R5 and R6 in docs/station-mode-scope.md; the
-   * relevant one for anyone setting this flag has changed since it was
-   * written: R5 is now measured on MT7612U (the BSSID registers do not gate a
-   * managed station's receive), and R6 is not (whether that MAC auto-ACKs is
-   * open - the gate's control for it does not move, so the method is void).
-   * docs/mt7612u-station-identity.md, and read its retraction section before
-   * quoting any number from it. */
+   * False means "not ported / not measured", never "the silicon cannot". Do
+   * not set it from a code-reading: the bar is an on-air cell showing this
+   * adapter receiving an AP's unicast traffic and being ACKed for its own -
+   * the same shape of evidence ack_responder_ok carries, measured per die.
+   *
+   * TRUE on MT7612U only, and read docs/mt7612u-station-identity.md - its
+   * retraction section first - before quoting a number from it. Both halves
+   * of the bar are measured there, with controls, but note two limits the
+   * measurements do NOT clear and which a caller should know:
+   *
+   *   - every cell ran an UNASSOCIATED station receiving traffic it had not
+   *     negotiated, so power save, TIM parsing, cross-BSS duplicate detection
+   *     and hardware key lookup are untested;
+   *   - no cell drove SetStationIdentity itself. The seam writes no register
+   *     on that part, so the hardware state measured is the state a
+   *     successful arm leaves behind - but the literal end-to-end path
+   *     "arm the seam, then measure" has not been exercised.
+   *
+   * FALSE on every other backend: not ported. */
   bool station_mode_ok = false;
 
   /* --- feature flags --- */

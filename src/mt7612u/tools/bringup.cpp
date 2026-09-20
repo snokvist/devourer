@@ -3047,7 +3047,17 @@ static int gate_staid(void)
  * refusing for a reason that does not hold - which is worth knowing before
  * Phase 3 builds on it.
  *
- *   bringup norsp <chan> <secs>
+ * The third argument selects which side of the comparison this is:
+ *   1 (default) - clear MT_AUTO_RSP_EN: the CONTROL
+ *   0           - leave it set: the CLAIM
+ * Both run the SAME code path with the SAME managed filter, so the two arms
+ * differ by exactly one bit. They did not before: the claim arm used
+ * `bringup arx`, which installs the MONITOR filter
+ * (mt7612u_set_monitor_rx at the top of gate_arx), so the comparison varied
+ * the receive filter AND the init path as well as the bit, while the write-up
+ * called it single-variable. Caught in review, not on the bench.
+ *
+ *   bringup norsp <chan> <secs> [clear_rsp]
  */
 static void norsp_rx_cb(void *user, const void *frame, size_t len,
                         const struct mt7612u_rx_info *info)
@@ -3055,7 +3065,7 @@ static void norsp_rx_cb(void *user, const void *frame, size_t len,
 	(void)user; (void)frame; (void)len; (void)info;
 }
 
-static int gate_norsp(uint8_t chan, int secs)
+static int gate_norsp(uint8_t chan, int secs, int clear_rsp)
 {
 	uint32_t before = 0, after = 0;
 	double t0;
@@ -3080,21 +3090,32 @@ static int gate_norsp(uint8_t chan, int secs)
 		printf("GATE NORSP: FAIL - cannot read MT_AUTO_RSP_CFG\n");
 		mt_async_stop(&dev); mt_mac_stop(&dev); return 1;
 	}
-	if (mt_rmw(&dev, MT_AUTO_RSP_CFG, MT_AUTO_RSP_EN, 0)) {
-		printf("GATE NORSP: FAIL - cannot clear MT_AUTO_RSP_EN\n");
-		mt_async_stop(&dev); mt_mac_stop(&dev); return 1;
-	}
-	mt_rr_chk(&dev, MT_AUTO_RSP_CFG, &after);
-	if (after & MT_AUTO_RSP_EN) {
-		printf("GATE NORSP: FAIL - MT_AUTO_RSP_EN did not stay clear "
-		       "(%08x -> %08x); the arm would measure nothing\n",
-		       before, after);
-		mt_rmw(&dev, MT_AUTO_RSP_CFG, MT_AUTO_RSP_EN, MT_AUTO_RSP_EN);
-		mt_async_stop(&dev); mt_mac_stop(&dev); return 2;
+	if (clear_rsp) {
+		if (mt_rmw(&dev, MT_AUTO_RSP_CFG, MT_AUTO_RSP_EN, 0)) {
+			printf("GATE NORSP: FAIL - cannot clear MT_AUTO_RSP_EN\n");
+			mt_async_stop(&dev); mt_mac_stop(&dev); return 1;
+		}
+		mt_rr_chk(&dev, MT_AUTO_RSP_CFG, &after);
+		if (after & MT_AUTO_RSP_EN) {
+			printf("GATE NORSP: FAIL - MT_AUTO_RSP_EN did not stay clear "
+			       "(%08x -> %08x); the arm would measure nothing\n",
+			       before, after);
+			mt_rmw(&dev, MT_AUTO_RSP_CFG, MT_AUTO_RSP_EN, MT_AUTO_RSP_EN);
+			mt_async_stop(&dev); mt_mac_stop(&dev); return 2;
+		}
+	} else {
+		after = before;
+		if (!(after & MT_AUTO_RSP_EN)) {
+			printf("GATE NORSP: FAIL - asked to LEAVE MT_AUTO_RSP_EN set but "
+			       "it is already clear (%08x); this arm would be the control, "
+			       "not the claim\n", after);
+			mt_async_stop(&dev); mt_mac_stop(&dev); return 2;
+		}
 	}
 
-	printf("MT_AUTO_RSP_CFG %08x -> %08x (EN cleared), receiving %d s on ch%u\n",
-	       before, after, secs, chan);
+	printf("MT_AUTO_RSP_CFG %08x -> %08x (EN %s), managed filter, "
+	       "receiving %d s on ch%u\n", before, after,
+	       clear_rsp ? "CLEARED" : "left SET", secs, chan);
 
 	t0 = now_ms();
 	while (now_ms() - t0 < secs * 1000.0 && !g_stop)
@@ -3102,7 +3123,8 @@ static int gate_norsp(uint8_t chan, int secs)
 
 	/* Put it back: this is the state init leaves and everything else on the
 	 * part assumes. */
-	mt_rmw(&dev, MT_AUTO_RSP_CFG, MT_AUTO_RSP_EN, MT_AUTO_RSP_EN);
+	if (clear_rsp)
+		mt_rmw(&dev, MT_AUTO_RSP_CFG, MT_AUTO_RSP_EN, MT_AUTO_RSP_EN);
 	mt_async_stop(&dev);
 	mt_mac_stop(&dev);
 	printf("GATE NORSP: done (restored)\n");
@@ -5318,7 +5340,8 @@ int main(int argc, char **argv)
 		                argc > 3 ? atoi(argv[3]) : 25);
 	} else if (!strcmp(cmd, "norsp")) {
 		rc = gate_norsp(argc > 2 ? (uint8_t)atoi(argv[2]) : 6,
-		                argc > 3 ? atoi(argv[3]) : 25);
+		                argc > 3 ? atoi(argv[3]) : 25,
+		                argc > 4 ? atoi(argv[4]) : 1);
 	} else if (!strcmp(cmd, "staid")) {
 		rc = gate_staid();
 	} else if (!strcmp(cmd, "staack")) {

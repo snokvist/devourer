@@ -221,19 +221,19 @@ inline bool ccmp_decrypt(CryptoOps& crypto, const uint8_t tk[16],
   return true;
 }
 
-/* Per-key receive replay state (802.11-2016 12.5.3.4.4).
- *
- * ONE COUNTER PER TID, not one per key. 802.11 keeps a separate receive
- * replay counter for each TID of QoS traffic, and a single shared counter
- * drops legitimate frames as soon as two TIDs interleave - which is routine
- * the moment voice or video shares a link with best-effort. Non-QoS traffic
- * uses a counter of its own (index kNonQosTid).
- *
- * The gate is `pn <= last`, NOT `pn < last`. PR #335 shipped the strict form
- * and its review called it KRACK-class: an equal-counter replay passed, which
- * is exactly how a group-key reinstallation attack lands. Keep the equality.
- */
 /* CCMP replay protection: a sliding window per TID, not a bare counter.
+ *
+ * ONE WINDOW PER TID, not one per key. 802.11 keeps a separate receive replay
+ * counter for each TID of QoS traffic, and a single shared one drops
+ * legitimate frames as soon as two TIDs interleave - routine the moment voice
+ * or video shares a link with best-effort. Non-QoS traffic uses a window of
+ * its own (index kNonQosTid).
+ *
+ * An EQUAL PN is a replay and must be refused. PR #335 shipped `<` and its
+ * review called it KRACK-class: an equal-counter replay passed, which is
+ * exactly how a group-key reinstallation attack lands. Here that is bit 0 of
+ * the mask, which is always set for the head, so `pn == last_` can never be
+ * re-admitted. tests/ccmp_selftest.cpp pins it.
  *
  * 802.11-2016 12.5.3.4.4 requires a receiver to discard an MPDU whose PN is
  * not greater than the replay counter for its TID. Implemented as a strict
@@ -254,10 +254,20 @@ inline bool ccmp_decrypt(CryptoOps& crypto, const uint8_t tk[16],
  * been seen. So a frame is accepted exactly once whether it arrives early,
  * on time, or late but still inside the window.
  *
- * kWindow = 64 because that is the largest BlockAck buffer a peer can
- * negotiate, so anything the reorder buffer can legitimately hold fits. A PN
- * older than that is not reordering - it is a replay, or a peer that has lost
- * its way - and is refused.
+ * kWindow = 64 because that is IEEE80211_MAX_AMPDU_BUF_HT: the largest
+ * BlockAck buffer an HT or VHT peer can negotiate, so anything such a reorder
+ * buffer can legitimately hold fits. A PN older than that is not reordering -
+ * it is a replay, or a peer that has lost its way - and is refused.
+ *
+ * THAT BOUND IS NOT UNIVERSAL, and an earlier version of this comment claimed
+ * it was. The kernel's own constants are HT 0x40, HE 0x100, EHT 0x400
+ * (linux/ieee80211.h). So on an 802.11ax die a peer may negotiate a 256-frame
+ * reorder buffer and a frame 64..255 behind would be refused here - the exact
+ * silent loss this window exists to prevent, one generation up. It is left at
+ * 64 because the station role is MT7612U-first and that part is VHT, where 64
+ * IS the bound; widening it means a multi-word mask, which is real complexity
+ * for a die this code does not yet run on. Anyone porting the station role to
+ * Kestrel must revisit this constant first.
  *
  * What this deliberately does NOT do: tolerate a PN that jumps forward and
  * then asks for the skipped values later beyond the window. A forward jump of

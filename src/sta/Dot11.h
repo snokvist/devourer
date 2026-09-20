@@ -197,6 +197,65 @@ inline void append_ds_params(std::vector<uint8_t>& m, uint8_t chan) {
   append_ie(m, kEidDsParams, &chan, 1);
 }
 
+/* Traffic Indication Map (802.11-2016 9.4.2.6).
+ *
+ * EVERY beacon must carry one. A beacon without a TIM is not a conforming AP
+ * beacon (802.11-2016 9.4.2.6), and this tree's AP harnesses shipped without
+ * one for the whole of their existence.
+ *
+ * BE PRECISE ABOUT WHAT THAT COST, because an earlier version of this comment
+ * was not. A station in power save loses most of what these harnesses send it
+ * - measured, 0/60 pings with power save on against 60/60 with it off - but
+ * that measurement PREDATES this element and adding it does not repair it.
+ * The loss is caused by nothing being buffered: replies air the instant the
+ * request is parsed, so a dozing station misses them whatever schedule the
+ * beacon advertises. What the missing TIM cost was CONFORMANCE, and a station
+ * having no DTIM schedule to synchronise to at all. Those are worth fixing on
+ * their own; they are not the 0/60.
+ *
+ * This is the MINIMUM conforming element and nothing more. It advertises
+ * "nothing is buffered for anyone":
+ *
+ *   DTIM Count   0   - this beacon IS a DTIM beacon
+ *   DTIM Period  1   - every beacon is, so a station never waits
+ *   Bitmap Ctrl  0   - offset 0, and bit 0 clear means no group-addressed
+ *                      traffic is buffered either
+ *   Partial VBM  0   - one octet, no AID's bit set
+ *
+ * That is the truth for these harnesses: they buffer nothing and send every
+ * reply immediately. It is NOT power-save support, and a station that dozes
+ * will still miss frames. Actually serving a dozing peer needs a per-AID
+ * bitmap and a buffer, which is out of scope (docs/ap-mode.md), and
+ * tests/mt7612u_ap_onair.sh still requires power save OFF.
+ *
+ * `aid` is accepted so a future implementation that DOES buffer can set the
+ * right bit without changing every caller; 0 means "nobody", which is the
+ * only thing these harnesses can honestly advertise.
+ *
+ * AN AID OUTSIDE 1..7 SETS NOTHING, silently, and a caller that begins
+ * buffering must notice that before relying on it: this minimum body carries
+ * one bitmap octet with offset 0, so it can only page AIDs 1..7. Paging
+ * anything higher needs a longer partial virtual bitmap and a non-zero
+ * bitmap-control offset, i.e. a real implementation - at which point this
+ * function's signature should grow a way to report refusal. It is left
+ * silent rather than half-encoding, because a wrapped shift would set some
+ * OTHER station's bit and tell the wrong peer to stay awake. */
+inline void append_tim(std::vector<uint8_t>& m, uint8_t dtim_count = 0,
+                       uint8_t dtim_period = 1, uint16_t aid = 0) {
+  uint8_t tim[4];
+
+  tim[0] = dtim_count;
+  tim[1] = dtim_period;
+  tim[2] = 0;   /* bitmap control: offset 0, no buffered group traffic */
+  tim[3] = 0;   /* partial virtual bitmap: one octet, AIDs 1..7 */
+  /* AIDs 1..7 live in bits 1..7 of this first octet. Anything larger needs a
+   * longer bitmap and an offset, which this minimum form does not carry - so
+   * refuse to half-encode it rather than set a bit for the wrong station. */
+  if (aid >= 1 && aid <= 7)
+    tim[3] = (uint8_t)(1u << aid);
+  append_ie(m, kEidTim, tim, sizeof tim);
+}
+
 /* The WPA2-PSK RSN element: CCMP group, CCMP pairwise, PSK AKM.
  *
  * Both roles need byte-identical bytes here — an AP advertises it in its

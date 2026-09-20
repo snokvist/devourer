@@ -79,17 +79,25 @@ arm() {
   tag="$1"; ra="$2"; dut_up="$3"
   DUT_PID=""
   if [ "$dut_up" != 0 ]; then
-    # 1 = receiver on, managed filter, NOTHING armed - that is the claim.
-    # 2 = the same, with MT_AUTO_RSP_EN cleared: one bit different, which is
-    #     the single-variable test of WHICH mechanism answers.
+    # 1 = receiver on, MANAGED filter, nothing armed - the claim.
+    # 2 = the same code path with MT_AUTO_RSP_EN cleared - the control.
+    # 3 = managed, a WRONG BSSID in an ENABLED APC slot - closes R5.
+    #
+    # Arm 1 used `bringup arx`, which installs the MONITOR filter at the top
+    # of gate_arx, while arm 2 used `norsp`, which leaves the managed one. So
+    # the comparison varied the receive filter AND the init path as well as
+    # the bit under test, in a write-up that called it single-variable. It is
+    # the same defect class as the R5 gate overwriting its own filter, caught
+    # in review rather than on the bench. Both arms now run `norsp`, which
+    # takes the bit as an argument.
     if [ "$dut_up" = 3 ]; then
       "$BUILD/mt7612uprobe" bssen "$CH" $((SECS + 14)) \
           >"$OUT/dut_$tag.log" 2>&1 &
     elif [ "$dut_up" = 2 ]; then
-      "$BUILD/mt7612uprobe" norsp "$CH" $((SECS + 14)) \
+      "$BUILD/mt7612uprobe" norsp "$CH" $((SECS + 14)) 1 \
           >"$OUT/dut_$tag.log" 2>&1 &
     else
-      "$BUILD/mt7612uprobe" arx "$CH" $((SECS + 14)) \
+      "$BUILD/mt7612uprobe" norsp "$CH" $((SECS + 14)) 0 \
           >"$OUT/dut_$tag.log" 2>&1 &
     fi
     DUT_PID=$!

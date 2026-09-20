@@ -602,7 +602,102 @@ void test_fcs_trim() {
   check(mpdu_len(mpdu_len(100, true), false) == 96, "fcs: not trimmed twice");
 }
 
+/* The TIM element (802.11-2016 9.4.2.6).
+ *
+ * Every conforming beacon carries one, and this tree's AP beacons carried
+ * none for their whole existence. That is why a station in power save loses
+ * most of what they send: with no DTIM count or period to wake on it sleeps
+ * through the reply. Measured on this bench, 0/60 pings with power save on
+ * against 60/60 with it off.
+ *
+ * The element added is the MINIMUM conforming one - "nothing is buffered for
+ * anyone" - which is the truth for these harnesses. It is not power-save
+ * support and the test says so by pinning exactly that content. */
+void test_tim() {
+  std::vector<uint8_t> m;
+  append_tim(m);
+
+  check(m.size() == 6, "tim: 2 bytes of header and 4 of body");
+  check(m[0] == kEidTim, "tim: element id 5");
+  check(m[1] == 4, "tim: length 4 - the minimum conforming body");
+  check(m[2] == 0, "tim: DTIM count 0 - this beacon IS a DTIM beacon");
+  check(m[3] == 1, "tim: DTIM period 1 - every beacon is, so nobody waits");
+  check(m[4] == 0, "tim: bitmap control 0 - offset 0, no buffered group traffic");
+  check(m[5] == 0, "tim: empty partial virtual bitmap - nothing buffered");
+
+  /* The walker must accept it, since a real station parses beacons with it. */
+  size_t len = 0;
+  const uint8_t* found = find_ie(m.data(), m.size(), kEidTim, &len);
+  check(found != nullptr && len == 4, "tim: the IE walker finds it");
+
+  /* An AID inside the one-octet bitmap sets exactly its own bit. */
+  std::vector<uint8_t> a3;
+  append_tim(a3, 0, 1, 3);
+  check(a3[5] == 0x08, "tim: AID 3 sets bit 3 and nothing else");
+  std::vector<uint8_t> a7;
+  append_tim(a7, 0, 1, 7);
+  check(a7[5] == 0x80, "tim: AID 7 sets the top bit of the octet");
+
+  /* AID 0 is not a station - it is the group-addressed indication, and that
+   * lives in bit 0 of the BITMAP CONTROL octet, not the bitmap. Setting
+   * bitmap bit 0 for "AID 0" would announce buffered multicast that does not
+   * exist and make a station wait for it. */
+  std::vector<uint8_t> a0;
+  append_tim(a0, 0, 1, 0);
+  check(a0[5] == 0, "tim: AID 0 sets no bitmap bit");
+  check(a0[4] == 0, "tim: AID 0 does not claim buffered group traffic");
+
+  /* An AID this minimum form CANNOT express must set nothing rather than
+   * half-encode it - a wrapped shift would set some other station's bit and
+   * tell the wrong peer to stay awake. */
+  std::vector<uint8_t> big;
+  append_tim(big, 0, 1, 8);
+  check(big[5] == 0, "tim: AID 8 is out of range for a one-octet bitmap");
+  std::vector<uint8_t> huge;
+  append_tim(huge, 0, 1, 2007);
+  check(huge[5] == 0, "tim: the maximum AID does not wrap into someone else's bit");
+
+  /* DTIM count and period are passed through, for a caller that does buffer. */
+  std::vector<uint8_t> d;
+  append_tim(d, 2, 3);
+  check(d[2] == 2 && d[3] == 3, "tim: DTIM count and period are carried");
+
+  /* BEACON ONLY. 802.11-2016 9.4.2.6 puts the TIM in the Beacon frame body;
+   * a TIM in a probe response is a malformed frame some stations reject
+   * outright. The harnesses build beacons and probe/assoc responses from the
+   * SAME IE helper with a flag, so nothing but this pins the flag - the
+   * wiring was correct by inspection and unpinned, which is how the
+   * `fc0 == 0x88` duplication survived being fixed once already.
+   *
+   * Modelled the way the harnesses order it: SSID, rates, DS Params, then
+   * the TIM only when the frame is a beacon. */
+  auto ies = [](bool beacon) {
+    std::vector<uint8_t> m;
+    append_ssid(m, "devourerAP");
+    append_supported_rates(m);
+    append_ds_params(m, 6);
+    if (beacon) append_tim(m);
+    return m;
+  };
+  size_t n = 0;
+  check(find_ie(ies(true).data(), ies(true).size(), kEidTim, &n) != nullptr,
+        "tim: present when the frame is a beacon");
+  check(find_ie(ies(false).data(), ies(false).size(), kEidTim, &n) == nullptr,
+        "tim: ABSENT from a probe/assoc response");
+  /* And it must come after the DS Parameter Set, which is the element order
+   * the standard gives and which a strict parser will check. */
+  {
+    std::vector<uint8_t> b = ies(true);
+    size_t dl = 0, tl = 0;
+    const uint8_t* ds = find_ie(b.data(), b.size(), kEidDsParams, &dl);
+    const uint8_t* tm = find_ie(b.data(), b.size(), kEidTim, &tl);
+    check(ds != nullptr && tm != nullptr && ds < tm,
+          "tim: ordered after the DS Parameter Set");
+  }
+}
+
 int main() {
+  test_tim();
   test_fcs_trim();
   test_mgmt_hdr();
   test_seq();

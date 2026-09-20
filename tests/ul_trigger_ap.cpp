@@ -42,6 +42,7 @@
 #include "WiFiDriver.h"
 #include "env_config.h"
 #include "logger.h"
+#include "rx_mpdu.h"
 
 // Locally-administered unicast BSSID (a station cannot unicast-auth to a
 // multicast address — see ap_responder.cpp).
@@ -245,12 +246,16 @@ static void on_rx(const Packet& p) {
     // Keep the data plane alive (ARP/ICMP/DHCP) so the station stays associated
     // and keeps generating UL traffic — the BSR the fw needs to grant a trigger.
     int hlen = 24 + ((fc0 == 0x88 || fc0 == 0xe8) ? 2 : 0);
-    if ((int)p.Data.size() < hlen + 8) return;
+    /* NOT p.Data.size(): this harness targets Kestrel, where fcs_present is
+     * TRUE, so the raw span ends four bytes past the frame and the ARP/ICMP
+     * payloads sliced below would include the FCS. See tests/rx_mpdu.h. */
+    const int mlen = (int)devourer::test::mpdu_len(p);
+    if (mlen < hlen + 8) return;
     const uint8_t* llc = p.Data.data() + hlen;
     if (!(llc[0] == 0xaa && llc[1] == 0xaa && llc[2] == 0x03)) return;
     uint16_t eth = (llc[6] << 8) | llc[7];
     const uint8_t* pl = llc + 8;
-    int pllen = (int)p.Data.size() - (hlen + 8);
+    int pllen = mlen - (hlen + 8);
     if (eth == 0x0806 && pllen >= 28) {
       uint16_t oper = (pl[6] << 8) | pl[7];
       const uint8_t* sha = pl + 8; const uint8_t* spa = pl + 14; const uint8_t* tpa = pl + 24;

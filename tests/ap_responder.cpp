@@ -189,6 +189,11 @@ static void on_rx(const Packet& p) {
     enqueue(std::move(m));
   } else if (fc0 == 0xb0 && to_us) {                 // authentication
     g_auth.fetch_add(1);
+    /* The 24-byte guard above covers the HEADER; the auth body adds
+     * algorithm, sequence and status. A frame that stops after the header is
+     * something a radio delivers - the body is not guaranteed by the FCS
+     * being valid - and reading it anyway walks past the span. */
+    if (mlen < 24 + 6) return;
     uint16_t alg = p.Data[24] | (p.Data[25] << 8), seq = p.Data[26] | (p.Data[27] << 8);
     fprintf(stderr, "  AUTH req from %02x:%02x:%02x:%02x:%02x:%02x alg=%u seq=%u retry=%d\n",
             sta[0],sta[1],sta[2],sta[3],sta[4],sta[5], alg, seq, retry);
@@ -287,7 +292,11 @@ int main(int argc, char** argv) {
   { const char* s = kSsid; bcn.insert(bcn.end(), {0x00,0x0a});
     bcn.insert(bcn.end(), s, s + 10);
     append_rates(bcn);
-    bcn.insert(bcn.end(), {0x03,0x01,g_chan}); }
+    bcn.insert(bcn.end(), {0x03,0x01,g_chan});
+    /* The TIM, which every conforming beacon carries and this one did not.
+     * Beacon only - 802.11-2016 9.4.2.6 - so append_ies(), which also builds
+     * probe and assoc responses, does not get it. See src/sta/Dot11.h. */
+    devourer::sta::append_tim(bcn); }
   int bcn_tu = 100;
   if (const char* iv = std::getenv("DEVOURER_BCN_TU")) bcn_tu = atoi(iv);
   bool bok = g_dev->StartBeacon(bcn.data(), bcn.size(), bcn_tu);

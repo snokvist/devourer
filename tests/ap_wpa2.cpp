@@ -156,7 +156,12 @@ static std::vector<uint8_t> mgmt_hdr(uint8_t fc, const uint8_t* sta) {
   devourer::sta::assign_seq(m, g_seq.next());
   return m;
 }
-static void append_ies(std::vector<uint8_t>& m, bool ssid) {
+/* `beacon` adds the TIM. It is deliberately NOT added to probe or
+ * association responses: 802.11-2016 9.4.2.6 puts the TIM in the Beacon
+ * frame body only, and a TIM in a probe response is a malformed frame that
+ * some stations will reject outright. The element order below is the
+ * standard's: SSID, Supported Rates, DS Parameter Set, TIM, then RSN. */
+static void append_ies(std::vector<uint8_t>& m, bool ssid, bool beacon = false) {
   if (ssid) devourer::sta::append_ssid(m, kSsid);
   // Band-correct Supported Rates: CCK+OFDM on 2.4 GHz, OFDM-only on 5 GHz. CCK
   // basic rates (1/2/5.5/11) do not exist on 5 GHz — advertising them makes a
@@ -166,6 +171,7 @@ static void append_ies(std::vector<uint8_t>& m, bool ssid) {
   if (g_chan <= 14) devourer::sta::append_supported_rates(m);
   else devourer::sta::append_supported_rates_5g(m);
   devourer::sta::append_ds_params(m, (uint8_t)g_chan);
+  if (beacon) devourer::sta::append_tim(m);
   m.insert(m.end(), rsn_ie().begin(), rsn_ie().end());   // RSN IE -> advertise WPA2
 }
 
@@ -488,8 +494,21 @@ static void on_rx(const Packet& p) {
         // PN from an unauthenticated frame would let anyone advance the window
         // and lock out the real peer. The TID comes from the QoS header when
         // there is one, because 802.11 keeps one counter per TID.
+        //
+        // The QoS Control field is at offset 24 for a 3-address frame and 30
+        // for a 4-address one - ccmp_aad() in the same module already encodes
+        // that, and this site did not: on a 4-address QoS frame it read
+        // addr4[0] and used the low nibble of an ADDRESS as the TID. Not a
+        // replay bypass (addr4 is authenticated, so a replay maps to the same
+        // wrong window and is still refused) but it pollutes another TID's
+        // window and can drop legitimate frames. These BSSes air 3-address
+        // frames only, so it was latent.
+        const bool four_addr =
+            (fc1 & (devourer::sta::kFcToDs | devourer::sta::kFcFromDs)) ==
+            (devourer::sta::kFcToDs | devourer::sta::kFcFromDs);
+        const size_t qoff = four_addr ? 30 : 24;
         const int tid = devourer::sta::is_qos_data(fc0)
-                            ? (d[24] & 0x0f)
+                            ? (d[qoff] & 0x0f)
                             : devourer::sta::CcmpReplay::kNonQosTid;
         if (g_ccmp_replay.accept(pn, tid))
           handle_plain(sta, pt.data(), (int)ptlen);      // decrypted -> ARP/ICMP
@@ -559,7 +578,7 @@ int main(int argc, char** argv) {
       kBssid[0],kBssid[1],kBssid[2],kBssid[3],kBssid[4],kBssid[5],
       kBssid[0],kBssid[1],kBssid[2],kBssid[3],kBssid[4],kBssid[5],
       0,0, 0,0,0,0,0,0,0,0, (uint8_t)(tu&0xff),(uint8_t)(tu>>8), 0x11,0x00};
-  append_ies(bcn, true);
+  append_ies(bcn, true, /*beacon=*/true);
   bool bok = g_dev->StartBeacon(bcn.data(), bcn.size(), tu);
   std::thread rx([&]{ g_dev->StartRxLoop(on_rx); });
   fprintf(stderr, "ap_wpa2 up: SSID %s WPA2-PSK '%s' ch%d beacon=%s\n",

@@ -24,9 +24,40 @@ So, honestly:
     tests/ccmp_selftest.cpp are what pin those, one rule at a time, and they
     are written against the standard's text rather than against this script.
 
-The fix for the remaining gap is the IEEE 802.11-2016 Annex J CCMP test
-vector, which is an actual third-party answer; dropping it in here is a
-strict improvement and the selftest is shaped for it.
+THE REMAINING GAP, and why it is still open.
+
+The fix is the IEEE 802.11-2016 Annex J.4 CCMP test vector - an actual
+third-party answer, computed by people who were not reading this code. The
+selftest is shaped to take it.
+
+It has NOT been added, and the reason is worth stating so nobody "fixes" it
+the wrong way: adding a vector transcribed from memory would be worse than
+having none. A known-answer test whose answer is remembered rather than
+sourced is not a check on the implementation - it is a second guess by the
+same author, and if it disagreed the natural move would be to "correct" it
+until it matched, which is how a wrong implementation acquires a passing test.
+
+What was tried on this machine and did not work:
+
+  * No copy of 802.11-2016 is present, and the reference/ submodules are
+    vendor drivers, not the standard.
+  * scapy 2.6.1 is installed and its Dot11CCMP is a packet LAYER only; its
+    crypto module (scapy.modules.krack.crypto) implements TKIP - michael,
+    RC4, the TKIP mixing - and no CCMP AAD or nonce construction. So it is
+    not a second implementation of the framing either.
+
+What would close it, in order of preference:
+
+  1. The Annex J.4 vector itself, copied from the standard.
+  2. hostapd's test vectors (its tree carries the same CCMP vectors for
+     wlantest), which is a third-party transcription that has been
+     independently exercised for years.
+  3. Any capture of a real AP's CCMP traffic where the TK is known: decrypting
+     someone else's frames with this code is the same check by other means.
+
+Until then the honest position is the one above: the cipher plumbing is
+pinned, the framing rules are pinned only by the direct assertions in
+tests/ccmp_selftest.cpp, and those are one author's reading of the standard.
 
 Regenerate:  python3 tests/ccmp_gen_vectors.py > tests/ccmp_vectors.h
 Deterministic - every input below is fixed.

@@ -287,11 +287,14 @@ void mt7612u_clear_ack_responder(struct mt7612u_dev *dev);
  * result rather than a shortcut - docs/mt7612u-station-identity.md:
  *
  *   - It does NOT write MT_MAC_ADDR; it requires `own` to already BE the port
- *     identity and fails if it is not. Moving that register takes a station
- *     from 0.8% to 98% retried downlink frames, because the auto-response
- *     engine matches address 1 against it. This is why a station must not be
- *     armed with mt7612u_set_ack_responder(bssid): that call retargets the
- *     very register a station needs left alone.
+ *     identity and fails if it is not. The auto-response engine matches
+ *     address 1 against that register, so moving it stops the station being
+ *     acknowledged; under the MANAGED receive filter it also stops the
+ *     station receiving at all. This is why a station must not be armed with
+ *     mt7612u_set_ack_responder(bssid): that call retargets the very register
+ *     a station needs left alone. (An earlier revision of this comment quoted
+ *     "0.8% to 98% retried" here; that measurement ran with the wrong receive
+ *     filter and is withdrawn - see the doc.)
  *   - It does NOT write MT_MAC_BSSID or the APC slot table. Six measured arms,
  *     including one with both deliberately wrong, receive the same traffic.
  *     The BSSID is recorded for the host (it is addr3 on every frame a station
