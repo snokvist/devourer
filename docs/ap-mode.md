@@ -104,9 +104,18 @@ descriptor fields, which are absent in devourer (only Jaguar1 has
 ## Scope
 
 These harnesses implement enough AP-side logic to interoperate with a real station
-end to end. What is intentionally out of scope (AP-*stack* breadth, not driver
-parity): multiple concurrent clients, GTK broadcast/rekey, routing/NAT, and a real
-DHCP address pool.
+end to end. What is out of scope *for these harnesses as they stand* (AP-*stack* breadth,
+not driver parity): multiple concurrent clients, GTK broadcast/rekey,
+routing/NAT, and a real DHCP address pool.
+
+**Three of those four are now targets, not permanent exclusions.**
+`docs/station-mode-scope.md`'s "The target: an ordinary BSS, with the AP
+bridging" (decided 2026-09-20) makes multiple concurrent clients the goal, and
+a GTK transmit path and a real DHCP address pool prerequisites for it — ARP is
+broadcast, so station-to-station IP does not work without the first, and the
+ARP responder cannot answer without the second. Routing/NAT remains out of
+scope, and whether the AP stays a gateway or becomes a transparent bridge is
+explicitly undecided there.
 
 **802.11 power save is out of scope too, and this is the one that bites.**
 Nothing is buffered for a dozing peer — every reply is enqueued the moment the
