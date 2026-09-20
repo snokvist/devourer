@@ -21,6 +21,7 @@
 #ifndef DEVOURER_STA_DOT11_H
 #define DEVOURER_STA_DOT11_H
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -127,15 +128,23 @@ inline void assign_seq(std::vector<uint8_t>& frame, uint16_t seq) {
   frame[23] = (uint8_t)(sc >> 8);
 }
 
-/* A monotonic 12-bit sequence counter. One per transmitter; a station needs
- * exactly one for everything it sends. */
+/* A monotonic 12-bit sequence counter. One per transmitter address; a station
+ * needs exactly one for everything it sends.
+ *
+ * Atomic, because "one for everything it sends" is an invitation to share it
+ * between a TX thread and the RX thread that answers management frames - which
+ * is exactly the shape both AP harnesses have. The relaxed ordering is right:
+ * the only requirement is that no two frames get the same number, not that the
+ * numbers order against anything else. */
 class SeqCounter {
 public:
-  uint16_t next() { return (uint16_t)(n_++ & 0x0fff); }
-  void reset() { n_ = 0; }
+  uint16_t next() {
+    return (uint16_t)(n_.fetch_add(1, std::memory_order_relaxed) & 0x0fff);
+  }
+  void reset() { n_.store(0, std::memory_order_relaxed); }
 
 private:
-  uint16_t n_ = 0;
+  std::atomic<uint16_t> n_{0};
 };
 
 /* ---- information elements --------------------------------------------- */
@@ -233,6 +242,81 @@ inline const uint8_t* find_ie(const uint8_t* body, size_t body_len, uint8_t eid,
 
 /* ---- parsing ---------------------------------------------------------- */
 
+/* A parsed RSN element (802.11-2016 9.4.2.25).
+ *
+ * The element is VARIABLE: counts precede the suite lists, and a real
+ * deployment almost never has exactly one of each. A mixed-mode WPA/WPA2 AP
+ * offers TKIP and CCMP as pairwise; a WPA3-transition AP offers PSK and
+ * PSK-SHA256 as AKM. Byte-comparing a canonical one-of-each layout - which
+ * this module did until a review caught it - reports both as unusable, so a
+ * station skips BSSes it could have joined perfectly well.
+ */
+struct RsnInfo {
+  bool valid = false;           /* the element parsed without running short */
+  uint16_t version = 0;
+  bool group_ccmp = false;
+  bool pairwise_ccmp = false;   /* CCMP is AMONG the offered pairwise suites */
+  bool akm_psk = false;         /* PSK is AMONG the offered AKMs */
+  uint16_t capabilities = 0;
+  bool mfp_required = false;    /* RSN capabilities bit 6 */
+  bool mfp_capable = false;     /* bit 7 */
+  uint16_t pairwise_count = 0;
+  uint16_t akm_count = 0;
+};
+
+/* Suite selectors are 4 bytes: a 3-byte OUI then a type. 00-0F-AC is the
+ * 802.11 OUI; a vendor OUI is a suite we do not implement and must not
+ * mistake for one we do. */
+inline bool rsn_suite_is(const uint8_t* s, uint8_t type) {
+  return s[0] == 0x00 && s[1] == 0x0f && s[2] == 0xac && s[3] == type;
+}
+
+/* Parse an RSN element body (the bytes AFTER the EID and length octets).
+ *
+ * Every step is bounds-checked against `len` and stops rather than reading
+ * on: this is attacker-controlled input from the air. Absent trailing fields
+ * are legal - an element may stop after the group cipher - and leave their
+ * flags false rather than failing the parse. */
+inline bool parse_rsn(const uint8_t* p, size_t len, RsnInfo* out) {
+  size_t i = 0;
+
+  if (!p || !out) return false;
+  *out = RsnInfo{};
+  if (len < 2) return false;
+  out->version = get_le16(p);
+  i = 2;
+  if (out->version != 1) return false; /* nothing else is defined */
+
+  if (i + 4 <= len) {
+    out->group_ccmp = rsn_suite_is(p + i, 4);
+    i += 4;
+  }
+  if (i + 2 <= len) {
+    out->pairwise_count = get_le16(p + i);
+    i += 2;
+    /* A count that overruns the element is malformed, not merely unsupported.
+     * Refuse rather than walk off the end. */
+    if (i + (size_t)out->pairwise_count * 4 > len) return false;
+    for (uint16_t n = 0; n < out->pairwise_count; n++, i += 4)
+      if (rsn_suite_is(p + i, 4)) out->pairwise_ccmp = true;
+  }
+  if (i + 2 <= len) {
+    out->akm_count = get_le16(p + i);
+    i += 2;
+    if (i + (size_t)out->akm_count * 4 > len) return false;
+    for (uint16_t n = 0; n < out->akm_count; n++, i += 4)
+      if (rsn_suite_is(p + i, 2)) out->akm_psk = true;
+  }
+  if (i + 2 <= len) {
+    out->capabilities = get_le16(p + i);
+    out->mfp_required = (out->capabilities & 0x0040) != 0;
+    out->mfp_capable = (out->capabilities & 0x0080) != 0;
+    i += 2;
+  }
+  out->valid = true;
+  return true;
+}
+
 /* What a station learns about a BSS from one beacon or probe response. */
 struct BssInfo {
   uint8_t bssid[6] = {0};
@@ -250,6 +334,8 @@ struct BssInfo {
    * diagnostic. */
   bool rsn_mfp_required = false;
   uint16_t rsn_capabilities = 0;
+  RsnInfo rsn;  /* the whole element, for a caller that wants more than the
+                 * one verdict above */
 };
 
 /* A beacon/probe-response body is a 12-byte fixed part (timestamp, beacon
@@ -280,20 +366,17 @@ inline bool parse_beacon(const uint8_t* frame, size_t len, BssInfo* out) {
     if (ie_len >= 1) out->channel = p[0];
   if (const uint8_t* p = find_ie(body, body_len, kEidRsn, &ie_len)) {
     out->has_rsn = true;
-    /* Accept only the one suite this project implements, and say so rather
-     * than associating and failing the handshake later: version 1, CCMP group
-     * at bytes 2..5, one CCMP pairwise, one PSK AKM. */
-    static const uint8_t want[] = {0x01, 0x00, 0x00, 0x0f, 0xac, 0x04,
-                                   0x01, 0x00, 0x00, 0x0f, 0xac, 0x04,
-                                   0x01, 0x00, 0x00, 0x0f, 0xac, 0x02};
-    /* >= 20, not >= 18: the RSN Capabilities field is what carries MFPR, and
-     * an element that stops before it cannot be judged safe to join. */
-    out->rsn_ccmp_psk =
-        ie_len >= sizeof want + 2 && std::memcmp(p, want, sizeof want) == 0;
-    if (ie_len >= sizeof want + 2) {
-      out->rsn_capabilities = get_le16(p + sizeof want);
-      out->rsn_mfp_required = (out->rsn_capabilities & 0x0040) != 0;
-    }
+    parse_rsn(p, ie_len, &out->rsn);
+    /* Joinable when CCMP is among the offered pairwise suites and PSK among
+     * the AKMs - NOT when they are the only ones. And not when the BSS
+     * requires management-frame protection, which this project does not
+     * implement: better to skip it in the scan than to associate and fail the
+     * handshake with no diagnostic. */
+    out->rsn_ccmp_psk = out->rsn.valid && out->rsn.group_ccmp &&
+                        out->rsn.pairwise_ccmp && out->rsn.akm_psk &&
+                        !out->rsn.mfp_required;
+    out->rsn_capabilities = out->rsn.capabilities;
+    out->rsn_mfp_required = out->rsn.mfp_required;
   }
   return true;
 }
@@ -344,10 +427,16 @@ inline std::vector<uint8_t> build_probe_req(const uint8_t own[6],
                                             uint8_t chan, bool five_ghz) {
   static const uint8_t bcast[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
   std::vector<uint8_t> m = mgmt_hdr(kFcProbeReq, bcast, own, bcast);
-  append_ssid(m, ssid);
+
+  /* An over-length SSID must abort the build, not produce a management frame
+   * that is silently missing its SSID element - which is invalid, and which a
+   * peer drops without comment. */
+  if (!append_ssid(m, ssid)) return {};
   if (five_ghz) append_supported_rates_5g(m);
   else append_supported_rates(m);
-  if (chan) append_ds_params(m, chan);
+  /* The DS Parameter Set is a 2.4 GHz element (802.11-2016 9.4.2.4); a 5 GHz
+   * probe carries no channel element. */
+  if (chan && !five_ghz) append_ds_params(m, chan);
   return m;
 }
 
@@ -372,7 +461,7 @@ inline std::vector<uint8_t> build_assoc_req(const uint8_t own[6],
   std::vector<uint8_t> m = mgmt_hdr(kFcAssocReq, bssid, own, bssid);
   put_le16(m, (uint16_t)(0x0001 | (rsn ? 0x0010 : 0))); /* ESS | Privacy */
   put_le16(m, listen_interval);
-  append_ssid(m, ssid);
+  if (!append_ssid(m, ssid)) return {};
   if (five_ghz) append_supported_rates_5g(m);
   else append_supported_rates(m);
   /* The RSN element goes AFTER the rates, and anything that follows it must
@@ -410,7 +499,7 @@ inline void append_llc_snap(std::vector<uint8_t>& m, uint16_t ethertype) {
 inline std::vector<uint8_t> data_hdr_to_ds(const uint8_t bssid[6],
                                            const uint8_t own[6],
                                            const uint8_t dest[6],
-                                           bool protect) {
+                                           bool protect, uint16_t seq = 0) {
   std::vector<uint8_t> m;
   m.reserve(24);
   m.push_back(kFcData);
@@ -419,14 +508,14 @@ inline std::vector<uint8_t> data_hdr_to_ds(const uint8_t bssid[6],
   m.insert(m.end(), bssid, bssid + 6);
   m.insert(m.end(), own, own + 6);
   m.insert(m.end(), dest, dest + 6);
-  put_le16(m, 0);
+  put_le16(m, (uint16_t)((seq & 0x0fff) << 4));
   return m;
 }
 
 inline std::vector<uint8_t> data_hdr_from_ds(const uint8_t sta[6],
                                              const uint8_t bssid[6],
                                              const uint8_t src[6],
-                                             bool protect) {
+                                             bool protect, uint16_t seq = 0) {
   std::vector<uint8_t> m;
   m.reserve(24);
   m.push_back(kFcData);
@@ -435,7 +524,7 @@ inline std::vector<uint8_t> data_hdr_from_ds(const uint8_t sta[6],
   m.insert(m.end(), sta, sta + 6);
   m.insert(m.end(), bssid, bssid + 6);
   m.insert(m.end(), src, src + 6);
-  put_le16(m, 0);
+  put_le16(m, (uint16_t)((seq & 0x0fff) << 4));
   return m;
 }
 

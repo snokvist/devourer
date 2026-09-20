@@ -262,6 +262,12 @@ struct HarnessCrypto : devourer::sta::CryptoOps {
                       uint8_t*) override { return false; }
 };
 static HarnessCrypto g_crypto;
+// The replay window is now a deployed control rather than a tested fixture.
+// It is reset on every fresh PTK install: a new key is a new PN space.
+static devourer::sta::CcmpReplay g_ccmp_replay;
+// Data-plane visibility. The one thing the on-air runs could not answer was
+// whether encrypted frames were arriving at all, because nothing counted them.
+static std::atomic<uint64_t> g_enc_rx{0}, g_mic_fail{0}, g_replayed{0};
 
 static uint64_t g_txpn = 1;                              // AP outbound packet number
 static uint16_t csum16(const uint8_t* d, int len) {
@@ -276,10 +282,12 @@ static std::vector<uint8_t> ccmp_tx(const uint8_t* sta, uint16_t eth,
                                     const uint8_t* pl, int plen) {
   std::vector<uint8_t> pt = {0xaa,0xaa,0x03,0,0,0,(uint8_t)(eth>>8),(uint8_t)(eth&0xff)};
   pt.insert(pt.end(), pl, pl+plen);
-  std::vector<uint8_t> hdr = {0x08,0x42,0,0,             // data, from-DS + protected
-      sta[0],sta[1],sta[2],sta[3],sta[4],sta[5],
-      kBssid[0],kBssid[1],kBssid[2],kBssid[3],kBssid[4],kBssid[5],
-      kBssid[0],kBssid[1],kBssid[2],kBssid[3],kBssid[4],kBssid[5], 0,0};
+  // The data plane carries a sequence number now. The management-frame fix was
+  // the visible half; THIS is the path that feeds a peer's duplicate detector
+  // in volume, and it was still pinned at 0. Built by the shared helper so the
+  // AP's downlink and a station's uplink cannot disagree about the layout.
+  std::vector<uint8_t> hdr = devourer::sta::data_hdr_from_ds(
+      sta, kBssid, kBssid, /*protect=*/true, g_seq.next());
   uint64_t pn = g_txpn++;
   // Non-QoS AAD (qos_tid defaults to -1): this AP airs plain data frames, and
   // that is what has been validated on air. A station sending QoS data needs
@@ -394,8 +402,22 @@ static void on_rx(const Packet& p) {
       uint64_t pn = 0;
       if (devourer::sta::ccmp_decrypt(g_crypto, g_ptk + 32, d, (size_t)len,
                                       (size_t)hlen, sta, pt.data(), &ptlen,
-                                      &pn))
-        handle_plain(sta, pt.data(), (int)ptlen);        // decrypted -> ARP/ICMP
+                                      &pn)) {
+        // Replay check, AFTER the MIC verifies and never before: admitting a
+        // PN from an unauthenticated frame would let anyone advance the window
+        // and lock out the real peer. The TID comes from the QoS header when
+        // there is one, because 802.11 keeps one counter per TID.
+        const int tid = devourer::sta::is_qos_data(fc0)
+                            ? (d[24] & 0x0f)
+                            : devourer::sta::CcmpReplay::kNonQosTid;
+        if (g_ccmp_replay.accept(pn, tid))
+          handle_plain(sta, pt.data(), (int)ptlen);      // decrypted -> ARP/ICMP
+        else
+          g_replayed.fetch_add(1);
+      } else {
+        g_mic_fail.fetch_add(1);
+      }
+      g_enc_rx.fetch_add(1);
       return;
     }
     if ((int)p.Data.size() < hlen + 8) return;
@@ -414,7 +436,8 @@ static void on_rx(const Packet& p) {
     } else if ((ki & 0x0100) && (ki & 0x0200)) {        // msg4: MIC + secure
       if (check_mic(e, elen)) {
         g_state = 2;
-        fprintf(stderr, "  WPA2: msg4 OK — 4-WAY HANDSHAKE COMPLETE (station keyed)\n");
+        g_ccmp_replay.reset();
+      fprintf(stderr, "  WPA2: msg4 OK — 4-WAY HANDSHAKE COMPLETE (station keyed)\n");
       }
     }
   }
@@ -470,6 +493,18 @@ int main(int argc, char** argv) {
             (unsigned long long)g_ccmp_rx_bytes.load(),
             (unsigned long long)g_ccmp_rx_ns.load());
   }
+  /* The data-plane ledger. The on-air runs could not tell an AP that never
+   * RECEIVED an encrypted frame from one that received and failed to decrypt
+   * them, because nothing counted either - so a 100%-ping-loss result had no
+   * diagnosis attached. Printed unconditionally, at every exit. */
+  fprintf(stderr,
+          "  data plane: encrypted frames received=%llu, MIC failures=%llu, "
+          "replays rejected=%llu, frames sent=%llu\n",
+          (unsigned long long)g_enc_rx.load(),
+          (unsigned long long)g_mic_fail.load(),
+          (unsigned long long)g_replayed.load(),
+          (unsigned long long)g_sent.load());
+
   /* Retried, and the failure reported. StopBeacon can now genuinely fail (an
    * EP0 stall during teardown), IRadio.h says such a failure "must be retried
    * ... before its shared port is reused", and `_exit(0)` below means there is

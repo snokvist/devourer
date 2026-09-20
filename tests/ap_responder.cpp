@@ -86,13 +86,11 @@ static uint16_t csum16(const uint8_t* d, int len) {
 // Build an AP->STA data frame (from-DS): 802.11 data hdr + LLC/SNAP + payload.
 static std::vector<uint8_t> build_data(const uint8_t* sta, uint16_t eth,
                                        const uint8_t* pl, int plen) {
-  std::vector<uint8_t> m = {0x08, 0x02, 0x00, 0x00,      // data, from-DS
-      sta[0],sta[1],sta[2],sta[3],sta[4],sta[5],          // addr1 = STA (DA)
-      kBssid[0],kBssid[1],kBssid[2],kBssid[3],kBssid[4],kBssid[5],  // addr2 = BSSID (TA)
-      kBssid[0],kBssid[1],kBssid[2],kBssid[3],kBssid[4],kBssid[5],  // addr3 = SA
-      0x00, 0x00,
-      0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00,                 // LLC/SNAP
-      (uint8_t)(eth >> 8), (uint8_t)(eth & 0xff)};
+  // Sequence-numbered like the management responses. This is the path that
+  // feeds a peer's duplicate detector in volume; it was pinned at 0.
+  std::vector<uint8_t> m = devourer::sta::data_hdr_from_ds(
+      sta, kBssid, kBssid, /*protect=*/false, g_seq.next());
+  devourer::sta::append_llc_snap(m, eth);
   m.insert(m.end(), pl, pl + plen);
   return m;
 }

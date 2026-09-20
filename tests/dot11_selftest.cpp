@@ -372,6 +372,149 @@ void test_data_frames() {
   check(llc[6] == 0x08 && llc[7] == 0x00, "ethertype is big-endian in SNAP");
 }
 
+
+/* RSN elements as they actually appear in the field.
+ *
+ * The module used to byte-compare a canonical one-pairwise/one-AKM layout, so
+ * it reported every mixed-mode WPA/WPA2 AP and every WPA3-transition AP as
+ * unusable and a station would have skipped BSSes it could join. These cases
+ * are the shapes that were rejected, plus the malformed ones that must still
+ * be refused. */
+namespace rsn {
+
+std::vector<uint8_t> build(uint16_t ver, const std::vector<uint32_t>& group,
+                           const std::vector<uint32_t>& pairwise,
+                           const std::vector<uint32_t>& akm,
+                           bool caps, uint16_t capval) {
+  std::vector<uint8_t> v;
+  auto suite = [&](uint32_t t) {
+    v.push_back(0x00); v.push_back(0x0f); v.push_back(0xac);
+    v.push_back((uint8_t)t);
+  };
+  put_le16(v, ver);
+  for (uint32_t g : group) suite(g);
+  if (!pairwise.empty() || !akm.empty() || caps) {
+    put_le16(v, (uint16_t)pairwise.size());
+    for (uint32_t c : pairwise) suite(c);
+  }
+  if (!akm.empty() || caps) {
+    put_le16(v, (uint16_t)akm.size());
+    for (uint32_t a : akm) suite(a);
+  }
+  if (caps) put_le16(v, capval);
+  return v;
+}
+
+}  // namespace rsn
+
+void test_rsn_real_world() {
+  RsnInfo r;
+
+  /* The canonical one-of-each element, which always worked. */
+  auto plain = rsn::build(1, {4}, {4}, {2}, true, 0x0000);
+  check(parse_rsn(plain.data(), plain.size(), &r), "canonical RSN parses");
+  check(r.group_ccmp && r.pairwise_ccmp && r.akm_psk, "canonical is CCMP/PSK");
+  check(!r.mfp_required && !r.mfp_capable, "canonical has no MFP");
+
+  /* MIXED MODE: TKIP group, TKIP+CCMP pairwise, PSK. Rejected before; a very
+   * common real AP. The group cipher is TKIP, so this is NOT joinable by this
+   * project - but the PAIRWISE search must still find CCMP. */
+  auto mixed = rsn::build(1, {2}, {2, 4}, {2}, true, 0x0000);
+  check(parse_rsn(mixed.data(), mixed.size(), &r), "mixed-mode RSN parses");
+  check(r.pairwise_count == 2, "two pairwise suites are counted");
+  check(r.pairwise_ccmp, "CCMP is found AMONG several pairwise suites");
+  check(!r.group_ccmp, "a TKIP group cipher is reported as not CCMP");
+
+  /* WPA2-only AP that still lists two pairwise suites (CCMP first). */
+  auto two_cc = rsn::build(1, {4}, {4, 2}, {2}, true, 0x0000);
+  check(parse_rsn(two_cc.data(), two_cc.size(), &r), "parses");
+  check(r.group_ccmp && r.pairwise_ccmp && r.akm_psk,
+        "CCMP group with a TKIP fallback pairwise is joinable");
+
+  /* WPA3 TRANSITION: CCMP, AKM = PSK + PSK-SHA256, MFP capable but not
+   * required. Rejected before; extremely common now. */
+  auto trans = rsn::build(1, {4}, {4}, {2, 6}, true, 0x0080);
+  check(parse_rsn(trans.data(), trans.size(), &r), "WPA3-transition parses");
+  check(r.akm_count == 2, "two AKMs are counted");
+  check(r.akm_psk, "PSK is found AMONG several AKMs");
+  check(r.mfp_capable && !r.mfp_required, "MFP capable, not required");
+
+  /* WPA3-ONLY: SAE AKM, MFP required. Must NOT be reported as joinable. */
+  auto sae = rsn::build(1, {4}, {4}, {8}, true, 0x00c0);
+  check(parse_rsn(sae.data(), sae.size(), &r), "WPA3-only parses");
+  check(!r.akm_psk, "SAE is not PSK");
+  check(r.mfp_required, "WPA3-only requires MFP");
+
+  /* A vendor OUI must not be mistaken for an 802.11 suite of the same type. */
+  std::vector<uint8_t> vendor = plain;
+  vendor[8] = 0x00; vendor[9] = 0x50; vendor[10] = 0xf2;  /* pairwise OUI */
+  check(parse_rsn(vendor.data(), vendor.size(), &r), "vendor-OUI RSN parses");
+  check(!r.pairwise_ccmp, "a vendor OUI is not 00-0F-AC CCMP");
+
+  /* Truncation and malformed counts: refuse, never read past the end. */
+  check(!parse_rsn(plain.data(), 1, &r), "a 1-byte RSN body is refused");
+  auto bad_ver = rsn::build(2, {4}, {4}, {2}, true, 0);
+  check(!parse_rsn(bad_ver.data(), bad_ver.size(), &r),
+        "an unknown RSN version is refused");
+  std::vector<uint8_t> overrun = plain;
+  overrun[6] = 0xff; overrun[7] = 0xff;  /* pairwise count = 65535 */
+  check(!parse_rsn(overrun.data(), overrun.size(), &r),
+        "a pairwise count that overruns the element is refused");
+  std::vector<uint8_t> akm_overrun = plain;
+  akm_overrun[12] = 0xff; akm_overrun[13] = 0xff;
+  check(!parse_rsn(akm_overrun.data(), akm_overrun.size(), &r),
+        "an AKM count that overruns the element is refused");
+
+  /* A short-but-legal element stops early and leaves later flags false. */
+  auto group_only = rsn::build(1, {4}, {}, {}, false, 0);
+  check(parse_rsn(group_only.data(), group_only.size(), &r),
+        "an element with only a group cipher is legal");
+  check(r.group_ccmp && !r.pairwise_ccmp && !r.akm_psk,
+        "absent lists leave their flags false");
+
+  /* And the end-to-end verdict through parse_beacon: a WPA3-transition BSS
+   * must now be JOINABLE, and an MFP-required one must not. */
+  auto mkbeacon = [&](const std::vector<uint8_t>& ie) {
+    std::vector<uint8_t> m = mgmt_hdr(kFcBeacon,
+                                      (const uint8_t*)"\xff\xff\xff\xff\xff\xff",
+                                      kOwn, kBssid);
+    for (int i = 0; i < 8; i++) m.push_back(0);
+    put_le16(m, 100);
+    put_le16(m, 0x0011);
+    append_ssid(m, "ap");
+    append_ie(m, kEidRsn, ie.data(), ie.size());
+    return m;
+  };
+  BssInfo b;
+  auto bt = mkbeacon(trans);
+  check(parse_beacon(bt.data(), bt.size(), &b), "transition beacon parses");
+  check(b.rsn_ccmp_psk,
+        "a WPA3-TRANSITION BSS is joinable (it was rejected before)");
+  auto bm = mkbeacon(mixed);
+  check(parse_beacon(bm.data(), bm.size(), &b), "mixed beacon parses");
+  check(!b.rsn_ccmp_psk, "a TKIP-group BSS is not joinable");
+  auto bs = mkbeacon(sae);
+  check(parse_beacon(bs.data(), bs.size(), &b), "WPA3-only beacon parses");
+  check(!b.rsn_ccmp_psk && b.rsn_mfp_required,
+        "an MFP-REQUIRED BSS is not joinable and says why");
+}
+
+/* Data frames carry sequence numbers too. The management-frame fix was the
+ * visible half; the data plane is the one that actually feeds a duplicate
+ * detector in volume. */
+void test_data_seq() {
+  const uint8_t dest[6] = {1, 2, 3, 4, 5, 6};
+
+  std::vector<uint8_t> a = data_hdr_to_ds(kBssid, kOwn, dest, true, 1);
+  check(a[22] == 0x10 && a[23] == 0x00, "uplink carries its sequence number");
+  std::vector<uint8_t> b = data_hdr_from_ds(kOwn, kBssid, dest, false, 0x0fff);
+  check(b[22] == 0xf0 && b[23] == 0xff, "downlink carries its sequence number");
+  std::vector<uint8_t> c = data_hdr_to_ds(kBssid, kOwn, dest, true);
+  check(c[22] == 0 && c[23] == 0, "the default is still zero");
+  std::vector<uint8_t> d = data_hdr_to_ds(kBssid, kOwn, dest, true, 0x1001);
+  check(d[22] == 0x10 && d[23] == 0x00, "a data sequence wraps at 12 bits");
+}
+
 }  // namespace
 
 int main() {
@@ -384,6 +527,8 @@ int main() {
   test_station_builders();
   test_assoc_resp_parse();
   test_data_frames();
+  test_rsn_real_world();
+  test_data_seq();
 
   if (g_fail) {
     std::printf("dot11_selftest: %d failure(s)\n", g_fail);
