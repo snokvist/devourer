@@ -179,9 +179,12 @@ require it:
    refuted its own earlier hypothesis. Arms for WCID, QSEL and A-MPDU are in
    `bringup txs` and **have not been run**. Matters for injection, not for a
    station.
-2. **`CcmpReplay` is a strict counter, not a bitmap.** No reorder tolerance; a
-   late retransmission across a hole is dropped. Safe while the AP declines
-   ADDBA, wrong as a general rule.
+2. ~~**`CcmpReplay` is a strict counter, not a bitmap.**~~ **CLOSED** by
+   `f0a67b7`: it is a 64-slot sliding window with a per-TID mask across 17
+   slots (`src/sta/Ccmp.h`). Reorder within the window is tolerated and an
+   equal or already-seen PN is still rejected. Note that R3's "decline ADDBA"
+   recommendation was propped partly on the old no-reorder-tolerance argument,
+   so that recommendation should be re-derived rather than inherited.
 3. **The KAT vectors pin the cipher plumbing, not the framing rules.** Stated
    plainly in `tests/ccmp_gen_vectors.py`. The IEEE 802.11-2016 Annex J CCMP
    vector is a drop-in improvement and the selftest is shaped for it.

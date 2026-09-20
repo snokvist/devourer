@@ -9,7 +9,13 @@ written once.
 
 A **harness** that fits devourer's existing structure and lets devourer join a
 real access point — scan, authenticate, associate, WPA2-PSK 4-way as the
-supplicant, encrypted data plane. The MT7612U is the guinea pig: the first and
+supplicant, encrypted data plane.
+
+**Widened 2026-09-20.** The target decision in `docs/station-mode-scope.md`
+adds the other half: the AP side must serve an ordinary BSS — multiple
+associated stations, with the AP relaying between them — for clients we
+configure (power save off; serving a genuinely unmodified client needs DTIM
+buffering, which stays out of scope). That work is Phase 2b below. The MT7612U is the guinea pig: the first and
 only backend implemented now, chosen because AP mode is already proven there
 end to end.
 
@@ -558,6 +564,52 @@ Still open against the original acceptance text:
 - `station_mode_ok` is now **true** for MT7612U: both halves of its bar are
   measured — see `docs/mt7612u-station-identity.md` for the arms, the controls
   and the four limits that travel with it.
+
+## Phase 2b — the AP-side BSS. Added 2026-09-20 by the target decision.
+
+The scoping decision in `docs/station-mode-scope.md` ("The target: an ordinary
+BSS, with the AP bridging") named eight work items and, in its first form,
+recorded them **only there** — no gate, no acceptance evidence, no ledger row,
+for eight steps of which three are security-relevant. That is a direct miss of
+rule 4 above, caught by the Opus continuity review, and this section is the
+correction.
+
+**Why it is 2b and not part of Phase 3.** Phase 3 is *station* logic, offline.
+Every item here is *AP-harness* work on hardware-facing code
+(`tests/ap_wpa2.cpp`, `tests/ap_responder.cpp`, `tests/ul_trigger_ap.cpp`,
+`src/sta/`). The two sets do not intersect, and the decision document's order
+of work is not a substitute for a phase.
+
+**Ordering against Phase 3.** 2b.1 (the CCMP nonce) is **not optional and not
+deferrable** — it is a live defect in merged code, it is what Phase 5 would
+otherwise discover against a real client, and it must land before any per-TID
+PN counter exists anywhere. The rest of 2b may run in parallel with Phase 3 or
+after it; nothing in Phase 3 depends on it.
+
+| # | Item | Gate |
+|---|---|---|
+| 2b.1 | Fix the CCMP nonce flags octet; re-source vectors from IEEE Annex J | A ctest cell that FAILS against the current `nonce[0] = 0` and passes after. Vectors must not come from `ccmp_gen_vectors.py` — that file shares the misreading |
+| 2b.2 | Per-station table in `src/sta/` (assoc state, AID, PTK, TX PN, per-station `CcmpReplay`) | ctest, pure and backend-agnostic; a two-station fixture the old single-`g_sta` code cannot satisfy |
+| 2b.3 | Pass the real SA; read addr3 | ctest on the frame builders; a relayed header byte-compared against Table 9-26 |
+| 2b.4 | Real DHCP address pool + binding table | Two stations lease two distinct addresses on air |
+| 2b.5 | Association-table ARP responder answering with the target's real MAC | A resolves B and gets **B's** MAC, not the AP's |
+| 2b.6 | GTK transmit path: key id 1, one GTK per BSS, own PN space | A second association must not revoke the first station's group key. On-air: a group frame decrypts at both stations |
+| 2b.7 | Intra-BSS relay, with duplicate detection and a stated position on fragmentation and A-MSDU | A pings B through the AP. Negative control: a retransmitted MPDU is relayed **once** |
+| 2b.8 | TAP forwarder in `tests/` or `tools/`; 802.11 ↔ 802.3 helper (incl. the Ethernet II header) in `src/sta/` | Host stack reaches a station through the TAP; the doc states which side owns ARP/ICMP |
+
+**Acceptance for the phase as a whole.** Two associated stations, both
+configured with power save off, exchanging encrypted unicast through the AP,
+plus a group-addressed frame that both decrypt. And per rule 2, two adversarial
+reviews with every finding resolved.
+
+**Structural property to hold, stated because Phase 1's equivalent is what made
+that phase checkable:** none of 2b.1-2b.7 may add a backend branch. All of it
+is `src/sta/` or harness code. Only 2b.8 is allowed to be OS-specific, and that
+is why it lives outside the library.
+
+**Status:** not started. Decision recorded 2026-09-20; reviewed by two Flash
+reviewers and one Opus continuity review the same day, whose findings are in
+the scope document's own correction table and in the ledger below.
 
 ## Phase 3 — pure station logic, offline
 

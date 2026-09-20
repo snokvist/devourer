@@ -96,7 +96,12 @@ interoperate. So devourer is a complete zero-config WPA2-PSK AP: associate → 4
 
 CCMP framing detail: the AAD masks the FC subtype/retry/pwr-mgmt/more-data bits and
 sets protected, and masks the sequence number (keeping the fragment number); the
-nonce is `0 | A2 | PN(6, big-endian)`; the CCMP header carries the 48-bit PN + the
+nonce is `flags | A2 | PN(6, big-endian)` — and note that this file
+said `0 | A2 | PN` until 2026-09-20, which is **wrong** and matched the same
+misreading in `src/sta/Ccmp.h:113` and `tests/ccmp_gen_vectors.py:109`.
+802.11-2016 12.5.3.3.4 defines the flags octet as Priority (b0..b3) |
+Management (b4), so it is the QoS TID, not zero. See "A CCMP defect this design
+would inherit" in `docs/station-mode-scope.md`; the CCMP header carries the 48-bit PN + the
 ext-IV key id. A hardware CCMP offload would instead need the J3 security TX/RX
 descriptor fields, which are absent in devourer (only Jaguar1 has
 `SET_TX_DESC_SEC_TYPE_8812`) — software CCMP sidesteps that.

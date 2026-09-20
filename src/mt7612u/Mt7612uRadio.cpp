@@ -1195,8 +1195,13 @@ devourer::AdapterCaps Mt7612uRadio::GetAdapterCaps() {
    *     but the literal end-to-end path is unexercised.
    *   - THE LIBRARY'S OWN STATION RX PATH IS PROMISCUOUS. StartRxLoop calls
    *     mt7612u_set_monitor_rx() unconditionally, so a station driven through
-   *     IRadio does not run the managed filter these results describe. Phase
-   *     3 has to decide which filter a station should use.
+   *     IRadio does not run the managed filter these results describe.
+   *     DECIDED 2026-09-20 (docs/station-mode-scope.md, "The target"): the
+   *     managed filter is the right one, and it belongs under the
+   *     SetStationIdentity ordering contract as a role-selected value - NOT
+   *     as an edit to this shared entry point, which would regress every
+   *     monitor consumer and the AP harnesses. That makes it Phase 2 work,
+   *     not the Phase 3 open question this comment used to call it.
    *   - one DUT, one peer, one channel, near field, no soak.
    */
   c.station_mode_ok = true;

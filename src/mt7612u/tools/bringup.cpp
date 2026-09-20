@@ -2690,9 +2690,18 @@ static int gate_sta(uint8_t chan, int secs, const char *bssid_str)
  *   - if we do not, the AP's MAC retransmits until its limit, and we see the
  *     SAME response again with FC Retry SET.
  *
- * So `retried` is the signal, and it is the sound form of the auto-ACK test -
- * the same "count the retried copies" the AP harness's own bring-up row used
- * and its on-air script never did. No second observer, no third radio.
+ * So `retried` is the signal - but READ THIS BEFORE TRUSTING THIS GATE. This
+ * "count the retried copies" method was WITHDRAWN on 2026-09-20. Its
+ * single-variable control (clear MT_AUTO_RSP_EN, hold reception constant) does
+ * not move, so the method cannot fail and therefore cannot measure; it is the
+ * second of the two failed methods recorded in
+ * docs/mt7612u-station-identity.md. An earlier version of this header called
+ * it "the sound form of the auto-ACK test", which it is not.
+ *
+ * R6 was answered instead by asking the TRANSMITTER -
+ * tests/mt7612u_sta_autoack.sh reads a Realtek peer's per-frame CCX reports.
+ * This gate is kept for the register-level state it prints, not for its
+ * verdict.
  *
  * A high retried fraction is evidence we are NOT acknowledging. A low one,
  * with responses actually arriving, is evidence we are.

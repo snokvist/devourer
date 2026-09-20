@@ -2,10 +2,15 @@
 # mt7612u_sta_autoack.sh - does an MT7612U station acknowledge unicast sent to
 # its own address, with NOTHING armed?
 #
-# This is R6, and it is the one Phase 2 question that stayed open.
-# docs/station-mode-scope.md asserts the answer is yes, from a register
-# reading: the auto-response engine matches address 1 against MT_MAC_ADDR and
-# MT_AUTO_RSP_EN is on from init. It has never been measured.
+# This is R6. ANSWERED by this script on 2026-09-20: 1279 frames, 100%
+# acknowledged at 0.45 mean retries with nothing armed, against three controls
+# pinned at the 12-retry limit. docs/mt7612u-station-identity.md has the table
+# and its limits - notably that it is a ONE-PEER result.
+#
+# Before that it was only a register reading (the auto-response engine matches
+# address 1 against MT_MAC_ADDR, and MT_AUTO_RSP_EN is on from init), and the
+# header here said "it has never been measured" for some time after it had
+# been.
 #
 # TWO EARLIER METHODS FAILED, recorded so they are not retried:
 #

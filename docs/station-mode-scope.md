@@ -119,8 +119,22 @@ the pair is for. That was adequate through Phase 2 and is not adequate for
 Phase 3, because the data plane's shape falls out of it.
 
 **The target is a normal AP/station setup**, with the AP relaying between its
-associated stations. Not a bespoke point-to-point arrangement, not raw-frame
-parity with the AP half: a BSS that an unmodified client joins and uses.
+associated stations. Not a bespoke point-to-point arrangement, and not raw-frame
+parity with the AP half.
+
+**With one stated exception, and it is not a small one: power save must be off
+on the client.** An earlier draft of this section said "a BSS that an unmodified
+client joins and uses", which is not what the fleet policy below delivers and
+quietly reversed a measured position. `docs/ap-mode.md:121-137` records
+`power_save on` giving **0/60** pings with the link dropping mid-run, and says
+in as many words that the 14/14 gate "does **not** certify these harnesses
+against a default-configured Linux station, because Linux defaults to power
+save on". `docs/mt7612u-ap-mode.md:196-201` already chose the same answer:
+advertise DTIM=1, buffer nothing, **do not support power-saving clients**.
+
+So the honest target is **an ordinary BSS for clients we configure**. Serving a
+genuinely unmodified client means implementing DTIM buffering, which stays out
+of scope. Do not let "ordinary BSS" drift back into "any client".
 
 This section was adversarially reviewed twice on the day it was written, and
 roughly half of its first draft was wrong. What follows is the corrected
@@ -175,16 +189,23 @@ re-litigated.
 
 ### How many stations: an inference, not a measurement
 
-There is **probably** no hardware obstacle. A station always sets RA = the AP's
-address, so one ACK-match address serves any number of stations, and CCMP is
-software here, so there are no key slots to exhaust. That reasoning is sound
-but it is **an inference from a mechanism measured with one peer**
-(`docs/mt7612u-station-identity.md`), and R8 below leaves open whether a
-station needs a WCID entry at all — a WCID table is finite hardware. Treat
-"multi-client is purely a software problem" as the working assumption it is,
-and see "What this decision does NOT settle".
+There is no hardware obstacle, and the AP-side record already says so with
+numbers: **the WCID table is 256 entries and SKEY is per-BSS in hardware, so
+the silicon supports many clients; extending is harness work, not driver work**
+(`docs/mt7612u-ap-mode.md:225-228`). A first draft of this section hedged this
+into an inference while failing to cite that record at all — the hedge was
+misplaced, because R8's open WCID question is about the **station** role, and
+this target is the AP role.
 
-What *is* certain is that the single-station state is software, and that it is
+Two honest qualifications remain. The auto-ACK mechanism itself (one ACK-match
+address serving any number of stations, since every station sets RA = the AP)
+was measured with **one peer** (`docs/mt7612u-station-identity.md`). And
+`docs/mt7612u-ccmp-benchmark.md:152-158` lists "several concurrent stations" as
+one of the triggers for revisiting the software-CCMP decision — that is a
+trigger to re-measure the CPU cost, not a claim that multi-client needs
+hardware keys.
+
+What is certain is that the single-station state is software, and that it is
 spread across **three** harnesses, not one: `tests/ap_wpa2.cpp:107-115`
 (`g_sta`, `g_ptk`, `g_gtk`, `g_state`, `g_replay`), `tests/ap_responder.cpp`,
 and `tests/ul_trigger_ap.cpp:61,65` (its own `g_sta`, its own single lease).
@@ -209,8 +230,13 @@ without a GTK transmit path. Three concrete defects to fix, not one:
 3. **A group PN space**, separate from every pairwise one.
 
 **What still breaks without it**, stated precisely: IPv6 ND (NS/RS/RA), DHCPv6,
-mDNS, SSDP. **DHCPv4 does not break** — the AP unicasts its OFFER/ACK — and the
-first draft implied otherwise.
+mDNS, SSDP. **DHCPv4 does not break under the current gateway model** — the
+userspace responder sets addr1 = the station (`tests/ap_responder.cpp:92-93`,
+`tests/ap_wpa2.cpp:385-386`) even though the IP destination is broadcast, so
+the frame is individually addressed and pairwise-protected. That stops being
+true the moment step 8's TAP fronts a real DHCP server: its OFFER leaves
+group-addressed at L2 and needs the GTK path. The claim is scoped to today's
+model, and an earlier draft stated it unscoped.
 
 **Proxy ARP is not the escape hatch the first draft claimed.** Two reasons.
 There is no IP-to-MAC binding table to answer from: the DHCP server leases a
@@ -229,9 +255,11 @@ requires a real address pool first.
 The first draft proposed a TAP in a Linux bridge and claimed intra-BSS relay
 would "fall out of the kernel bridge at no extra cost". **Both reviewers
 independently showed that is false**, and the reason is decisive: a Linux
-bridge never forwards a frame back out its ingress port. With one TAP carrying
-the whole BSS, A → B arrives on that port with B already learned on the same
-port, and the bridge drops it. There is no intra-BSS relay from the bridge.
+bridge never forwards a frame back out its ingress port — for flooded frames as
+well as learned ones, so it does not depend on B having been learned yet. With
+one TAP carrying the whole BSS, A → B arrives on the only port B could be
+reached through, and the bridge will not send it back out. There is no
+intra-BSS relay from the bridge.
 
 One TAP *per station* would give the bridge distinct ports to switch between,
 but then the DA lookup is redundant (the port identifies the station) and a
@@ -255,6 +283,12 @@ What the TAP genuinely buys is **host-stack access and an upstream port** — no
 switching. The association table is the forwarder; saying otherwise was the
 first draft's central error.
 
+**The TAP collides with the userspace IP responders the moment it exists**, and
+this is not only a bridging problem. As soon as a TAP carries the BSS, the host
+stack answers ARP and ICMP for that interface alongside the responders in
+`tests/ap_responder.cpp` and `tests/ap_wpa2.cpp`. Step 8 must say which one
+owns each protocol, even in the gateway model where no upstream port exists.
+
 **The gateway/bridge models are not interchangeable.** Today the AP *is* the
 network: its own subnet `192.168.99.0/24`, a userspace DHCP server, and ARP and
 ICMP responders for its own IP. A transparent bridge to an upstream interface
@@ -271,12 +305,15 @@ destination was wrong: `examples/` targets are declared in the root
 `CMakeLists.txt` and are the cross-platform, CI-built plane, which is exactly
 where a Linux-only privileged binary forces the conditional compilation the
 argument set out to avoid. `tests/ap_wpa2.cpp` and `ap_responder.cpp` are not
-CMake targets at all — they are hand-built — which is what makes `tests/` the
-natural home, alongside `sta_client.cpp`.
+CMake targets at all — they are hand-built — which is what makes `tests/` a
+natural home, alongside `sta_client.cpp`. That argument is weaker than the
+`examples/` half: `tests/` is not purely hand-built either (`CMakeLists.txt`
+builds `reglat` and the ctest selftests from it). `tools/`, where
+`tun_p2p.py` already lives, is the other defensible answer.
 
 There is also prior art the first draft missed: **`tools/precoder/tun_p2p.py`**
-already opens `/dev/net/tun` under `CAP_NET_ADMIN` and drives `streamtx` /
-`rxdemo` as subprocesses (`:147-151`). It is TUN (L3) rather than TAP, and it
+already opens `/dev/net/tun` under `CAP_NET_ADMIN` (`:147-151`) and drives
+`streamtx` / `rxdemo` as subprocesses (elsewhere in the same file). It is TUN (L3) rather than TAP, and it
 documents its own single-peer scope. So the repo's established home for
 privileged host-side netdev glue is `tools/`, and a single-peer forwarder is
 already the accepted shape for this kind of tool.
@@ -296,11 +333,18 @@ device's traffic), so the helper has two consumers either way.
 simple, unfragmented, non-aggregated MSDU:
 
 - **Duplicate detection.** Relaying without a per-TA/TID sequence cache
-  (802.11-2016 §10.3.4.6) forwards A's retransmission to B a second time
+  (802.11-2016, "Duplicate detection and recovery" — clause number
+  deliberately not quoted here; an earlier draft cited §10.3.4.6 and review
+  could not confirm it) forwards A's retransmission to B a second time
   whenever the AP's ACK to A is lost. The phase table above asserts "DUP
-  handling decided"; the decision is not stated anywhere, and the managed
-  filter sets `MT_RX_FILTR_CFG_DUP` (`src/mt7612u/beacon.cpp:497`) whose
-  per-TA behaviour on this part is unverified.
+  handling decided"; the decision is not stated anywhere. And hardware will
+  not do it for us: BIT(7) `MT_RX_FILTR_CFG_DUP` is set in the init value, but
+  `mt7612u_set_monitor_rx()` is what clears it
+  (`src/mt7612u/beacon.cpp:494-498`) and `StartRxLoop` calls that
+  unconditionally for every role (`src/mt7612u/Mt7612uRadio.cpp:410-412`). So
+  the AP harnesses run with DUP **clear, always** — a software per-TA/TID
+  cache is the answer, and nothing in the order of work currently turns the
+  hardware filter on either.
 - **Fragmentation.** A fragmented MSDU must be reassembled before it becomes an
   802.3 frame. `Ccmp.h:88` deliberately preserves the fragment number in the
   AAD, so the information is there; nothing uses it.
@@ -319,10 +363,23 @@ unconditionally. 802.11-2016 §12.5.3.3.4 defines it as Priority (b0..b3) |
 Management (b4) — Linux builds it as `qos_tid | (is_mgmt << 4)`. The AAD *does*
 carry the TID (`Ccmp.h:101-103`); only the nonce omits it.
 
-It is currently masked: the AP airs non-QoS data (`tests/ap_wpa2.cpp:388`) and
-ordinary client traffic is TID 0, for which the correct flags octet is also 0.
-It would surface on TID 1-7 — **the video and voice access categories**, which
-is the traffic this project exists to carry.
+**This is a live defect in merged code, not a latent one.** Phase 1
+deliberately fixed the *AAD* half of exactly this bug —
+`tests/ap_wpa2.cpp:508-515` carries the TID into the AAD and its comment says
+the previous behaviour "is wrong for QoS and survived only because the
+validated runs used a station that associated legacy and sent non-QoS data. A
+real 802.11n station sends QoS, and every one of its frames would have failed
+the MIC with no diagnostic at either end." The nonce half of the same bug was
+missed, so that sentence is **still true today**: a TID 1-7 QoS frame still
+fails its MIC with no diagnostic.
+
+It is masked only by the rig: the AP airs non-QoS data
+(`tests/ap_wpa2.cpp:388`), ordinary client traffic is TID 0 (for which flags 0
+is coincidentally correct), and the 14/14 gate ran against a legacy,
+non-QoS station — so the gate is structurally unable to see it. It surfaces on
+TID 1-7, **the video and voice access categories**, which is the traffic this
+project exists to carry, and the exposure widens under this target from our own
+TID-0 fleet to any client with WMM.
 
 The KATs cannot catch it. `tests/ccmp_gen_vectors.py:109-111` builds the nonce
 as `bytes([0]) + a2 + pn`, the same misreading as the C, so the vectors are
@@ -333,7 +390,7 @@ of *implementation* (python-cryptography vs OpenSSL) is not independence of
 already names the fix: the official IEEE Annex J vectors, "a drop-in
 replacement when someone has it to hand".
 
-A second consequence is latent rather than active. The standard keeps PN
+A second consequence is genuinely latent. The standard keeps PN
 counters **per TID**; this tree uses one counter (`tests/ap_wpa2.cpp:368`), so
 no nonce repeats today. Adopting per-TID PNs — which the per-station table work
 invites — without fixing the nonce would make two frames on different TIDs
@@ -380,20 +437,38 @@ value — not as an edit to the shared RX entry point.
 
 ### Order of work
 
-1. **Per-station table** — association state, AID, PTK, TX PN, and a
+These are now **Phase 2b** in `docs/station-mode-plan.md`, with a gate and
+acceptance evidence per item and a structural property for the phase. Recording
+them only here, as the first draft did, violated that document's own rule 4
+(`docs/station-mode-plan.md:32-33`) — eight steps, three of them
+security-relevant, with no gate. The list below is the rationale; the plan is
+the authority on ordering and acceptance.
+
+1. **Fix the CCMP nonce** (`src/sta/Ccmp.h:113`) and re-source the vectors from
+   IEEE Annex J. **First, not second** — an earlier draft had this second,
+   behind the per-station table, which is the one ordering that can *create*
+   the hazard this step removes: the table's "TX PN" invites per-TID counters,
+   and per-TID PNs over a TID-blind nonce is keystream reuse. If for any reason
+   the table lands first, it must pin **one PN per station, never per TID**,
+   until this step is done.
+2. **Per-station table** — association state, AID, PTK, TX PN, and a
    `CcmpReplay` instance each, across all three harnesses. Precondition for
    everything below. Per-station PN and replay state deserve the same care as
-   the 4-way: a mistake there is a security bug, not a wrong number.
-2. **Fix the CCMP nonce** and re-source the vectors, before per-TID PN
-   counters exist.
+   the 4-way: a mistake there is a security bug, not a wrong number. **Home:**
+   `src/sta/`, under the same purity contract as the rest of that directory —
+   pure, backend-agnostic, ctest-gated, no `IRadio` and no OS calls. It is the
+   largest item here and the first draft failed to say where it goes.
 3. **Pass the real SA** and **read addr3** in `ap_wpa2.cpp` (and
    `ap_responder.cpp`). Cheap; unblocks relay.
-4. **A real DHCP address pool** with a binding table — needed by both the ARP
-   responder and any second client.
-5. **GTK transmit path**: key id 1, one GTK per BSS, its own PN space.
-6. **Intra-BSS relay** — association-table lookup plus re-encrypt, with
+4. **A real DHCP address pool** with a binding table.
+5. **An association-table ARP responder** that answers with the target
+   station's real MAC. Named at "Proxy ARP is not the escape hatch" as the
+   correct cheap substitute, and the first draft's step list forgot to build
+   it. Depends on 4.
+6. **GTK transmit path**: key id 1, one GTK per BSS, its own PN space.
+7. **Intra-BSS relay** — association-table lookup plus re-encrypt, with
    duplicate detection and an explicit position on fragmentation and A-MSDU.
-7. **TAP forwarder** in `tests/` or `tools/`, with the 802.11 ↔ 802.3
+8. **TAP forwarder** in `tests/` or `tools/`, with the 802.11 ↔ 802.3
    translation (including the Ethernet II header) as a pure helper in
    `src/sta/`.
 
@@ -452,13 +527,30 @@ verified against the tree before being accepted; one was rejected.
 
 **Rejected:** that the up path should decrypt group traffic with the GTK. A
 station's uplink is always addressed to the AP, so it is pairwise-protected
-regardless of the payload's DA — and encrypted DHCP, whose DISCOVER carries a
-broadcast DA, already works through the single pairwise decrypt path at
-`tests/ap_wpa2.cpp:518`.
+regardless of the payload's DA. A non-AP STA in an infrastructure BSS has no
+transmit GTK at all — for it the GTK is receive-only. Encrypted DHCP, whose
+DISCOVER carries a broadcast DA, already works through the single pairwise
+decrypt path at `tests/ap_wpa2.cpp:518`. Note precisely what that evidence
+shows: not that the AP *chose* pairwise, since there is no key-selection
+branch to choose with — that absence is gap #2 above — but that a station's
+broadcast-DA frame arrives pairwise-protected and decrypts under the PTK.
 
 ## Risks, measured and unmeasured
 
-### R1 — the unicast cliff. This gates the whole project.
+### R1 — the unicast cliff. ANSWERED: Phase 0 PASS, and it did not gate.
+
+**Answered 2026-08 by Phase 0** (`docs/station-mode-phase0.md`): a
+station-shaped transmitter runs at **2084 fps with a 99.9% ACK rate**, 71% of
+its matched broadcast control. The 40x cliff is real and is a property of
+**TX-only injection**, not of the part and not of a station.
+`docs/mt7612u-tx-retry.md:24-38` carries the arm that R1 says does not exist —
+`ucast peer ownSA Normal`, 655 fps, 40/40, **0 retries**, MAC receiver on.
+
+The rest of this entry is the pre-measurement reasoning. It is kept because the
+mechanism it describes is correct and still explains the TX-only case; its
+instruction to measure before writing supplicant code has been carried out.
+
+### R1, as originally written — the unicast cliff
 
 `docs/mt7612u.md` measures injected TX on this part:
 
@@ -600,7 +692,8 @@ of stations" as an inference rather than a measurement.
 
 The rest of this entry is the historical record of the two failed methods.
 
-**Was a register reading, and Phase 2's first attempt failed to measure it.** The gate's
+**It was a register reading, and Phase 2's first attempt failed to measure
+it.** The gate's
 single-variable control — clear `MT_AUTO_RSP_EN`, hold reception constant —
 does not move the retried-copy count, so that method is void on this rig and
 auto-ACK is **unmeasured**. An earlier Phase 2 revision claimed to have
@@ -692,7 +785,7 @@ union: **no device access, no environment, no clock of record, no threads, no
 sockets.** That is what makes them testable without hardware, and a
 station's protocol logic is the most test-worthy code in this scope.
 
-- `Dot11Mgmt.h/.cpp` — build probe-request / auth / assoc-request; parse
+- ``src/sta/Dot11.h` (header-only)` — build probe-request / auth / assoc-request; parse
   beacon, probe-response, auth, assoc-response, deauth, disassoc. IE walker.
   RSN IE build and parse. **Shared with the AP side**: `ap_responder.cpp` and
   `ap_wpa2.cpp` open-code the mirror images of these today. Converting them is
@@ -728,13 +821,16 @@ can substitute mbedTLS without touching the state machine. Promoting
 `ccmp_software.h` therefore means promoting its *framing*, with its EVP body
 staying in the harness as one `CryptoOps` method.
 
-**Where the benchmark artifacts actually are.** `docs/mt7612u-ccmp-benchmark.md`,
-`tests/ccmp_software.h` and `tests/ccmp_sw_bench.cpp` are **uncommitted working
-files on the `bench/mt7612u-ccmp` branch in the primary checkout**, not in this
-worktree and not on `master`. Review round 1 flagged that Phase 1 cannot start
-from the repo as it stands and the "0.47% of one core" figure cannot be checked
-by a reader. Phase 1's first step is therefore to land them, and until it does,
-that number is a working note, not a citation.
+**Where the benchmark artifacts are: in the tree.**
+`docs/mt7612u-ccmp-benchmark.md`, `tests/ccmp_software.h` and
+`tests/ccmp_sw_bench.cpp` were landed by `1139782` and are all present here.
+This paragraph previously said they were uncommitted working files on a
+`bench/mt7612u-ccmp` branch "not in this worktree", and that the "0.47% of one
+core" figure was "a working note, not a citation" — both stale, and the second
+sat awkwardly beside this document's own use of that figure to justify building
+station mode entirely on software CCMP. The figure is citable. What it is
+**not** is an ARM number: it is x86 with AES-NI, which is why CPU budget
+remains listed as the largest unmeasured risk in the target section above.
 
 ### 2. The one backend seam — `IRadio`
 

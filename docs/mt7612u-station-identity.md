@@ -285,7 +285,10 @@ success*.
   property of the managed filter specifically. Under the monitor filter the
   station would still RECEIVE with the port identity moved — it would simply
   stop acknowledging. The prohibition stands either way; the reason differs
-  by filter, and Phase 3 has to decide which filter a station should run.
+  by filter. **Decided 2026-09-20** (`docs/station-mode-scope.md`, "The
+  target"): a station runs the managed filter, selected by role under the
+  `SetStationIdentity` ordering contract rather than by editing `StartRxLoop`.
+  That makes it Phase 2 work, not the Phase 3 question this used to pose.
 - **No cell drove `SetStationIdentity` itself.** The seam writes no register,
   so the measured hardware state is the state a successful arm leaves behind
   — but the literal "arm the seam, then measure" path is unexercised.

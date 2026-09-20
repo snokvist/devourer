@@ -227,10 +227,15 @@ the work are in [MT7612U CCMP offload benchmark](mt7612u-ccmp-benchmark.md).
    harness handles one (`docs/ap-mode.md` scope). Extending is **harness** work
    (a client table, per-client PTK), not driver work.
 
-5. **Out of scope, standard AP-stack breadth.** WMM/QoS EDCA parameter sets,
-   DFS/radar on 5 GHz DFS channels, 802.11w management-frame protection, band
-   steering, and a real DHCP pool. None are MT-specific gaps; they are AP-stack
-   features the harness does not implement.
+5. **Out of scope, standard AP-stack breadth.** DFS/radar on 5 GHz DFS
+   channels, 802.11w management-frame protection, and band steering. None are
+   MT-specific gaps; they are AP-stack features the harness does not implement.
+
+   **Two items moved off this list on 2026-09-20.** A real DHCP pool is now a
+   prerequisite, and WMM/QoS is now in the blast radius — see "The target: an
+   ordinary BSS, with the AP bridging" in `docs/station-mode-scope.md`. The
+   ARP responder the relay needs cannot answer without a binding table, and a
+   client sending QoS exposes the CCMP nonce defect recorded in that section.
 
 6. **Management-frame timing is fine.** Probe/auth/assoc responses are tens-of-ms
    tolerant and the userspace RX→TX round-trip is a few ms, proven on the
