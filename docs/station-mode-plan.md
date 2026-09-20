@@ -589,7 +589,7 @@ after it; nothing in Phase 3 depends on it.
 | # | Item | Gate |
 |---|---|---|
 | 2b.1 | ~~Fix the CCMP nonce flags octet~~ **DONE 2026-09-20** | Gate met: mutation reintroducing `nonce[0] = 0` fails 8 checks (4 vector cells + 4 direct assertions in `test_nonce_flags()`); regeneration changed only the two QoS vectors. **Not met:** vectors still come from `ccmp_gen_vectors.py` (fixed in the same pass, so they are a regression gate, not an independent one), and interop is unproven because this AP advertises neither WMM nor HT, so no station sends it QoS. Annex J, and an on-air TID 1..7 cell, ride with the WMM work |
-| 2b.2 | Per-station table in `src/sta/` (assoc state, AID, PTK, TX PN, per-station `CcmpReplay`) | ctest, pure and backend-agnostic; a two-station fixture the old single-`g_sta` code cannot satisfy |
+| 2b.2 | ~~Per-station table in `src/sta/`~~ **DONE 2026-09-20** — `src/sta/StationTable.h`, `tests/station_table_selftest.cpp`, ctest 74 | Gate met: `test_two_stations_are_independent()` holds two PTKs, two TX PN spaces and two CCMP windows, and a mutation collapsing `add()` to slot 0 is caught. 4 mutations run, 3 caught; the survivor (deleting `add()`'s redundant wipe) is recorded in the test rather than hidden. **Not done:** nothing is wired onto it yet — the three harnesses still use their own `g_sta`, so this is a container with its contract pinned, not a multi-client AP |
 | 2b.3 | Pass the real SA; read addr3 | ctest on the frame builders; a relayed header byte-compared against Table 9-26 |
 | 2b.4 | Real DHCP address pool + binding table | Two stations lease two distinct addresses on air |
 | 2b.5 | Association-table ARP responder answering with the target's real MAC | A resolves B and gets **B's** MAC, not the AP's |

@@ -995,6 +995,18 @@ target_include_directories(Dot11Selftest PRIVATE
 target_compile_features(Dot11Selftest PRIVATE cxx_std_20)
 add_test(NAME dot11_frames COMMAND Dot11Selftest)
 
+# src/sta/StationTable.h - the associated-station table (Phase 2b.2), the thing
+# that stops the AP harnesses being single-client. Pure and header-only like
+# the rest of src/sta/, so no OpenSSL and no libusb: it runs in every CI job.
+# The load-bearing cell is test_two_stations_are_independent(), which is the
+# phase gate - two stations with their own PTKs, TX PN spaces and CCMP receive
+# windows, none of which a file-scope `g_sta`/`g_ptk`/`g_txpn` shape can hold.
+add_executable(StationTableSelftest tests/station_table_selftest.cpp)
+target_include_directories(StationTableSelftest PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+add_test(NAME station_table COMMAND StationTableSelftest)
+
 # Headless guard for the TX quiesce seam (ITransport::quiesce_tx via
 # RtlAdapter): the explicit "stop TX and wait it out" call every device makes
 # before anything is released. UsbTransport's cancel/drain is validated on
