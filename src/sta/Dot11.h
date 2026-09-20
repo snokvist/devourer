@@ -1,0 +1,419 @@
+/* Dot11 — 802.11 management-frame construction and parsing, shared by the AP
+ * and station roles.
+ *
+ * Pure: no device access, no environment, no clock, no threads, no sockets —
+ * the contract `src/hopset/` and `src/chanmig/` keep, and the reason those are
+ * testable without hardware. Everything here is a function of its arguments.
+ *
+ * WHY THE TWO ROLES SHARE ONE FILE. A station's auth-request and an AP's
+ * auth-response are the same frame with two fields swapped; a beacon an AP
+ * builds and a beacon a station parses are the same bytes read in opposite
+ * directions. `tests/ap_responder.cpp` and `tests/ap_wpa2.cpp` each grew their
+ * own copy of the builder half, inline and untested, and a station would have
+ * made a third. One module with a selftest is the alternative, and the AP
+ * harnesses switching onto it is what proves it is genuinely neutral rather
+ * than a station module with AP-shaped holes.
+ *
+ * Byte order: 802.11 is little-endian on the wire. Every 16-bit field here is
+ * written and read as such explicitly, never by casting a struct over a
+ * buffer.
+ */
+#ifndef DEVOURER_STA_DOT11_H
+#define DEVOURER_STA_DOT11_H
+
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <string>
+#include <vector>
+
+namespace devourer {
+namespace sta {
+
+/* ---- frame control ---------------------------------------------------- */
+
+/* fc[0] values: type and subtype together, which is how the harnesses match.
+ * Keeping them as the composed byte rather than separate type/subtype fields
+ * is deliberate — every dispatch site compares the whole octet. */
+enum : uint8_t {
+  kFcAssocReq = 0x00,
+  kFcAssocResp = 0x10,
+  kFcReassocReq = 0x20,
+  kFcReassocResp = 0x30,
+  kFcProbeReq = 0x40,
+  kFcProbeResp = 0x50,
+  kFcBeacon = 0x80,
+  kFcDisassoc = 0xa0,
+  kFcAuth = 0xb0,
+  kFcDeauth = 0xc0,
+  kFcData = 0x08,
+  kFcQosData = 0x88,
+};
+
+/* fc[1] flags */
+enum : uint8_t {
+  kFcToDs = 0x01,
+  kFcFromDs = 0x02,
+  kFcMoreFrag = 0x04,
+  kFcRetry = 0x08,
+  kFcPwrMgmt = 0x10,
+  kFcMoreData = 0x20,
+  kFcProtected = 0x40,
+};
+
+/* Element IDs used by an infrastructure BSS association. */
+enum : uint8_t {
+  kEidSsid = 0,
+  kEidSupportedRates = 1,
+  kEidDsParams = 3,
+  kEidTim = 5,
+  kEidErp = 42,
+  kEidHtCaps = 45,
+  kEidRsn = 48,
+  kEidExtSupportedRates = 50,
+  kEidHtOperation = 61,
+  kEidVhtCaps = 191,
+  kEidVhtOperation = 192,
+};
+
+inline void put_le16(std::vector<uint8_t>& v, uint16_t x) {
+  v.push_back((uint8_t)(x & 0xff));
+  v.push_back((uint8_t)(x >> 8));
+}
+inline uint16_t get_le16(const uint8_t* p) {
+  return (uint16_t)(p[0] | (p[1] << 8));
+}
+
+/* ---- headers ---------------------------------------------------------- */
+
+/* A 24-byte 3-address management header.
+ *
+ * `da` is address 1, `sa` address 2, `bssid` address 3. That ordering is the
+ * whole difference between the two roles: an AP answering a station passes
+ * (station, bssid, bssid); a station addressing its AP passes
+ * (bssid, own, bssid). Sequence control is left zero — see assign_seq below,
+ * which is NOT optional for a station.
+ */
+inline std::vector<uint8_t> mgmt_hdr(uint8_t subtype_fc, const uint8_t da[6],
+                                     const uint8_t sa[6],
+                                     const uint8_t bssid[6]) {
+  std::vector<uint8_t> m;
+  m.reserve(24);
+  m.push_back(subtype_fc);
+  m.push_back(0x00);
+  put_le16(m, 0); /* duration */
+  m.insert(m.end(), da, da + 6);
+  m.insert(m.end(), sa, sa + 6);
+  m.insert(m.end(), bssid, bssid + 6);
+  put_le16(m, 0); /* sequence control */
+  return m;
+}
+
+/* Write a sequence number into a built frame's Sequence Control field.
+ *
+ * THIS MATTERS AND IS EASY TO MISS. On this project's MediaTek backend the MAC
+ * assigns sequence numbers only for beacons — `MT_TXWI_ACK_CTL_NSEQ` is set
+ * for `MT_TXOPT_BEACON` and nothing else (`src/mt7612u/tx.cpp`). Both AP
+ * harnesses therefore air every management frame with sequence 0, which
+ * survives only because they air so few. A station's data plane feeds the AP's
+ * duplicate detector, where a pinned sequence number is precisely what gets
+ * dropped. `seq` is a 12-bit counter; the low 4 bits are the fragment number
+ * and stay zero for an unfragmented frame.
+ */
+inline void assign_seq(std::vector<uint8_t>& frame, uint16_t seq) {
+  if (frame.size() < 24) return;
+  uint16_t sc = (uint16_t)((seq & 0x0fff) << 4);
+  frame[22] = (uint8_t)(sc & 0xff);
+  frame[23] = (uint8_t)(sc >> 8);
+}
+
+/* A monotonic 12-bit sequence counter. One per transmitter; a station needs
+ * exactly one for everything it sends. */
+class SeqCounter {
+public:
+  uint16_t next() { return (uint16_t)(n_++ & 0x0fff); }
+  void reset() { n_ = 0; }
+
+private:
+  uint16_t n_ = 0;
+};
+
+/* ---- information elements --------------------------------------------- */
+
+inline void append_ie(std::vector<uint8_t>& m, uint8_t eid, const uint8_t* body,
+                      size_t len) {
+  m.push_back(eid);
+  m.push_back((uint8_t)len);
+  m.insert(m.end(), body, body + len);
+}
+
+inline void append_ssid(std::vector<uint8_t>& m, const std::string& ssid) {
+  append_ie(m, kEidSsid, (const uint8_t*)ssid.data(), ssid.size());
+}
+
+/* The basic-rate set both harnesses air, byte for byte: 1/2/5.5/11 CCK marked
+ * basic, then 9/12/18/24/36/48/54 OFDM. Kept as one function so the AP and a
+ * station advertise the same thing and a mismatch cannot appear between them. */
+inline void append_supported_rates(std::vector<uint8_t>& m) {
+  static const uint8_t r[] = {0x82, 0x84, 0x8b, 0x96, 0x24, 0x30, 0x48, 0x6c};
+  append_ie(m, kEidSupportedRates, r, sizeof r);
+}
+
+/* 5 GHz has no CCK, so the basic set is OFDM-only. Airing CCK rates as BASIC
+ * on a 5 GHz BSS is a spec violation a strict station may refuse outright. */
+inline void append_supported_rates_5g(std::vector<uint8_t>& m) {
+  static const uint8_t r[] = {0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48, 0x60, 0x6c};
+  append_ie(m, kEidSupportedRates, r, sizeof r);
+}
+
+inline void append_ds_params(std::vector<uint8_t>& m, uint8_t chan) {
+  append_ie(m, kEidDsParams, &chan, 1);
+}
+
+/* The WPA2-PSK RSN element: CCMP group, CCMP pairwise, PSK AKM.
+ *
+ * Both roles need byte-identical bytes here — an AP advertises it in its
+ * beacon and probe response, and a station echoes the AP's choice back in its
+ * association request. A station that sends something the AP did not offer is
+ * refused, and a review of PR #335 caught exactly that class of bug in its
+ * assoc-request builder (a non-default cipher path truncated the frame tail).
+ */
+inline void append_rsn_ccmp_psk(std::vector<uint8_t>& m) {
+  static const uint8_t rsn[] = {
+      0x01, 0x00,                          /* version 1 */
+      0x00, 0x0f, 0xac, 0x04,              /* group cipher: CCMP */
+      0x01, 0x00, 0x00, 0x0f, 0xac, 0x04,  /* 1 pairwise: CCMP */
+      0x01, 0x00, 0x00, 0x0f, 0xac, 0x02,  /* 1 AKM: PSK */
+      0x00, 0x00,                          /* RSN capabilities */
+  };
+  append_ie(m, kEidRsn, rsn, sizeof rsn);
+}
+
+/* Walk the IEs in `body` and return a pointer to the first with `eid`, with
+ * its length in `len_out`. Returns nullptr when absent.
+ *
+ * Bounds-checked against a truncated or hostile frame: an element whose length
+ * runs past the end of the buffer terminates the walk rather than reading off
+ * it. Every caller here is parsing frames from the air. */
+inline const uint8_t* find_ie(const uint8_t* body, size_t body_len, uint8_t eid,
+                              size_t* len_out) {
+  size_t i = 0;
+
+  while (i + 2 <= body_len) {
+    uint8_t id = body[i];
+    size_t len = body[i + 1];
+
+    if (i + 2 + len > body_len) return nullptr; /* truncated: stop, do not read */
+    if (id == eid) {
+      if (len_out) *len_out = len;
+      return body + i + 2;
+    }
+    i += 2 + len;
+  }
+  return nullptr;
+}
+
+/* ---- parsing ---------------------------------------------------------- */
+
+/* What a station learns about a BSS from one beacon or probe response. */
+struct BssInfo {
+  uint8_t bssid[6] = {0};
+  std::string ssid;
+  uint16_t capability = 0;
+  uint16_t beacon_interval_tu = 0;
+  uint8_t channel = 0;     /* from the DS Parameter Set; 0 when absent */
+  bool privacy = false;    /* capability bit 4 */
+  bool has_rsn = false;
+  bool rsn_ccmp_psk = false; /* the only suite this project speaks */
+};
+
+/* A beacon/probe-response body is a 12-byte fixed part (timestamp, beacon
+ * interval, capability) followed by IEs. `frame` starts at the 802.11 header.
+ * Returns false on anything too short to trust. */
+inline bool parse_beacon(const uint8_t* frame, size_t len, BssInfo* out) {
+  const size_t fixed = 24 + 12;
+  const uint8_t* body;
+  size_t body_len, ie_len;
+
+  if (!frame || !out || len < fixed) return false;
+  std::memcpy(out->bssid, frame + 16, 6); /* addr3 */
+  out->beacon_interval_tu = get_le16(frame + 24 + 8);
+  out->capability = get_le16(frame + 24 + 10);
+  out->privacy = (out->capability & 0x0010) != 0;
+
+  body = frame + fixed;
+  body_len = len - fixed;
+
+  if (const uint8_t* p = find_ie(body, body_len, kEidSsid, &ie_len))
+    out->ssid.assign((const char*)p, ie_len);
+  if (const uint8_t* p = find_ie(body, body_len, kEidDsParams, &ie_len))
+    if (ie_len >= 1) out->channel = p[0];
+  if (const uint8_t* p = find_ie(body, body_len, kEidRsn, &ie_len)) {
+    out->has_rsn = true;
+    /* Accept only the one suite this project implements, and say so rather
+     * than associating and failing the handshake later: version 1, CCMP group
+     * at bytes 2..5, one CCMP pairwise, one PSK AKM. */
+    static const uint8_t want[] = {0x01, 0x00, 0x00, 0x0f, 0xac, 0x04,
+                                   0x01, 0x00, 0x00, 0x0f, 0xac, 0x04,
+                                   0x01, 0x00, 0x00, 0x0f, 0xac, 0x02};
+    out->rsn_ccmp_psk =
+        ie_len >= sizeof want && std::memcmp(p, want, sizeof want) == 0;
+  }
+  return true;
+}
+
+/* Authentication frame body: algorithm, sequence, status. */
+struct AuthFields {
+  uint16_t algorithm = 0;
+  uint16_t seq = 0;
+  uint16_t status = 0;
+};
+inline bool parse_auth(const uint8_t* frame, size_t len, AuthFields* out) {
+  if (!frame || !out || len < 24 + 6) return false;
+  out->algorithm = get_le16(frame + 24);
+  out->seq = get_le16(frame + 26);
+  out->status = get_le16(frame + 28);
+  return true;
+}
+
+/* Association-response body: capability, status, AID. */
+struct AssocRespFields {
+  uint16_t capability = 0;
+  uint16_t status = 0;
+  uint16_t aid = 0; /* the two top bits are always set on the wire */
+};
+inline bool parse_assoc_resp(const uint8_t* frame, size_t len,
+                             AssocRespFields* out) {
+  if (!frame || !out || len < 24 + 6) return false;
+  out->capability = get_le16(frame + 24);
+  out->status = get_le16(frame + 26);
+  out->aid = (uint16_t)(get_le16(frame + 28) & 0x3fff);
+  return true;
+}
+
+/* Deauth/disassoc reason code. */
+inline bool parse_reason(const uint8_t* frame, size_t len, uint16_t* reason) {
+  if (!frame || !reason || len < 24 + 2) return false;
+  *reason = get_le16(frame + 24);
+  return true;
+}
+
+/* ---- station-side builders -------------------------------------------- */
+
+/* Probe request. A broadcast-SSID probe with an empty SSID element is a
+ * wildcard scan; a named SSID is a directed probe, which is what finds a
+ * hidden BSS. */
+inline std::vector<uint8_t> build_probe_req(const uint8_t own[6],
+                                            const std::string& ssid,
+                                            uint8_t chan, bool five_ghz) {
+  static const uint8_t bcast[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+  std::vector<uint8_t> m = mgmt_hdr(kFcProbeReq, bcast, own, bcast);
+  append_ssid(m, ssid);
+  if (five_ghz) append_supported_rates_5g(m);
+  else append_supported_rates(m);
+  if (chan) append_ds_params(m, chan);
+  return m;
+}
+
+/* Open-system authentication, sequence 1 — the station's half. */
+inline std::vector<uint8_t> build_auth_req(const uint8_t own[6],
+                                           const uint8_t bssid[6]) {
+  std::vector<uint8_t> m = mgmt_hdr(kFcAuth, bssid, own, bssid);
+  put_le16(m, 0); /* open system */
+  put_le16(m, 1); /* sequence 1 */
+  put_le16(m, 0); /* status 0 */
+  return m;
+}
+
+/* Association request. `capability` must claim ESS, and Privacy when the BSS
+ * advertises RSN — an association request whose Privacy bit disagrees with the
+ * RSN element it carries is refused by a conforming AP. */
+inline std::vector<uint8_t> build_assoc_req(const uint8_t own[6],
+                                            const uint8_t bssid[6],
+                                            const std::string& ssid,
+                                            bool rsn, bool five_ghz,
+                                            uint16_t listen_interval = 10) {
+  std::vector<uint8_t> m = mgmt_hdr(kFcAssocReq, bssid, own, bssid);
+  put_le16(m, (uint16_t)(0x0001 | (rsn ? 0x0010 : 0))); /* ESS | Privacy */
+  put_le16(m, listen_interval);
+  append_ssid(m, ssid);
+  if (five_ghz) append_supported_rates_5g(m);
+  else append_supported_rates(m);
+  /* The RSN element goes AFTER the rates, and anything that follows it must
+   * still be emitted — PR #335's review found its assoc-request truncating the
+   * HT/VHT/ExtCap tail on a non-default cipher path. There is no tail here
+   * yet; when one is added it belongs below this line, not above it. */
+  if (rsn) append_rsn_ccmp_psk(m);
+  return m;
+}
+
+/* Deauthentication, so a station leaves cleanly instead of making the AP time
+ * it out. Reason 3 = "station is leaving". */
+inline std::vector<uint8_t> build_deauth(const uint8_t own[6],
+                                         const uint8_t bssid[6],
+                                         uint16_t reason = 3) {
+  std::vector<uint8_t> m = mgmt_hdr(kFcDeauth, bssid, own, bssid);
+  put_le16(m, reason);
+  return m;
+}
+
+/* ---- data frames ------------------------------------------------------ */
+
+/* LLC/SNAP header for an ethertype, the 8 bytes that precede every IP payload
+ * inside an 802.11 data frame. */
+inline void append_llc_snap(std::vector<uint8_t>& m, uint16_t ethertype) {
+  m.insert(m.end(), {0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00});
+  m.push_back((uint8_t)(ethertype >> 8));
+  m.push_back((uint8_t)(ethertype & 0xff));
+}
+
+/* A station's uplink data header: to-DS, addr1 = BSSID, addr2 = own,
+ * addr3 = destination. The AP's downlink is the mirror (from-DS, addr1 = sta,
+ * addr2 = bssid, addr3 = source), which is why this takes a direction rather
+ * than being two near-identical functions. */
+inline std::vector<uint8_t> data_hdr_to_ds(const uint8_t bssid[6],
+                                           const uint8_t own[6],
+                                           const uint8_t dest[6],
+                                           bool protect) {
+  std::vector<uint8_t> m;
+  m.reserve(24);
+  m.push_back(kFcData);
+  m.push_back((uint8_t)(kFcToDs | (protect ? kFcProtected : 0)));
+  put_le16(m, 0);
+  m.insert(m.end(), bssid, bssid + 6);
+  m.insert(m.end(), own, own + 6);
+  m.insert(m.end(), dest, dest + 6);
+  put_le16(m, 0);
+  return m;
+}
+
+inline std::vector<uint8_t> data_hdr_from_ds(const uint8_t sta[6],
+                                             const uint8_t bssid[6],
+                                             const uint8_t src[6],
+                                             bool protect) {
+  std::vector<uint8_t> m;
+  m.reserve(24);
+  m.push_back(kFcData);
+  m.push_back((uint8_t)(kFcFromDs | (protect ? kFcProtected : 0)));
+  put_le16(m, 0);
+  m.insert(m.end(), sta, sta + 6);
+  m.insert(m.end(), bssid, bssid + 6);
+  m.insert(m.end(), src, src + 6);
+  put_le16(m, 0);
+  return m;
+}
+
+/* A QoS data frame carries two extra bytes after the 24-byte header, so every
+ * offset into its body shifts. Getting this wrong reads the LLC header two
+ * bytes early and silently drops every QoS frame. */
+inline size_t data_hdr_len(uint8_t fc0, uint8_t fc1) {
+  size_t n = 24;
+  if (fc0 == kFcQosData) n += 2;
+  if ((fc1 & (kFcToDs | kFcFromDs)) == (kFcToDs | kFcFromDs)) n += 6; /* 4-addr */
+  return n;
+}
+
+}  // namespace sta
+}  // namespace devourer
+
+#endif /* DEVOURER_STA_DOT11_H */

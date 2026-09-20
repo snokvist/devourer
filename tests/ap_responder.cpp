@@ -49,6 +49,7 @@
 #include <unistd.h>
 #include <libusb.h>
 #include "RadiotapBuilder.h"
+#include "sta/Dot11.h"
 #include "RxPacket.h"
 #include "SelectedChannel.h"
 #include "TxMode.h"
@@ -66,6 +67,8 @@
 static const uint8_t kBssid[6] = {0x02, 0x42, 0x75, 0x05, 0xd6, 0x00};
 static IRadio* g_dev = nullptr;
 static std::vector<uint8_t> g_rt;
+static const char* kSsid = "devourerAP";
+static devourer::sta::SeqCounter g_seq;
 static uint8_t g_chan = 6;
 static std::atomic<uint64_t> g_probe{0}, g_auth{0}, g_assoc{0}, g_sent{0}, g_data{0};
 static std::mutex g_q_mu;
@@ -129,18 +132,18 @@ static std::vector<uint8_t> build_dhcp_reply(const uint8_t* sta, const uint8_t* 
 // CCK basic rates (1/2/5.5/11) do not exist on 5 GHz — advertising them makes a
 // 5 GHz station skip the BSS with "rate sets do not match" (silent, only in
 // wpa_supplicant -d), so no association on any 5 GHz channel.
+// Now src/sta/Dot11.h's, byte for byte - a station advertises the same set in
+// its probe and association requests, and a disagreement between the two sides
+// of this project would be invisible until an association silently failed.
 static void append_rates(std::vector<uint8_t>& m) {
-  if (g_chan <= 14)  // 2.4 GHz: 1*,2*,5.5*,11*,18,24,36,54
-    m.insert(m.end(), {0x01, 0x08, 0x82, 0x84, 0x8b, 0x96, 0x24, 0x30, 0x48, 0x6c});
-  else               // 5 GHz: 6*,9,12*,18,24*,36,48,54 (basic = high bit set)
-    m.insert(m.end(), {0x01, 0x08, 0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48, 0x60, 0x6c});
+  if (g_chan <= 14) devourer::sta::append_supported_rates(m);
+  else devourer::sta::append_supported_rates_5g(m);
 }
 // Common: [SSID + rates + DS] IE tail for probe/assoc responses.
 static void append_ies(std::vector<uint8_t>& m, bool with_ssid) {
-  if (with_ssid) { const char* s = "devourerAP";
-    m.insert(m.end(), {0x00, 0x0a}); m.insert(m.end(), s, s + 10); }
+  if (with_ssid) devourer::sta::append_ssid(m, kSsid);
   append_rates(m);
-  m.insert(m.end(), {0x03, 0x01, g_chan});
+  devourer::sta::append_ds_params(m, (uint8_t)g_chan);
 }
 static void enqueue(std::vector<uint8_t> mpdu) {
   std::vector<uint8_t> f; f.reserve(g_rt.size() + mpdu.size());
@@ -149,12 +152,19 @@ static void enqueue(std::vector<uint8_t> mpdu) {
   std::lock_guard<std::mutex> lk(g_q_mu);
   if (g_q.size() < 128) g_q.push_back(std::move(f));
 }
+// An AP answering a station is (da=sta, sa=bssid, bssid); a station addressing
+// its AP is (da=bssid, sa=own, bssid). One builder, two argument orders - the
+// asymmetry that used to justify a private copy in every role.
+//
+// These responses now carry a real sequence number. The MediaTek MAC assigns
+// one only for beacons (MT_TXWI_ACK_CTL_NSEQ rides MT_TXOPT_BEACON and nothing
+// else), so every management response used to air as sequence 0. An AP gets
+// away with it because it sends so few; a station's data plane would not.
 static std::vector<uint8_t> mgmt_hdr(uint8_t subtype_fc, const uint8_t* sta) {
-  return {subtype_fc, 0x00, 0x00, 0x00,
-          sta[0],sta[1],sta[2],sta[3],sta[4],sta[5],
-          kBssid[0],kBssid[1],kBssid[2],kBssid[3],kBssid[4],kBssid[5],
-          kBssid[0],kBssid[1],kBssid[2],kBssid[3],kBssid[4],kBssid[5],
-          0x00, 0x00};
+  std::vector<uint8_t> m =
+      devourer::sta::mgmt_hdr(subtype_fc, sta, kBssid, kBssid);
+  devourer::sta::assign_seq(m, g_seq.next());
+  return m;
 }
 
 static void on_rx(const Packet& p) {
@@ -267,7 +277,7 @@ int main(int argc, char** argv) {
       kBssid[0],kBssid[1],kBssid[2],kBssid[3],kBssid[4],kBssid[5],
       kBssid[0],kBssid[1],kBssid[2],kBssid[3],kBssid[4],kBssid[5],
       0x00,0x00, 0,0,0,0,0,0,0,0, 0x64,0x00, 0x01,0x00};
-  { const char* s = "devourerAP"; bcn.insert(bcn.end(), {0x00,0x0a});
+  { const char* s = kSsid; bcn.insert(bcn.end(), {0x00,0x0a});
     bcn.insert(bcn.end(), s, s + 10);
     append_rates(bcn);
     bcn.insert(bcn.end(), {0x03,0x01,g_chan}); }

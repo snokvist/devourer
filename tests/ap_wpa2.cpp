@@ -46,6 +46,8 @@
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
 #include "RadiotapBuilder.h"
+#include "sta/Ccmp.h"
+#include "sta/Dot11.h"
 #include "RxPacket.h"
 #include "SelectedChannel.h"
 #include "TxMode.h"
@@ -107,22 +109,24 @@ static void enqueue(std::vector<uint8_t> mpdu) {
   std::lock_guard<std::mutex> lk(g_q_mu);
   if (g_q.size() < 128) g_q.push_back(std::move(f));
 }
+static devourer::sta::SeqCounter g_seq;
+// (da=sta, sa=bssid, bssid) for an AP answering; a station swaps the first two.
+// These now carry a real sequence number - see the note in ap_responder.cpp.
 static std::vector<uint8_t> mgmt_hdr(uint8_t fc, const uint8_t* sta) {
-  return {fc,0,0,0, sta[0],sta[1],sta[2],sta[3],sta[4],sta[5],
-      kBssid[0],kBssid[1],kBssid[2],kBssid[3],kBssid[4],kBssid[5],
-      kBssid[0],kBssid[1],kBssid[2],kBssid[3],kBssid[4],kBssid[5], 0,0};
+  std::vector<uint8_t> m = devourer::sta::mgmt_hdr(fc, sta, kBssid, kBssid);
+  devourer::sta::assign_seq(m, g_seq.next());
+  return m;
 }
 static void append_ies(std::vector<uint8_t>& m, bool ssid) {
-  if (ssid) { m.insert(m.end(), {0x00,(uint8_t)strlen(kSsid)});
-    m.insert(m.end(), kSsid, kSsid+strlen(kSsid)); }
+  if (ssid) devourer::sta::append_ssid(m, kSsid);
   // Band-correct Supported Rates: CCK+OFDM on 2.4 GHz, OFDM-only on 5 GHz. CCK
   // basic rates (1/2/5.5/11) do not exist on 5 GHz — advertising them makes a
   // 5 GHz station skip the BSS ("rate sets do not match"), so no association.
-  if (g_chan <= 14)
-    m.insert(m.end(), {0x01,0x08,0x82,0x84,0x8b,0x96,0x24,0x30,0x48,0x6c});
-  else
-    m.insert(m.end(), {0x01,0x08,0x8c,0x12,0x98,0x24,0xb0,0x48,0x60,0x6c});
-  m.insert(m.end(), {0x03,0x01,g_chan});
+  // Byte-identical to what this harness carried; now shared with the station
+  // side so the two cannot drift apart unnoticed.
+  if (g_chan <= 14) devourer::sta::append_supported_rates(m);
+  else devourer::sta::append_supported_rates_5g(m);
+  devourer::sta::append_ds_params(m, (uint8_t)g_chan);
   m.insert(m.end(), kRsn, kRsn+sizeof(kRsn));           // RSN IE -> advertise WPA2
 }
 
@@ -231,23 +235,33 @@ static void send_msg3() {
 
 // --- CCMP data plane (software AES-CCM) so the station pings encrypted --------
 static const uint8_t kApIp[4] = {192, 168, 99, 1};
+// src/sta/Ccmp.h takes its cipher as a vtable so libdevourer stays free of
+// OpenSSL. This is the harness's side of that seam, and it routes through
+// profiled_ccmp() so the `bench` cell's per-frame timing is unaffected.
+struct HarnessCrypto : devourer::sta::CryptoOps {
+  bool aes_ccm(bool encrypt, const uint8_t key[16], const uint8_t nonce[13],
+               const uint8_t* aad, size_t aad_len, const uint8_t* in,
+               size_t in_len, uint8_t* out, uint8_t* tag) override {
+    return profiled_ccmp(encrypt, key, nonce, aad, (int)aad_len, in,
+                         (int)in_len, out, tag);
+  }
+  bool hmac_sha1(const uint8_t*, size_t, const uint8_t*, size_t,
+                 uint8_t[20]) override { return false; }
+  bool pbkdf2_sha1(const char*, const uint8_t*, size_t, unsigned, uint8_t*,
+                   size_t) override { return false; }
+  bool aes_key_unwrap(const uint8_t*, size_t, const uint8_t*, size_t,
+                      uint8_t*) override { return false; }
+};
+static HarnessCrypto g_crypto;
+
 static uint64_t g_txpn = 1;                              // AP outbound packet number
 static uint16_t csum16(const uint8_t* d, int len) {
   uint32_t s = 0; for (int i=0;i+1<len;i+=2) s += (d[i]<<8)|d[i+1];
   if (len&1) s += d[len-1]<<8; while (s>>16) s=(s&0xffff)+(s>>16); return (uint16_t)~s;
 }
-// CCMP AAD + nonce from the 802.11 header (802.11i 8.3.3.3.2/.3).
-static void ccmp_aad_nonce(const uint8_t* hdr, uint64_t pn, const uint8_t* a2,
-                           uint8_t* aad, int* aadlen, uint8_t* nonce) {
-  uint16_t fc = hdr[0] | (hdr[1] << 8);
-  fc &= ~0x0070; fc &= ~(0x0800|0x1000|0x2000); fc |= 0x4000;  // mask subtype/retry/pm/md, set prot
-  aad[0]=fc&0xff; aad[1]=fc>>8;
-  memcpy(aad+2, hdr+4, 18);                              // addr1,2,3
-  uint16_t seq = (hdr[22]|(hdr[23]<<8)) & 0x000f;        // keep frag, mask seqnum
-  aad[20]=seq&0xff; aad[21]=seq>>8; *aadlen=22;
-  nonce[0]=0; memcpy(nonce+1, a2, 6);
-  for (int i=0;i<6;i++) nonce[7+i] = (pn >> (8*(5-i))) & 0xff;
-}
+// The CCMP AAD/nonce/header rules now live in src/sta/Ccmp.h, known-answer
+// tested against vectors from a third implementation (ctest ccmp_framing).
+// They used to be inline here and in nobody's test.
 // Encrypt an AP->STA payload (LLC/SNAP+eth+data) into a CCMP data frame.
 static std::vector<uint8_t> ccmp_tx(const uint8_t* sta, uint16_t eth,
                                     const uint8_t* pl, int plen) {
@@ -258,16 +272,16 @@ static std::vector<uint8_t> ccmp_tx(const uint8_t* sta, uint16_t eth,
       kBssid[0],kBssid[1],kBssid[2],kBssid[3],kBssid[4],kBssid[5],
       kBssid[0],kBssid[1],kBssid[2],kBssid[3],kBssid[4],kBssid[5], 0,0};
   uint64_t pn = g_txpn++;
-  uint8_t aad[32], nonce[13], mic[8]; int aadlen;
-  ccmp_aad_nonce(hdr.data(), pn, kBssid, aad, &aadlen, nonce);
-  std::vector<uint8_t> ct(pt.size());
-  profiled_ccmp(true, g_ptk+32, nonce, aad, aadlen,
-                pt.data(), pt.size(), ct.data(), mic);
-  uint8_t ch8[8] = {(uint8_t)(pn&0xff),(uint8_t)((pn>>8)&0xff),0,0x20,
-      (uint8_t)((pn>>16)&0xff),(uint8_t)((pn>>24)&0xff),(uint8_t)((pn>>32)&0xff),(uint8_t)((pn>>40)&0xff)};
-  std::vector<uint8_t> m = hdr;
-  m.insert(m.end(), ch8, ch8+8); m.insert(m.end(), ct.begin(), ct.end());
-  m.insert(m.end(), mic, mic+8);
+  // Non-QoS AAD (qos_tid defaults to -1): this AP airs plain data frames, and
+  // that is what has been validated on air. A station sending QoS data needs
+  // the other form - the two are not interchangeable, and ctest ccmp_framing
+  // asserts that a frame built under one does not verify under the other.
+  std::vector<uint8_t> m(24 + devourer::sta::kCcmpHdrLen + pt.size() +
+                         devourer::sta::kCcmpMicLen);
+  size_t n = devourer::sta::ccmp_encrypt(g_crypto, g_ptk + 32, hdr.data(),
+                                         kBssid, pn, 0, pt.data(), pt.size(),
+                                         m.data());
+  m.resize(n);
   return m;
 }
 // DHCP OFFER/ACK payload (IP+UDP+BOOTP) leasing 192.168.99.2 — encrypted by ccmp_tx.
@@ -355,18 +369,19 @@ static void on_rx(const Packet& p) {
       int len = (int)p.Data.size();
       if (len < hlen + 8 + 8) return;                   // hdr + CCMP hdr + MIC
       const uint8_t* d = p.Data.data();
-      const uint8_t* cc = d + hlen;                     // CCMP header
-      uint64_t pn = cc[0] | (cc[1]<<8) | ((uint64_t)cc[4]<<16) | ((uint64_t)cc[5]<<24)
-                  | ((uint64_t)cc[6]<<32) | ((uint64_t)cc[7]<<40);
-      int ctlen = len - hlen - 8 - 8;
-      const uint8_t* ct = d + hlen + 8; const uint8_t* mic = ct + ctlen;
-      uint8_t aad[32], nonce[13], tag[8]; int aadlen;
-      ccmp_aad_nonce(d, pn, sta, aad, &aadlen, nonce);   // A2 = station
-      memcpy(tag, mic, 8);
-      std::vector<uint8_t> pt(ctlen);
-      if (profiled_ccmp(false, g_ptk+32, nonce, aad, aadlen,
-                        ct, ctlen, pt.data(), tag))
-        handle_plain(sta, pt.data(), ctlen);             // decrypted -> ARP/ICMP
+      // ccmp_decrypt works from the 802.11 header, so a QoS frame's two extra
+      // bytes have to be folded out first - the AAD is built over the 24-byte
+      // header in either case. The harness has always done it this way; what
+      // is new is that the rule is now in one tested place.
+      std::vector<uint8_t> frame(d, d + len);
+      if (hlen > 24) frame.erase(frame.begin() + 24, frame.begin() + hlen);
+      std::vector<uint8_t> pt(frame.size());
+      size_t ptlen = 0;
+      uint64_t pn = 0;
+      if (devourer::sta::ccmp_decrypt(g_crypto, g_ptk + 32, frame.data(),
+                                      frame.size(), sta, pt.data(), &ptlen,
+                                      &pn))
+        handle_plain(sta, pt.data(), (int)ptlen);        // decrypted -> ARP/ICMP
       return;
     }
     if ((int)p.Data.size() < hlen + 8) return;

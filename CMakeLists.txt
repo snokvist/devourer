@@ -981,6 +981,16 @@ if(OpenSSL_FOUND)
     add_test(NAME ccmp_framing COMMAND CcmpSelftest)
 endif()
 
+# src/sta/Dot11.h - the management-frame module the AP harnesses and a station
+# share. Pure and header-only, so this needs neither OpenSSL nor libusb and
+# runs in every CI job. Covers the IE walker against truncated and hostile
+# lengths, the builders' exact wire bytes, and the 12-bit sequence counter the
+# MediaTek MAC does not assign for anything but a beacon.
+add_executable(Dot11Selftest tests/dot11_selftest.cpp)
+target_include_directories(Dot11Selftest PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src)
+add_test(NAME dot11_frames COMMAND Dot11Selftest)
+
 # Headless guard for the TX quiesce seam (ITransport::quiesce_tx via
 # RtlAdapter): the explicit "stop TX and wait it out" call every device makes
 # before anything is released. UsbTransport's cancel/drain is validated on

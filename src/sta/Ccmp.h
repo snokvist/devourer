@@ -52,9 +52,18 @@ constexpr size_t kCcmpNonceLen = 13;
  *    frame, because the sequence number is assigned after the MIC is computed
  *    on a hardware-sequencing MAC.
  *
- * `hdr` is a 24-byte 3-address header. Returns the AAD length (22).
+ *  - QoS Control: for a QoS data frame the AAD gains two more octets carrying
+ *    the TID, everything else masked. `qos_tid` selects that form; -1 is the
+ *    non-QoS form. This is NOT cosmetic - a peer that includes the QoS field
+ *    while we omit it computes a different MIC, and the frame is dropped with
+ *    no diagnostic on either side. The AP harnesses have always used the
+ *    non-QoS form and interoperate, so the station side must not assume the
+ *    other one works until it is measured against a real AP.
+ *
+ * `hdr` is a 24-byte 3-address header. Returns the AAD length: 22, or 24 for
+ * the QoS form.
  */
-inline size_t ccmp_aad(const uint8_t* hdr, uint8_t* aad) {
+inline size_t ccmp_aad(const uint8_t* hdr, uint8_t* aad, int qos_tid = -1) {
   uint16_t fc = (uint16_t)(hdr[0] | (hdr[1] << 8));
 
   fc &= (uint16_t)~0x0070u;                      /* subtype */
@@ -68,6 +77,14 @@ inline size_t ccmp_aad(const uint8_t* hdr, uint8_t* aad) {
 
     aad[20] = (uint8_t)(seq & 0xff);
     aad[21] = (uint8_t)(seq >> 8);
+  }
+  if (qos_tid >= 0) {
+    /* 802.11-2016 12.5.3.3.3: the QoS Control octets are included with only
+     * the TID retained; the ack-policy, EOSP and A-MSDU bits are masked
+     * because they may differ between transmission and reception. */
+    aad[22] = (uint8_t)(qos_tid & 0x0f);
+    aad[23] = 0;
+    return 24;
   }
   return 22;
 }
@@ -118,10 +135,10 @@ inline uint64_t ccmp_header_pn(const uint8_t* ccmp_hdr) {
 inline size_t ccmp_encrypt(CryptoOps& crypto, const uint8_t tk[16],
                            const uint8_t* hdr, const uint8_t a2[6], uint64_t pn,
                            uint8_t key_id, const uint8_t* plain,
-                           size_t plain_len, uint8_t* out) {
+                           size_t plain_len, uint8_t* out, int qos_tid = -1) {
   uint8_t aad[kCcmpAadMax];
   uint8_t nonce[kCcmpNonceLen];
-  size_t aad_len = ccmp_aad(hdr, aad);
+  size_t aad_len = ccmp_aad(hdr, aad, qos_tid);
 
   ccmp_nonce(a2, pn, nonce);
   std::memcpy(out, hdr, 24);
@@ -145,7 +162,7 @@ inline size_t ccmp_encrypt(CryptoOps& crypto, const uint8_t tk[16],
 inline bool ccmp_decrypt(CryptoOps& crypto, const uint8_t tk[16],
                          const uint8_t* mpdu, size_t mpdu_len,
                          const uint8_t a2[6], uint8_t* out, size_t* out_len,
-                         uint64_t* pn_out) {
+                         uint64_t* pn_out, int qos_tid = -1) {
   const size_t overhead = 24 + kCcmpHdrLen + kCcmpMicLen;
   uint8_t aad[kCcmpAadMax];
   uint8_t nonce[kCcmpNonceLen];
@@ -155,7 +172,7 @@ inline bool ccmp_decrypt(CryptoOps& crypto, const uint8_t tk[16],
   if (mpdu_len <= overhead) return false;
   body = mpdu_len - overhead;
   pn = ccmp_header_pn(mpdu + 24);
-  aad_len = ccmp_aad(mpdu, aad);
+  aad_len = ccmp_aad(mpdu, aad, qos_tid);
   ccmp_nonce(a2, pn, nonce);
   if (!crypto.aes_ccm(false, tk, nonce, aad, aad_len, mpdu + 24 + kCcmpHdrLen,
                       body, out,

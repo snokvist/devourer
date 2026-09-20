@@ -73,7 +73,7 @@ void test_vectors() {
     std::snprintf(label, sizeof label, "encrypt vector '%s'", v.name);
     size_t n = devourer::sta::ccmp_encrypt(crypto, v.tk, v.hdr, v.a2, v.pn,
                                            v.key_id, v.plain, v.plain_len,
-                                           out.data());
+                                           out.data(), v.qos_tid);
     check(n == v.mpdu_len, label);
     if (n == v.mpdu_len)
       check(std::memcmp(out.data(), v.mpdu, n) == 0, label);
@@ -89,7 +89,7 @@ void test_vectors() {
     std::snprintf(label, sizeof label, "decrypt vector '%s'", v.name);
     bool ok = devourer::sta::ccmp_decrypt(crypto, v.tk, mpdu.data(),
                                           mpdu.size(), v.a2, plain.data(),
-                                          &plain_len, &pn);
+                                          &plain_len, &pn, v.qos_tid);
     check(ok, label);
     if (ok) {
       check(plain_len == v.plain_len, label);
@@ -125,6 +125,39 @@ void test_mic_rejected() {
   check(!devourer::sta::ccmp_decrypt(crypto, v.tk, v.mpdu, 24 + 8 + 8, v.a2,
                                      plain.data(), nullptr, nullptr),
         "a frame with no body must be refused");
+}
+
+/* The two AAD forms must not be interchangeable. A QoS frame decrypted with
+ * the non-QoS AAD has to fail — that mismatch is the silent one, and if it
+ * ever passed it would mean the TID octets were not reaching the MIC at all. */
+void test_qos_aad_distinct() {
+  OpenSslCcm crypto;
+  const CcmpVector* q = nullptr;
+
+  for (size_t i = 0; i < kCcmpVectorCount; i++)
+    if (kCcmpVectors[i].qos_tid >= 0) q = &kCcmpVectors[i];
+  check(q != nullptr, "there is a QoS vector to test");
+  if (!q) return;
+
+  std::vector<uint8_t> plain(q->mpdu_len, 0);
+  check(!devourer::sta::ccmp_decrypt(crypto, q->tk, q->mpdu, q->mpdu_len,
+                                     q->a2, plain.data(), nullptr, nullptr, -1),
+        "a QoS frame must NOT decrypt under the non-QoS AAD");
+  check(devourer::sta::ccmp_decrypt(crypto, q->tk, q->mpdu, q->mpdu_len, q->a2,
+                                    plain.data(), nullptr, nullptr,
+                                    q->qos_tid),
+        "the same frame decrypts under the QoS AAD");
+  /* And the wrong TID must fail too, or the TID is not really authenticated. */
+  check(!devourer::sta::ccmp_decrypt(crypto, q->tk, q->mpdu, q->mpdu_len,
+                                     q->a2, plain.data(), nullptr, nullptr,
+                                     (q->qos_tid + 1) & 0x0f),
+        "a wrong TID must not verify");
+
+  uint8_t aad[devourer::sta::kCcmpAadMax];
+  check(devourer::sta::ccmp_aad(q->hdr, aad, 5) == 24,
+        "the QoS AAD is 24 bytes");
+  check(aad[22] == 5 && aad[23] == 0,
+        "the QoS AAD carries the TID with the other bits masked");
 }
 
 /* The AAD rules, asserted directly, because they are the part that is silent
@@ -196,6 +229,7 @@ void test_replay() {
 int main() {
   test_vectors();
   test_mic_rejected();
+  test_qos_aad_distinct();
   test_aad_masking();
   test_header_pn();
   test_replay();
