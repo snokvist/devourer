@@ -120,8 +120,10 @@ cleanup() {
   # Put power save back the way we found it: a root script should not
   # permanently change the state of an adapter the operator uses for other
   # things. Only on the FINAL exit - cleanup() also runs between cells.
-  [ -n "${STA_IF:-}" ] && [ "${PS_RESTORE:-}" = on ] && [ "${FINAL:-}" = 1 ] &&
-    iw dev "$STA_IF" set power_save on 2>/dev/null
+  if [ "${FINAL:-}" = 1 ] && [ -n "${STA_IF:-}" ]; then
+    [ "${PS_RESTORE:-}" = on ] && iw dev "$STA_IF" set power_save on 2>/dev/null
+    [ -n "${NM_RESTORE:-}" ] && nmcli device set "$STA_IF" managed yes >/dev/null 2>&1
+  fi
   # The MAC beacons autonomously, so a cell that died before its teardown can
   # leave one airing into the next cell. What silences it:
   #
@@ -230,20 +232,67 @@ ip link set "$STA_IF" up 2>/dev/null || {
 # Not a hard exit: the `stop` cell has no data plane and does not care, and a
 # station driver that does not implement the setting should not make the whole
 # harness unrunnable. The two data-plane cells refuse instead, by name.
-PS_OK=no
-ps_err=$(iw dev "$STA_IF" set power_save off 2>&1) && PS_OK=yes
-if [ "$PS_OK" = yes ]; then
-  # Succeeding is not proof it took: a driver may accept and ignore it.
-  case "$(iw dev "$STA_IF" get power_save 2>/dev/null)" in
-    *off*) : ;;
-    *)     PS_OK=no; ps_err="accepted the request but still reports it on" ;;
+# Remember what to put back BEFORE changing anything.
+PS_RESTORE=$(iw dev "$STA_IF" get power_save 2>/dev/null | grep -oE 'on|off' | head -1)
+NM_RESTORE=""
+
+# TAKE THE INTERFACE AWAY FROM NetworkManager FIRST. Setting power save off
+# once at script start is not enough: nothing re-read it, and nothing
+# re-applied it at the moment each measurement actually begins, which is
+# association.
+#
+# NetworkManager is the obvious candidate for re-enabling it - it applies its
+# own wifi.powersave at activation, and this host ships
+# /etc/NetworkManager/conf.d/default-wifi-powersave-on.conf with
+# `wifi.powersave = 3`, i.e. enable. That NM does this to THIS interface is
+# NOT established: a sibling USB WiFi adapter on the same host reports as
+# `unmanaged`, so NM may never touch these at all. No mechanism is claimed.
+# The defence is cheap and works whatever the cause, which is the point.
+#
+# Unmanaging also removes a second source of flakiness nobody had named: NM
+# autoconnecting the station to a real network in the middle of a cell. A
+# no-op if the device was already unmanaged. Restored in cleanup() - this is
+# host state, not ours to keep.
+if command -v nmcli >/dev/null 2>&1; then
+  case "$(nmcli -t -f DEVICE,STATE device 2>/dev/null | grep "^$STA_IF:")" in
+    "$STA_IF:unmanaged") : ;;                 # already ours, leave it alone
+    "$STA_IF:"*)
+      if nmcli device set "$STA_IF" managed no >/dev/null 2>&1; then
+        NM_RESTORE=yes
+        say "NetworkManager: $STA_IF set unmanaged for the duration"
+        sleep 1
+      fi ;;
   esac
 fi
-[ "$PS_OK" = yes ] || say "WARNING: power save is not off on $STA_IF ($ps_err)"
 
-# Restore it on the way out - this is a root script changing host state on an
-# adapter the operator uses for other things.
-PS_RESTORE=$(iw dev "$STA_IF" get power_save 2>/dev/null | grep -oE 'on|off' | head -1)
+# The adapter suspending is a different failure with the same shape - a
+# station that is not listening - so pin it too, for both adapters.
+for d in "$STA_SYSFS" "$AP_SYSFS"; do
+  echo on > "/sys/bus/usb/devices/$d/power/control" 2>/dev/null || true
+done
+
+# ps_off() is called HERE and again after every association, because that is
+# what actually re-enables it. Each call sets, then READS BACK - a driver may
+# accept the request and ignore it, and "the command returned 0" is not
+# evidence.
+ps_off() {
+  local err
+  err=$(iw dev "$STA_IF" set power_save off 2>&1) || { PS_OK=no; ps_err="$err"; return 1; }
+  case "$(iw dev "$STA_IF" get power_save 2>/dev/null)" in
+    *off*) PS_OK=yes; ps_err=""; return 0 ;;
+    *)     PS_OK=no; ps_err="accepted the request but still reports it on"; return 1 ;;
+  esac
+}
+PS_OK=no; ps_err=""
+ps_off || say "WARNING: power save is not off on $STA_IF ($ps_err)"
+
+# Re-assert after an association and fail the cell if it did not hold. The
+# check is at the point of measurement, not only at script start.
+ps_reassert() {  # $1 = cell name, for the message
+  ps_off && return 0
+  bad "$1: power save came back on after associating ($ps_err) - something is re-enabling it (NetworkManager?)"
+  return 1
+}
 say "AP $AP_SYSFS   station $STA_SYSFS ($STA_IF)   ch$CH ($FREQ MHz)"
 
 # `flush` is not optional: without it the BSS cache reports a beacon that
@@ -436,6 +485,8 @@ cell_open() {
   else
     bad "open: station did not associate"; kill $ap 2>/dev/null; return
   fi
+  # Associating is exactly when power save comes back. Re-assert and verify.
+  ps_reassert open || { kill $ap 2>/dev/null; return; }
 
   ip addr add "$STAIP/24" dev "$STA_IF" 2>/dev/null
   ping -c 1 -W 2 -I "$STA_IF" "$APIP" >/dev/null 2>&1   # warm ARP
@@ -541,6 +592,7 @@ cell_wpa2() {
   done
   if grep -q "4-WAY HANDSHAKE COMPLETE" "$OUT/wpa2.log"; then
     ok "wpa2: 4-way complete (MIC verified, station keyed)"
+    ps_off || say "  NOTE: power save came back on after the 4-way ($ps_err)"
   else
     bad "wpa2: 4-way did not complete"
     kill "$(cat "$OUT/wpa.pid" 2>/dev/null)" 2>/dev/null
@@ -727,8 +779,15 @@ FINAL=1
 say ""
 say "=== $pass passed, $fail failed   (logs: $OUT) ==="
 say "=== station $STA_IF on ch$CH/$FREQ, BCN_TU=$BCN_TU, power_save=$([ "${PS_OK:-no}" = yes ] && echo off || echo UNKNOWN) ==="
-if [ $(( pass + fail )) -ne "$want" ]; then
-  say "=== HARNESS ERROR: ran $(( pass + fail )) checks, expected $want ==="
+# The count assertion guards ONE thing: a run that looks clean but quietly
+# ran fewer checks than it claims - a dropped ok()/bad() pair reporting 13
+# checks as "14/14". A run that already failed something is SUPPOSED to be
+# short, because every cell returns early once its preconditions are gone, so
+# asserting the count there would just relabel an ordinary failure as a
+# harness bug.
+if [ "$fail" -eq 0 ] && [ "$pass" -ne "$want" ]; then
+  say "=== HARNESS ERROR: $pass checks passed, none failed, but $want were expected ==="
+  say "=== a check went missing - do NOT read this as $want/$want ==="
   exit 2
 fi
 exit $(( fail > 0 ))
