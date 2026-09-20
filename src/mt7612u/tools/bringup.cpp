@@ -1768,6 +1768,356 @@ static int gate_ampdu(uint8_t chan, int count)
 	return 0;
 }
 
+/*
+ * Unicast TX cliff, bisected against a peer that actually answers.
+ *
+ * gate_ampdu above established that unicast collapses this part's transmit
+ * rate ~40x (3037 fps broadcast against 75 fps unicast, docs/mt7612u.md), and
+ * that neither txwi.ack_ctl's REQ bit nor the QoS No Ack policy prevents it.
+ * Both of those are host-side levers. The one variable they cannot change is
+ * whether an ACK comes back at all, and every arm measured so far addressed a
+ * peer that was never there.
+ *
+ * That matters now because a station's whole data plane is unicast to its AP.
+ * 75 fps is ~13.3 ms per frame; a single ACK timeout is tens of microseconds,
+ * so what is being measured is a retry ladder running to exhaustion - which
+ * should collapse to one ACK time the moment the first attempt is answered.
+ * This gate is what decides whether that reasoning survives contact.
+ *
+ * Five arms, one session, one channel, one rate, one frame size, so the
+ * comparison is internal and needs no cross-session calibration:
+ *
+ *   A  broadcast,            No Ack       the ceiling
+ *   B  unicast to nobody,    Normal Ack   the published cliff
+ *   C  unicast to nobody,    No Ack       the published cliff, other policy
+ *   D  unicast to the peer,  Normal Ack   THE QUESTION
+ *   E  unicast to the peer,  No Ack       separates the address from the ACK
+ *
+ * B and C are controls: until they reproduce the published cliff on this rig,
+ * D's number means nothing. wcid stays 0xff in every arm - the same no-station
+ * index the published table used - so addr1 and the ack policy are the only
+ * things that move.
+ *
+ * The peer is an independent radio armed as a hardware ACK responder for
+ * `peer` (an RTL8812AU running rxdemo with DEVOURER_ACK_RESPONDER). Air it on
+ * the same channel first. With no such peer armed, D and E degenerate into
+ * repeats of B and C, which is exactly what the gate reports.
+ *
+ * ch_busy corroborates: a MAC grinding through a retry ladder holds the
+ * channel busy far out of proportion to the frames it delivers.
+ */
+/*
+ * Arm V's receiver. An 802.11 ACK is FC 0xd4 0x00, duration, addr1 - ten
+ * bytes, and this part does not deliver the FCS, so `len` is 10 here rather
+ * than the 14 a Realtek witness reports. addr1 of an ACK is the address that
+ * solicited it, i.e. OUR addr2, which is what distinguishes our peer's ACKs
+ * from the ambient ACK traffic any busy channel carries.
+ */
+struct ucast_ack_count {
+	std::atomic<unsigned long> acks{0};
+	std::atomic<unsigned long> frames{0};
+	uint8_t ta[6];
+};
+
+static void ucast_rx_cb(void *user, const void *frame, size_t len,
+                        const struct mt7612u_rx_info *info)
+{
+	struct ucast_ack_count *c = (struct ucast_ack_count *)user;
+	const uint8_t *f = (const uint8_t *)frame;
+
+	(void)info;
+	c->frames.fetch_add(1, std::memory_order_relaxed);
+	if (len < 10 || len > 16) return;
+	if (f[0] != 0xd4 || f[1] != 0x00) return;
+	if (memcmp(f + 4, c->ta, 6) != 0) return;
+	c->acks.fetch_add(1, std::memory_order_relaxed);
+}
+
+static int parse_mac6(const char *s, uint8_t out[6])
+{
+	unsigned v[6];
+	int i;
+
+	if (!s) return -1;
+	if (sscanf(s, "%x:%x:%x:%x:%x:%x",
+	           &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6)
+		return -1;
+	for (i = 0; i < 6; i++) {
+		if (v[i] > 0xff) return -1;
+		out[i] = (uint8_t)v[i];
+	}
+	return 0;
+}
+
+static int gate_ucast(uint8_t chan, int secs, const char *peer_str, int bytes)
+{
+	/* Locally administered, and the same shape gate_ampdu used so the two
+	 * gates' numbers sit on the same axis. */
+	static const uint8_t src[6]  = { 0x02, 0x4d, 0x54, 0x76, 0x12, 0x01 };
+	static const uint8_t dead[6] = { 0x02, 0x4d, 0x54, 0x76, 0x12, 0x02 };
+	static const uint8_t bcast[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+	uint8_t peer[6] = { 0x02, 0x4d, 0x54, 0x76, 0x12, 0x0a };
+	static uint8_t frame[1600];
+	size_t flen;
+	struct mt7612u_link_stats ls;
+	unsigned io_before;
+	double ceiling = 0.0, cliff = 0.0, answered = 0.0;
+	long acks = 0, sent_v = 0;
+	double own_sa_fps = 0.0, own_sa_bcast = 0.0;
+	/*
+	 * `own_sa` is the arm that matters most and the one the first draft of
+	 * this gate did not have. Every published measurement of the cliff - and
+	 * arms A-E here - transmits from an invented addr2 that is not the port
+	 * identity the MAC was brought up with. A real station transmits from its
+	 * OWN address. If the MAC treats a frame whose addr2 is not its own
+	 * differently, then the cliff is an artefact of injection and says
+	 * nothing about a station, which is the opposite conclusion from the one
+	 * arms A-E support. That is worth two extra arms.
+	 */
+	static const struct {
+		char tag; const uint8_t *a1; int no_ack; int own_sa; const char *what;
+	} arms[] = {
+		{ 'A', bcast, 1, 0, "broadcast,       No Ack" },
+		{ 'B', dead,  0, 0, "ucast nobody,    Normal" },
+		{ 'C', dead,  1, 0, "ucast nobody,    No Ack" },
+		{ 'D', peer,  0, 0, "ucast PEER,      Normal" },
+		{ 'E', peer,  1, 0, "ucast PEER,      No Ack" },
+		{ 'F', peer,  0, 1, "ucast PEER, ownSA Normal" },
+		{ 'G', bcast, 1, 1, "broadcast,  ownSA No Ack" },
+	};
+
+	if (secs <= 0) {
+		printf("GATE UCAST: FAIL - seconds per arm must be positive\n");
+		return 2;
+	}
+	/* The published bisect table is ~1400-byte frames: its 75 fps / 0.83
+	 * Mbit/s unicast row only closes at 1383 bytes, and its 3037 fps /
+	 * 34.01 Mbit/s broadcast row at 1400. A first draft of this gate used
+	 * gate_ampdu's 48-byte arms, which is a DIFFERENT measurement, and its
+	 * numbers were not on the published axis at all. Default to 1400. */
+	if (bytes < 40 || (size_t)bytes > sizeof frame) {
+		printf("GATE UCAST: FAIL - frame bytes must be 40..%zu\n", sizeof frame);
+		return 2;
+	}
+	flen = (size_t)bytes;
+	if (peer_str && parse_mac6(peer_str, peer)) {
+		printf("GATE UCAST: FAIL - bad peer MAC '%s'\n", peer_str);
+		return 2;
+	}
+	if (peer[0] & 0x01) {
+		printf("GATE UCAST: FAIL - peer %02x:%02x:%02x:%02x:%02x:%02x is "
+		       "multicast; a responder cannot ACK it\n",
+		       peer[0], peer[1], peer[2], peer[3], peer[4], peer[5]);
+		return 2;
+	}
+
+	if (mt_eeprom_init(&dev)) return 1;
+	if (mt_init_hardware(&dev, NULL)) return 1;
+	if (mt_set_channel(&dev, chan, MT7612U_BW_20)) return 1;
+	if (mt_mac_start(&dev, MT_RX_DRAIN_NONE)) return 1;
+	if (mt_async_start(&dev, NULL, NULL)) return 1;
+	mt7612u_link_stats_start(&dev);
+
+	printf("chan %u, HT MCS7 BW20, %zu-byte QoS data, wcid 0xff, %d s per arm\n",
+	       chan, flen, secs);
+	printf("io errors after bring-up: %u  (a nonzero count here means the "
+	       "channel set was degraded; re-run)\n", mt_io_errors(&dev));
+	printf("peer %02x:%02x:%02x:%02x:%02x:%02x  (arm this address as an ACK "
+	       "responder on another radio)\n\n",
+	       peer[0], peer[1], peer[2], peer[3], peer[4], peer[5]);
+	printf("  arm  %-24s %8s %10s %8s\n", "configuration", "fps", "Mbit/s", "busy%");
+
+	for (unsigned a = 0; a < sizeof arms / sizeof arms[0]; a++) {
+		struct mt7612u_tx_rate rate = { };
+		double t0, wall, fps, busy = -1.0;
+		long n = 0;
+
+		rate.phy = MT7612U_PHY_HT;
+		rate.mcs = 7;
+		rate.nss = 1;
+		rate.bw = MT7612U_BW_20;
+		rate.no_ack = (unsigned)arms[a].no_ack;
+
+		memset(frame, 0, sizeof frame);
+		frame[0] = 0x88;                        /* QoS Data */
+		frame[1] = 0x00;
+		{
+			const uint8_t *sa = arms[a].own_sa ? dev.macaddr : src;
+
+			memcpy(frame + 4,  arms[a].a1, 6);  /* addr1 */
+			memcpy(frame + 10, sa, 6);          /* addr2 */
+			memcpy(frame + 16, sa, 6);          /* addr3 */
+		}
+		/* QoS Control bits 6:5 - 00 Normal Ack, 01 No Ack. The txwi
+		 * no_ack flag above and this byte are separate levers and the
+		 * arms move them together on purpose: the published result is
+		 * that neither alone changes anything. */
+		frame[24] = arms[a].no_ack ? 0x20 : 0x00;
+		frame[25] = 0x00;
+		memcpy(frame + 26, "MT7612U-UCAST", 13);
+		frame[40] = (uint8_t)arms[a].tag;
+		io_before = mt_io_errors(&dev);
+
+		/* Discard whatever the previous arm left in the counters; each
+		 * read is an interval, so this one is the barrier. */
+		mt7612u_link_stats(&dev, &ls);
+
+		t0 = now_ms();
+		while (now_ms() - t0 < secs * 1000.0 && !g_stop) {
+			frame[22] = (uint8_t)((n & 0xf) << 4);
+			frame[23] = (uint8_t)(n >> 4);
+			if (mt_tx_raw(&dev, frame, flen, &rate, 0xff, 0) == 0)
+				n++;
+		}
+		wall = now_ms() - t0;
+		if (mt7612u_link_stats(&dev, &ls) == 0 && (ls.ch_busy + ls.ch_idle))
+			busy = 100.0 * ls.ch_busy / (double)(ls.ch_busy + ls.ch_idle);
+		fps = n * 1000.0 / wall;
+
+		printf("  %c    %-24s %8.0f %10.2f %7.1f%s%s\n",
+		       arms[a].tag, arms[a].what, fps,
+		       n * flen * 8.0 / wall / 1000.0,
+		       busy < 0 ? 0.0 : busy, busy < 0 ? " (n/a)" : "",
+		       mt_io_errors(&dev) != io_before ? "   IO-ERRORS" : "");
+
+		if (arms[a].tag == 'A') ceiling = fps;
+		if (arms[a].tag == 'B') cliff = fps;
+		if (arms[a].tag == 'D') answered = fps;
+		if (arms[a].tag == 'F') own_sa_fps = fps;
+		if (arms[a].tag == 'G') own_sa_bcast = fps;
+
+		if (g_stop) break;
+		mt_usleep(200000);
+	}
+
+	mt_async_stop(&dev);
+	mt_mac_stop(&dev);
+
+	if (g_stop) {
+		printf("\nGATE UCAST: INTERRUPTED - no verdict\n");
+		return 3;
+	}
+
+	/*
+	 * Arm V - was the peer ACKing at all?
+	 *
+	 * Without this the gate's FAIL verdict is unfalsifiable: a peer that is
+	 * off channel, unarmed, or deaf produces exactly the same number as a
+	 * MAC whose cliff genuinely survives being answered, and the operator is
+	 * left to take it on trust. So repeat arm D with the receiver up and
+	 * count the ACKs addressed to our own addr2.
+	 *
+	 * It is a SEPARATE arm, not the RX ring left on through A-E, because the
+	 * ring costs USB bandwidth and CPU that would land on the throughput
+	 * numbers the published table is being compared against. Arm V's fps is
+	 * therefore NOT comparable with arm D's; only its ACK count is evidence.
+	 *
+	 * Ordering is the wedge rule from Mt7612uRadio's header, and it is not
+	 * negotiable: the ring must be draining EP 4 BEFORE MAC RX comes on.
+	 * Then the monitor filter, because the managed value mt_mac_start()
+	 * leaves drops frames not addressed to the port identity - and the ACKs
+	 * are addressed to the injected addr2, not to the factory MAC.
+	 */
+	{
+		static struct ucast_ack_count ctr;
+		struct mt7612u_tx_rate rate = { };
+		double t0, wall;
+		long n = 0;
+
+		memcpy(ctr.ta, src, 6);
+		rate.phy = MT7612U_PHY_HT;
+		rate.mcs = 7;
+		rate.nss = 1;
+		rate.bw = MT7612U_BW_20;
+		rate.no_ack = 0;
+
+		memset(frame, 0, sizeof frame);
+		frame[0] = 0x88;
+		memcpy(frame + 4,  peer, 6);
+		memcpy(frame + 10, src, 6);
+		memcpy(frame + 16, src, 6);
+		frame[24] = 0x00;                  /* Normal Ack, as arm D */
+		memcpy(frame + 26, "MT7612U-UCAST-V", 15);
+
+		if (mt_mac_start(&dev, MT_RX_DRAIN_NONE)) return 1;
+		if (mt_async_start(&dev, ucast_rx_cb, &ctr)) { mt_mac_stop(&dev); return 1; }
+		if (mt_mac_start(&dev, MT_RX_DRAIN_RING)) {
+			mt_async_stop(&dev); mt_mac_stop(&dev); return 1;
+		}
+		mt7612u_set_monitor_rx(&dev, 0);
+
+		t0 = now_ms();
+		while (now_ms() - t0 < secs * 1000.0 && !g_stop) {
+			frame[22] = (uint8_t)((n & 0xf) << 4);
+			frame[23] = (uint8_t)(n >> 4);
+			if (mt_tx_raw(&dev, frame, flen, &rate, 0xff, 0) == 0)
+				n++;
+		}
+		wall = now_ms() - t0;
+		acks = (long)ctr.acks.load(std::memory_order_relaxed);
+		sent_v = n;
+		printf("  V    ucast PEER, Normal, RX up  %ld sent, %ld ACKs to our TA, "
+		       "%lu frames seen  (%.0f fps - NOT comparable, ring is up)\n",
+		       n, acks, ctr.frames.load(std::memory_order_relaxed),
+		       n * 1000.0 / wall);
+		mt_async_stop(&dev);
+		mt_mac_stop(&dev);
+	}
+
+	if (sent_v > 0 && acks == 0) {
+		printf("\nGATE UCAST: VOID - the peer never ACKed (%ld frames sent, "
+		       "0 ACKs to our TA). This measures the rig, not the MAC. Arm the "
+		       "responder, put it on channel %u, and re-run.\n", sent_v, chan);
+		return 3;
+	}
+	if (ceiling <= 0.0 || cliff <= 0.0) {
+		printf("\nGATE UCAST: FAIL - a control arm aired nothing; no "
+		       "conclusion about the peer arm\n");
+		return 1;
+	}
+	/* The controls have to behave before D is allowed to mean anything: the
+	 * published cliff is ~40x, so anything under 5x says this rig is not
+	 * reproducing the phenomenon under test. */
+	if (ceiling / cliff < 5.0) {
+		printf("\nGATE UCAST: INCONCLUSIVE - the control cliff is only "
+		       "%.1fx (published ~40x); this rig does not reproduce it, "
+		       "so arm D measures nothing\n", ceiling / cliff);
+		return 3;
+	}
+	printf("\n  ceiling A %.0f fps, cliff B %.0f fps (%.0fx), peer D %.0f fps, "
+	       "own-SA peer F %.0f fps (own-SA bcast control G %.0f fps)\n",
+	       ceiling, cliff, ceiling / cliff, answered, own_sa_fps, own_sa_bcast);
+	/* Checked BEFORE the D verdict: if transmitting from the port identity
+	 * lifts the cliff, then arms A-E measured injection from a foreign
+	 * address, and a station - which never does that - is unaffected. */
+	if (own_sa_fps >= 0.5 * ceiling) {
+		printf("GATE UCAST: PASS - unicast from the PORT IDENTITY runs at "
+		       "%.0f%% of the ceiling (%.0f fps) while unicast from an "
+		       "injected addr2 sits at %.0f fps. The cliff is an artefact of "
+		       "foreign-SA injection; a station transmits from its own "
+		       "address and is not subject to it.\n",
+		       100.0 * own_sa_fps / ceiling, own_sa_fps, answered);
+		return 0;
+	}
+	if (answered >= 0.5 * ceiling) {
+		printf("GATE UCAST: PASS - an answering peer recovers unicast "
+		       "(%.0f%% of the broadcast ceiling). A station data plane "
+		       "is viable on this part.\n", 100.0 * answered / ceiling);
+		return 0;
+	}
+	if (answered <= 2.0 * cliff) {
+		printf("GATE UCAST: FAIL - the cliff survives an answering peer "
+		       "(%.0f fps against a %.0f fps cliff), and arm V proves the peer "
+		       "WAS answering (%ld ACKs). The ACK is not what the MAC is "
+		       "waiting for.\n", answered, cliff, acks);
+		return 1;
+	}
+	printf("GATE UCAST: INCONCLUSIVE - arm D landed between the ceiling and "
+	       "the cliff (%.0f fps). That needs an explanation, not a rerun.\n",
+	       answered);
+	return 3;
+}
+
 /* Somebody has to read EP 4 whenever MAC RX is on; this gate does not care
  * what arrives, only that the endpoint keeps being drained. */
 static void drain_cb(void *user, const void *frame, size_t len,
@@ -3702,6 +4052,11 @@ int main(int argc, char **argv)
 	} else if (!strcmp(cmd, "ampdu")) {
 		rc = gate_ampdu(argc > 2 ? (uint8_t)atoi(argv[2]) : 149,
 		                argc > 3 ? atoi(argv[3]) : 400);
+	} else if (!strcmp(cmd, "ucast")) {
+		rc = gate_ucast(argc > 2 ? (uint8_t)atoi(argv[2]) : 149,
+		                argc > 3 ? atoi(argv[3]) : 5,
+		                argc > 4 ? argv[4] : NULL,
+		                argc > 5 ? atoi(argv[5]) : 1400);
 	} else if (!strcmp(cmd, "pwr")) {
 		rc = gate_pwr(argc > 2 ? (uint8_t)atoi(argv[2]) : 149);
 	} else if (!strcmp(cmd, "soak")) {
