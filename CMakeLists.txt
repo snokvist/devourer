@@ -985,6 +985,15 @@ if(OpenSSL_FOUND)
     # CryptoOps and tests/openssl_crypto_ops.h is the one complete
     # implementation in the tree; the modules themselves link nothing.
     #
+    # It also carries tests/eapol_kernel_vectors.h: the four EAPOL-Key frames
+    # hostapd and wpa_supplicant actually exchanged over a virtual rig, with
+    # the PTK wpa_supplicant derived and the GTK it installed. That is the
+    # only thing in the tree that pins the PRF, the EAPOL MIC and the GTK KDE
+    # layout against software that has never read this repository - the
+    # fixture authenticator in the same file cannot, because it shares an
+    # author with the code it tests. Regenerate with
+    # tests/eapol_capture_vectors.sh; checked in, so ctest needs no rig.
+    #
     # THIS TARGET IS THE PHASE'S ACCEPTANCE. Two of its cells are named after
     # defects that shipped in a reviewed PR (#335): a forged EAPOL-Key MIC
     # must be rejected, and an equal-counter replayed group rekey must be

@@ -13,17 +13,26 @@
  * WHAT IS AND IS NOT INDEPENDENT HERE. The authenticator below is a fixture,
  * and it builds its frames with the same `build_eapol_key` the supplicant
  * parses — so this file pins the STATE MACHINE and the CHECKS, not the wire
- * format. Two things cover the format instead: the known-answer vectors at
- * the top, which come from IEEE 802.11i Annex H.4 and were cross-checked
- * against Python's hashlib (a third implementation), and the cross-role cell
- * in tests/ap_wpa2_selftest.inc, where this supplicant talks to an
- * authenticator that hand-rolls every offset independently.
+ * format. Three things cover the format instead:
+ *
+ *   - the IEEE 802.11i Annex H.4.2 vectors at the top, which cover PBKDF2
+ *     AND NOTHING ELSE. An earlier version of this comment implied they
+ *     covered "the format"; they do not, and saying so was the same kind of
+ *     overstatement this file exists to guard against.
+ *   - test_against_a_real_four_way(), which replays the four EAPOL-Key frames
+ *     HOSTAPD AND WPA_SUPPLICANT actually exchanged and checks our PTK
+ *     against the one wpa_supplicant derived. That is the PRF, the address
+ *     and nonce sorting, the MIC and the GTK KDE layout, all pinned against
+ *     software that has never read this repository.
+ *   - the cross-role cell in tests/ap_wpa2_selftest.inc, where this
+ *     supplicant talks to an authenticator that hand-rolls every offset.
  */
 #include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
 
+#include "eapol_kernel_vectors.h"
 #include "openssl_crypto_ops.h"
 #include "sta/Eapol.h"
 #include "sta/Supplicant.h"
@@ -846,6 +855,112 @@ void test_msg1_on_a_live_association() {
   check(sup.ptk_valid(), "...and the station stays keyed");
 }
 
+/* A REAL FOUR-WAY, FROM HOSTAPD AND WPA_SUPPLICANT.
+ *
+ * Everything else in this file is this repository talking to itself. These
+ * are the four EAPOL-Key frames two independent daemons exchanged over a
+ * mac80211_hwsim rig, with the PTK wpa_supplicant derived and the GTK hostapd
+ * generated, captured by tests/eapol_capture_vectors.sh.
+ *
+ * Four separate claims, each of which fails on its own:
+ *
+ *   1. Our PMK from the passphrase and SSID matches what both ends used —
+ *      otherwise nothing below verifies at all.
+ *   2. Our PTK, derived from that PMK and the two nonces in the captured
+ *      frames, equals the one WPA_SUPPLICANT LOGGED. That is the 802.11 PRF
+ *      and the min/max sorting of the addresses and nonces, pinned.
+ *   3. Our MIC check accepts hostapd's message 3 and wpa_supplicant's
+ *      messages 2 and 4 — three MICs, two implementations, one of them the
+ *      other role.
+ *   4. Our Supplicant, given the captured SNonce, drives the whole exchange
+ *      to Done and arrives at the same PTK and at HOSTAPD'S OWN GTK.
+ */
+void test_against_a_real_four_way() {
+  using namespace devourer::test;
+  OpenSslCryptoOps crypto;
+  devourer::sta::EapolKey k1, k2, k3, k4;
+  uint8_t pmk[32], ptk[48];
+
+  check(devourer::sta::parse_eapol_key(kEapolFourWay[0].eapol,
+                                       kEapolFourWay[0].len, &k1) &&
+            devourer::sta::parse_eapol_key(kEapolFourWay[1].eapol,
+                                           kEapolFourWay[1].len, &k2) &&
+            devourer::sta::parse_eapol_key(kEapolFourWay[2].eapol,
+                                           kEapolFourWay[2].len, &k3) &&
+            devourer::sta::parse_eapol_key(kEapolFourWay[3].eapol,
+                                           kEapolFourWay[3].len, &k4),
+        "all four captured EAPOL-Key frames parse");
+
+  /* Our reading of the key-info bits, against what the two daemons actually
+   * set. If message 3 does not look like message 3 to us, nothing else in
+   * this file means what it says. */
+  check(k1.pairwise() && k1.ack() && !k1.has_mic(),
+        "hostapd's message 1 is pairwise+ack with no MIC");
+  check(k2.pairwise() && k2.has_mic() && !k2.ack() && !k2.secure(),
+        "wpa_supplicant's message 2 is pairwise+MIC, not ack, not secure");
+  check(k3.pairwise() && k3.ack() && k3.has_mic() && k3.install() &&
+            k3.secure() && k3.encrypted(),
+        "hostapd's message 3 is install+ack+MIC+secure+encrypted");
+  check(k4.pairwise() && k4.has_mic() && k4.secure() && !k4.ack(),
+        "wpa_supplicant's message 4 is MIC+secure");
+  check(k1.version == 2 && k3.version == 2,
+        "both are key descriptor version 2");
+
+  check(devourer::sta::pmk_from_psk(crypto, kHostapdPassphrase, kHostapdSsid,
+                                    pmk),
+        "the PMK derives from the captured passphrase and SSID");
+  check(devourer::sta::derive_ptk(crypto, pmk, kEapolAa, kEapolSpa, k1.nonce,
+                                  k2.nonce, ptk),
+        "the PTK derives from the two captured nonces");
+  check(std::memcmp(ptk, kSupplicantPtk, 48) == 0,
+        "OUR PTK EQUALS THE ONE WPA_SUPPLICANT DERIVED — the PRF and the "
+        "address/nonce sorting, against an implementation that has never read "
+        "this repository");
+
+  check(devourer::sta::eapol_mic_ok(crypto, ptk, k2),
+        "our MIC check accepts wpa_supplicant's message 2");
+  check(devourer::sta::eapol_mic_ok(crypto, ptk, k3),
+        "...and hostapd's message 3");
+  check(devourer::sta::eapol_mic_ok(crypto, ptk, k4),
+        "...and wpa_supplicant's message 4");
+  /* The negative arm, so the three above are not a function that returns
+   * true: the same frames under a key one bit different must fail. */
+  {
+    uint8_t wrong[48];
+    std::memcpy(wrong, ptk, 48);
+    wrong[0] ^= 0x01;
+    check(!devourer::sta::eapol_mic_ok(crypto, wrong, k3),
+          "...and refuses message 3 under a KCK one bit out");
+  }
+
+  /* THE WHOLE EXCHANGE, through our own state machine. The SNonce is
+   * wpa_supplicant's, taken from its own message 2, so our message 2 should
+   * be the one it sent. */
+  Supplicant sup;
+  std::vector<uint8_t> out;
+  sup.start(crypto, pmk, kEapolSpa, kEapolAa, k2.nonce);
+  check(sup.on_eapol(kEapolFourWay[0].eapol, kEapolFourWay[0].len, &out) ==
+            Supplicant::Verdict::Reply,
+        "our supplicant answers hostapd's message 1");
+  check(out.size() == kEapolFourWay[1].len &&
+            std::memcmp(out.data(), kEapolFourWay[1].eapol, out.size()) == 0,
+        "OUR MESSAGE 2 IS BYTE-FOR-BYTE THE ONE WPA_SUPPLICANT SENT");
+
+  out.clear();
+  check(sup.on_eapol(kEapolFourWay[2].eapol, kEapolFourWay[2].len, &out) ==
+            Supplicant::Verdict::Reply,
+        "our supplicant accepts hostapd's message 3");
+  check(sup.state() == Supplicant::State::Done, "...and reaches Done");
+  check(std::memcmp(sup.ptk(), kSupplicantPtk, 48) == 0,
+        "...on wpa_supplicant's PTK");
+  check(sup.gtk_valid() && sup.gtk_len() == 16 &&
+            std::memcmp(sup.gtk(), kHostapdGtk, 16) == 0,
+        "...having unwrapped HOSTAPD'S OWN GTK out of message 3");
+  check(out.size() == kEapolFourWay[3].len &&
+            std::memcmp(out.data(), kEapolFourWay[3].eapol, out.size()) == 0,
+        "...and our message 4 is byte-for-byte the one wpa_supplicant sent");
+}
+
 /* ---- the wire format, from the air ------------------------------------- */
 
 void test_parse_bounds() {
@@ -950,6 +1065,7 @@ void test_gtk_kde() {
 int main() {
   test_psk_known_answers();
   test_ptk_sorting();
+  test_against_a_real_four_way();
   test_parse_bounds();
   test_gtk_kde();
   test_four_way();

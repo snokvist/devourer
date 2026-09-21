@@ -271,9 +271,16 @@ class Supplicant {
     /* The key data carries the whole RSN element, EID and length included -
      * a conforming authenticator compares it with the one in the association
      * request. */
+    /* KEY LENGTH ZERO. 802.11-2016 12.7.6.3: the Key Length field of message
+     * 2 is 0 in an RSNA - the pairwise key length is the AUTHENTICATOR's
+     * statement, made in messages 1 and 3, and a supplicant does not repeat
+     * it. This said 16 until a captured wpa_supplicant handshake was compared
+     * byte for byte; the field is inside the MIC, so hostapd accepted it, and
+     * an AP that checks it would not have. */
     std::vector<uint8_t> e = build_eapol_key(
-        (uint16_t)(kKeyDescVersionCcmp | kKiPairwise | kKiMic), 16, k.replay,
-        snonce_, nullptr, rsn.data(), rsn.size(), crypto_, cand_ptk_);
+        (uint16_t)(kKeyDescVersionCcmp | kKiPairwise | kKiMic), 0, k.replay,
+        snonce_, nullptr, rsn.data(), rsn.size(), crypto_, cand_ptk_,
+        kEapolVersionSupplicant);
     if (e.empty()) return note(Verdict::CryptoError);
 
     answer(Kind::Msg1, k.replay, e);
@@ -337,8 +344,9 @@ class Supplicant {
     }
 
     std::vector<uint8_t> e = build_eapol_key(
-        (uint16_t)(kKeyDescVersionCcmp | kKiPairwise | kKiMic | kKiSecure), 16,
-        k.replay, nullptr, nullptr, nullptr, 0, crypto_, cand_ptk_);
+        (uint16_t)(kKeyDescVersionCcmp | kKiPairwise | kKiMic | kKiSecure), 0,
+        k.replay, nullptr, nullptr, nullptr, 0, crypto_, cand_ptk_,
+        kEapolVersionSupplicant);
     if (e.empty()) {
       secure_wipe(plain.data(), plain.size());
       return note(Verdict::CryptoError);
@@ -377,8 +385,8 @@ class Supplicant {
     }
 
     std::vector<uint8_t> e = build_eapol_key(
-        (uint16_t)(kKeyDescVersionCcmp | kKiMic | kKiSecure), 16, k.replay,
-        nullptr, nullptr, nullptr, 0, crypto_, ptk_);
+        (uint16_t)(kKeyDescVersionCcmp | kKiMic | kKiSecure), 0, k.replay,
+        nullptr, nullptr, nullptr, 0, crypto_, ptk_, kEapolVersionSupplicant);
     if (e.empty()) {
       secure_wipe(plain.data(), plain.size());
       return note(Verdict::CryptoError);

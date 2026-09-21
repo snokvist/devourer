@@ -66,6 +66,20 @@ enum : uint16_t {
 inline constexpr uint16_t kKeyDescVersionCcmp = 2;
 inline constexpr uint8_t kKeyDescTypeRsn = 2;
 
+/* THE 802.1X PROTOCOL VERSION A SUPPLICANT SENDS.
+ *
+ * One, not two, and not an echo of what the authenticator sent. This is what
+ * wpa_supplicant ships as its default, and the reason is compatibility: the
+ * octet is inside the MIC'd region, some access points have historically
+ * misbehaved on version 2 from a station, and there is no upside to claiming
+ * a higher number - the field is not a negotiation.
+ *
+ * Found by comparing our message 2 with a captured wpa_supplicant one byte
+ * for byte. An earlier draft echoed the authenticator's version, which
+ * produced 2 against hostapd and was the last difference between the two
+ * frames. */
+inline constexpr uint8_t kEapolVersionSupplicant = 1;
+
 /* A parsed EAPOL-Key frame. The pointers alias the caller's buffer and are
  * valid only as long as it is. */
 struct EapolKey {
@@ -155,7 +169,16 @@ inline bool parse_eapol_key(const uint8_t* eapol, size_t len, EapolKey* out) {
 /* Build an EAPOL-Key frame. `mic_kck` non-null sets the MIC over the finished
  * frame with the MIC field zeroed, which is the only order that works: the
  * MIC covers the key data and the key data length, so nothing may be appended
- * afterwards. */
+ * afterwards.
+ *
+ * `proto_version` IS THE 802.1X VERSION OCTET, and it is an argument because
+ * it sits inside the MIC'd region and the two reference implementations do
+ * not agree on it: hostapd sends 2 and wpa_supplicant sends 1, in the same
+ * exchange, and each accepts the other. It is "the highest version the sender
+ * supports", not a negotiation, so neither is wrong.
+ *
+ * The default is 2 because the authenticators in this tree send 2. A
+ * supplicant should send kEapolVersionSupplicant - see the note there. */
 inline std::vector<uint8_t> build_eapol_key(uint16_t key_info, uint16_t key_len,
                                             uint64_t replay,
                                             const uint8_t nonce[32],
@@ -163,10 +186,11 @@ inline std::vector<uint8_t> build_eapol_key(uint16_t key_info, uint16_t key_len,
                                             const uint8_t* key_data,
                                             size_t key_data_len,
                                             CryptoOps* crypto,
-                                            const uint8_t* mic_kck) {
+                                            const uint8_t* mic_kck,
+                                            uint8_t proto_version = 2) {
   std::vector<uint8_t> e(kEapolKeyFixedLen, 0);
 
-  e[0] = 2;                                    /* 802.1X-2004 */
+  e[0] = proto_version;                        /* 802.1X version */
   e[1] = 3;                                    /* EAPOL-Key */
   const size_t body = kEapolKeyFixedLen - 4 + key_data_len;
   e[2] = (uint8_t)((body >> 8) & 0xff);
