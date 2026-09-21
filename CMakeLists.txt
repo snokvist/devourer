@@ -999,20 +999,30 @@ endif()
 # libusb is opened, so ctest needs no adapter, no root and no airtime.
 #
 # It links libusb and OpenSSL because the harness does, not because the cells
-# do - which is also why this target is guarded the same way CcmpSelftest is.
-if(OpenSSL_FOUND)
-    add_executable(ApWpa2
+# do. LINUX ONLY, and not merely UNIX: tests/ap_wpa2.cpp includes <linux/if.h>
+# and <linux/if_tun.h> unconditionally for the TAP forwarder, so on a macOS
+# job where find_package(OpenSSL) succeeds - Homebrew - the build matrix would
+# define this target and die at "'linux/if.h' file not found". Every other
+# target under the OpenSSL guard is portable; this is the first that is not.
+#
+# The name must end in "Selftest": the `selftests` aggregate at the bottom of
+# this file collects by that convention, the mingw job builds only that
+# aggregate and then runs ctest, and a registered test whose binary was never
+# built is a "Not Run" failure - the exact outcome the aggregate exists to
+# prevent. Named ApWpa2 at first, which sat outside it.
+if(OpenSSL_FOUND AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(ApWpa2Selftest
         tests/ap_wpa2.cpp
         examples/common/env_config.cpp
         examples/common/usb_select.cpp
     )
-    target_link_libraries(ApWpa2 PUBLIC devourer
+    target_link_libraries(ApWpa2Selftest PUBLIC devourer
                           PRIVATE PkgConfig::libusb OpenSSL::Crypto)
-    target_include_directories(ApWpa2 PRIVATE
+    target_include_directories(ApWpa2Selftest PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/tests
         ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
-    add_test(NAME ap_wpa2_headless COMMAND ApWpa2 --self-test)
+    add_test(NAME ap_wpa2_headless COMMAND ApWpa2Selftest --self-test)
 endif()
 
 # src/sta/Dot11.h - the management-frame module the AP harnesses and a station

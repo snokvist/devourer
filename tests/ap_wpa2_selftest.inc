@@ -607,8 +607,12 @@ static void test_qos_uplink(Supplicant& a, Supplicant& b) {
   const uint64_t before = g_relayed.load();
   const std::vector<uint8_t> body = msdu(0x0800, 0x90, 32);
 
+  /* No assertion that f[0] == 0x88 here: sta_encrypted() sets that byte, so
+   * it would be a property of the fixture and could not fail whatever the AP
+   * did. What proves the AP took the QoS path is the relay below - a 26-byte
+   * header read as 24 puts the CCMP header two bytes early and the MIC
+   * fails. */
   std::vector<uint8_t> f = sta_encrypted(a, b.addr, body, /*tid=*/5);
-  check(f[0] == 0x88, "the uplink frame is QoS Data");
   feed(f);
   std::vector<std::vector<uint8_t>> q = drain();
   check(g_relayed.load() == before + 1,
@@ -624,12 +628,19 @@ static void test_qos_uplink(Supplicant& a, Supplicant& b) {
    * shared counter drops legitimate frames the moment two TIDs interleave,
    * which is routine as soon as voice or video shares a link. */
   const uint64_t replays = g_replayed.load();
+  const uint64_t relayed = g_relayed.load();
   a.tx_pn--;                                 /* re-use the PN just consumed */
   std::vector<uint8_t> other = sta_encrypted(a, b.addr, body, /*tid=*/6);
   feed(other);
   drain();
   check(g_replayed.load() == replays,
         "the same PN on another TID is not a replay");
+  /* AND IT WAS ACTUALLY FORWARDED. "the replay counter did not move" is also
+   * true of a frame dropped for a completely different reason - a MIC
+   * failure, a refused relay - so on its own it is a negative arm that passes
+   * for the wrong reason. */
+  check(g_relayed.load() == relayed + 1,
+        "...it was decrypted and relayed, not merely not-counted");
 }
 
 /* Group traffic. Until 2b.6 the GTK was delivered and then never used to
