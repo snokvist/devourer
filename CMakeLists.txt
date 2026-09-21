@@ -968,18 +968,6 @@ if(OpenSSL_FOUND)
     target_link_libraries(CcmpSwBench PRIVATE OpenSSL::Crypto)
     add_test(NAME ccmp_software_roundtrip COMMAND CcmpSwBench --self-test)
 
-    # src/sta/Ccmp.h - the 802.11 CCMP framing both roles share. The vectors
-    # (tests/ccmp_gen_vectors.py) pin the CIPHER against a third
-    # implementation; they do NOT independently pin the framing, because
-    # generator and header share one author's reading - which is how a wrong
-    # CCM nonce stayed green. See the note atop tests/ccmp_selftest.cpp.
-    # tests/ccmp_kernel_vectors.h closes that gap from the other side: frames
-    # the LINUX KERNEL encrypted, at all eight TIDs, captured off a virtual
-    # two-radio rig by tests/ccmp_capture_vectors.sh. Checked in, so this
-    # target stays hardware-free and needs neither hwsim nor root.
-    # Also pins the AAD masking rules, the 48-bit PN packing, and the replay
-    # gate's `<=`, which PR #335 shipped as `<` - a KRACK-class defect its
-    # review caught. Header-only; no libusb, no device.
     # src/sta/Eapol.h and src/sta/Supplicant.h - the station half of the
     # WPA2-PSK key exchange (Phase 3). OpenSSL because the cells need a
     # CryptoOps and tests/openssl_crypto_ops.h is the one complete
@@ -1017,6 +1005,18 @@ if(OpenSSL_FOUND)
     target_link_libraries(StationSmSelftest PRIVATE OpenSSL::Crypto)
     add_test(NAME station_sm COMMAND StationSmSelftest)
 
+    # src/sta/Ccmp.h - the 802.11 CCMP framing both roles share. The vectors
+    # (tests/ccmp_gen_vectors.py) pin the CIPHER against a third
+    # implementation; they do NOT independently pin the framing, because
+    # generator and header share one author's reading - which is how a wrong
+    # CCM nonce stayed green. See the note atop tests/ccmp_selftest.cpp.
+    # tests/ccmp_kernel_vectors.h closes that gap from the other side: frames
+    # the LINUX KERNEL encrypted, at all eight TIDs, captured off a virtual
+    # two-radio rig by tests/ccmp_capture_vectors.sh. Checked in, so this
+    # target stays hardware-free and needs neither hwsim nor root.
+    # Also pins the AAD masking rules, the 48-bit PN packing, and the replay
+    # gate's `<=`, which PR #335 shipped as `<` - a KRACK-class defect its
+    # review caught. Header-only; no libusb, no device.
     add_executable(CcmpSelftest tests/ccmp_selftest.cpp)
     target_include_directories(CcmpSelftest PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/tests
@@ -1075,12 +1075,6 @@ target_include_directories(Dot11Selftest PRIVATE
 target_compile_features(Dot11Selftest PRIVATE cxx_std_20)
 add_test(NAME dot11_frames COMMAND Dot11Selftest)
 
-# src/sta/StationTable.h - the associated-station table (Phase 2b.2), the thing
-# that stops the AP harnesses being single-client. Pure and header-only like
-# the rest of src/sta/, so no OpenSSL and no libusb: it runs in every CI job.
-# The load-bearing cell is test_two_stations_are_independent(), which is the
-# phase gate - two stations with their own PTKs, TX PN spaces and CCMP receive
-# windows, none of which a file-scope `g_sta`/`g_ptk`/`g_txpn` shape can hold.
 # src/sta/BssTable.h - the scan result, and which BSS is worth joining
 # (Phase 3). Pure and header-only, so no OpenSSL and no libusb. The two cells
 # that matter are select(), which must not offer a BSS this station cannot
@@ -1094,6 +1088,12 @@ target_include_directories(BssTableSelftest PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 add_test(NAME bss_table COMMAND BssTableSelftest)
 
+# src/sta/StationTable.h - the associated-station table (Phase 2b.2), the thing
+# that stops the AP harnesses being single-client. Pure and header-only like
+# the rest of src/sta/, so no OpenSSL and no libusb: it runs in every CI job.
+# The load-bearing cell is test_two_stations_are_independent(), which is the
+# phase gate - two stations with their own PTKs, TX PN spaces and CCMP receive
+# windows, none of which a file-scope `g_sta`/`g_ptk`/`g_txpn` shape can hold.
 add_executable(StationTableSelftest tests/station_table_selftest.cpp)
 target_include_directories(StationTableSelftest PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src

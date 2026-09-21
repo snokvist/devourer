@@ -826,23 +826,17 @@ static void test_library_station_associates() {
   uint8_t snonce[32];
   std::vector<uint8_t> f;
 
-  /* The station finds the BSS the way a real one does: out of a beacon. The
-   * beacon is the one this AP actually airs, element for element. */
-  std::vector<uint8_t> b = {0,0,0x0a,0,0,0x80,0,0,0x08,0,
-      0x80,0,0,0, 0xff,0xff,0xff,0xff,0xff,0xff,
-      kBssid[0],kBssid[1],kBssid[2],kBssid[3],kBssid[4],kBssid[5],
-      kBssid[0],kBssid[1],kBssid[2],kBssid[3],kBssid[4],kBssid[5],
-      0,0, 0,0,0,0,0,0,0,0, 100,0, 0x11,0x00};
-  append_ies(b, true, /*beacon=*/true);
-  /* THE FIRST TEN BYTES ARE NOT 802.11. What main() hands StartBeacon is a
-   * MediaTek beacon-offload header followed by the MPDU, and the 802.11 frame
-   * control is at offset 10 - which is why the literal above starts 0x00 0x00
-   * 0x0a and the beacon subtype 0x80 appears twice. A parser fed the buffer
-   * from byte 0 reads that header as a frame control and refuses it, which is
-   * exactly what happened the first time this cell ran. */
-  const size_t kBcnHdr = 10;
+  /* The station finds the BSS the way a real one does: out of a beacon - and
+   * out of THE beacon, from the same builder main() hands to StartBeacon, so
+   * this cannot drift from what the AP transmits.
+   *
+   * kBeaconHdrLen is skipped because the first ten bytes are not 802.11 but a
+   * MediaTek beacon-offload header; a parser fed the buffer from byte 0 reads
+   * that header as a frame control and refuses it, which is exactly what
+   * happened the first time this cell ran. */
+  std::vector<uint8_t> b = build_beacon(100);
   const devourer::sta::BssEntry* e =
-      bss.observe(b.data() + kBcnHdr, b.size() - kBcnHdr, -40, 0);
+      bss.observe(b.data() + kBeaconHdrLen, b.size() - kBeaconHdrLen, -40, 0);
   check(e != nullptr, "library station: the AP's own beacon parses");
   if (!e) return;
   check(e->info.ssid == kSsid, "library station: the SSID matches");

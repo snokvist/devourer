@@ -45,7 +45,7 @@ that tree up; nothing here depends on it any more.
 | 0 — can the part carry a station? | **PASS.** The 40× unicast cliff is a property of TX-only injection with the MAC receiver disabled, not of the part. Station-shaped TX runs at 2084 fps / 99.9% ACK. |
 | 1 — shared frame + crypto layer | **DONE, GATE CLOSED.** 14/14 twice on each band against independent silicon. See below. |
 | 2 — the `IRadio` seam | **Implemented.** Seam + caps flag + MT7612U implementation + five bring-up gates + a headless selftest. R5 and R6 both measured; `station_mode_ok` is **true** for MT7612U. `docs/mt7612u-station-identity.md` — read its retraction section before quoting any number. The R6 table was re-taken 2026-09-20 under the corrected single-variable harness and holds. |
-| 3 — pure station logic | Not started. BSS table, association state machine, 4-way supplicant. |
+| 3 — pure station logic | **DONE 2026-09-21.** BSS table, association state machine, EAPOL/4-way supplicant, all headless. Both acceptance negatives present and load-bearing. Pinned against a captured hostapd/wpa_supplicant four-way. |
 | 4–6 | Not started. |
 
 ## What exists now
@@ -58,13 +58,29 @@ no threads, no sockets:
   nonce, CCMP header, PN, encrypt/decrypt, per-TID replay window.
 - `Dot11.h` — management frames: header builder, IE builders, a bounds-checked
   IE walker, RSN build **and parse**, beacon/auth/assoc parsers,
-  station-side request builders, sequence counter, data-frame headers.
+  station-side request builders (with the STATION's own rate set, which the
+  AP's deliberately is not), sequence counter, data-frame headers, and the
+  802.11 ↔ 802.3 translation.
+- `StationTable.h` — the AP's per-station records, and `decide_forward()`.
+- `Eapol.h` — the EAPOL-Key wire format, the 802.11 PRF, the PMK and PTK
+  derivations, the MIC, the KDE walker.
+- `Supplicant.h` — the four-way and the group rekey, as a state machine.
+- `BssTable.h` — one record per BSSID, and which of them to join.
+- `StationSm.h` — authenticate, associate, four-way, connected, and every way
+  that stops.
 
 Tested headless by `ctest`: `ccmp_framing`, `dot11_frames`,
-`ccmp_software_roundtrip`, and since Phase 2b `station_table` and
-`ap_wpa2_headless` — the last of which runs the WPA2 AP harness itself with
-no radio. **75/75 green.** Every selftest here was verified capable of failing
-by injecting the defect it exists to catch.
+`ccmp_software_roundtrip`, `station_table`, `ap_wpa2_headless` — which runs
+the WPA2 AP harness itself with no radio — and, since Phase 3, `supplicant`,
+`station_sm` and `bss_table`. **78/78 green.** Every selftest here was
+verified capable of failing by injecting the defect it exists to catch.
+
+`supplicant` carries `tests/eapol_kernel_vectors.h` in the same spirit: the
+four EAPOL-Key frames hostapd and wpa_supplicant actually exchanged, with the
+PTK wpa_supplicant derived and the GTK it installed, captured by
+`tests/eapol_capture_vectors.sh`. It is the only thing in the tree that pins
+the PRF, the EAPOL MIC and the GTK KDE layout against software that has never
+read this repository — and it found two interop defects on its first run.
 
 `ccmp_framing` also carries `tests/ccmp_kernel_vectors.h`: sixteen protected
 QoS data frames the LINUX KERNEL encrypted, all eight TIDs in both directions,

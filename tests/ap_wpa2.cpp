@@ -222,6 +222,31 @@ static void append_ies(std::vector<uint8_t>& m, bool ssid, bool beacon = false) 
   m.insert(m.end(), rsn_ie().begin(), rsn_ie().end());   // RSN IE -> advertise WPA2
 }
 
+/* THE BEACON THIS AP AIRS, in one place.
+ *
+ * The first ten bytes are NOT 802.11: they are the MediaTek beacon-offload
+ * header StartBeacon expects, and the frame control is at offset 10. That is
+ * worth knowing before reading the literal, and it is why kBeaconHdrLen
+ * exists - a parser handed this buffer from byte 0 reads the offload header
+ * as a frame control and refuses it.
+ *
+ * `--self-test`'s cross-role cell parses what this returns, so the station
+ * side is tested against the bytes main() actually transmits. It used to be a
+ * second copy of the same literal, with a comment claiming it was "the one
+ * this AP actually airs" - true until somebody changed one of them. */
+static constexpr size_t kBeaconHdrLen = 10;
+
+static std::vector<uint8_t> build_beacon(int tu) {
+  std::vector<uint8_t> bcn = {0,0,0x0a,0,0,0x80,0,0,0x08,0,
+      0x80,0,0,0, 0xff,0xff,0xff,0xff,0xff,0xff,
+      kBssid[0],kBssid[1],kBssid[2],kBssid[3],kBssid[4],kBssid[5],
+      kBssid[0],kBssid[1],kBssid[2],kBssid[3],kBssid[4],kBssid[5],
+      0,0, 0,0,0,0,0,0,0,0, (uint8_t)(tu&0xff),(uint8_t)(tu>>8), 0x11,0x00};
+  append_ies(bcn, true, /*beacon=*/true);
+  return bcn;
+}
+
+
 // --- WPA2 crypto (openssl) --------------------------------------------------
 static void prf(const uint8_t* key, int klen, const char* label,
                 const uint8_t* data, int dlen, uint8_t* out, int olen) {
@@ -1123,12 +1148,7 @@ int main(int argc, char** argv) {
   g_rt = devourer::build_stream_radiotap(devourer::parse_tx_mode_str("6M"));
   g_dev->InitWrite(SelectedChannel{g_chan, 0, CHANNEL_WIDTH_20});
   int tu = 25; if (const char* i = std::getenv("DEVOURER_BCN_TU")) tu = atoi(i);
-  std::vector<uint8_t> bcn = {0,0,0x0a,0,0,0x80,0,0,0x08,0,
-      0x80,0,0,0, 0xff,0xff,0xff,0xff,0xff,0xff,
-      kBssid[0],kBssid[1],kBssid[2],kBssid[3],kBssid[4],kBssid[5],
-      kBssid[0],kBssid[1],kBssid[2],kBssid[3],kBssid[4],kBssid[5],
-      0,0, 0,0,0,0,0,0,0,0, (uint8_t)(tu&0xff),(uint8_t)(tu>>8), 0x11,0x00};
-  append_ies(bcn, true, /*beacon=*/true);
+  std::vector<uint8_t> bcn = build_beacon(tu);
   bool bok = g_dev->StartBeacon(bcn.data(), bcn.size(), tu);
   std::thread rx([&]{ g_dev->StartRxLoop(on_rx); });
 

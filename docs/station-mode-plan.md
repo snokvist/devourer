@@ -102,6 +102,11 @@ favourable measurement without its adversarial counterpart in the same breath.
 | Phase 1 gate | `tests/mt7612u_ap_onair.sh` @ e26d12c | Flash (harness logic) | changes required | 8 (F1–F8) | yes |
 | Phase 1 gate | `tests/mt7612u_ap_onair.sh` @ e26d12c | Flash (evidence vs claims) | **overclaims found** | 10 (F1–F10) | yes |
 | Phase 1 gate | `tests/mt7612u_ap_onair.sh` @ e26d12c | Opus subagent | **two checks could not fail** | 14 + clean bills | yes |
+| 2b.1 nonce interop | `b716aa2` | Flash (adversarial) | changes required | 4 (F1–F4) | yes — `7dd6f91` |
+| 2b ctest target | `7dd6f91`+`8a3ccd9` | Flash (adversarial) | changes required | 4 (F1–F4) | yes — `903c69e` |
+| Phase 3 | `264a6f7` | Flash (protocol + memory safety) | **state-machine defect** | 5 | yes — `03d2478` |
+| Phase 3 | `264a6f7` | Opus subagent (continuity) | **rule 4 violated again** | 12 (F1–F12) | yes — `03d2478`, `86d5ad5`, this commit |
+| Phase 3 | `264a6f7` | Opus subagent (architecture) | **replay counter poisonable** | 11 | yes — `03d2478` |
 
 ### Round 5 — the Phase 1 gate, 2026-09-20
 
@@ -894,7 +899,119 @@ them PR #335 defects that shipped in a reviewed PR: **a forged EAPOL-Key MIC
 must be rejected**, and **an equal-counter replayed group rekey must be
 rejected**. A phase that cannot fail those two tests has not been tested.
 
-**Status:** not started.
+**Status: DONE 2026-09-21.** `264a6f7` built it, `03d2478` acted on the
+review batch, `86d5ad5` added the cross-implementation vectors. ctest 78/78,
+three new cells, none of which needs a radio, root or airtime.
+
+| Module | What it is |
+|---|---|
+| `src/sta/Eapol.h` | the EAPOL-Key wire format, the 802.11 PRF, the PMK and PTK derivations, the MIC, the KDE walker |
+| `src/sta/Supplicant.h` | the four-way and the group rekey, as a state machine |
+| `src/sta/BssTable.h` | one record per BSSID, and which of them to join |
+| `src/sta/StationSm.h` | authenticate, associate, four-way, connected — and every way that stops |
+| `tests/openssl_crypto_ops.h` | the one COMPLETE CryptoOps in the tree; three partial ones were about to exist |
+
+**The acceptance is met, and both cells carry their positive arm.**
+`test_forged_mic_is_rejected()` asserts the negative across the verdict, the
+counter, the absent message 4, the uninstalled PTK, the uninstalled GTK and
+the unchanged state, then feeds the GENUINE message 3 and requires it to work
+— so a supplicant that rejected everything cannot pass.
+`test_group_rekey_replay_rejected()` does a genuine rekey, then the
+byte-identical replay, then the case that actually matters (the same counter
+carrying a DIFFERENT key) and requires the old GTK to survive, then a lower
+counter refused outright and a greater one still installing.
+
+**THE REVIEW FOUND A THIRD DEFECT OF THE SAME FAMILY, and it was mine.**
+Message 1 of the four-way carries no MIC, and the first draft let it advance
+the replay counter. Reproduced before fixing:
+
+```
+forged msg1 @2^64-1  verdict=Reply     replay_now=18446744073709551615
+genuine msg1 @1      verdict=Replayed  replays=1
+```
+
+One frame anyone within range can build then refused every genuine EAPOL-Key
+for the rest of the association — silently, because the station was already
+keyed. It stayed Connected with `keyed()` true while its key management was
+dead; the symptom would have appeared hours later as "multicast stopped
+working". The counter now advances in exactly two places, both of which have
+verified a MIC first. Two of the three reviewers found this independently.
+
+**Nine more findings, all real and all fixed in `03d2478`:** `find_gtk_kde`
+returning one bool for "absent" and "malformed" (a message 3 with a truncated
+GTK KDE left the station Connected and keyed with no group key, nothing
+counted); an unbounded transmit queue an attacker could fill from one captured
+frame (measured at 12.1 MB of replies); `join()` not clearing that queue, so
+frames for the BSS we left were aired at the one we joined; the SNonce being
+an argument to `configure()` next to the PMK, when the two have opposite
+lifetimes; `StationSm` counting nothing it dropped, on the one filter that on
+real hardware is the only address filter in the system; `Connected` having no
+exit but a deauth; the station advertising the AP's rate set, which omits the
+mandatory 6 and 12 Mbps and invites status 18; keys not wiped on teardown,
+which `docs/station-mode-scope.md` lists as a PR #335 review item and
+`src/sta/StationTable.h` has done for the AP side since Phase 2b; and
+`BssTable`'s eviction rule picking exactly the entry a flooding attacker wants
+gone.
+
+**Known answers, which is the class of test PR #335 had none of.** Two
+independent sources, because one was not enough:
+
+- the IEEE 802.11i Annex H.4.2 passphrase-to-PSK vectors, recomputed with
+  Python's hashlib before being written down. They cover **PBKDF2 and nothing
+  else** — an earlier comment implied more, which was the same kind of
+  overstatement this phase exists to guard against.
+- `tests/eapol_kernel_vectors.h`: the four EAPOL-Key frames **hostapd and
+  wpa_supplicant actually exchanged**, captured off a two-radio
+  `mac80211_hwsim` rig by `tests/eapol_capture_vectors.sh` — no hardware, so
+  the bench is untouched. Our PTK must equal the one wpa_supplicant derived
+  (the PRF and the address/nonce sorting), our MIC check must accept all three
+  MIC'd frames and refuse message 3 under a KCK one bit out, and our
+  Supplicant must drive the whole exchange to Done on the same PTK and
+  hostapd's own GTK.
+
+That last one **found two interop defects immediately**, both invisible to
+every other test because both sit inside the MIC and our own authenticator
+verified our own frames happily: messages 2 and 4 carried Key Length 16 where
+802.11-2016 12.7.6.3 says 0 in an RSNA, and the 802.1X version octet was 2
+where wpa_supplicant ships 1. With both fixed, our messages 2 and 4 are
+byte-for-byte the ones wpa_supplicant sent.
+
+**Two independent implementations, made to agree.** Each module's own test
+uses a fixture written by the same author, so neither can catch a shared
+misreading. `test_library_station_associates()` in
+`tests/ap_wpa2_selftest.inc` runs this supplicant against the Phase 2b
+authenticator — which hand-rolls every EAPOL offset inline, was written months
+earlier, and shares no code with `src/sta/Eapol.h`. The station finds the AP's
+own beacon in a `BssTable`, authenticates, associates, completes the four-way,
+and both sides must hold the same PTK and GTK at the same key id.
+
+**Mutations.** 28 on the first draft (27 caught; the survivor is recorded in
+the code — deleting the "message 3's key data must be encrypted" check changes
+no outcome, because plaintext key data fails the AES unwrap's integrity check
+anyway), and 18 on the rules the review added, all caught. The harness now
+refuses to run unless every anchor is present: killing it mid-run leaves a
+mutation in the tree, and the next sweep then measures something that is
+already wrong while looking plausible.
+
+**Carried out of Phase 3, written down here rather than left for Phase 4 to
+discover:**
+
+- **No reconnect policy.** `StationSm` notices beacon loss and fails; it does
+  not re-scan or re-join. Phase 4's `reconnect` cell has to drive that from
+  outside, and the decision about *when* to retry is genuinely the
+  integrator's.
+- **No 802.11w.** A deauth is accepted unauthenticated, because without MFP
+  there is no way to tell a forged one from a real one and a station that
+  ignored them would stay associated to an AP that has forgotten it. Stated at
+  the code, listed as out of scope in the scope document.
+- **Nothing wires `BssTable` to `StationSm`.** A scanner — channels, dwell
+  times, probe requests — needs a radio and is Phase 4's.
+- **`aes_key_unwrap`'s output size is a contract `CryptoOps.h` does not
+  state.** The caller sizes the buffer to `in_len - 8`, which is what RFC 3394
+  writes, but the interface does not say so.
+- **The four-way's interoperability is pinned offline, not on air.** The
+  captured vectors and the cross-role cell are strong evidence; a real
+  association against a real AP is Phase 5.
 
 ## Phase 4 — the harness
 
