@@ -988,6 +988,33 @@ if(OpenSSL_FOUND)
     add_test(NAME ccmp_framing COMMAND CcmpSelftest)
 endif()
 
+# tests/ap_wpa2.cpp itself, headless.
+#
+# THE DEFECT THIS CLOSES. Phase 2b shipped with this written down as its
+# largest carried-forward gap: the WPA2 AP harness had no build target of any
+# kind, so the four-way handshake, the intra-BSS relay's crypto and the TAP
+# forwarder existed only inside an on-air script, and four phase gates rested
+# on a narrated bench run. `ap_wpa2 --self-test` drives the real on_rx() with
+# synthetic frames and reads the real transmit queue back; it returns before
+# libusb is opened, so ctest needs no adapter, no root and no airtime.
+#
+# It links libusb and OpenSSL because the harness does, not because the cells
+# do - which is also why this target is guarded the same way CcmpSelftest is.
+if(OpenSSL_FOUND)
+    add_executable(ApWpa2
+        tests/ap_wpa2.cpp
+        examples/common/env_config.cpp
+        examples/common/usb_select.cpp
+    )
+    target_link_libraries(ApWpa2 PUBLIC devourer
+                          PRIVATE PkgConfig::libusb OpenSSL::Crypto)
+    target_include_directories(ApWpa2 PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
+    add_test(NAME ap_wpa2_headless COMMAND ApWpa2 --self-test)
+endif()
+
 # src/sta/Dot11.h - the management-frame module the AP harnesses and a station
 # share. Pure and header-only, so this needs neither OpenSSL nor libusb and
 # runs in every CI job. Covers the IE walker against truncated and hostile

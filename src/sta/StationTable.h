@@ -238,8 +238,11 @@ struct ForwardDecision {
  * copy drops the bit that said otherwise.
  *
  * Refusing both converts an unbounded silent-corruption surface into two
- * counters. Neither can reach this AP while it advertises neither WMM nor HT,
- * but "unreachable today" is not a reason to forward something wrong. */
+ * counters. A-MSDU cannot reach this AP while it advertises neither WMM nor
+ * HT - but "unreachable today" is not a reason to forward something wrong,
+ * and FRAGMENTATION IS REACHABLE TODAY: it is a legacy feature with no
+ * relationship to WMM or HT, and any station with a fragmentation threshold
+ * set will use it. See the fragment test below. */
 inline ForwardDecision decide_forward(const uint8_t* hdr, size_t hdr_len,
                                       const uint8_t bssid[6],
                                       const StationTable& table) {
@@ -250,7 +253,23 @@ inline ForwardDecision decide_forward(const uint8_t* hdr, size_t hdr_len,
   const size_t need = 24 + (four_addr ? 6 : 0) + (qos ? 2 : 0);
 
   if (hdr_len < need) return {Disposition::Malformed, nullptr};
-  if (fc1 & kFcMoreFrag) return {Disposition::RefuseFragmented, nullptr};
+  /* BOTH HALVES OF "this is a fragment".
+   *
+   * More Fragments alone is not enough: it is CLEAR on the LAST fragment of a
+   * fragmented MSDU, which then looked like an ordinary whole frame and was
+   * forwarded as one. It carries no LLC/SNAP header - only fragment 0 does -
+   * so the peer received the tail of somebody else's MSDU with every counter
+   * on this AP reading success. That is the exact silent corruption the
+   * refusal exists to prevent, arriving through the door the refusal left
+   * open, and the comment above claiming it "cannot reach this AP while it
+   * advertises neither WMM nor HT" was wrong twice over: fragmentation has
+   * nothing to do with either, and any legacy station with a fragmentation
+   * threshold set does this.
+   *
+   * Found by tests/ap_wpa2_selftest.inc on the day it was written; the cell
+   * in tests/station_table_selftest.cpp only ever set the bit. */
+  if ((fc1 & kFcMoreFrag) || (hdr[22] & 0x0f))
+    return {Disposition::RefuseFragmented, nullptr};
   if (qos && (hdr[four_addr ? 30 : 24] & 0x80))
     return {Disposition::RefuseAmsdu, nullptr};
 

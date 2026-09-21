@@ -338,6 +338,20 @@ void test_forward_decision() {
   check(decide_forward(h, 24, BSSID, t).what == Disposition::RefuseFragmented,
         "More Fragments is refused rather than forwarded");
 
+  /* THE LAST FRAGMENT, which has More Fragments CLEAR and a nonzero fragment
+   * number. This cell set only the bit until 2026-09-21, so the tail of a
+   * fragmented MSDU - no LLC/SNAP header, not a whole MSDU - was forwarded as
+   * an ordinary frame and the peer received corruption while every counter
+   * read success. Fragmentation needs no WMM and no HT; a legacy station with
+   * a fragmentation threshold produces this on its own. */
+  h[1] &= (uint8_t)~devourer::sta::kFcMoreFrag;
+  h[22] = (uint8_t)((h[22] & 0xf0) | 0x03);
+  check(decide_forward(h, 24, BSSID, t).what == Disposition::RefuseFragmented,
+        "the LAST fragment is refused too, not forwarded as a whole MSDU");
+  h[22] &= 0xf0;
+  check(decide_forward(h, 24, BSSID, t).what != Disposition::RefuseFragmented,
+        "...and an unfragmented frame is still not refused");
+
   /* The refusal must win over the destination: a FRAGMENTED frame for the AP
    * itself is still not something to hand to a parser expecting a whole MSDU. */
   to_ds(h, BSSID, kA, BSSID);

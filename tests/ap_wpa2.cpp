@@ -604,6 +604,42 @@ static std::vector<uint8_t> ccmp_relay(const uint8_t* dst, const uint8_t* src,
   return m;
 }
 
+/* DOWN: one Ethernet frame from the host becomes one protected 802.11 frame.
+ *
+ * Lifted out of the TAP reader thread's lambda so it is reachable without a
+ * TAP device: the thread is now a read() loop around this call, and
+ * `ap_wpa2 --self-test` calls it directly with a pipe standing in for the fd.
+ *
+ * Takes g_hs_mu itself - it is called from the reader thread, which holds
+ * nothing. */
+static void tap_down_one(const uint8_t* eth, size_t len) {
+  uint8_t msdu[2048], da[6], sa[6];
+  const size_t m =
+      devourer::sta::eth_to_msdu(eth, len, msdu, sizeof msdu, da, sa);
+
+  if (m == 0) { g_tap_drop.fetch_add(1); return; }
+  g_tap_rx.fetch_add(1);
+
+  std::lock_guard<std::mutex> l(g_hs_mu);
+  std::vector<uint8_t> f;
+  if (da[0] & 0x01) {
+    /* Group: one frame under the GTK reaches every station, so this is the
+     * path that does NOT fan out. */
+    if (g_stas.count() == 0) return;
+    f = ccmp_group_tx(sa, msdu, (int)m);
+  } else if (g_stas.find(da)) {
+    f = ccmp_relay(da, sa, msdu, (int)m);
+  } else {
+    /* The host sent something for an address that is not on this BSS.
+     * Dropping is right: flooding a unicast would leak it to every
+     * station. */
+    g_tap_drop.fetch_add(1);
+    return;
+  }
+  if (!f.empty()) enqueue(std::move(f));
+  else g_tap_drop.fetch_add(1);
+}
+
 /* Caller holds g_hs_mu: every path into here runs inside the RX callback's
  * data branch, which takes the lock to look the station up in the first
  * place. An unkeyed or unknown destination emits nothing rather than airing a
@@ -1044,6 +1080,10 @@ static void on_rx(const Packet& p) {
   }
 }
 
+/* The headless cells. Included rather than linked because everything they
+ * drive is static in this file; see the note at the top of that file. */
+#include "ap_wpa2_selftest.inc"
+
 int main(int argc, char** argv) {
   int sec = argc > 1 ? atoi(argv[1]) : 60;
   {   /* before the radio: a wiring check that needs one is no check at all */
@@ -1056,6 +1096,10 @@ int main(int argc, char** argv) {
    * four-way - which is what this harness did until Phase 2b.2 - hands the
    * second station a fresh group key and revokes the first station's. */
   RAND_bytes(g_gtk, 16);
+  /* HEADLESS. Everything above this line is the wiring check and the BSS's
+   * group key, both of which the cells need; everything below it is a radio.
+   * `ap_wpa2 --self-test` is what ctest runs, and it touches no device. */
+  if (argc > 1 && std::strcmp(argv[1], "--self-test") == 0) return self_test();
   if (const char* t = std::getenv("DEVOURER_AP_TAP")) g_tap_fd = tap_open(t);
   if (const char* c = std::getenv("DEVOURER_CHANNEL")) g_chan = (uint8_t)atoi(c);
   if (const char* k = std::getenv("DEVOURER_WPA2_PSK")) g_psk = k;
@@ -1088,35 +1132,14 @@ int main(int argc, char** argv) {
    * Its own thread because read() blocks; it exits when the fd is closed. */
   std::thread tap_rd;
   if (g_tap_fd >= 0) {
+    /* The loop is the thread's; the decision is tap_down_one()'s, so
+     * `ap_wpa2 --self-test` can drive it without a TAP device or a thread. */
     tap_rd = std::thread([&]{
-      uint8_t eth[2048], msdu[2048];
+      uint8_t eth[2048];
       for (;;) {
         const ssize_t got = ::read(g_tap_fd, eth, sizeof eth);
         if (got <= 0) return;                 /* closed, or a fatal error */
-        uint8_t da[6], sa[6];
-        const size_t m = devourer::sta::eth_to_msdu(eth, (size_t)got, msdu,
-                                                    sizeof msdu, da, sa);
-        if (m == 0) { g_tap_drop.fetch_add(1); continue; }
-        g_tap_rx.fetch_add(1);
-
-        std::lock_guard<std::mutex> l(g_hs_mu);
-        std::vector<uint8_t> f;
-        if (da[0] & 0x01) {
-          /* Group: one frame under the GTK reaches every station, so this is
-           * the path that does NOT fan out. */
-          if (g_stas.count() == 0) continue;
-          f = ccmp_group_tx(sa, msdu, (int)m);
-        } else if (g_stas.find(da)) {
-          f = ccmp_relay(da, sa, msdu, (int)m);
-        } else {
-          /* The host sent something for an address that is not on this BSS.
-           * Dropping is right: flooding unicast would leak it to every
-           * station. */
-          g_tap_drop.fetch_add(1);
-          continue;
-        }
-        if (!f.empty()) enqueue(std::move(f));
-        else g_tap_drop.fetch_add(1);
+        tap_down_one(eth, (size_t)got);
       }
     });
   }
