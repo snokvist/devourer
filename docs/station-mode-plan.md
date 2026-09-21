@@ -633,13 +633,42 @@ after it; nothing in Phase 3 depends on it.
 | 2b.4 | ~~Real DHCP address pool + binding table~~ **DONE** | The station table IS the binding table: address = `192.168.99.(1 + aid)`, so nothing can outlive its lease or be double-allocated. On air: `DHCP: ACK 192.168.99.2 to aid=1` and `192.168.99.3 to aid=2` |
 | 2b.5 | ~~Association-table ARP responder~~ **DONE** | `Unicast reply from 192.168.99.3 [40:A5:EF:2F:22:9B]` — B's own MAC, not the AP's, which is what keeps the traffic at layer 2 instead of making the AP an L3 hop |
 | 2b.6 | ~~GTK transmit path~~ **DONE** | Key id 1 (the TX path hardcoded 0, so every group frame was looked up as the pairwise key and MIC-failed), one GTK per BSS, its own PN space. Probed with an ARP for an address **nobody holds**, so the AP's responder cannot answer and the flood is the only path: B received it decrypted |
-| 2b.7 | ~~Intra-BSS relay~~ **DONE (partially)** | A pings B through the AP: 100% loss → **4/4, 0% loss**, `relayed=8 dropped=0`. **Not done:** duplicate detection, fragmentation and A-MSDU still have no implementation and no stated refusal — carried forward |
-| 2b.8 | TAP forwarder in `tests/` or `tools/`; 802.11 ↔ 802.3 helper (incl. the Ethernet II header) in `src/sta/` | **NOT STARTED** — the one item of this phase still open. Host stack reaches a station through the TAP; the doc states which side owns ARP/ICMP |
+| 2b.7 | ~~Intra-BSS relay~~ **DONE** | A pings B through the AP: 100% loss → **4/4, 0% loss**, `relayed=8 dropped=0`. Duplicate detection turned out to exist by construction (an 802.11 retransmission carries the same PN, and `CcmpReplay::accept` gates the relay decision) — the earlier "no implementation" note was wrong. Fragmentation and A-MSDU are now **refused and counted**, which is the stated position the gate asked for |
+| 2b.8 | ~~TAP forwarder~~ **DONE 2026-09-21** | `sta::msdu_to_eth`/`eth_to_msdu` in `src/sta/Dot11.h` (6/6 mutations caught); the forwarder is `DEVOURER_AP_TAP=<ifname>` in `ap_wpa2.cpp`, off by default. Gate met with the station's PHY in its own netns so the TAP is the only route: **4/4, 0% loss**. **Who owns ARP/ICMP/DHCP: the HOST**, and the userspace responders are disabled whenever a TAP is open |
 
 **Acceptance for the phase as a whole.** Two associated stations, both
 configured with power save off, exchanging encrypted unicast through the AP,
 plus a group-addressed frame that both decrypt. And per rule 2, two adversarial
 reviews with every finding resolved.
+
+### Phase 2b — COMPLETE 2026-09-21
+
+All eight items done. The forwarding decision was lifted out of the harness
+into `sta::decide_forward()` (6/6 mutations caught) so that four of those gates
+stop resting on narrated bench runs, and so 2b.8 could reuse the same decision
+rather than writing a second copy.
+
+**Two gates nearly passed without meaning anything, and both are worth
+remembering.** The TAP cell's first run read 4/4 with 0% loss while the AP's
+ledger showed only one non-group frame arriving over the air — both addresses
+were local to one host and the kernel had routed between them internally. Its
+second run read 100% loss because the root namespace reached the station
+through the 8812CU, which still held an address from the relay cell. The cell
+now clears competing addresses and **asserts the route before measuring**,
+aborting rather than reporting a number about a different interface.
+
+**Still open, carried out of the phase rather than closed inside it:**
+
+- `tests/ap_wpa2.cpp` has no ctest target of its own. `decide_forward` and the
+  802.3 translation are now covered headlessly, but the handshake, the relay's
+  crypto and the TAP paths are exercised only on the bench.
+- The AID→IP derivation couples identity to a reusable slot index, so an
+  unauthenticated deauth costs more here than on a normal AP, where a lease is
+  keyed on MAC. Inherent to the "table IS the binding table" simplification.
+- 2b.1's nonce fix is still interop-unproven: the AP advertises neither WMM nor
+  HT, so no station sends it a QoS frame. Annex J vectors and an on-air TID
+  1–7 cell ride with the WMM work.
+- Two stations, not seven, and no churn during traffic.
 
 ### Phase 2b review ledger
 
