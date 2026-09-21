@@ -46,6 +46,12 @@
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
 #include "RadiotapBuilder.h"
+#include <fcntl.h>
+#include <linux/if.h>
+#include <linux/if_tun.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+
 #include "sta/Ccmp.h"
 #include "sta/StationTable.h"
 #include "sta/Dot11.h"
@@ -464,6 +470,47 @@ static uint16_t csum16(const uint8_t* d, int len) {
 // tested against vectors from a third implementation (ctest ccmp_framing).
 // They used to be inline here and in nobody's test.
 // Encrypt an AP->STA payload (LLC/SNAP+eth+data) into a CCMP data frame.
+/* ------------------------------------------------------------ TAP (2b.8)
+ *
+ * One TAP for the whole BSS, opt-in with DEVOURER_AP_TAP=<ifname>. Unset -
+ * which is how every existing cell runs it - and nothing below executes, so
+ * the AP behaves exactly as it did.
+ *
+ * WHY ONE TAP AND NOT ONE PER STATION, and why the bridge is not the switch:
+ * a Linux bridge never forwards a frame back out its ingress port, so with
+ * one TAP carrying the BSS, A->B arrives on the only port B is reachable
+ * through and is dropped. Intra-BSS relay is therefore OURS - it short-
+ * circuits in decide_forward() before the TAP is ever involved - and what the
+ * TAP buys is host-stack access and an upstream port. That is the conclusion
+ * docs/station-mode-scope.md reached after two reviews took the opposite
+ * claim apart.
+ *
+ * WHO OWNS ARP, ICMP AND DHCP - the question the scope document said the
+ * implementation had to answer. With a TAP, the HOST does. The userspace
+ * responders in handle_plain() and the AID-derived address pool are disabled
+ * for the duration, because two things answering ARP for the same subnet is
+ * an address conflict, not redundancy. Without a TAP they own it, as before.
+ */
+static int g_tap_fd = -1;
+static std::atomic<uint64_t> g_tap_tx{0}, g_tap_rx{0}, g_tap_drop{0};
+
+static int tap_open(const char* name) {
+  int fd = ::open("/dev/net/tun", O_RDWR);
+  if (fd < 0) { perror("  TAP: open /dev/net/tun"); return -1; }
+  struct ifreq ifr;
+  std::memset(&ifr, 0, sizeof ifr);
+  ifr.ifr_flags = IFF_TAP | IFF_NO_PI;     /* layer 2, no 4-byte prefix */
+  std::snprintf(ifr.ifr_name, IFNAMSIZ, "%s", name);
+  if (::ioctl(fd, TUNSETIFF, &ifr) < 0) {
+    perror("  TAP: TUNSETIFF (CAP_NET_ADMIN?)");
+    ::close(fd);
+    return -1;
+  }
+  fprintf(stderr, "  TAP: %s open - the host stack owns ARP/ICMP/DHCP now,"
+                  " the userspace responders are OFF\n", ifr.ifr_name);
+  return fd;
+}
+
 /* THE GROUP TRANSMIT PATH (Phase 2b.6).
  *
  * Until now the GTK was generated, wrapped into msg3 and installed by every
@@ -505,6 +552,22 @@ static std::vector<uint8_t> ccmp_group_tx(const uint8_t* src,
       msdu, (size_t)len, m.data(), m.size());
   m.resize(n);
   return m;
+}
+
+/* UP: a decrypted MSDU becomes an Ethernet frame on the host's TAP.
+ * Caller holds g_hs_mu, which is not needed here but is simpler than
+ * releasing it; the write is non-blocking and the fd is set once at startup. */
+static void tap_up(const uint8_t* da, const uint8_t* sa,
+                   const uint8_t* msdu, int len) {
+  if (g_tap_fd < 0) return;
+  uint8_t eth[2048];
+  const size_t n = devourer::sta::msdu_to_eth(da, sa, msdu, (size_t)len,
+                                              eth, sizeof eth);
+  /* 0 means the MSDU was not an ethertype SNAP, or would not fit. Either way
+   * it is not something to hand the host as an Ethernet frame. */
+  if (n == 0) { g_tap_drop.fetch_add(1); return; }
+  if (::write(g_tap_fd, eth, n) == (ssize_t)n) g_tap_tx.fetch_add(1);
+  else g_tap_drop.fetch_add(1);
 }
 
 /* INTRA-BSS RELAY (Phase 2b.7).
@@ -848,6 +911,7 @@ static void on_rx(const Packet& p) {
             return;
           case devourer::sta::Disposition::Group:
             g_to_group.fetch_add(1);
+            tap_up(fwd.da, sta, pt.data(), (int)ptlen);
             /* Answer it locally AND flood it to the BSS. A station's broadcast
              * is both a request this AP may answer (ARP for the AP's own
              * address, DHCP DISCOVER) and traffic its peers are entitled to
@@ -856,7 +920,8 @@ static void on_rx(const Packet& p) {
              * The sender receives its own broadcast back, which is what a
              * group-addressed frame means and what every AP does; a station
              * discards a frame whose SA is its own. */
-            handle_plain(sta, pt.data(), (int)ptlen);    // decrypted -> ARP/ICMP
+            if (g_tap_fd < 0)
+              handle_plain(sta, pt.data(), (int)ptlen);  // decrypted -> ARP/ICMP
             if (g_stas.count() > 1) {
               std::vector<uint8_t> f = ccmp_group_tx(sta, pt.data(), (int)ptlen);
               if (!f.empty()) {
@@ -869,7 +934,10 @@ static void on_rx(const Packet& p) {
             break;
           case devourer::sta::Disposition::Local:
             g_to_ap.fetch_add(1);
-            handle_plain(sta, pt.data(), (int)ptlen);    // decrypted -> ARP/ICMP
+            /* With a TAP the host answers; without one, our own responders
+             * do. Never both - see the TAP note above. */
+            if (g_tap_fd >= 0) tap_up(fwd.da, sta, pt.data(), (int)ptlen);
+            else handle_plain(sta, pt.data(), (int)ptlen);
             break;
           case devourer::sta::Disposition::Relay: {
             g_to_peer.fetch_add(1);
@@ -888,6 +956,10 @@ static void on_rx(const Packet& p) {
           }
           case devourer::sta::Disposition::OffBss:
             g_to_elsewhere.fetch_add(1);
+            /* Not on this BSS: the host stack is the only thing that might
+             * know where it goes. Without a TAP it is simply lost, which is
+             * what it was before 2b.8. */
+            tap_up(fwd.da, sta, pt.data(), (int)ptlen);
             break;
           }
         } else {
@@ -984,6 +1056,7 @@ int main(int argc, char** argv) {
    * four-way - which is what this harness did until Phase 2b.2 - hands the
    * second station a fresh group key and revokes the first station's. */
   RAND_bytes(g_gtk, 16);
+  if (const char* t = std::getenv("DEVOURER_AP_TAP")) g_tap_fd = tap_open(t);
   if (const char* c = std::getenv("DEVOURER_CHANNEL")) g_chan = (uint8_t)atoi(c);
   if (const char* k = std::getenv("DEVOURER_WPA2_PSK")) g_psk = k;
   if (const char* p = std::getenv("DEVOURER_CCMP_PROFILE"))
@@ -1010,6 +1083,43 @@ int main(int argc, char** argv) {
   append_ies(bcn, true, /*beacon=*/true);
   bool bok = g_dev->StartBeacon(bcn.data(), bcn.size(), tu);
   std::thread rx([&]{ g_dev->StartRxLoop(on_rx); });
+
+  /* DOWN: the host's frames become 802.11, addressed and keyed per station.
+   * Its own thread because read() blocks; it exits when the fd is closed. */
+  std::thread tap_rd;
+  if (g_tap_fd >= 0) {
+    tap_rd = std::thread([&]{
+      uint8_t eth[2048], msdu[2048];
+      for (;;) {
+        const ssize_t got = ::read(g_tap_fd, eth, sizeof eth);
+        if (got <= 0) return;                 /* closed, or a fatal error */
+        uint8_t da[6], sa[6];
+        const size_t m = devourer::sta::eth_to_msdu(eth, (size_t)got, msdu,
+                                                    sizeof msdu, da, sa);
+        if (m == 0) { g_tap_drop.fetch_add(1); continue; }
+        g_tap_rx.fetch_add(1);
+
+        std::lock_guard<std::mutex> l(g_hs_mu);
+        std::vector<uint8_t> f;
+        if (da[0] & 0x01) {
+          /* Group: one frame under the GTK reaches every station, so this is
+           * the path that does NOT fan out. */
+          if (g_stas.count() == 0) continue;
+          f = ccmp_group_tx(sa, msdu, (int)m);
+        } else if (g_stas.find(da)) {
+          f = ccmp_relay(da, sa, msdu, (int)m);
+        } else {
+          /* The host sent something for an address that is not on this BSS.
+           * Dropping is right: flooding unicast would leak it to every
+           * station. */
+          g_tap_drop.fetch_add(1);
+          continue;
+        }
+        if (!f.empty()) enqueue(std::move(f));
+        else g_tap_drop.fetch_add(1);
+      }
+    });
+  }
   fprintf(stderr, "ap_wpa2 up: SSID %s WPA2-PSK '%s' ch%d beacon=%s\n",
           kSsid, g_psk, g_chan, bok ? "OK" : "FAIL");
   auto end = std::chrono::steady_clock::now() + std::chrono::seconds(sec);
@@ -1071,6 +1181,11 @@ int main(int argc, char** argv) {
           (unsigned long long)g_relay_drop.load(),
           (unsigned long long)g_to_elsewhere.load(),
           (unsigned long long)g_group_tx.load());
+  if (g_tap_fd >= 0)
+    fprintf(stderr, "  TAP: to host=%llu, from host=%llu, dropped=%llu\n",
+            (unsigned long long)g_tap_tx.load(),
+            (unsigned long long)g_tap_rx.load(),
+            (unsigned long long)g_tap_drop.load());
   fprintf(stderr,
           "  refused before relay: fragmented=%llu, A-MSDU=%llu,"
           " group flood cipher-refused=%llu\n",
