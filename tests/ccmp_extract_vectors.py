@@ -18,19 +18,20 @@ out_path = sys.argv[3]
 assert len(tk) == 16
 
 
-# radiotap field (size, alignment) by present-bit, enough to reach Flags (bit
-# 1) past whatever else a capture happens to carry. hwsim emits two different
-# present words in one capture, so the offset of Flags is NOT fixed.
-_RT_FIELDS = {
-    0: (8, 8), 1: (1, 1), 2: (1, 1), 3: (4, 2), 4: (2, 2), 5: (1, 1),
-    6: (1, 1), 7: (2, 2), 8: (2, 2), 9: (2, 2), 10: (1, 1), 11: (1, 1),
-    12: (1, 1), 13: (1, 1), 14: (2, 2), 15: (2, 2), 16: (1, 1), 17: (8, 4),
-    18: (3, 1), 19: (8, 4), 20: (12, 2), 21: (12, 8),
-}
-
-
 def radiotap_flags(pkt):
-    """The radiotap Flags octet, or None when the header does not carry it."""
+    """The radiotap Flags octet, or None when the header does not carry it.
+
+    Only ONE field is ever needed here, and only one field can precede it:
+    radiotap fields appear in present-bit order, Flags is bit 1, and the only
+    lower bit is TSFT. So this walks exactly that much and refuses everything
+    else. An earlier version carried a table of twenty-odd field sizes to skip
+    past - dead code, since the walk returns at bit 1, and five of its entries
+    were off by one. A table that is never read is a table nobody notices is
+    wrong; this has none.
+
+    hwsim emits two different present words in one capture, which is why the
+    offset of Flags cannot simply be hardcoded.
+    """
     rt_len = struct.unpack('<H', pkt[2:4])[0]
     words, off = [], 4
     while True:
@@ -40,23 +41,10 @@ def radiotap_flags(pkt):
         if not (w & 0x80000000):
             break
     if not (words[0] & 0x02):
-        return None
-    for word_idx, w in enumerate(words):
-        for bit in range(31):
-            if not (w & (1 << bit)):
-                continue
-            idx = word_idx * 32 + bit
-            if idx not in _RT_FIELDS:
-                return None          # an extension we cannot skip safely
-            size, align = _RT_FIELDS[idx]
-            pad = (-(off - 0)) % align
-            off += pad
-            if idx == 1:
-                return pkt[off]
-            off += size
-            if off > rt_len:
-                return None
-    return None
+        return None              # no Flags field at all
+    if words[0] & 0x01:
+        off += (-off) % 8 + 8    # TSFT: 8 bytes, 8-aligned
+    return pkt[off] if off < rt_len else None
 
 
 blob = open(pcap, 'rb').read()
@@ -91,6 +79,13 @@ while off + 16 <= len(blob):
         continue
     fc0, fc1 = mpdu[0], mpdu[1]
     if fc0 != 0x88:          # QoS data, subtype 8
+        continue
+    if fc1 & 0x80:
+        # +HTC/Order: the header grows by four bytes of HT Control and the
+        # emitted hdr_len of 26 would be wrong. It would fail loudly (the
+        # CCMP header would be read from the wrong offset and the MIC would
+        # not verify), but failing loudly in a GENERATOR is still a broken
+        # regeneration, so skip it here instead.
         continue
     if not (fc1 & 0x40):     # Protected
         continue

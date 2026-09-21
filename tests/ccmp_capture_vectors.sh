@@ -32,7 +32,9 @@ SSID=ccmpvec
 [ "$(id -u)" = 0 ] || { echo "this needs root"; exit 1; }
 
 cleanup() {
-    pkill -x tcpdump 2>/dev/null || true
+    # BY PID. `pkill -x tcpdump` killed every unrelated capture on the host,
+    # which on a machine that is also a radio bench is somebody else's run.
+    [ -n "${CAP_PID:-}" ] && kill "$CAP_PID" 2>/dev/null || true
     pkill -f "hostapd .*$WORK" 2>/dev/null || true
     ip netns exec "$NS" pkill -f wpa_supplicant 2>/dev/null || true
     ip netns del "$NS" 2>/dev/null || true
@@ -102,6 +104,7 @@ echo "--- capture, AP, station"
 ip link set hwsim0 up
 ip link set "$AP_IF" up
 setsid tcpdump -i hwsim0 -s 0 -w "$WORK/cap.pcap" -U >"$WORK/tcpdump.log" 2>&1 &
+CAP_PID=$!
 sleep 2
 setsid hostapd -dd -K -t "$WORK/hostapd.conf" >"$WORK/hostapd.log" 2>&1 &
 sleep 4
@@ -125,9 +128,23 @@ ip netns exec "$NS" ping -c 1 -W 3 10.77.0.1 >/dev/null 2>&1 || true
 ip netns exec "$NS" python3 "$HERE/ccmp_tid_send.py" 10.77.0.1
 python3 "$HERE/ccmp_tid_send.py" 10.77.0.2
 sleep 2
-pkill -x tcpdump || true
+kill "$CAP_PID" 2>/dev/null || true
 sleep 1
 
 python3 "$HERE/ccmp_extract_vectors.py" "$WORK/cap.pcap" "$TK" \
     "$HERE/ccmp_kernel_vectors.h"
-echo "--- done; rebuild and run CcmpSelftest"
+
+# VERIFY ITS OWN OUTPUT. The extractor refuses a short vector set and an FCS
+# flag, but a TK read from the wrong hexdump line would still produce a
+# plausible-looking header that only fails when somebody else builds. Running
+# the test here is what makes a bad regeneration this script's failure.
+BUILD=${BUILD:-$HERE/../build}
+if [ -f "$BUILD/CMakeCache.txt" ]; then
+    echo "--- rebuilding and running CcmpSelftest against the new vectors"
+    cmake --build "$BUILD" --target CcmpSelftest >/dev/null 2>&1 \
+        || { echo "FAIL: CcmpSelftest does not build"; exit 1; }
+    "$BUILD/CcmpSelftest" || { echo "FAIL: the new vectors do not verify"; exit 1; }
+else
+    echo "--- no build tree at $BUILD; build and run CcmpSelftest yourself"
+fi
+echo "--- done"

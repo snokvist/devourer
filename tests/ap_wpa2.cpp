@@ -860,8 +860,8 @@ static void on_rx(const Packet& p) {
       size_t ptlen = 0;
       uint64_t pn = 0;
       if (devourer::sta::ccmp_decrypt(g_crypto, sender->ptk + 32, d, (size_t)len,
-                                      (size_t)hlen, sta, pt.data(), &ptlen,
-                                      &pn)) {
+                                      (size_t)hlen, sta, pt.data(), pt.size(),
+                                      &ptlen, &pn)) {
         // Replay check, AFTER the MIC verifies and never before: admitting a
         // PN from an unauthenticated frame would let anyone advance the window
         // and lock out the real peer. The TID comes from the QoS header when

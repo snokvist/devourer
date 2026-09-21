@@ -191,6 +191,14 @@ inline size_t ccmp_encrypted_len(size_t hdr_len, size_t plain_len) {
   return hdr_len + kCcmpHdrLen + plain_len + kCcmpMicLen;
 }
 
+/* How many plaintext bytes ccmp_decrypt can write for an MPDU of this size,
+ * so a caller can size its buffer instead of guessing. Zero when the frame is
+ * too short to hold a header, a CCMP header and a MIC. */
+inline size_t ccmp_decrypted_len(size_t mpdu_len, size_t hdr_len) {
+  const size_t overhead = hdr_len + kCcmpHdrLen + kCcmpMicLen;
+  return mpdu_len > overhead ? mpdu_len - overhead : 0;
+}
+
 inline size_t ccmp_encrypt(CryptoOps& crypto, const uint8_t tk[16],
                            const uint8_t* hdr, size_t hdr_len,
                            const uint8_t a2[6], uint64_t pn, uint8_t key_id,
@@ -218,15 +226,26 @@ inline size_t ccmp_encrypt(CryptoOps& crypto, const uint8_t tk[16],
  * 802.11 header, WITHOUT the FCS, and `hdr_len` is its header length
  * (data_hdr_len() computes it).
  *
- * Returns false when the frame is too short, or when the MIC does not verify.
- * A false return means DROP: `out` holds no trustworthy bytes, and the PN must
- * not be admitted to a replay window. Replay checking itself is the caller's -
- * it needs per-TID state this function does not own.
+ * Returns false when the frame is too short, when `out_cap` is too small, or
+ * when the MIC does not verify. A false return means DROP: `out` holds no
+ * trustworthy bytes, and the PN must not be admitted to a replay window.
+ * Replay checking itself is the caller's - it needs per-TID state this
+ * function does not own.
+ *
+ * `out_cap` IS NOT OPTIONAL, for the same reason ccmp_encrypt takes one: the
+ * plaintext length comes from the MPDU, which comes from the air. This
+ * function took no capacity at all until 2026-09-21, so a caller with a
+ * fixed-size buffer - tests/ccmp_selftest.cpp had `uint8_t plain[512]` - was
+ * one full-MTU frame away from a stack smash, and the cipher writes the
+ * plaintext out BEFORE the tag is checked, so a forged frame is enough. An
+ * adversarial review found it; nothing in the tree had triggered it, because
+ * every vector on hand happened to be short. ccmp_decrypted_len() computes
+ * the size to allocate.
  */
 inline bool ccmp_decrypt(CryptoOps& crypto, const uint8_t tk[16],
                          const uint8_t* mpdu, size_t mpdu_len, size_t hdr_len,
-                         const uint8_t a2[6], uint8_t* out, size_t* out_len,
-                         uint64_t* pn_out) {
+                         const uint8_t a2[6], uint8_t* out, size_t out_cap,
+                         size_t* out_len, uint64_t* pn_out) {
   const size_t overhead = hdr_len + kCcmpHdrLen + kCcmpMicLen;
   uint8_t aad[kCcmpAadMax];
   uint8_t nonce[kCcmpNonceLen];
@@ -242,6 +261,7 @@ inline bool ccmp_decrypt(CryptoOps& crypto, const uint8_t tk[16],
 
   if (mpdu_len < overhead) return false;
   body = mpdu_len - overhead;
+  if (out_cap < body) return false;
   pn = ccmp_header_pn(mpdu + hdr_len);
   aad_len = ccmp_aad(mpdu, hdr_len, aad);
   if (aad_len == 0) return false;

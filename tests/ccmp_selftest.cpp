@@ -120,7 +120,8 @@ void test_vectors() {
     std::snprintf(label, sizeof label, "decrypt vector '%s'", v.name);
     bool ok = devourer::sta::ccmp_decrypt(crypto, v.tk, mpdu.data(),
                                           mpdu.size(), v.hdr_len, v.a2,
-                                          plain.data(), &plain_len, &pn);
+                                          plain.data(), plain.size(),
+                                          &plain_len, &pn);
     check(ok, label);
     if (ok) {
       check(plain_len == v.plain_len, label);
@@ -158,8 +159,8 @@ void test_mic_rejected() {
 
   mpdu[mpdu.size() - 1] ^= 0x01;
   check(!devourer::sta::ccmp_decrypt(crypto, v.tk, mpdu.data(), mpdu.size(),
-                                     v.hdr_len, v.a2, plain.data(), nullptr,
-                                     nullptr),
+                                     v.hdr_len, v.a2, plain.data(),
+                                     plain.size(), nullptr, nullptr),
         "a flipped MIC bit must be rejected");
 
   /* Same for the ciphertext: CCM authenticates it, so a body edit must fail
@@ -167,15 +168,27 @@ void test_mic_rejected() {
   std::vector<uint8_t> body(v.mpdu, v.mpdu + v.mpdu_len);
   body[v.hdr_len + devourer::sta::kCcmpHdrLen] ^= 0x80;
   check(!devourer::sta::ccmp_decrypt(crypto, v.tk, body.data(), body.size(),
-                                     v.hdr_len, v.a2, plain.data(), nullptr,
-                                     nullptr),
+                                     v.hdr_len, v.a2, plain.data(),
+                                     plain.size(), nullptr, nullptr),
         "a flipped ciphertext bit must be rejected");
+
+  /* A buffer too small for the plaintext is refused rather than written past.
+   * ccmp_encrypt has always checked its capacity; decrypt did not have one to
+   * check until 2026-09-21, and the cipher writes the plaintext out before it
+   * verifies the tag, so a forged oversized frame was enough. */
+  check(!devourer::sta::ccmp_decrypt(crypto, v.tk, v.mpdu, v.mpdu_len,
+                                     v.hdr_len, v.a2, plain.data(),
+                                     v.plain_len - 1, nullptr, nullptr),
+        "an output buffer one byte too small must be refused");
+  check(devourer::sta::ccmp_decrypted_len(v.mpdu_len, v.hdr_len) == v.plain_len,
+        "ccmp_decrypted_len says exactly how much room to allocate");
 
   /* And a frame shorter than its own overhead must be refused rather than
    * read past its end. */
   check(!devourer::sta::ccmp_decrypt(crypto, v.tk, v.mpdu,
                                      v.hdr_len + 8 + 8 - 1, v.hdr_len, v.a2,
-                                     plain.data(), nullptr, nullptr),
+                                     plain.data(), plain.size(), nullptr,
+                                     nullptr),
         "a frame shorter than its own overhead must be refused");
 }
 
@@ -205,7 +218,8 @@ void test_qos_aad() {
    * implementation makes - must not verify. */
   std::vector<uint8_t> plain(q->mpdu_len, 0);
   check(!devourer::sta::ccmp_decrypt(crypto, q->tk, q->mpdu, q->mpdu_len, 24,
-                                     q->a2, plain.data(), nullptr, nullptr),
+                                     q->a2, plain.data(), plain.size(), nullptr,
+                                     nullptr),
         "a QoS frame read as non-QoS must NOT verify");
 
   /* A different TID in the header must not verify either, or the TID is not
@@ -213,8 +227,8 @@ void test_qos_aad() {
   std::vector<uint8_t> tweak(q->mpdu, q->mpdu + q->mpdu_len);
   tweak[24] = (uint8_t)((tweak[24] & 0xf0) | ((q->hdr[24] + 1) & 0x0f));
   check(!devourer::sta::ccmp_decrypt(crypto, q->tk, tweak.data(), tweak.size(),
-                                     q->hdr_len, q->a2, plain.data(), nullptr,
-                                     nullptr),
+                                     q->hdr_len, q->a2, plain.data(),
+                                     plain.size(), nullptr, nullptr),
         "a altered TID must not verify");
 
   /* And a header too short for what its frame control claims is refused
@@ -578,7 +592,13 @@ void test_kernel_vectors() {
         devourer::test::kKernelCcmpVectors[i];
     /* A 3-address frame's A2 is the transmitter in both directions. */
     const uint8_t* a2 = v.mpdu + 10;
-    uint8_t plain[512], again[640];
+    /* SIZED FROM THE VECTOR, not from a guess. These were `uint8_t
+     * plain[512]` until an adversarial review pointed out that nothing ties
+     * that number to anything: regenerate on a rig whose first frame for some
+     * TID is full-MTU and the decrypt writes a kilobyte past it. */
+    std::vector<uint8_t> plain(
+        devourer::sta::ccmp_decrypted_len(v.mpdu_len, v.hdr_len));
+    std::vector<uint8_t> again(v.mpdu_len);
     size_t plen = 0, n;
     uint64_t pn = 0;
     char what[128];
@@ -587,7 +607,8 @@ void test_kernel_vectors() {
                   v.name);
     if (!checked(devourer::sta::ccmp_decrypt(crypto, devourer::test::kKernelTk,
                                              v.mpdu, v.mpdu_len, v.hdr_len, a2,
-                                             plain, &plen, &pn),
+                                             plain.data(), plain.size(), &plen,
+                                             &pn),
                  what))
       continue;
     tids_seen |= 1u << v.tid;
@@ -606,9 +627,9 @@ void test_kernel_vectors() {
                   v.name);
     n = devourer::sta::ccmp_encrypt(
         crypto, devourer::test::kKernelTk, v.mpdu, v.hdr_len, a2, pn,
-        (uint8_t)((v.mpdu[v.hdr_len + 3] >> 6) & 0x03), plain, plen, again,
-        sizeof again);
-    check(n == v.mpdu_len && std::memcmp(again, v.mpdu, n) == 0, what);
+        (uint8_t)((v.mpdu[v.hdr_len + 3] >> 6) & 0x03), plain.data(), plen,
+        again.data(), again.size());
+    check(n == v.mpdu_len && std::memcmp(again.data(), v.mpdu, n) == 0, what);
   }
 
   /* The coverage assertion is the point of the exercise. TID 0 passes with a
