@@ -52,7 +52,9 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 
+#include "sta/BssTable.h"
 #include "sta/Ccmp.h"
+#include "sta/StationSm.h"
 #include "sta/StationTable.h"
 #include "sta/Dot11.h"
 #include "RxPacket.h"
@@ -64,6 +66,7 @@
 #include "logger.h"
 #include "usb_select.h"
 #include "ccmp_software.h"
+#include "openssl_crypto_ops.h"
 #include "rx_mpdu.h"
 
 static const uint8_t kBssid[6] = {0x02, 0x42, 0x75, 0x05, 0xd6, 0x00};
@@ -423,19 +426,20 @@ static const uint8_t kApIp[4] = {192, 168, 99, 1};
 // src/sta/Ccmp.h takes its cipher as a vtable so libdevourer stays free of
 // OpenSSL. This is the harness's side of that seam, and it routes through
 // profiled_ccmp() so the `bench` cell's per-frame timing is unaffected.
-struct HarnessCrypto : devourer::sta::CryptoOps {
+/* The three non-CCM methods used to be stubs that returned false, on the
+ * reasoning that this harness only ever encrypts. That stopped being true
+ * when `--self-test` started driving devourer::sta::Supplicant against this
+ * AP: a supplicant needs PBKDF2, HMAC-SHA1 and AES key unwrap, and a stub
+ * would have failed the handshake in a way that looked like a protocol bug.
+ * So the complete implementation is inherited, and only aes_ccm is wrapped -
+ * for the `bench` cell's per-frame timing. */
+struct HarnessCrypto : devourer::test::OpenSslCryptoOps {
   bool aes_ccm(bool encrypt, const uint8_t key[16], const uint8_t nonce[13],
                const uint8_t* aad, size_t aad_len, const uint8_t* in,
                size_t in_len, uint8_t* out, uint8_t* tag) override {
     return profiled_ccmp(encrypt, key, nonce, aad, (int)aad_len, in,
                          (int)in_len, out, tag);
   }
-  bool hmac_sha1(const uint8_t*, size_t, const uint8_t*, size_t,
-                 uint8_t[20]) override { return false; }
-  bool pbkdf2_sha1(const char*, const uint8_t*, size_t, unsigned, uint8_t*,
-                   size_t) override { return false; }
-  bool aes_key_unwrap(const uint8_t*, size_t, const uint8_t*, size_t,
-                      uint8_t*) override { return false; }
 };
 static HarnessCrypto g_crypto;
 // The replay window is now a deployed control rather than a tested fixture.

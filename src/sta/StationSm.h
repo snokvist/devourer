@@ -1,0 +1,325 @@
+/* StationSm — the association state machine: scan result in, connected out.
+ *
+ * Authenticate, associate, run the four-way, and notice when any of it stops
+ * working. It owns a Supplicant and drives it; it does not reimplement any of
+ * the key exchange.
+ *
+ * NO CLOCK AND NO RADIO. Time arrives as a `now_ms` argument and frames arrive
+ * through on_rx(); frames to send come out of pop_tx(). That is what makes the
+ * retransmission and timeout behaviour testable at all — the AP harness's
+ * equivalent logic reads a steady_clock, and the result was that its retry
+ * schedule could only ever be observed on a bench.
+ *
+ * WHAT IT IS NOT. Not a scanner: it has no notion of channels or dwell times,
+ * because those need a radio. Feed it beacons through a BssTable and hand it
+ * the entry to join.
+ */
+#ifndef DEVOURER_STA_STATION_SM_H
+#define DEVOURER_STA_STATION_SM_H
+
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <string>
+#include <vector>
+
+#include "sta/BssTable.h"
+#include "sta/CryptoOps.h"
+#include "sta/Dot11.h"
+#include "sta/Eapol.h"
+#include "sta/Supplicant.h"
+
+namespace devourer {
+namespace sta {
+
+class StationSm {
+ public:
+  enum class State : uint8_t {
+    Idle,            /* nothing in progress */
+    Authenticating,  /* auth request sent */
+    Associating,     /* association request sent */
+    FourWay,         /* associated; the key exchange is running */
+    Connected,       /* keyed, and the data plane may run */
+    Failed,          /* gave up, or was thrown off; see fail_reason() */
+  };
+
+  /* Why the machine is in Failed. `status` carries the 802.11 status code of
+   * a refused authentication or association, or the reason code of a deauth,
+   * so "it did not connect" always comes with the number the AP gave. */
+  enum class Failure : uint8_t {
+    None,
+    AuthTimeout,
+    AuthRefused,
+    AssocTimeout,
+    AssocRefused,
+    Deauthenticated,
+    HandshakeTimeout,
+    HandshakeFailed,
+    NoPmk,
+  };
+
+  /* Three transmissions of each management frame, 300 ms apart. An AP that
+   * has not answered three probes in a second is not going to. */
+  static constexpr int kMaxTries = 3;
+  static constexpr uint32_t kMgmtTimeoutMs = 300;
+  /* The authenticator drives the four-way and retransmits it; this side only
+   * answers, so its timeout is a give-up, not a retry schedule. */
+  static constexpr uint32_t kHandshakeTimeoutMs = 3000;
+
+  /* `snonce` is the caller's, for the reason Supplicant::start documents at
+   * length: there is no RNG in this library, and a stub that looked like one
+   * would be worse than an argument somebody has to fill in. */
+  bool configure(CryptoOps& crypto, const std::string& ssid, const char* psk,
+                 const uint8_t own[6], const uint8_t snonce[32]) {
+    crypto_ = &crypto;
+    ssid_ = ssid;
+    std::memcpy(own_, own, 6);
+    std::memcpy(snonce_, snonce, 32);
+    /* PBKDF2 once, here, rather than per association attempt: it is 4096
+     * HMAC-SHA1 iterations and the answer only depends on the passphrase and
+     * the SSID, neither of which changes between retries. */
+    have_pmk_ = pmk_from_psk(crypto, psk, ssid, pmk_);
+    return have_pmk_;
+  }
+
+  /* Begin an association with this BSS. */
+  bool join(const BssEntry& bss, uint32_t now_ms) {
+    if (!crypto_) return false;
+    if (!have_pmk_) { fail(Failure::NoPmk, 0); return false; }
+    /* Refuse a BSS this station cannot finish with, rather than authenticating
+     * and discovering it at the four-way. BssTable::select already filters on
+     * this; join() is also reachable with a hand-picked entry. */
+    if (!bss.info.rsn_ccmp_psk) { fail(Failure::AssocRefused, 0); return false; }
+
+    std::memcpy(bssid_, bss.info.bssid, 6);
+    channel_ = bss.info.channel;
+    aid_ = 0;
+    fail_ = Failure::None;
+    status_ = 0;
+    sup_ = Supplicant{};
+    state_ = State::Authenticating;
+    tries_ = 0;
+    send_auth(now_ms);
+    return true;
+  }
+
+  /* One received frame. `len` is the true MPDU length with no FCS. */
+  void on_rx(const uint8_t* frame, size_t len, uint32_t now_ms) {
+    if (!frame || len < 24) return;
+    if (state_ == State::Idle || state_ == State::Failed) return;
+
+    const uint8_t fc0 = frame[0], fc1 = frame[1];
+    const uint8_t* a1 = frame + 4;
+    const uint8_t* a2 = frame + 10;
+
+    /* EVERYTHING must come from the BSS we are talking to and be addressed to
+     * this station (or broadcast). Without the addr2 check, any frame from any
+     * AP on the channel drives this machine. */
+    if (std::memcmp(a2, bssid_, 6) != 0) return;
+    const bool to_us = std::memcmp(a1, own_, 6) == 0;
+    const bool bcast = (a1[0] & 0x01) != 0;
+    if (!to_us && !bcast) return;
+
+    switch (fc0) {
+      case kFcAuth:
+        if (to_us) on_auth(frame, len, now_ms);
+        return;
+      case kFcAssocResp:
+      case kFcReassocResp:
+        if (to_us) on_assoc_resp(frame, len, now_ms);
+        return;
+      case kFcDeauth:
+      case kFcDisassoc: {
+        uint16_t reason = 0;
+
+        /* ACCEPTED UNAUTHENTICATED, and that is a known cost rather than an
+         * oversight: 802.11w is not implemented here, so there is no way to
+         * tell a real deauthentication from a forged one, and a station that
+         * ignored them would stay associated to an AP that has forgotten it.
+         * Recorded in the scope document as the price of no MFP. */
+        parse_reason(frame, len, &reason);
+        fail(Failure::Deauthenticated, reason);
+        return;
+      }
+      default:
+        break;
+    }
+
+    /* Data frames: the only one this machine cares about is EAPOL. */
+    if (fc0 != kFcData && !is_qos_data(fc0)) return;
+    if (!(fc1 & kFcFromDs) || (fc1 & kFcToDs)) return;
+    if (fc1 & kFcProtected) return;   /* the four-way is never protected */
+    const size_t hlen = data_hdr_len(fc0, fc1);
+    if (len < hlen + kLlcSnapLen) return;
+    const uint8_t* llc = frame + hlen;
+    if (!(llc[0] == 0xaa && llc[1] == 0xaa && llc[2] == 0x03)) return;
+    if (!(llc[6] == 0x88 && llc[7] == 0x8e)) return;   /* ethertype 0x888E */
+    on_eapol(llc + kLlcSnapLen, len - hlen - kLlcSnapLen, now_ms);
+  }
+
+  /* Drive timeouts and retransmissions. Call it as often as convenient; it
+   * does nothing until a deadline has passed. */
+  void tick(uint32_t now_ms) {
+    const uint32_t since = (uint32_t)(now_ms - last_tx_ms_);
+
+    switch (state_) {
+      case State::Authenticating:
+        if (since < kMgmtTimeoutMs) return;
+        if (tries_ >= kMaxTries) { fail(Failure::AuthTimeout, 0); return; }
+        send_auth(now_ms);
+        return;
+      case State::Associating:
+        if (since < kMgmtTimeoutMs) return;
+        if (tries_ >= kMaxTries) { fail(Failure::AssocTimeout, 0); return; }
+        send_assoc(now_ms);
+        return;
+      case State::FourWay:
+        /* No retransmission: the authenticator owns that schedule. This is
+         * only the give-up, and it is measured from the last thing that
+         * actually moved the handshake forward. */
+        if (since >= kHandshakeTimeoutMs) fail(Failure::HandshakeTimeout, 0);
+        return;
+      default:
+        return;
+    }
+  }
+
+  /* Take one frame to transmit, oldest first. Returns false when empty. */
+  bool pop_tx(std::vector<uint8_t>* out) {
+    if (tx_.empty()) return false;
+    if (out) *out = std::move(tx_.front());
+    tx_.erase(tx_.begin());
+    return true;
+  }
+
+  size_t pending_tx() const { return tx_.size(); }
+  State state() const { return state_; }
+  Failure fail_reason() const { return fail_; }
+  uint16_t status() const { return status_; }
+  uint16_t aid() const { return aid_; }
+  uint8_t channel() const { return channel_; }
+  const uint8_t* bssid() const { return bssid_; }
+  const Supplicant& supplicant() const { return sup_; }
+  bool keyed() const { return state_ == State::Connected && sup_.ptk_valid(); }
+
+  uint32_t auth_tx = 0;
+  uint32_t assoc_tx = 0;
+  uint32_t eapol_tx = 0;
+  uint32_t eapol_rx = 0;
+
+ private:
+  void send_auth(uint32_t now_ms) {
+    std::vector<uint8_t> m = build_auth_req(own_, bssid_);
+    assign_seq(m, seq_.next());
+    tx_.push_back(std::move(m));
+    last_tx_ms_ = now_ms;
+    tries_++;
+    auth_tx++;
+  }
+
+  void send_assoc(uint32_t now_ms) {
+    /* The band comes from the BSS's own DS Parameter Set, because the rate
+     * set differs: a 5 GHz association request carrying 802.11b rates is
+     * refused. Channel 0 means the beacon omitted the element, and 2.4 GHz is
+     * the safe default - its rate set is the superset. */
+    std::vector<uint8_t> m =
+        build_assoc_req(own_, bssid_, ssid_, /*rsn=*/true,
+                        /*five_ghz=*/channel_ > 14);
+    /* build_assoc_req returns an empty vector for an SSID it cannot encode.
+     * Sending a truncated association request would be worse than failing. */
+    if (m.empty()) { fail(Failure::AssocRefused, 0); return; }
+    assign_seq(m, seq_.next());
+    tx_.push_back(std::move(m));
+    last_tx_ms_ = now_ms;
+    tries_++;
+    assoc_tx++;
+  }
+
+  void on_auth(const uint8_t* frame, size_t len, uint32_t now_ms) {
+    AuthFields a;
+
+    if (state_ != State::Authenticating) return;
+    if (!parse_auth(frame, len, &a)) return;
+    /* Open System only. A Shared Key response is a four-frame exchange this
+     * does not implement, and treating its sequence 2 as success would send an
+     * association request into a state the AP is not in. */
+    if (a.algorithm != 0) { fail(Failure::AuthRefused, a.status); return; }
+    if (a.seq != 2) return;
+    if (a.status != 0) { fail(Failure::AuthRefused, a.status); return; }
+
+    state_ = State::Associating;
+    tries_ = 0;
+    send_assoc(now_ms);
+  }
+
+  void on_assoc_resp(const uint8_t* frame, size_t len, uint32_t now_ms) {
+    AssocRespFields r;
+
+    if (state_ != State::Associating) return;
+    if (!parse_assoc_resp(frame, len, &r)) return;
+    if (r.status != 0) { fail(Failure::AssocRefused, r.status); return; }
+    /* AID 0 is not a valid association identifier; an AP that answers success
+     * with one has not actually allocated anything. */
+    if (r.aid == 0) { fail(Failure::AssocRefused, r.status); return; }
+
+    aid_ = r.aid;
+    state_ = State::FourWay;
+    last_tx_ms_ = now_ms;
+    sup_.start(*crypto_, pmk_, own_, bssid_, snonce_);
+  }
+
+  void on_eapol(const uint8_t* eapol, size_t len, uint32_t now_ms) {
+    std::vector<uint8_t> reply;
+
+    if (state_ != State::FourWay && state_ != State::Connected) return;
+    eapol_rx++;
+    const Supplicant::Verdict v = sup_.on_eapol(eapol, len, &reply);
+    if (v != Supplicant::Verdict::Reply &&
+        v != Supplicant::Verdict::Retransmit)
+      return;
+    if (reply.empty()) return;
+
+    std::vector<uint8_t> m = data_hdr_to_ds(bssid_, own_, bssid_,
+                                            /*protect=*/false, seq_.next());
+    append_llc_snap(m, 0x888e);
+    m.insert(m.end(), reply.begin(), reply.end());
+    tx_.push_back(std::move(m));
+    eapol_tx++;
+
+    /* The deadline moves only when the handshake moved. A retransmission we
+     * answered again is not progress, and letting it push the give-up out
+     * would let a stuck authenticator hold this state open forever. */
+    if (v == Supplicant::Verdict::Reply) last_tx_ms_ = now_ms;
+    if (sup_.state() == Supplicant::State::Done && sup_.ptk_valid())
+      state_ = State::Connected;
+  }
+
+  void fail(Failure why, uint16_t status) {
+    state_ = State::Failed;
+    fail_ = why;
+    status_ = status;
+  }
+
+  CryptoOps* crypto_ = nullptr;
+  State state_ = State::Idle;
+  Failure fail_ = Failure::None;
+  std::string ssid_;
+  uint8_t own_[6] = {0};
+  uint8_t bssid_[6] = {0};
+  uint8_t snonce_[32] = {0};
+  uint8_t pmk_[32] = {0};
+  bool have_pmk_ = false;
+  uint8_t channel_ = 0;
+  uint16_t aid_ = 0;
+  uint16_t status_ = 0;
+  int tries_ = 0;
+  uint32_t last_tx_ms_ = 0;
+  SeqCounter seq_;
+  Supplicant sup_;
+  std::vector<std::vector<uint8_t>> tx_;
+};
+
+}  // namespace sta
+}  // namespace devourer
+
+#endif /* DEVOURER_STA_STATION_SM_H */

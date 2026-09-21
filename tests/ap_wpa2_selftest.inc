@@ -799,6 +799,107 @@ static void test_tap(Supplicant& a, Supplicant& b) {
   ::close(fds[1]);
 }
 
+
+/* THE PHASE 3 STATION, ASSOCIATING WITH THE PHASE 2b AP.
+ *
+ * Everything else in this file plays the supplicant by hand. This cell runs
+ * the real one — devourer::sta::StationSm driving devourer::sta::Supplicant —
+ * against the authenticator in this file, entirely in memory.
+ *
+ * WHY IT IS WORTH ITS OWN CELL. The two implementations share no code and
+ * were written months apart from the same clause of the same standard. The
+ * authenticator here hand-rolls every EAPOL offset inline; src/sta/Eapol.h
+ * names them as constants and parses with bounds checks. Each one's unit test
+ * uses a fixture built by its own author, so neither can catch a shared
+ * misreading — this is the only place where two independent readings have to
+ * agree on the wire, and a disagreement shows up as a handshake that does not
+ * complete rather than as a subtle difference nobody looks at.
+ *
+ * It is also the only cell that exercises the station's ASSOCIATION path:
+ * authentication, association, the AID, and the four-way in sequence.
+ */
+static void test_library_station_associates() {
+  using devourer::sta::StationSm;
+  static const uint8_t kStaS[6] = {0x02, 0x11, 0x22, 0x33, 0x44, 0x05};
+  devourer::sta::BssTable bss;
+  StationSm sm;
+  uint8_t snonce[32];
+  std::vector<uint8_t> f;
+
+  /* The station finds the BSS the way a real one does: out of a beacon. The
+   * beacon is the one this AP actually airs, element for element. */
+  std::vector<uint8_t> b = {0,0,0x0a,0,0,0x80,0,0,0x08,0,
+      0x80,0,0,0, 0xff,0xff,0xff,0xff,0xff,0xff,
+      kBssid[0],kBssid[1],kBssid[2],kBssid[3],kBssid[4],kBssid[5],
+      kBssid[0],kBssid[1],kBssid[2],kBssid[3],kBssid[4],kBssid[5],
+      0,0, 0,0,0,0,0,0,0,0, 100,0, 0x11,0x00};
+  append_ies(b, true, /*beacon=*/true);
+  /* THE FIRST TEN BYTES ARE NOT 802.11. What main() hands StartBeacon is a
+   * MediaTek beacon-offload header followed by the MPDU, and the 802.11 frame
+   * control is at offset 10 - which is why the literal above starts 0x00 0x00
+   * 0x0a and the beacon subtype 0x80 appears twice. A parser fed the buffer
+   * from byte 0 reads that header as a frame control and refuses it, which is
+   * exactly what happened the first time this cell ran. */
+  const size_t kBcnHdr = 10;
+  const devourer::sta::BssEntry* e =
+      bss.observe(b.data() + kBcnHdr, b.size() - kBcnHdr, -40, 0);
+  check(e != nullptr, "library station: the AP's own beacon parses");
+  if (!e) return;
+  check(e->info.ssid == kSsid, "library station: the SSID matches");
+  check(e->info.rsn_ccmp_psk,
+        "library station: the AP's RSN element reads as WPA2-PSK/CCMP");
+  check(bss.select(kSsid) == e, "library station: it is the selected BSS");
+
+  /* A fixed SNonce: this is a test, and Supplicant::start says in as many
+   * words that a real one must be unpredictable. */
+  for (int i = 0; i < 32; i++) snonce[i] = (uint8_t)(0xc0 + i);
+  check(sm.configure(g_crypto, kSsid, g_psk, kStaS, snonce),
+        "library station: configure derives the PMK from the AP's own PSK");
+  check(sm.join(*e, 0), "library station: join starts");
+
+  /* Pump both queues until neither moves. No clock advances, so nothing here
+   * can pass because of a timeout. */
+  for (int round = 0; round < 12; round++) {
+    bool moved = false;
+
+    while (sm.pop_tx(&f)) {
+      moved = true;
+      feed(f);
+    }
+    std::vector<std::vector<uint8_t>> q = drain();
+    for (std::vector<uint8_t>& m : q) {
+      moved = true;
+      sm.on_rx(m.data(), m.size(), 0);
+    }
+    if (!moved) break;
+  }
+
+  check(sm.state() == StationSm::State::Connected,
+        "THE LIBRARY STATION ASSOCIATES WITH THIS AP");
+  check(sm.aid() != 0, "library station: it was given an AID");
+  check(sm.keyed(), "library station: it is keyed");
+
+  /* The two sides must hold the same key material. A handshake that completes
+   * on two different PTKs is the failure this cell exists to catch, and
+   * "Connected" alone would not see it. */
+  std::lock_guard<std::mutex> l(g_hs_mu);
+  devourer::sta::Station* st = g_stas.find(kStaS);
+  check(st != nullptr, "library station: the AP has a record for it");
+  if (!st) return;
+  check(st->state == devourer::sta::HsState::Done,
+        "library station: the AP considers the four-way complete");
+  check(std::memcmp(st->ptk, sm.supplicant().ptk(), 48) == 0,
+        "library station: BOTH SIDES DERIVED THE SAME PTK");
+  check(sm.supplicant().gtk_valid() &&
+            std::memcmp(sm.supplicant().gtk(), g_gtk, 16) == 0,
+        "library station: it unwrapped this BSS's GTK from message 3");
+  check(sm.supplicant().gtk_key_id() == 1,
+        "library station: at key id 1, which is what this AP transmits on");
+  check(st->aid == sm.aid(),
+        "library station: the AID it recorded is the one the AP allocated");
+  g_stas.remove(const_cast<uint8_t*>(kStaS));
+}
+
 }  // namespace selftest
 
 /* Headless. Returns before libusb, the radio or the beacon are touched. */
@@ -825,6 +926,7 @@ static int self_test() {
   test_refusals(a, b);
   test_local_arp(a);
   test_tap(a, b);
+  test_library_station_associates();
 
   if (g_fail) {
     std::fprintf(stdout, "ap_wpa2 --self-test: %d failure(s)\n", g_fail);

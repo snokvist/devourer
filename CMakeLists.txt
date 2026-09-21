@@ -980,6 +980,34 @@ if(OpenSSL_FOUND)
     # Also pins the AAD masking rules, the 48-bit PN packing, and the replay
     # gate's `<=`, which PR #335 shipped as `<` - a KRACK-class defect its
     # review caught. Header-only; no libusb, no device.
+    # src/sta/Eapol.h and src/sta/Supplicant.h - the station half of the
+    # WPA2-PSK key exchange (Phase 3). OpenSSL because the cells need a
+    # CryptoOps and tests/openssl_crypto_ops.h is the one complete
+    # implementation in the tree; the modules themselves link nothing.
+    #
+    # THIS TARGET IS THE PHASE'S ACCEPTANCE. Two of its cells are named after
+    # defects that shipped in a reviewed PR (#335): a forged EAPOL-Key MIC
+    # must be rejected, and an equal-counter replayed group rekey must be
+    # rejected. It also carries the IEEE 802.11i Annex H.4 passphrase-to-PSK
+    # known answers, which is the class of test that PR had none of.
+    add_executable(SupplicantSelftest tests/supplicant_selftest.cpp)
+    target_include_directories(SupplicantSelftest PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(SupplicantSelftest PRIVATE OpenSSL::Crypto)
+    add_test(NAME supplicant COMMAND SupplicantSelftest)
+
+    # src/sta/StationSm.h - the association state machine (Phase 3). Its
+    # timeouts are assertable at all only because the clock is an argument:
+    # the AP harness reads a steady_clock for the same job, which is why its
+    # retry schedule could only ever be watched on a bench.
+    add_executable(StationSmSelftest tests/station_sm_selftest.cpp)
+    target_include_directories(StationSmSelftest PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(StationSmSelftest PRIVATE OpenSSL::Crypto)
+    add_test(NAME station_sm COMMAND StationSmSelftest)
+
     add_executable(CcmpSelftest tests/ccmp_selftest.cpp)
     target_include_directories(CcmpSelftest PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/tests
@@ -1044,6 +1072,19 @@ add_test(NAME dot11_frames COMMAND Dot11Selftest)
 # The load-bearing cell is test_two_stations_are_independent(), which is the
 # phase gate - two stations with their own PTKs, TX PN spaces and CCMP receive
 # windows, none of which a file-scope `g_sta`/`g_ptk`/`g_txpn` shape can hold.
+# src/sta/BssTable.h - the scan result, and which BSS is worth joining
+# (Phase 3). Pure and header-only, so no OpenSSL and no libusb. The two cells
+# that matter are select(), which must not offer a BSS this station cannot
+# finish a handshake with, and observe(), which must not invent a BSS out of a
+# frame that is not a beacon - every management frame shares the same 24-byte
+# header, so a deauth handed to parse_beacon reads its reason code as part of
+# a timestamp.
+add_executable(BssTableSelftest tests/bss_table_selftest.cpp)
+target_include_directories(BssTableSelftest PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+add_test(NAME bss_table COMMAND BssTableSelftest)
+
 add_executable(StationTableSelftest tests/station_table_selftest.cpp)
 target_include_directories(StationTableSelftest PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
