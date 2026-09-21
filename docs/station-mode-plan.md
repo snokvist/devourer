@@ -107,6 +107,9 @@ favourable measurement without its adversarial counterpart in the same breath.
 | Phase 3 | `264a6f7` | Flash (protocol + memory safety) | **state-machine defect** | 5 | yes — `03d2478` |
 | Phase 3 | `264a6f7` | Opus subagent (continuity) | **rule 4 violated again** | 12 (F1–F12) | yes — `03d2478`, `86d5ad5`, this commit |
 | Phase 3 | `264a6f7` | Opus subagent (architecture) | **replay counter poisonable** | 11 | yes — `03d2478` |
+| Phase 3 | `0dc7d70` | Flash (hostile input to every parser) | **AAD defect** | 3 | yes — `2fef219` |
+| Phase 3 | `0dc7d70` | Flash (can any assertion fail?) | **6 unfalsifiable cells** | 7 | yes — `2fef219` |
+| Phase 3 | `0dc7d70` | Flash (branch-wide integration) | changes required | 11 | yes — `2fef219` |
 
 ### Round 5 — the Phase 1 gate, 2026-09-20
 
@@ -984,6 +987,23 @@ authenticator — which hand-rolls every EAPOL offset inline, was written months
 earlier, and shares no code with `src/sta/Eapol.h`. The station finds the AP's
 own beacon in a `BssTable`, authenticates, associates, completes the four-way,
 and both sides must hold the same PTK and GTK at the same key id.
+
+**A third review batch, on `0dc7d70`, found one more real defect and six
+assertions that could not fail.** `ccmp_aad` never masked the Order bit
+(+HTC) on a QoS data frame, which 802.11-2016 12.5.3.3.3 requires and Linux
+does — so every +HTC frame failed its MIC against a conforming peer, while
+`data_hdr_len()` had always accounted for the HT Control field that bit
+announces. The vector generator carried the same omission twice, which is why
+no vector in it ever set the bit. The six unfalsifiable assertions are listed
+in `2fef219`; the pattern worth carrying is that four of them passed because a
+DIFFERENT rule produced the same outcome, so the rule under test could be
+deleted with no test failing.
+
+And running the selftests under `-DDEVOURER_SANITIZE=address+undefined` for
+the first time — which happened only because one of the new arms depends on
+that job — found a years-old overread in `test_aad_masking` itself: a 24-byte
+array passed as a 26-byte QoS header. The suite is now green under the
+sanitizer build too, 76/76.
 
 **Mutations.** 28 on the first draft (27 caught; the survivor is recorded in
 the code — deleting the "message 3's key data must be encrypted" check changes
