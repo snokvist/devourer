@@ -11,12 +11,21 @@
  * That was false, and the CCM nonce proved it. tests/ccmp_gen_vectors.py
  * built the same wrong Flags octet as src/sta/Ccmp.h, because the same author
  * read the clause once and wrote it twice. Independence of IMPLEMENTATION is
- * not independence of INTERPRETATION. The framing rules are pinned only by
- * the direct assertion cells below - test_nonce_flags, test_qos_aad,
- * test_aad_masking - and by nothing else.
+ * not independence of INTERPRETATION. The framing rules are pinned by the
+ * direct assertion cells below - test_nonce_flags, test_qos_aad,
+ * test_aad_masking - and, since 2026-09-21, by test_kernel_vectors().
  *
- * WHAT IT IS NOT. Not the official IEEE Annex J vector — that would be
- * strictly better and is a drop-in replacement when someone has it to hand.
+ * test_kernel_vectors() is the one cell here whose expected values were not
+ * written by anyone reading the standard. They are frames the LINUX KERNEL
+ * encrypted, captured off a mac80211_hwsim rig running hostapd with WMM on,
+ * so all eight TIDs appear — the case the devourer AP cannot produce on the
+ * bench, because it advertises neither WMM nor HT. See ccmp_kernel_vectors.h.
+ *
+ * WHAT IT IS NOT. Still not the official IEEE Annex J vector; mac80211 is an
+ * interop reference, not the specification, and if the kernel and this header
+ * misread the same clause in the same way, no cell in this file would notice.
+ * That is a smaller risk than it sounds — mac80211 interoperates with every
+ * commercial AP — but it is not zero, and Annex J remains a drop-in upgrade.
  * And it is not a round-trip: the whole reason it exists is that PR #335
  * shipped hand-rolled crypto with zero known-answer tests, and its review
  * named that the single highest-leverage gap in the PR. A round-trip would
@@ -31,6 +40,7 @@
 #include <cstring>
 #include <vector>
 
+#include "ccmp_kernel_vectors.h"
 #include "ccmp_software.h"
 #include "ccmp_vectors.h"
 #include "sta/Ccmp.h"
@@ -44,6 +54,13 @@ void check(bool ok, const char* what) {
     std::printf("FAIL: %s\n", what);
     g_fail++;
   }
+}
+
+/* check(), but it says whether it passed, so a cell can stop working on a
+ * vector whose decrypt already failed instead of asserting on garbage. */
+bool checked(bool ok, const char* what) {
+  check(ok, what);
+  return ok;
 }
 
 /* The OpenSSL CryptoOps the harnesses will supply. Only aes_ccm is exercised
@@ -204,6 +221,44 @@ void test_qos_aad() {
    * rather than read past. */
   check(devourer::sta::ccmp_aad(q->hdr, 24, aad) == 0,
         "a QoS header declared as 24 bytes is refused");
+
+  /* THE SUBFIELDS ABOVE THE TID, which no vector in this repository can see.
+   *
+   * 802.11-2016 12.5.3.3.3 keeps only the TID out of the QoS Control field:
+   * EOSP, the ack policy and A-MSDU-present are masked, and the second octet
+   * is replaced by zero. Every real frame available here - the generated
+   * vectors AND the kernel-captured ones - carries a plain TID with a zero
+   * upper nibble and a zero second octet, so `hdr[qoff] & 0x0f` and
+   * `hdr[qoff]` are the same byte and the mask is invisible to all of them.
+   *
+   * Deleting that mask was tried on 2026-09-21 and SURVIVED the entire file,
+   * kernel frames included. This cell is the only thing that distinguishes
+   * it, and it has to build its own header to do so, because the mask only
+   * matters for a frame nobody in this rig transmits: a block-acked or
+   * A-MSDU frame, which is what a real WMM/HT station sends constantly.
+   *
+   * The nonce half of the same rule was already covered - test_nonce_flags
+   * feeds it a 0xf5 QoS octet. Only the AAD half was missing. */
+  {
+    uint8_t loud[26], plainq[26];
+    uint8_t a_loud[devourer::sta::kCcmpAadMax];
+    uint8_t a_plain[devourer::sta::kCcmpAadMax];
+
+    std::memcpy(loud, q->hdr, 26);
+    loud[24] = 0x05 | 0x10 | 0x60 | 0x80; /* TID 5, EOSP, ack policy 3, A-MSDU */
+    loud[25] = 0xff;                      /* TXOP limit / queue size */
+    std::memcpy(plainq, loud, 26);
+    plainq[24] = 0x05;                    /* the same TID, nothing else */
+    plainq[25] = 0x00;
+
+    check(devourer::sta::ccmp_aad(loud, 26, a_loud) == 24 &&
+              devourer::sta::ccmp_aad(plainq, 26, a_plain) == 24,
+          "both QoS AADs are 24 bytes");
+    check(a_loud[22] == 0x05 && a_loud[23] == 0x00,
+          "the QoS AAD masks EOSP, ack policy and A-MSDU-present");
+    check(std::memcmp(a_loud, a_plain, 24) == 0,
+          "only the TID of the QoS control field reaches the AAD");
+  }
 }
 
 /* The nonce's Flags octet, asserted DIRECTLY rather than through a vector.
@@ -218,9 +273,14 @@ void test_qos_aad() {
  * 802.11-2016 12.5.3.3.4: Flags = Priority (b0..b3) | Management (b4).
  * Priority is the QoS TID for a QoS data frame, 0 otherwise. Linux builds the
  * identical byte as `qos_tid | (ieee80211_is_mgmt(fc) << 4)`
- * (net/mac80211/wpa.c) - that is the independent reading this pins against,
- * and the real interop proof is an on-air cell with a station sending TID
- * 1..7, because a round trip against ourselves cannot see this at all. */
+ * (net/mac80211/wpa.c) - that is the independent reading this pins against.
+ *
+ * A round trip against ourselves cannot see this at all, so the interop proof
+ * is test_kernel_vectors(): frames mac80211 actually encrypted at every TID,
+ * whose MIC fails the moment this octet is wrong. Zeroing the Flags octet
+ * again - the original defect - breaks 14 of those 16 vectors and leaves the
+ * two TID-0 ones green, which is exactly the shape of its two-month
+ * survival. */
 void test_nonce_flags() {
   const uint8_t a2[6] = {0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0x01};
   uint8_t nonce[devourer::sta::kCcmpNonceLen];
@@ -488,6 +548,77 @@ void test_replay() {
   check(t.accept(1, 0) && t.accept(1, 6), "reset clears every TID window");
 }
 
+
+/* The Linux kernel's own CCMP output, decrypted and then reproduced.
+ *
+ * Every other vector in this file was produced by software that shares this
+ * repository's reading of 802.11-2016 12.5.3.3 — which is how a nonce with a
+ * zero Flags octet passed the whole suite while being wrong for TID 1..7.
+ * These frames were produced by mac80211 and captured off the air of a
+ * two-radio mac80211_hwsim rig; nothing in this repository chose their bytes.
+ *
+ * Two directions of proof per vector:
+ *
+ *   DECRYPT. The MIC is the oracle. CCM authenticates the AAD and the nonce,
+ *   so a single wrong bit in either — a masked frame-control bit, the kept
+ *   fragment number, the TID in the Flags octet, the big-endian PN — makes the
+ *   tag fail. There is no way to pass this by accident.
+ *
+ *   ENCRYPT. Re-protecting the recovered plaintext under the same TK and PN
+ *   must reproduce the captured MPDU byte for byte, which additionally pins
+ *   the CCMP header layout (the reserved byte, the Ext IV bit, the split
+ *   little-endian PN) that a decrypt-only test would let drift.
+ */
+void test_kernel_vectors() {
+  OpenSslCcm crypto;
+  unsigned tids_seen = 0;
+
+  for (size_t i = 0; i < devourer::test::kKernelCcmpVectorCount; i++) {
+    const devourer::test::KernelCcmpVector& v =
+        devourer::test::kKernelCcmpVectors[i];
+    /* A 3-address frame's A2 is the transmitter in both directions. */
+    const uint8_t* a2 = v.mpdu + 10;
+    uint8_t plain[512], again[640];
+    size_t plen = 0, n;
+    uint64_t pn = 0;
+    char what[128];
+
+    std::snprintf(what, sizeof what, "kernel %s: the kernel's MIC verifies",
+                  v.name);
+    if (!checked(devourer::sta::ccmp_decrypt(crypto, devourer::test::kKernelTk,
+                                             v.mpdu, v.mpdu_len, v.hdr_len, a2,
+                                             plain, &plen, &pn),
+                 what))
+      continue;
+    tids_seen |= 1u << v.tid;
+
+    /* The recovered plaintext is an 802.11 MSDU, so it opens with LLC/SNAP.
+     * Redundant given the tag verified, but it turns a corrupted vector file
+     * into a legible failure instead of a crypto mystery. */
+    std::snprintf(what, sizeof what, "kernel %s: plaintext is LLC/SNAP",
+                  v.name);
+    check(plen > 8 && plain[0] == 0xaa && plain[1] == 0xaa && plain[2] == 0x03,
+          what);
+
+    /* The PN the kernel wrote into the header is the PN we must encrypt
+     * under, and the key id comes out of the same octet. */
+    std::snprintf(what, sizeof what, "kernel %s: re-encrypts to the same bytes",
+                  v.name);
+    n = devourer::sta::ccmp_encrypt(
+        crypto, devourer::test::kKernelTk, v.mpdu, v.hdr_len, a2, pn,
+        (uint8_t)((v.mpdu[v.hdr_len + 3] >> 6) & 0x03), plain, plen, again,
+        sizeof again);
+    check(n == v.mpdu_len && std::memcmp(again, v.mpdu, n) == 0, what);
+  }
+
+  /* The coverage assertion is the point of the exercise. TID 0 passes with a
+   * zero Flags octet too — that is why the defect survived — so a run that
+   * silently lost the QoS vectors would still be green without this. */
+  check(tids_seen == 0xffu, "kernel vectors cover all eight TIDs");
+  check(devourer::test::kKernelCcmpVectorCount == 16,
+        "kernel vectors: eight TIDs in each direction");
+}
+
 }  // namespace
 
 int main() {
@@ -496,6 +627,7 @@ int main() {
   test_mic_rejected();
   test_qos_aad();
   test_nonce_flags();
+  test_kernel_vectors();
   test_four_address_aad();
   test_aad_masking();
   test_header_pn();
@@ -505,6 +637,7 @@ int main() {
     std::printf("ccmp_selftest: %d failure(s)\n", g_fail);
     return 1;
   }
-  std::printf("ccmp_selftest: OK (%zu vectors)\n", kCcmpVectorCount);
+  std::printf("ccmp_selftest: OK (%zu vectors, %zu kernel frames)\n",
+              kCcmpVectorCount, devourer::test::kKernelCcmpVectorCount);
   return 0;
 }

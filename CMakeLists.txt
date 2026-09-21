@@ -973,6 +973,10 @@ if(OpenSSL_FOUND)
     # implementation; they do NOT independently pin the framing, because
     # generator and header share one author's reading - which is how a wrong
     # CCM nonce stayed green. See the note atop tests/ccmp_selftest.cpp.
+    # tests/ccmp_kernel_vectors.h closes that gap from the other side: frames
+    # the LINUX KERNEL encrypted, at all eight TIDs, captured off a virtual
+    # two-radio rig by tests/ccmp_capture_vectors.sh. Checked in, so this
+    # target stays hardware-free and needs neither hwsim nor root.
     # Also pins the AAD masking rules, the 48-bit PN packing, and the replay
     # gate's `<=`, which PR #335 shipped as `<` - a KRACK-class defect its
     # review caught. Header-only; no libusb, no device.
