@@ -506,6 +506,67 @@ void test_protected_data_is_counted_apart() {
   check(sm.rx_ignored == ignored, "...and NOT as ignored");
 }
 
+/* A FRAGMENT AND AN A-MSDU ARE NOT MSDUs, and this machine reassembles
+ * neither. The bytes at the LLC offset are a piece of a frame, or a subframe
+ * header - so feeding them to the EAPOL parser asks it to read the wrong
+ * bytes. The caller's data plane refuses both; the two receive layers
+ * disagreeing about it is how a later reader closes the gap in one place. */
+void test_fragmented_and_amsdu_eapol_are_refused() {
+  OpenSslCryptoOps crypto;
+  BssTable table;
+  StationSm sm;
+  FixtureAp ap;
+  uint8_t snonce[32];
+
+  std::memset(snonce, 0x7a, 32);
+  sm.configure(crypto, kSsid, kPsk, kOwn);
+  discovered(table);
+  const BssEntry* bss = table.select(kSsid);
+  if (!bss) { check(false, "BSS discovered"); return; }
+  sm.join(*bss, snonce, 0);
+  pump(sm, ap, 0);
+  check(sm.state() == StationSm::State::Connected, "connected");
+
+  /* A well-formed EAPOL frame is the control: the arms below must differ
+   * from it by exactly the bit under test. */
+  const uint32_t rx_before = sm.eapol_rx;
+  std::vector<uint8_t> good = ap.eapol_frame(ap.msg1());
+  sm.on_rx(good.data(), good.size(), 0);
+  check(sm.eapol_rx == rx_before + 1, "a whole EAPOL frame reaches the supplicant");
+
+  uint32_t bad_before = sm.rx_malformed;
+  std::vector<uint8_t> frag = ap.eapol_frame(ap.msg1());
+  frag[1] |= devourer::sta::kFcMoreFrag;
+  sm.on_rx(frag.data(), frag.size(), 0);
+  check(sm.rx_malformed == bad_before + 1, "a More Fragments EAPOL is refused");
+  check(sm.eapol_rx == rx_before + 1, "...and never reaches the supplicant");
+
+  /* THE LAST FRAGMENT HAS MoreFrag CLEAR. */
+  bad_before = sm.rx_malformed;
+  std::vector<uint8_t> last = ap.eapol_frame(ap.msg1());
+  last[22] = 0x02;                        /* fragment number 2 */
+  sm.on_rx(last.data(), last.size(), 0);
+  check(sm.rx_malformed == bad_before + 1, "...and so is a LAST fragment");
+
+  /* An A-MSDU. The bit lives in the QoS Control field, so the frame has to
+   * be a QoS one - which is why no non-QoS arm can reach this branch. */
+  bad_before = sm.rx_malformed;
+  std::vector<uint8_t> amsdu = ap.eapol_frame(ap.msg1());
+  amsdu[0] = 0x88;                        /* QoS Data */
+  amsdu.insert(amsdu.begin() + 24, {0x80, 0x00});   /* QoS Control: A-MSDU */
+  sm.on_rx(amsdu.data(), amsdu.size(), 0);
+  check(sm.rx_malformed == bad_before + 1, "an A-MSDU is refused");
+  check(sm.eapol_rx == rx_before + 1, "...and never reaches the supplicant");
+
+  /* The control for THAT: the same QoS frame without the bit does get
+   * through, so the arm is about the A-MSDU bit and not about QoS. */
+  std::vector<uint8_t> qos = ap.eapol_frame(ap.msg1());
+  qos[0] = 0x88;
+  qos.insert(qos.begin() + 24, {0x00, 0x00});
+  sm.on_rx(qos.data(), qos.size(), 0);
+  check(sm.eapol_rx == rx_before + 2, "...while a plain QoS EAPOL does");
+}
+
 void test_protected_eapol_ignored() {
   OpenSslCryptoOps crypto;
   BssTable table;
@@ -990,6 +1051,7 @@ int main() {
   test_frames_from_elsewhere_are_ignored();
   test_protected_eapol_ignored();
   test_protected_data_is_counted_apart();
+  test_fragmented_and_amsdu_eapol_are_refused();
   test_handshake_timeout();
   test_retransmission_does_not_extend_the_deadline();
   test_join_clears_the_transmit_queue();

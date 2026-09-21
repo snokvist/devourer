@@ -1074,8 +1074,8 @@ where wpa_supplicant ships 1.
 **Phase 4 — the harness. DONE 2026-09-21.**
 `tests/sta_client.cpp` plus `tests/mt7612u_sta_onair.sh`, graded pass/fail per
 cell in the style of `mt7612u_ap_onair.sh`: `open`, `wpa2`, `reconnect`,
-`bench`. **15/15 on ch6** against hostapd on an RTL8812AU, plus a headless
-ctest target (`sta_client_headless`, 17 cells) that drives the same receive
+`bench`. **16/16 on ch6** against hostapd on an RTL8812AU, plus a headless
+ctest target (`sta_client_headless`, 22 cells) that drives the same receive
 path with no radio.
 
 **Two things this section did not anticipate, recorded rather than quietly
@@ -1085,8 +1085,9 @@ amended** (the full account is in `docs/station-mode-plan.md`):
   `configure()` derived a PMK unconditionally, `join()` refused any BSS
   without `rsn_ccmp_psk`, and every association request carried an RSN
   element. `StationSm::configure_open` and `BssTable::select_open` close it —
-  the latter being exactly the "second function" the comment above `select()`
-  said would be written when something needed one.
+  the latter being exactly the "second function" that comment said would be
+  written when something needed one. (The paragraph moved with the decision;
+  it is above `select_open()` now, not above `select()`.)
 - **The group key handshake is PROTECTED, and `StationSm` refused every
   protected data frame.** hostapd's four message 1s were all counted as
   `rx_ignored`, the AP gave up and deauthenticated us, and every crypto

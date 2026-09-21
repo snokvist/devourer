@@ -203,6 +203,24 @@ class Supplicant {
   /* The last counter this station AUTHENTICATED, not the last it saw. */
   uint64_t replay_counter() const { return rx_replay_; }
 
+  /* HOW MANY TIMES EACH KEY HAS BEEN INSTALLED, monotonic for the life of
+   * this object and NOT reset by forget().
+   *
+   * A caller with a cipher has per-key state - packet numbers, replay
+   * windows - that must restart when the key does, and "are we connected
+   * now" is not the event: a PTK or GTK rekey happens with the association
+   * already up and the state machine already Connected. Without this the
+   * caller either misses the rekey or keeps a copy of the key to diff
+   * against, and a harness holding its own copy of the pairwise key is worse
+   * than a counter.
+   *
+   * tests/sta_client.cpp reads both. Getting this wrong is not subtle on
+   * air: the AP's new key starts at PN 1, so a stale window rejects every
+   * frame until the PN climbs back within 64 of the old head - a link that
+   * reports itself keyed and carries nothing. */
+  uint32_t ptk_generation() const { return ptk_gen_; }
+  uint32_t gtk_generation() const { return gtk_gen_; }
+
   uint32_t mic_failures = 0;
   uint32_t replays = 0;
   uint32_t retransmits = 0;
@@ -355,6 +373,7 @@ class Supplicant {
     /* INSTALL LAST. Up to here a failure has cost nothing. */
     std::memcpy(ptk_, cand_ptk_, 48);
     ptk_valid_ = true;
+    ptk_gen_++;
     install_gtk(g);
     authenticated(k.replay);
     answer(Kind::Msg3, k.replay, e);
@@ -405,6 +424,7 @@ class Supplicant {
     gtk_len_ = g.gtk_len;
     gtk_key_id_ = g.key_id;
     gtk_valid_ = true;
+    gtk_gen_++;
   }
 
   /* THE ONLY PLACE rx_replay_ MOVES, and both call sites have verified a MIC
@@ -435,6 +455,8 @@ class Supplicant {
   uint8_t gtk_[32] = {0};
   size_t gtk_len_ = 0;
   uint8_t gtk_key_id_ = 0;
+  uint32_t ptk_gen_ = 0;
+  uint32_t gtk_gen_ = 0;
   bool ptk_valid_ = false;
   bool cand_valid_ = false;
   bool gtk_valid_ = false;

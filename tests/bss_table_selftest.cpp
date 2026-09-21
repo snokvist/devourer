@@ -358,6 +358,40 @@ void test_select_open() {
   check(t.select("wepnet") == nullptr, "...and select refuses it too");
 }
 
+/* SIXTEEN BEACONS FOR THE WANTED SSID, FROM SIXTEEN BSSIDs.
+ *
+ * The rule that makes an entry with the wanted SSID unevictable exists to
+ * stop a flood of OTHER SSIDs pushing the target out. Applied without a
+ * fallback it becomes the attack it was written against: fill every slot
+ * with fabricated BSSes all claiming the wanted name, and the GENUINE AP can
+ * never be inserted at all - select() then returns only the attacker's, for
+ * as long as they keep beaconing.
+ */
+void test_a_flood_of_the_wanted_ssid_cannot_lock_the_table() {
+  BssTable t;
+  const uint8_t real_ap[6] = {0x02, 0xff, 0, 0, 0, 0x01};
+
+  t.set_wanted("target");
+  for (int i = 0; i < BssTable::kMaxBss; i++) {
+    const uint8_t bssid[6] = {0x02, 0, 0, 0, 0, (uint8_t)(0x40 + i)};
+    std::vector<uint8_t> f = beacon(bssid, "target", 6, true);
+    /* All at the same instant, and all refreshed constantly - which is what
+     * an attacker with a radio does. */
+    t.observe(f.data(), f.size(), -30, 1000);
+  }
+  check(t.count() == BssTable::kMaxBss, "the table is full of the wanted SSID");
+
+  std::vector<uint8_t> real = beacon(real_ap, "target", 6, true);
+  const BssEntry* e = t.observe(real.data(), real.size(), -20, 2000);
+  check(e != nullptr, "the genuine AP is still admitted");
+  check(t.find(real_ap) != nullptr, "...and is in the table");
+  const BssEntry* sel = t.select("target");
+  check(sel != nullptr, "...and something is selectable");
+  if (sel)
+    check(std::memcmp(sel->info.bssid, real_ap, 6) == 0,
+          "...and it is the genuine AP, which has the strongest signal");
+}
+
 }  // namespace
 
 int main() {
@@ -369,6 +403,7 @@ int main() {
   test_mfp_required_is_skipped();
   test_eviction_when_full();
   test_wanted_ssid_survives_a_flood();
+  test_a_flood_of_the_wanted_ssid_cannot_lock_the_table();
 
   if (g_fail) {
     std::printf("bss_table_selftest: %d failure(s)\n", g_fail);

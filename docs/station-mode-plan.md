@@ -110,6 +110,9 @@ favourable measurement without its adversarial counterpart in the same breath.
 | Phase 3 | `0dc7d70` | Flash (hostile input to every parser) | **AAD defect** | 3 | yes — `2fef219` |
 | Phase 3 | `0dc7d70` | Flash (can any assertion fail?) | **6 unfalsifiable cells** | 7 | yes — `2fef219` |
 | Phase 3 | `0dc7d70` | Flash (branch-wide integration) | changes required | 11 | yes — `2fef219` |
+| Phase 4 | `02a0f62` | Flash (hostile input + protocol) | **reachable OOB read** | 9 | yes — this commit |
+| Phase 4 | `02a0f62` | Flash (can any assertion fail?) | **a third shadowed cell** | 5 | yes — this commit |
+| Phase 4 | `02a0f62` | Flash (continuity + integration) | **a false doc claim, and a replay bypass** | 7 | yes — this commit |
 
 ### Round 5 — the Phase 1 gate, 2026-09-20
 
@@ -1044,9 +1047,9 @@ above; this is the structural test, and it is checkable by reading.
 ### Phase 4 — COMPLETE 2026-09-21
 
 **Status: DONE.** `tests/sta_client.cpp` + `tests/sta_client_selftest.inc`
-(ctest `sta_client_headless`, 17 cells) and `tests/mt7612u_sta_onair.sh`.
-**15/15 on ch6** against hostapd on an RTL8812AU, `open` 5, `wpa2` 5,
-`reconnect` 5; `bench` 2/2 separately.
+(ctest `sta_client_headless`, 22 cells) and `tests/mt7612u_sta_onair.sh`.
+**16/16 on ch6** against hostapd on an RTL8812AU — `open` 5, `wpa2` 6,
+`reconnect` 5 — plus `bench` 2/2 separately.
 
 **The acceptance property holds and is checkable by reading:** there is no
 chip test anywhere in `sta_client.cpp`. The two places the silicon genuinely
@@ -1070,7 +1073,8 @@ cannot say which half broke. The AP side has had the ladder since the
 beginning (`ap_responder` / `ap_wpa2`). Added: `StationSm::configure_open`
 (no PSK, no PMK, **no CryptoOps** — an open station links no crypto, exactly
 as `ap_responder` does not) and `BssTable::select_open`, which is the second
-function the comment above `select()` asked for. "Open" is `!privacy`, not
+function the comment that used to sit above `select()` asked for — the paragraph
+moved with the decision, and now sits above `select_open()` itself. "Open" is `!privacy`, not
 `!has_rsn`: a WEP BSS carries no RSN element and is not joinable either.
 
 #### THE FINDING OF THIS PHASE: the group rekey arrives inside the cipher
@@ -1147,11 +1151,17 @@ than its name claims**.
 #### Mutations
 
 11 on the open-network path (10 killed), 20 on the harness (20 killed, after
-two cells were rewritten because they could not fail — see `580aff5`). **One
+two cells were rewritten because they could not fail — see `580aff5`), and a
+third sweep over the receive path after the reviews (see below). **One
 recorded survivor**, stated at the line rather than implied by its absence:
 `configure_open`'s `secure_wipe` of the PMK is unobservable, because
 `have_pmk_` is cleared either way. It is defence against a core dump, not
 against a caller.
+
+**And the 20/20 was narrower than it read.** It is 20 of the 20 rules the
+sweep listed, not of every rule in the file — a review found a guard
+(`key_id != gtk_key_id`) that no row touched *and* no cell could fail on. The
+honest form of a mutation score names its list.
 
 And a **harness bug worth carrying**: the first sweep restored files with
 `shutil.copy2`, which preserves the mtime — so the restored file looked older
@@ -1187,10 +1197,105 @@ brought it back. The delete is conditional on the move having worked.
 | `ccmp_rx_ns_per_frame` | 15143 |
 
 **What this is not.** A flood ping is round-trip bound, so `reply_pps` (223)
-is a *latency* figure and not link throughput — nothing in this tree measures
-throughput. The receive path costs 2.5× the transmit path per frame and
+is a *latency* figure and not link throughput — **nothing in this tree
+measures the throughput of a station link.** (`tests/bench_onair.py` measures
+on-air TX throughput per chip with a USRP duty-cycle probe; it floods with
+`txdemo` and has no association in it, so it does not answer this question.) The receive path costs 2.5× the transmit path per frame and
 **that asymmetry is unexplained**; it is reported because it was measured,
 not because it is understood.
+
+#### The Phase 4 review round, and what three reviewers found
+
+Three Flash reviews on different angles, every finding verified against the
+tree before acting. Two of them found defects the on-air 15/15 could not have.
+
+**The reachable out-of-bounds read.** `rx_frame` guarded only `len < hlen`
+and then read the CCMP key id at `mpdu[hlen + 3]`. A 24-byte protected data
+frame — which any station on the channel can air with our AP's address in
+addr2 — read three bytes past the receive buffer; the proof of length lived
+inside `ccmp_decrypt`, five lines too late. On MT7612U that is past the
+allocation, because this part strips the FCS; on Realtek it landed in the
+four trailing FCS bytes, which is the only reason it was latent. **Proved by
+deleting the new guard and running the new cell under ASan**:
+`heap-buffer-overflow ... 3 bytes after 24-byte region`.
+
+**A replay-protection bypass, from an offset.** The TID for the per-TID
+replay window was read at `hlen - 2`. The QoS Control field is at a *fixed*
+offset and HT Control follows it, so on any +HTC frame that lands inside HT
+Control — and **HT Control is not covered by the CCMP AAD**, so an attacker
+can rewrite it on a *captured* frame without breaking its MIC. The replay is
+then filed under a different per-TID window from the original, where it is
+accepted. Two reviewers found the offset; the third supplied the escalation
+from "accounting error" to "bypass". `Ccmp.h` had it right; the harness did
+not, which is the drift a shared module is supposed to prevent.
+
+**A PTK rekey bypassed the per-key reset.** The transmit PN and the replay
+windows were reset on the `→ Connected` transition, and a rekey happens with
+the association already up. The AP's new key starts at PN 1, so a window left
+at the old key's head rejects every frame until the PN climbs back within 64
+— a link that reports itself keyed and carries nothing, which is the hardest
+failure on this list to see from outside. `Supplicant` now exposes an install
+generation per key, so the caller notices a rekey without keeping a copy of
+the key to diff against.
+
+**And implementing that found one more, before any hardware did.** A rekey's
+message 4 has to go out under the **old** pairwise key: the authenticator does
+not switch its own until it has accepted message 4, so a message 4 encrypted
+under the new TK is a frame it cannot read. That is the same shape as the
+group-rekey defect, one layer down, and the cell caught it twice — once in
+the code and once in the *fixture*, which had made the same mistake.
+
+**A third cell that could not fail.** The "converse" key-id arm used key id
+0, which the receiver maps to the *pairwise* branch before the rule the
+comment named is ever reached: the MIC failed on the cipher, and deleting the
+rule changed nothing. It uses an id we hold no key for now. Two more of the
+same shape had already been fixed in `580aff5`; this file has now produced
+three, which is worth saying out loud.
+
+**The `BssTable` protection was the attack it was written against.** An entry
+whose SSID matches the wanted one is unevictable, and `allocate()` refused
+when every slot was protected — so sixteen beacons for sixteen fabricated
+BSSIDs, all claiming the wanted SSID, lock the genuine AP out of the table
+permanently. It falls back to the ordinary victim rule now.
+
+**And the doc claim that was false when it was written:** "`scan_step`'s
+multi-channel branch has a headless cell". There was none — `reset_all()`
+configured exactly one channel and `scan_step()` returns early for a
+single-entry list, so the rotation was unreached by the whole file. There is
+a cell now. The review also caught this section closing Phase 4 with **no
+review rows in the ledger at all**, which is rule 2 being violated in the act
+of writing it up.
+
+**The third mutation sweep: 18/18**, over the rules the first two sweeps'
+lists never named, run against the sanitizer build because three of the rows
+are bounds checks. Four survived the first pass and each got a cell; one of
+those four was only killable after giving its rule **its own counter** — "we
+hold no key for this frame" reported a MIC failure, so removing the guard
+produced an identical observable. A rule whose only effect is a counter needs
+that counter to be its own.
+
+#### What the pairwise rekey costs, measured rather than assumed
+
+Adding `wpa_ptk_rekey` to the on-air cell — which no default hostapd
+configuration does — produced **one MIC failure across six rekeys in ~150 s,
+with the ping at 0% loss**. That is the protocol, not a defect: 802.11-2016
+12.7.6.5 has the supplicant install the new PTK at message 3 and the
+authenticator only once it has accepted message 4, so for one round trip the
+AP is still transmitting under the old key. At most one data frame per rekey
+can land in that window.
+
+It is **not defended against**. A grace period for the old key means a second
+replay window for its PN space and a second key in memory, to save one frame
+per rekey on a setting whose hostapd default is "never". The cell asserts
+`MIC failures <= pairwise rekeys`, which is that theory's exact prediction
+and a sharper test than zero: it still fails on a real MIC problem.
+
+**A first attempt at this cell read 6 associations and 50% ping loss**, and
+that reading is withdrawn — it did not reproduce in five subsequent runs
+(160 s with both rekeys and traffic: one association, 20 rekeys answered, 0
+MIC failures, TAP 74/74). Whatever it was, it was not the rekey path, and it
+is recorded here rather than deleted because an unexplained failure that
+stopped happening is not the same as one that was fixed.
 
 #### Carried out of Phase 4
 
@@ -1199,12 +1304,14 @@ not because it is understood.
   sending a deauth, partly because a deauth exercises a path that needs no
   supervision at all — and partly because an unauthenticated deauth is
   exactly what this station cannot tell from a forged one.
-- **The channel sweep is written but not exercised on air.** Every cell runs
-  on one configured channel, which is what `DEVOURER_STA_SCAN_CHANNELS`
-  defaults to. `scan_step`'s multi-channel branch has a headless cell and no
-  on-air one; retuning under a live association is refused by construction
-  (`supervise` returns the joined channel once the machine leaves
-  Idle/Failed) and that construction is untested against a real retune.
+- **The channel sweep is not exercised ON AIR.** Every cell runs on one
+  configured channel, which is what `DEVOURER_STA_SCAN_CHANNELS` defaults to.
+  It now has a headless cell — `test_the_channel_sweep_rotates`, added by the
+  review round below, because the claim that one existed was **false when it
+  was written**: `reset_all()` configured exactly one channel and
+  `scan_step()` returns early for a single-entry list, so the rotation was
+  unreached by the whole file. What is still untested is the rotation against
+  a **real retune**, where the radio takes 48–526 ms to change channel.
 - **One band.** ch6 only: the RTL8812AU's 5 GHz channels are all `no IR` in
   this regulatory domain, so hostapd cannot serve them here. The AP harness
   reads 14/14 on ch36 because *devourer* airs the beacon there; this harness
@@ -1212,6 +1319,16 @@ not because it is understood.
   AP adapter to reach 5 GHz.
 - **`aes_key_unwrap`'s output-size contract** is still unstated in
   `CryptoOps.h`. Carried forward unchanged from Phase 3.
+- **No duplicate filter on the receive path.** A frame the MAC delivers twice
+  reaches the host twice. The CCMP replay window catches it on a protected
+  link — which is every link this project ships — and an open link has
+  nothing. Not observed causing trouble, and not defended.
+- **One MIC failure per pairwise rekey is expected**, for the reason above.
+  An integrator who rekeys the PTK aggressively and cannot lose a frame needs
+  the grace-period cache this does not have.
+- **An unexplained on-air reading is on the record**: one run of the `wpa2`
+  cell read 6 associations and 50% loss and never reproduced. Five later runs
+  of the same configuration were clean.
 
 ## Phase 5 — validation, independent witness first
 

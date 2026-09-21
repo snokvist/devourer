@@ -59,8 +59,6 @@ class StationSm {
     NotConfigured,
   };
 
-  /* Three transmissions of each management frame, 300 ms apart. An AP that
-   * has not answered three probes in a second is not going to. */
   /* WHICH KIND OF BSS THIS STATION IS CONFIGURED FOR.
    *
    * Not a hypothetical second mode: without an open path a station that never
@@ -78,6 +76,8 @@ class StationSm {
     Wpa2Psk,
   };
 
+  /* Three transmissions of each management frame, 300 ms apart. An AP that
+   * has not answered three probes in a second is not going to. */
   static constexpr int kMaxTries = 3;
   static constexpr uint32_t kMgmtTimeoutMs = 300;
   /* The authenticator drives the four-way and retransmits it; this side only
@@ -289,8 +289,23 @@ class StationSm {
      * answers "why did nothing associate". A 60-second on-air run carrying
      * 75 frames reported ignored=75, which reads as 75 protocol errors. */
     if (fc1 & kFcProtected) { rx_protected++; return; }
+    /* FRAGMENTS AND A-MSDUs ARE NOT MSDUs. Nothing here reassembles, so the
+     * bytes at the LLC offset are a piece of a frame, not a frame - and an
+     * A-MSDU's are a subframe header. Feeding either to the EAPOL parser
+     * asks it to interpret the wrong bytes.
+     *
+     * The caller's data plane already refuses both (tests/sta_client.cpp),
+     * and the two receive layers disagreeing about it is the kind of gap a
+     * later reader closes in only one place. More Fragments is CLEAR on the
+     * LAST fragment, so the fragment number has to be tested too. */
+    if ((fc1 & kFcMoreFrag) || (frame[22] & 0x0f)) { rx_malformed++; return; }
     const size_t hlen = data_hdr_len(fc0, fc1);
     if (len < hlen + kLlcSnapLen) { rx_malformed++; return; }
+    /* The A-MSDU Present bit, in the QoS Control field - which is at a FIXED
+     * offset, with HT Control after it, so it is 24 and not hlen - 2. A
+     * 4-address frame would put it at 30, and cannot reach here: the
+     * FromDS/ToDS test above accepts only from-the-DS frames. */
+    if (is_qos_data(fc0) && (frame[24] & 0x80)) { rx_malformed++; return; }
     const uint8_t* llc = frame + hlen;
     if (!(llc[0] == 0xaa && llc[1] == 0xaa && llc[2] == 0x03)) {
       rx_ignored++;

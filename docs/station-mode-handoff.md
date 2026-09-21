@@ -58,7 +58,7 @@ that tree up; nothing here depends on it any more.
 | 1 — shared frame + crypto layer | **DONE, GATE CLOSED.** 14/14 twice on each band against independent silicon. See below. |
 | 2 — the `IRadio` seam | **Implemented.** Seam + caps flag + MT7612U implementation + five bring-up gates + a headless selftest. R5 and R6 both measured; `station_mode_ok` is **true** for MT7612U. `docs/mt7612u-station-identity.md` — read its retraction section before quoting any number. The R6 table was re-taken 2026-09-20 under the corrected single-variable harness and holds. |
 | 3 — pure station logic | **DONE 2026-09-21.** BSS table, association state machine, EAPOL/4-way supplicant, all headless. Both acceptance negatives present and load-bearing. Pinned against a captured hostapd/wpa_supplicant four-way. |
-| 4 — the harness | **DONE 2026-09-21.** `tests/sta_client.cpp` (+ its `.inc`, ctest `sta_client_headless`) and `tests/mt7612u_sta_onair.sh`. **15/15 on ch6** against hostapd on an RTL8812AU; `bench` 2/2 separately. No backend branch anywhere in it, which is the phase's acceptance property. |
+| 4 — the harness | **DONE 2026-09-21.** `tests/sta_client.cpp` (+ its `.inc`, ctest `sta_client_headless`) and `tests/mt7612u_sta_onair.sh`. **16/16 on ch6** against hostapd on an RTL8812AU; `bench` 2/2 separately. No backend branch anywhere in it, which is the phase's acceptance property. |
 | 5 — validation | **Half done by accident.** The Phase 4 harness needed something to associate to, and the honest choice was hostapd on non-MediaTek silicon — so the independent-witness run already exists and already found a defect. Still owed: devourer-to-devourer, 5 GHz, throughput, a soak. |
 | 6 — the Realtek arm | Not started. |
 
@@ -151,7 +151,7 @@ drives. Getting these the wrong way round is the first mistake to check.
 
 ```sh
 sudo STA_SYSFS=1-1 AP_SYSFS=8-1 CH=6 FW_DIR=/lib/firmware/mediatek \
-     tests/mt7612u_sta_onair.sh all        # open + wpa2 + reconnect = 15 checks
+     tests/mt7612u_sta_onair.sh all        # open + wpa2 + reconnect = 16 checks
 sudo STA_SYSFS=1-1 AP_SYSFS=8-1 CH=6 tests/mt7612u_sta_onair.sh bench
 ```
 
@@ -262,7 +262,7 @@ require it:
 
 ## What the station's on-air runs showed
 
-`tests/mt7612u_sta_onair.sh` reads **15/15 on ch6** against hostapd on an
+`tests/mt7612u_sta_onair.sh` reads **16/16 on ch6** against hostapd on an
 RTL8812AU — the MT7612U authenticates, associates, runs the four-way as the
 supplicant, answers group rekeys, carries an encrypted data plane, notices
 the AP going away and re-joins by itself when it comes back.
@@ -303,11 +303,11 @@ because it was measured, not because it is understood.
 4. **`SetStationIdentity` is provisional.** It ships with one implementation;
    `docs/station-mode-scope.md` argues the position honestly and Phase 2's gate
    should weigh landing the Realtek arm alongside it.
-5. **The channel sweep is written and not exercised on air.** Every station
-   cell runs on one configured channel. `scan_step`'s multi-channel branch
-   has a headless cell and no on-air one, and the rule that keeps it from
-   retuning under a live association is enforced by construction rather than
-   by a test against a real retune.
+5. **The channel sweep is not exercised on air.** Every station cell runs on
+   one configured channel. It has a headless cell only since the Phase 4
+   review round - the claim that one existed was false when it was written -
+   and the rotation has never met a **real** retune, which on this part takes
+   48-526 ms.
 6. **No duplicate filter on the station's receive path.** A retried frame the
    MAC delivers twice is handed to the host twice. The CCMP replay window
    catches it on a protected link, which is every link this project ships;

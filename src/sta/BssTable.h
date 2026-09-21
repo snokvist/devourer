@@ -232,15 +232,32 @@ class BssTable {
           (age_i == age_v && slots_[i].rssi < slots_[victim].rssi))
         victim = i;
     }
-    /* Every slot holds the wanted SSID. Admitting a seventeenth BSS for that
-     * SSID by evicting one of them gains nothing, so refuse - unless the
-     * incoming frame is NOT for the wanted network, in which case it has no
-     * claim on the table at all and is simply dropped, which is the same
-     * thing. */
+    /* EVERY SLOT IS PROTECTED. Refusing here - which is what this did - turns
+     * the anti-flood rule into the attack it exists to prevent: sixteen
+     * beacons for sixteen fabricated BSSIDs, all carrying the WANTED SSID,
+     * fill the table with unevictable entries and the genuine AP can then
+     * never be inserted at all. select() returns only the attacker's BSSes,
+     * for as long as they keep beaconing.
+     *
+     * So fall back to the ordinary victim rule over every slot. The
+     * protection still does its job in the case it was written for - a flood
+     * of OTHER SSIDs cannot evict the network being looked for - and in the
+     * degenerate case where every entry claims to be the wanted network,
+     * this table cannot tell which one is real and staying fresh beats
+     * staying stuck. */
     if (victim < 0) {
       (void)incoming_ssid;
-      return -1;
+      for (int i = 0; i < kMaxBss; i++) {
+        if (victim < 0) { victim = i; continue; }
+        const uint32_t age_v = (uint32_t)(now_ms - slots_[victim].last_seen_ms);
+        const uint32_t age_i = (uint32_t)(now_ms - slots_[i].last_seen_ms);
+
+        if (age_i > age_v ||
+            (age_i == age_v && slots_[i].rssi < slots_[victim].rssi))
+          victim = i;
+      }
     }
+    if (victim < 0) return -1;
     used_[victim] = false;
     count_--;
     return victim;

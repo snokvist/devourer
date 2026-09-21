@@ -27,7 +27,7 @@
 # Four cells, each with its own witness:
 #
 #   open       hostapd open       associate -> ARP/ICMP over an open link
-#   wpa2       hostapd WPA2-PSK   4-way -> group rekey -> encrypted ping
+#   wpa2       hostapd WPA2-PSK   4-way -> group AND pairwise rekey -> ping
 #   reconnect  hostapd stopped    beacon loss noticed -> AP back -> re-joined
 #   bench      hostapd WPA2-PSK   software CCMP cost under a flood ping
 #
@@ -73,6 +73,12 @@ TAP="${TAP:-dvsta0}"
 # inside its run, because the rekey is the half that was broken and a cell
 # that never provokes it proves only the four-way.
 REKEY_S="${REKEY_S:-20}"
+# And the PAIRWISE key's interval. A PTK rekey runs the four-way again with
+# the association already up, so nothing hung off "we just connected" sees it
+# - which is exactly how the station's replay windows came to be reset in the
+# wrong place. hostapd does not do this unless asked; no default
+# configuration anywhere would have exercised it.
+PTK_REKEY_S="${PTK_REKEY_S:-25}"
 BENCH_SECS="${BENCH_SECS:-15}"
 BENCH_PAYLOAD="${BENCH_PAYLOAD:-1400}"
 APIP=192.168.98.1
@@ -249,6 +255,8 @@ ap_conf() {   # $1 = "open" | "wpa2"
     if [ "$1" = wpa2 ]; then
       printf 'wpa=2\nwpa_passphrase=%s\nwpa_key_mgmt=WPA-PSK\n' "$PSK"
       printf 'rsn_pairwise=CCMP\nwpa_group_rekey=%s\n' "$REKEY_S"
+      [ "${PTK_REKEY_S:-0}" -gt 0 ] 2>/dev/null &&
+        printf 'wpa_ptk_rekey=%s\n' "$PTK_REKEY_S"
     fi
   } > "$OUT/hostapd.conf"
 }
@@ -334,10 +342,6 @@ tap_up() {
 # here turns a silent mismatch into a named failure.
 sta_mac() { cat "/sys/class/net/$TAP/address" 2>/dev/null; }
 
-ap_saw_connected() {
-  grep -q "AP-STA-CONNECTED $(sta_mac)" "$OUT/hostapd.log" 2>/dev/null
-}
-
 wait_for() {   # $1 = pattern, $2 = file, $3 = seconds
   local i
   for i in $(seq 1 "$3"); do
@@ -345,6 +349,16 @@ wait_for() {   # $1 = pattern, $2 = file, $3 = seconds
     sleep 1
   done
   return 1
+}
+
+# "The AP associated US." MAC-MATCHED, not a substring: a bare
+# `AP-STA-CONNECTED` is satisfied by any station on the channel, and - more
+# to the point here - by OUR station transmitting from an address that is not
+# the one the TAP carries, which is precisely the failure sta_client's
+# SIOCSIFHWADDR exists to prevent. This helper existed and nothing called it;
+# the weaker substring did the work.
+wait_for_us() {   # $1 = seconds
+  wait_for "AP-STA-CONNECTED $(sta_mac)" "$OUT/hostapd.log" "$1"
 }
 
 # One field out of the station's exit ledger, which is printed at every exit.
@@ -376,10 +390,12 @@ ping_cell() {
   return 1
 }
 
-sta_finished() {
-  wait "$STA_PID" 2>/dev/null
-  grep -q "^state=" "$OUT/sta.log" 2>/dev/null
-}
+# Wait for the station to exit, so its ledger is complete before anything
+# reads it. NOT a check: it used to also grep for a line report() prints
+# unconditionally, and every caller discarded the result - a gate that could
+# not fail and contributed no signal. The ledger assertions that follow it
+# are the check, and they fail on their own when the ledger is missing.
+sta_wait() { wait "$STA_PID" 2>/dev/null; }
 
 # --- cell: open network ----------------------------------------------------
 cell_open() {
@@ -393,17 +409,17 @@ cell_open() {
   tap_up || { kill "$STA_PID" 2>/dev/null; ap_down; return; }
   ok "open: TAP up and the route leaves through it"
 
-  if wait_for "AP-STA-CONNECTED" "$OUT/hostapd.log" 25; then
+  if wait_for_us 25; then
     ok "open: the AP associated us ($(sta_mac))"
   else
-    bad "open: the AP never associated us - see $OUT/sta.log's refusal counters"
+    bad "open: the AP never associated $(sta_mac) - see $OUT/sta.log's refusal counters"
     kill "$STA_PID" 2>/dev/null; ap_down; return
   fi
 
   ping_cell open "data plane"
 
   kill "$STA_PID" 2>/dev/null
-  sta_finished
+  sta_wait
   # The ledger, not the ping: a link that carried traffic AND logged crypto
   # errors is not the same result, and the ping cannot tell them apart.
   if [ "$(led 'plaintext rx')" -gt 0 ] 2>/dev/null &&
@@ -426,7 +442,7 @@ cell_wpa2() {
   # SECS covers the bring-up and the waits (see the note there); the rekey
   # intervals are on top of it, because this cell measures the half that was
   # broken and not only the four-way.
-  local secs=$(( SECS + REKEY_S * 2 ))
+  local secs=$(( SECS + REKEY_S * 2 + PTK_REKEY_S ))
   sta_up "$secs" DEVOURER_STA_PSK="$PSK" || { bad "wpa2: sta_client did not start"; ap_down; return; }
   tap_up || { kill "$STA_PID" 2>/dev/null; ap_down; return; }
 
@@ -449,16 +465,55 @@ cell_wpa2() {
     bad "wpa2: no group rekey completed in $(( REKEY_S + 25 ))s - grep 'group key handshake' $OUT/hostapd.log"
   fi
 
+  # AND THE PAIRWISE REKEY, which is a different handshake with a different
+  # failure. It runs the four-way again with the association already up, so
+  # the answer has to go out under the OLD key - the authenticator does not
+  # switch its own until it has accepted message 4. A station that replies
+  # under the new one sends a frame the AP cannot read.
+  #
+  # Found by review, not by the bench: no default hostapd configuration
+  # anywhere performs this, so `wpa_ptk_rekey` has to be asked for.
+  #
+  # COUNTED, NOT MATCHED. hostapd logs "pairwise key handshake completed" for
+  # the INITIAL four-way too, so a `wait_for` on that string returns before
+  # any rekey has happened - a check that cannot fail, which is the category
+  # this branch keeps finding. A rekey is the SECOND one and later.
+  local i pk=0
+  for i in $(seq 1 $(( PTK_REKEY_S + 25 ))); do
+    pk=$(grep -c "pairwise key handshake completed" "$OUT/hostapd.log" 2>/dev/null)
+    [ "${pk:-0}" -ge 2 ] && break
+    sleep 1
+  done
+  if [ "${pk:-0}" -ge 2 ]; then
+    ok "wpa2: the AP completed a PAIRWISE rekey ($pk handshakes, the first being the association's)"
+  else
+    bad "wpa2: no pairwise rekey in $(( PTK_REKEY_S + 25 ))s (only $pk pairwise handshake(s), i.e. the association's alone)"
+  fi
+
   # And it must not have cost us the association. "It reconnected" is not the
   # same result as "it stayed up", and only the ledger can tell them apart.
-  sta_finished
-  local assoc rekey mic
+  sta_wait
+  # THE LEDGER, not the AP's log. "It reconnected" is not the same result as
+  # "it stayed up", and only this side can tell them apart - the AP sees a
+  # fresh association either way.
+  local assoc rekey mic ptk
   assoc=$(led 'associations'); rekey=$(led 'answered'); mic=$(led 'MIC failures')
+  ptk=$(led 'PTK')
+  # MIC FAILURES <= PAIRWISE REKEYS, not zero, and that bound is the theory
+  # rather than a fudge. A pairwise rekey has a one-round-trip window in
+  # which the AP is still transmitting under the old key and this side has
+  # already installed the new one (802.11-2016 12.7.6.5), so at most one data
+  # frame per rekey can fail its MIC. Measured: 1 across 6 rekeys, with the
+  # ping at 0% loss. Asserting zero here would either fail on the protocol or
+  # force a grace-period cache that costs a second replay window to save one
+  # frame; asserting the bound catches a real MIC problem and tolerates this
+  # one. See the note at ccmp_decrypt's caller in tests/sta_client.cpp.
   if [ "${assoc:-0}" = 1 ] && [ "${rekey:-0}" -gt 0 ] 2>/dev/null &&
-     [ "${mic:-1}" = 0 ]; then
-    ok "wpa2: one association throughout, $rekey rekey(s) answered, 0 MIC failures"
+     [ "${ptk:-0}" -ge 2 ] 2>/dev/null &&
+     [ "${mic:-999}" -le "${ptk:-0}" ] 2>/dev/null; then
+    ok "wpa2: one association throughout, $rekey rekey(s) answered, $ptk pairwise keys, $mic MIC failure(s) (<= $ptk, the rekey switchover window)"
   else
-    bad "wpa2: ledger says associations=$assoc rekeys_answered=$rekey MIC_failures=$mic (expected 1, >0, 0)"
+    bad "wpa2: ledger says associations=$assoc rekeys_answered=$rekey PTK_installs=$ptk MIC_failures=$mic (expected 1, >0, >=2, and MIC <= PTK)"
   fi
   ap_down
 }
@@ -473,7 +528,8 @@ cell_reconnect() {
   say "== reconnect (AP goes away and comes back) =="
   build_sta || { bad "reconnect: build"; return; }
   ns_up || { bad "reconnect: could not move $AP_PHY into $NS"; return; }
-  ap_up wpa2 || { bad "reconnect: hostapd did not come up"; return; }
+  PTK_REKEY_S=0 ap_up wpa2 ||
+    { bad "reconnect: hostapd did not come up"; return; }
 
   # Its own budget has to cover TWO associations plus an eight-second gap, so
   # it is longer than SECS rather than a fixed 70 - see the note there.
@@ -500,7 +556,8 @@ cell_reconnect() {
   # It must come back on the SAME BSSID, or the station is choosing a
   # different BSS and "it reconnected" would mean something else.
   rm -f "$OUT/hostapd.log"
-  ap_up wpa2 || { bad "reconnect: the AP did not come back"; kill "$STA_PID" 2>/dev/null; return; }
+  PTK_REKEY_S=0 ap_up wpa2 ||
+    { bad "reconnect: the AP did not come back"; kill "$STA_PID" 2>/dev/null; return; }
   say "  AP back"
 
   if wait_for "EAPOL-4WAY-HS-COMPLETED" "$OUT/hostapd.log" 30; then
@@ -517,7 +574,7 @@ cell_reconnect() {
   ping_cell reconnect "the data plane came back"
 
   kill "$STA_PID" 2>/dev/null
-  sta_finished
+  sta_wait
   local rc assoc
   rc=$(led 'reconnects'); assoc=$(led 'associations')
   if [ "${rc:-0}" -ge 1 ] 2>/dev/null && [ "${assoc:-0}" -ge 2 ] 2>/dev/null; then
@@ -546,7 +603,8 @@ cell_bench() {
   ns_up || { bad "bench: could not move $AP_PHY into $NS"; return; }
   # No rekey during a measurement - it would land inside one of the windows
   # and be indistinguishable from noise.
-  REKEY_S=86400 ap_up wpa2 || { bad "bench: hostapd did not come up"; return; }
+  REKEY_S=86400 PTK_REKEY_S=0 ap_up wpa2 ||
+    { bad "bench: hostapd did not come up"; return; }
 
   # Two measurement windows - one idle, one busy - on top of SECS.
   local run_secs=$(( SECS + BENCH_SECS * 2 ))
@@ -591,7 +649,7 @@ cell_bench() {
   fi
 
   kill "$STA_PID" 2>/dev/null
-  sta_finished
+  sta_wait
   local profile; profile=$(grep '"ev":"ccmp.profile"' "$OUT/sta.log" | tail -1)
   ap_down
   [ -n "$profile" ] || { bad "bench: missing ccmp.profile"; return; }
@@ -632,10 +690,10 @@ PYEOF
 # otherwise run one check fewer, exit 0, and still be reported as "N/N".
 case "$CELLS" in
   open)      cell_open;      want=5 ;;
-  wpa2)      cell_wpa2;      want=5 ;;
+  wpa2)      cell_wpa2;      want=6 ;;
   reconnect) cell_reconnect; want=5 ;;
   bench)     cell_bench;     want=2 ;;
-  all)       cell_open; cleanup; cell_wpa2; cleanup; cell_reconnect; want=15 ;;
+  all)       cell_open; cleanup; cell_wpa2; cleanup; cell_reconnect; want=16 ;;
   *)         echo "usage: $0 [open|wpa2|reconnect|bench|all]"; exit 2 ;;
 esac
 

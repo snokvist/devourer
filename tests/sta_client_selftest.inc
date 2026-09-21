@@ -77,8 +77,6 @@ void reset_all() {
   g_tx_pn = 1;
   g_rx_replay.reset();
   g_group_replay.reset();
-  g_have_gtk = false;
-  g_gtk_seen_id = 0xff;
   g_scan_idx = 0;
   g_scan_switch_ms = 0;
   g_next_join_ms = 0;
@@ -100,6 +98,9 @@ void reset_all() {
   g_tx_enc = 0; g_tx_enc_fail = 0; g_tx_plain = 0;
   g_crc_err = 0; g_amsdu_drop = 0; g_frag_drop = 0;
   g_eapol_enc_rx = 0; g_eapol_enc_tx = 0;
+  g_ptk_installs = 0; g_gtk_installs = 0; g_no_key = 0;
+  g_ptk_gen_seen = 0; g_gtk_gen_seen = 0;
+  g_scan_dwell_ms = 250;
 }
 
 /* Drain whatever the station queued, stripping the radiotap prefix the real
@@ -161,7 +162,7 @@ struct Ap {
   uint8_t pmk[32] = {0};
   uint8_t anonce[32] = {0};
   uint8_t ptk[48] = {0};
-  uint8_t gtk[16] = {0};
+  uint8_t gtk[32] = {0};
   uint8_t gtk_id = 1;
   uint64_t replay = 0;
   uint64_t tx_pn = 1;
@@ -173,7 +174,7 @@ struct Ap {
   Ap() {
     devourer::sta::pmk_from_psk(crypto, kPsk, kSsid, pmk);
     std::memset(anonce, 0x5e, 32);
-    std::memset(gtk, 0x31, 16);
+    std::memset(gtk, 0x31, 32);
   }
 
   std::vector<uint8_t> mgmt(uint8_t fc) {
@@ -196,12 +197,18 @@ struct Ap {
         16, replay, anonce, nullptr, nullptr, 0, nullptr, nullptr);
   }
 
+  /* 16 for CCMP. A KDE may carry 16 to 32 (find_gtk_kde accepts that whole
+   * range, because the field is cipher-independent), so an AP can hand a
+   * station a group key its data plane cannot use. */
+  size_t gtk_len = 16;
+
   std::vector<uint8_t> msg3() {
     std::vector<uint8_t> kd;
-    const uint8_t hdr[8] = {0xdd, 0x16, 0x00, 0x0f, 0xac, 0x01, gtk_id, 0x00};
+    const uint8_t hdr[8] = {0xdd, (uint8_t)(6 + gtk_len), 0x00, 0x0f, 0xac,
+                            0x01, gtk_id, 0x00};
     devourer::sta::append_rsn_ccmp_psk(kd);
     kd.insert(kd.end(), hdr, hdr + 8);
-    kd.insert(kd.end(), gtk, gtk + 16);
+    kd.insert(kd.end(), gtk, gtk + gtk_len);
     if (kd.size() % 8) {
       kd.push_back(0xdd);
       while (kd.size() % 8) kd.push_back(0x00);
@@ -345,11 +352,81 @@ struct Ap {
         16, replay, anonce, nullptr, w.data(), w.size(), &crypto, ptk);
   }
 
+  /* The same QoS downlink with an HT CONTROL field, which is what an HT AP
+   * sends whenever it wants link adaptation - so, routinely. HT Control sits
+   * AFTER the QoS Control, which is why a receiver that looks for the QoS
+   * Control at "header length minus two" reads link-adaptation bits instead.
+   *
+   * AND HT CONTROL IS NOT IN THE CCMP AAD (see ccmp_aad: frame control,
+   * addr1-3, the fragment number, addr4, the QoS TID - and nothing else), so
+   * an attacker can rewrite it on a captured frame without breaking the MIC.
+   * That is what turns a wrong offset from an accounting error into a replay
+   * bypass: flip HT Control, and the replayed frame is filed under a
+   * different per-TID window from the original. */
+  std::vector<uint8_t> qos_htc_to_sta(const uint8_t* payload, size_t len,
+                                      uint8_t tid, uint32_t htc,
+                                      uint64_t pn_override = 0) {
+    std::vector<uint8_t> pt;
+    devourer::sta::append_llc_snap(pt, 0x0800);
+    pt.insert(pt.end(), payload, payload + len);
+    std::vector<uint8_t> hdr;
+    hdr.push_back(0x88);                               /* QoS Data */
+    hdr.push_back((uint8_t)(devourer::sta::kFcFromDs |
+                            devourer::sta::kFcProtected | 0x80)); /* +HTC */
+    devourer::sta::put_le16(hdr, 0);
+    hdr.insert(hdr.end(), kStaMac, kStaMac + 6);
+    hdr.insert(hdr.end(), kBssid, kBssid + 6);
+    hdr.insert(hdr.end(), kPeer, kPeer + 6);
+    devourer::sta::put_le16(hdr, (uint16_t)((seq.next() & 0x0fff) << 4));
+    hdr.push_back((uint8_t)(tid & 0x0f));
+    hdr.push_back(0);
+    for (int i = 0; i < 4; i++)
+      hdr.push_back((uint8_t)((htc >> (8 * i)) & 0xff));
+    std::vector<uint8_t> m(
+        devourer::sta::ccmp_encrypted_len(hdr.size(), pt.size()));
+    const uint64_t pn = pn_override ? pn_override : tx_pn++;
+    const size_t n = devourer::sta::ccmp_encrypt(
+        crypto, ptk + 32, hdr.data(), hdr.size(), kBssid, pn, 0,
+        pt.data(), pt.size(), m.data(), m.size());
+    m.resize(n);
+    return m;
+  }
+
+  /* A PTK rekey: the four-way again, with the association already up. Both
+   * messages ride INSIDE the cipher, under the CURRENT pairwise key. */
+  std::vector<uint8_t> ptk_rekey_msg1() {
+    std::memset(anonce, 0x77, 32);          /* a fresh ANonce, as an AP does */
+    return eapol_protected(msg1());
+  }
+
+  /* An EAPOL-Key frame protected under the GROUP key and addressed to the
+   * BROADCAST. Not part of any handshake, and not the host's either. */
+  std::vector<uint8_t> group_eapol(const std::vector<uint8_t>& body) {
+    std::vector<uint8_t> pt;
+    devourer::sta::append_llc_snap(pt, 0x888e);
+    pt.insert(pt.end(), body.begin(), body.end());
+    std::vector<uint8_t> hdr = devourer::sta::data_hdr_from_ds(
+        kBcast, kBssid, kBssid, /*protect=*/true, seq.next());
+    std::vector<uint8_t> m(
+        devourer::sta::ccmp_encrypted_len(hdr.size(), pt.size()));
+    const size_t n = devourer::sta::ccmp_encrypt(
+        crypto, gtk, hdr.data(), hdr.size(), kBssid, group_pn++, gtk_id,
+        pt.data(), pt.size(), m.data(), m.size());
+    m.resize(n);
+    return m;
+  }
+
   /* An EAPOL-Key frame PROTECTED under the pairwise key - which is how a
    * real AP sends a group rekey, because it runs after the PTK is
    * installed. The cleartext eapol_frame() above is the four-way's shape and
    * is not this one. */
-  std::vector<uint8_t> eapol_protected(const std::vector<uint8_t>& body) {
+  /* `tk` defaults to the currently installed pairwise key. A PTK REKEY has
+   * to pass the OLD one explicitly: message 3 carries the material for the
+   * new key and is itself protected by the key still in force. Getting this
+   * wrong in the FIXTURE produced exactly the failure the code under test
+   * must not have - the station could not decrypt message 3 at all. */
+  std::vector<uint8_t> eapol_protected(const std::vector<uint8_t>& body,
+                                       const uint8_t* tk = nullptr) {
     std::vector<uint8_t> pt;
     devourer::sta::append_llc_snap(pt, 0x888e);
     pt.insert(pt.end(), body.begin(), body.end());
@@ -358,8 +435,8 @@ struct Ap {
     std::vector<uint8_t> m(
         devourer::sta::ccmp_encrypted_len(hdr.size(), pt.size()));
     const size_t n = devourer::sta::ccmp_encrypt(
-        crypto, ptk + 32, hdr.data(), hdr.size(), kBssid, tx_pn++, 0,
-        pt.data(), pt.size(), m.data(), m.size());
+        crypto, tk ? tk : ptk + 32, hdr.data(), hdr.size(), kBssid, tx_pn++,
+        0, pt.data(), pt.size(), m.data(), m.size());
     m.resize(n);
     return m;
   }
@@ -427,7 +504,13 @@ void test_open_ladder() {
   {
     std::lock_guard<std::mutex> l(g_mu);
     g_psk.clear();
-    check(g_sm.configure_open(kSsid, g_own), "configure_open");
+    /* NOT `check(configure_open(...))`: that return is `true` on every path
+     * of the function, so the assertion could only fail if someone edited
+     * the `return` statement itself. The observable consequence is what is
+     * worth asserting. */
+    g_sm.configure_open(kSsid, g_own);
+    check(g_sm.security() == StationSm::Security::Open,
+          "configure_open puts the station on the open path");
   }
   Ap ap;
   associate(ap, /*rsn=*/false);
@@ -489,9 +572,12 @@ void test_wpa2_ladder() {
   check(ap.saw_msg2 && ap.saw_msg4, "the AP saw messages 2 and 4");
   check(std::memcmp(g_sm.supplicant().ptk(), ap.ptk, 48) == 0,
         "both sides derived the same PTK");
-  check(g_have_gtk && std::memcmp(g_gtk_seen, ap.gtk, 16) == 0,
+  check(g_sm.supplicant().gtk_valid() &&
+            std::memcmp(g_sm.supplicant().gtk(), ap.gtk, 16) == 0,
         "the GTK the AP sent was installed");
-  check(g_gtk_seen_id == ap.gtk_id, "...at the key id it advertised");
+  check(g_sm.supplicant().gtk_key_id() == ap.gtk_id,
+        "...at the key id it advertised");
+  check(g_gtk_installs.load() == 1, "...and counted as one group key");
 
   const uint8_t payload[40] = {1, 2, 3, 4, 5};
   const std::vector<uint8_t> d = ap.data_to_sta(payload, sizeof payload);
@@ -637,13 +723,61 @@ void test_group_key_is_chosen_by_key_id() {
         "a UNICAST frame under the group key decrypts - the key id decides");
   check(g_mic_fail.load() == 0, "...with no MIC failure");
 
-  /* And the converse still has to hold: a group frame claiming a key id we
-   * hold no key for is refused rather than tried under the pairwise key. */
-  const std::vector<uint8_t> mis = ap.group_to_bss(arp, sizeof arp, 0);
+  /* And the converse: a group frame claiming a key id we hold NO key for.
+   *
+   * KEY ID 3, NOT 0. The arm here used to use 0 - which the receiver maps to
+   * the PAIRWISE branch before the "we hold no key for this id" rule is ever
+   * reached, so the MIC failed on the cipher and both checks passed for a
+   * reason the comment does not name. Deleting the rule under test changed
+   * nothing. That is the third cell in this file to have had that shape. */
+  const std::vector<uint8_t> mis = ap.group_to_bss(arp, sizeof arp, 3);
   const uint64_t before = g_mic_fail.load();
   rx_frame(mis.data(), mis.size(), -40, 0);
-  check(tap_read().empty(), "a group frame labelled key id 0 is refused");
-  check(g_mic_fail.load() == before + 1, "...as a MIC failure");
+  check(tap_read().empty(),
+        "a group frame at a key id we hold no key for is refused");
+  check(g_no_key.load() == 1, "...as a key we do not have");
+  check(g_mic_fail.load() == before, "...and NOT as a MIC failure");
+}
+
+/* A GROUP KEY THIS DATA PLANE CANNOT USE.
+ *
+ * The GTK KDE's key field is cipher-independent and find_gtk_kde accepts 16
+ * to 32 bytes, so an AP can complete a perfectly valid four-way and hand a
+ * station a 32-byte group key. Passing the cipher the first 16 bytes of it
+ * produces a MIC failure - which reads as tampering, and is not.
+ *
+ * "WE HOLD NO KEY FOR THIS" IS ITS OWN COUNTER, and that is what makes this
+ * cell possible at all: while the guard reported a MIC failure, deleting it
+ * changed nothing observable and a mutation removing it survived. A rule
+ * whose only effect is a counter needs that counter to be its own.
+ */
+void test_a_group_key_we_cannot_use() {
+  reset_all();
+  {
+    std::lock_guard<std::mutex> l(g_mu);
+    g_sm.configure(g_crypto, kSsid, kPsk, g_own);
+  }
+  Ap ap;
+  ap.gtk_len = 32;                       /* valid KDE, unusable by CCMP */
+  associate(ap, /*rsn=*/true);
+  check(g_sm.keyed(), "the four-way still completes");
+  check(g_sm.supplicant().gtk_valid() && g_sm.supplicant().gtk_len() == 32,
+        "...and the 32-byte group key is installed");
+
+  const uint8_t arp[28] = {0, 1};
+  const std::vector<uint8_t> g = ap.group_to_bss(arp, sizeof arp);
+  rx_frame(g.data(), g.size(), -40, 0);
+  check(tap_read().empty(), "a group frame under it reaches nothing");
+  check(g_no_key.load() == 1, "...counted as a key we do not have");
+  check(g_mic_fail.load() == 0, "...and NOT as a MIC failure");
+
+  /* The control: unicast under the PAIRWISE key still works, so the arm
+   * above is about the group key and not about the link. */
+  const uint8_t pl[16] = {4};
+  const std::vector<uint8_t> d = ap.data_to_sta(pl, sizeof pl);
+  rx_frame(d.data(), d.size(), -40, 0);
+  check(tap_read().size() == devourer::sta::kEthHdrLen + sizeof pl,
+        "...while unicast under the pairwise key still arrives");
 }
 
 /* A WPA2 link must not carry plaintext. The four-way's whole point is that
@@ -712,6 +846,196 @@ void test_fragments_and_amsdu_are_refused() {
         "...and reaches the host");
 }
 
+/* THE REPLAY WINDOW IS INDEXED BY THE REAL TID, AND THAT IS A SECURITY RULE.
+ *
+ * The QoS Control field is at a fixed offset and HT Control follows it, so
+ * "header length minus two" lands inside HT Control on any +HTC frame. HT
+ * Control is NOT covered by the CCMP AAD, so an attacker can rewrite it on a
+ * CAPTURED frame without breaking its MIC - and a receiver that takes the
+ * TID from there files the replay under a different per-TID window from the
+ * original, where it is accepted. That is a replay-protection bypass, not an
+ * accounting error.
+ */
+void test_the_tid_comes_from_the_qos_control_field() {
+  reset_all();
+  {
+    std::lock_guard<std::mutex> l(g_mu);
+    g_sm.configure(g_crypto, kSsid, kPsk, g_own);
+  }
+  Ap ap;
+  associate(ap, /*rsn=*/true);
+
+  const uint8_t payload[16] = {0x2c};
+  const std::vector<uint8_t> f = ap.qos_htc_to_sta(
+      payload, sizeof payload, /*tid=*/2, /*htc=*/0x00000005, /*pn=*/7);
+  rx_frame(f.data(), f.size(), -40, 0);
+  check(tap_read().size() == devourer::sta::kEthHdrLen + sizeof payload,
+        "a +HTC QoS frame decrypts and reaches the host");
+  check(g_rx_replay.last(2) == 7, "...and its PN landed in TID 2's window");
+  check(g_rx_replay.last(5) == 0, "...NOT in the window HT Control names");
+
+  /* THE ATTACK, end to end. The same MPDU with HT Control rewritten - which
+   * the MIC does not cover - replayed at the same PN. A receiver reading the
+   * TID from HT Control files it under TID 6, which has never seen PN 7, and
+   * accepts it. */
+  std::vector<uint8_t> replayed = ap.qos_htc_to_sta(
+      payload, sizeof payload, /*tid=*/2, /*htc=*/0x00000005, /*pn=*/7);
+  replayed[26] = 0x06;                    /* HT Control, byte 0 */
+  rx_frame(replayed.data(), replayed.size(), -40, 0);
+  check(tap_read().empty(), "the replay is refused despite the rewritten HTC");
+  check(g_replays.load() == 1, "...as a replay");
+}
+
+/* A PTK REKEY, which happens with the association already up and the machine
+ * already Connected - so nothing hung off the "we just connected" transition
+ * sees it. Both PN spaces restart with the new key; a receive window left at
+ * the old key's head rejects everything until the AP's PN climbs back within
+ * 64 of it, which is a link that reports itself keyed and carries nothing. */
+void test_ptk_rekey() {
+  reset_all();
+  {
+    std::lock_guard<std::mutex> l(g_mu);
+    g_sm.configure(g_crypto, kSsid, kPsk, g_own);
+  }
+  Ap ap;
+  associate(ap, /*rsn=*/true);
+  check(g_ptk_installs.load() == 1, "one pairwise key so far");
+
+  /* Carry enough traffic that a window which is NOT reset would reject the
+   * new key's PN 1 as ancient - the whole failure mode. */
+  const uint8_t pl[8] = {1};
+  for (int i = 0; i < 70; i++) {
+    const std::vector<uint8_t> d = ap.data_to_sta(pl, sizeof pl);
+    rx_frame(d.data(), d.size(), -40, 0);
+    (void)tap_read();
+  }
+  check(g_rx_replay.last() > 64, "the receive window is past a whole window");
+
+  uint8_t old_ptk[48];
+  std::memcpy(old_ptk, ap.ptk, sizeof old_ptk);
+
+  /* Message 1 of the rekey, inside the cipher, under the CURRENT key. */
+  const std::vector<uint8_t> m1 = ap.ptk_rekey_msg1();
+  rx_frame(m1.data(), m1.size(), -40, 0);
+  std::vector<std::vector<uint8_t>> tx = drain_tx();
+  check(tx.size() == 1, "message 2 goes out");
+  if (tx.size() == 1) {
+    /* UNDER THE OLD KEY. The authenticator has not switched its own yet. */
+    uint8_t plain[256];
+    size_t plen = 0;
+    uint64_t pn = 0;
+    check(devourer::sta::ccmp_decrypt(ap.crypto, old_ptk + 32, tx[0].data(),
+                                      tx[0].size(), 24, tx[0].data() + 10,
+                                      plain, sizeof plain, &plen, &pn),
+          "...encrypted under the key the rekey arrived under");
+    devourer::sta::EapolKey k;
+    if (devourer::sta::parse_eapol_key(plain + devourer::sta::kLlcSnapLen,
+                                       plen - devourer::sta::kLlcSnapLen, &k))
+      check(devourer::sta::derive_ptk(ap.crypto, ap.pmk, kBssid, kStaMac,
+                                      ap.anonce, k.nonce, ap.ptk),
+            "...and the AP derives the new PTK from it");
+  }
+
+  /* Message 3 completes it, still under the OLD key - it carries the NEW
+   * key's material and is protected by the one still in force. */
+  const std::vector<uint8_t> m3 = ap.eapol_protected(ap.msg3(), old_ptk + 32);
+  rx_frame(m3.data(), m3.size(), -40, 0);
+  check(g_ptk_installs.load() == 2, "the new pairwise key is installed");
+  check(std::memcmp(g_sm.supplicant().ptk(), ap.ptk, 48) == 0,
+        "...and both sides have the same one");
+  tx = drain_tx();
+  check(tx.size() == 1, "message 4 goes out");
+  if (tx.size() == 1) {
+    uint8_t plain[256];
+    size_t plen = 0;
+    uint64_t pn = 0;
+    /* THE SAME RULE, and the one that matters most: an authenticator that
+     * gets a message 4 it cannot decrypt fails the rekey and deauthenticates
+     * - the exact shape of the GROUP rekey defect this harness already
+     * found on air. */
+    check(devourer::sta::ccmp_decrypt(ap.crypto, old_ptk + 32, tx[0].data(),
+                                      tx[0].size(), 24, tx[0].data() + 10,
+                                      plain, sizeof plain, &plen, &pn),
+          "...also under the OLD key, which is all the AP can read");
+  }
+
+  check(g_tx_pn == 1, "the transmit PN restarted with the new key");
+  check(g_rx_replay.last() == 0, "...and so did the receive window");
+
+  /* And the AP's first frame under the new key, at PN 1, gets through. */
+  ap.tx_pn = 1;
+  const std::vector<uint8_t> d = ap.data_to_sta(pl, sizeof pl);
+  rx_frame(d.data(), d.size(), -40, 0);
+  check(tap_read().size() == devourer::sta::kEthHdrLen + sizeof pl,
+        "the first frame under the new key reaches the host");
+  check(g_replays.load() == 0, "...and is not rejected as a replay");
+}
+
+/* A group-addressed EAPOL-Key frame. It is not part of any handshake this
+ * station is in, and it is emphatically not the host's: writing an 0x888e
+ * frame onto the TAP hands the host stack a link-layer control frame the
+ * supplicant owns. */
+void test_group_addressed_eapol_is_not_the_hosts() {
+  reset_all();
+  {
+    std::lock_guard<std::mutex> l(g_mu);
+    g_sm.configure(g_crypto, kSsid, kPsk, g_own);
+  }
+  Ap ap;
+  associate(ap, /*rsn=*/true);
+  drain_tx();
+
+  const uint64_t rx_before = g_eapol_enc_rx.load();
+  const std::vector<uint8_t> g = ap.group_eapol(ap.msg1());
+  rx_frame(g.data(), g.size(), -40, 0);
+  check(tap_read().empty(), "a group-addressed EAPOL-Key is not given to the host");
+  check(g_eapol_enc_rx.load() == rx_before,
+        "...and is not fed to the state machine either");
+  check(drain_tx().empty(), "...and is not answered");
+
+  /* The control: a group frame that is NOT EAPOL still reaches the host, so
+   * the check above is about the ethertype and not about group frames. */
+  const uint8_t arp[28] = {0, 1};
+  const std::vector<uint8_t> ok_frame = ap.group_to_bss(arp, sizeof arp);
+  rx_frame(ok_frame.data(), ok_frame.size(), -40, 0);
+  check(tap_read().size() == devourer::sta::kEthHdrLen + sizeof arp,
+        "...while an ordinary group frame still does");
+}
+
+/* The multi-channel sweep. The docs claimed a cell covered this and none
+ * did: reset_all() configures exactly one channel, and scan_step() returns
+ * early for a single-entry list, so the rotation was unreached by the whole
+ * file. */
+void test_the_channel_sweep_rotates() {
+  reset_all();
+  {
+    std::lock_guard<std::mutex> l(g_mu);
+    g_sm.configure(g_crypto, kSsid, kPsk, g_own);
+    g_scan_chans.clear();
+    g_scan_chans.push_back(1);
+    g_scan_chans.push_back(6);
+    g_scan_chans.push_back(11);
+    g_scan_dwell_ms = 100;
+    g_scan_switch_ms = 0;
+    g_scan_idx = 0;
+  }
+  /* No BSS in the table, so supervise() stays in the scan and returns the
+   * channel it wants the radio on. */
+  check(supervise(0) == 1, "the sweep starts on the first channel");
+  check(supervise(50) == 1, "...and holds it for the dwell");
+  check(supervise(150) == 6, "...then moves on");
+  check(supervise(300) == 11, "...and on");
+  check(supervise(450) == 1, "...and wraps");
+
+  /* AND IT STOPS SWEEPING ONCE THERE IS SOMETHING TO JOIN. Retuning under a
+   * live association is how a station loses one. */
+  const std::vector<uint8_t> b = beacon(true, 6);
+  rx_frame(b.data(), b.size(), -40, 500);
+  check(supervise(600) == 6, "the joined BSS's channel is what it asks for");
+  check(g_joins.load() == 1, "...because it joined");
+  check(supervise(5000) == 6, "...and it does not sweep away from it");
+}
+
 /* A GROUP REKEY installs a new GTK under the same association, and its PN
  * space restarts with the key. A station that kept the old window goes deaf
  * to broadcast for a whole window - which on this bench is every ARP the AP
@@ -750,9 +1074,11 @@ void test_group_rekey() {
   check(g_eapol_enc_rx.load() == 1,
         "the protected rekey is recognised as EAPOL, not handed to the host");
   check(tap_read().empty(), "...so nothing of it reaches the host");
-  check(g_have_gtk && std::memcmp(g_gtk_seen, gtk2, 16) == 0,
+  check(g_sm.supplicant().gtk_valid() &&
+            std::memcmp(g_sm.supplicant().gtk(), gtk2, 16) == 0,
         "the new GTK is installed");
-  check(g_gtk_seen_id == 2, "...at its new key id");
+  check(g_sm.supplicant().gtk_key_id() == 2, "...at its new key id");
+  check(g_gtk_installs.load() == 2, "...and counted as a SECOND group key");
 
   /* AND THE ANSWER IS ENCRYPTED TOO. An AP that gets a cleartext message 2
    * to a protected message 1 drops it, which is the same failure with an
@@ -1117,6 +1443,24 @@ void test_hostile_and_foreign_frames() {
   rx_frame(runt, sizeof runt, -40, 0);
   check(g_rx_short.load() >= 1, "a frame shorter than a header is refused");
 
+  /* A PROTECTED FRAME WITH NOTHING AFTER THE HEADER. The key-id read used to
+   * happen before anything proved the CCMP header was there, so this read
+   * three bytes past the end of the buffer - on MT7612U past the allocation,
+   * because this part strips the FCS. Any station on the channel can air it.
+   *
+   * THIS ARM IS ONLY MEANINGFUL UNDER THE SANITIZER BUILD. In a normal build
+   * the overread succeeds and the counters come out the same; run it under
+   * -DDEVOURER_SANITIZE=address+undefined, which is where it was proved. */
+  const uint64_t mic_before = g_mic_fail.load();
+  const uint64_t short_before = g_rx_short.load();
+  std::vector<uint8_t> stub = devourer::sta::data_hdr_from_ds(
+      kStaMac, kBssid, kPeer, /*protect=*/true, 9);
+  rx_frame(stub.data(), stub.size(), -40, 0);
+  check(g_rx_short.load() == short_before + 1,
+        "a protected frame with no CCMP header is short");
+  check(g_mic_fail.load() == mic_before,
+        "...and NOT a MIC failure - it is malformed, not forged");
+
   /* A well-formed protected frame from a DIFFERENT BSS. Our address filter is
    * the only one in the system - the MAC runs promiscuous. */
   std::vector<uint8_t> foreign = ap.data_to_sta((const uint8_t*)"x", 1);
@@ -1155,6 +1499,11 @@ int self_test() {
   selftest::test_group_key_is_chosen_by_key_id();
   selftest::test_plaintext_is_refused_on_a_protected_link();
   selftest::test_fragments_and_amsdu_are_refused();
+  selftest::test_the_tid_comes_from_the_qos_control_field();
+  selftest::test_a_group_key_we_cannot_use();
+  selftest::test_group_addressed_eapol_is_not_the_hosts();
+  selftest::test_ptk_rekey();
+  selftest::test_the_channel_sweep_rotates();
   selftest::test_group_rekey();
   selftest::test_a_stale_bss_is_not_joined();
   selftest::test_rssi_conversion();
