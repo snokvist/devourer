@@ -175,6 +175,10 @@ std::atomic<uint64_t> g_group_rx{0}, g_plain_rx{0}, g_rx_short{0};
 std::atomic<uint64_t> g_tap_tx{0}, g_tap_rx{0}, g_tap_drop{0};
 std::atomic<uint64_t> g_tx_enc{0}, g_tx_enc_fail{0}, g_tx_plain{0};
 std::atomic<uint64_t> g_crc_err{0}, g_amsdu_drop{0}, g_frag_drop{0};
+/* The group rekey, which rides INSIDE the cipher and so is counted apart from
+ * the four-way's cleartext EAPOL. Zero here on a link the AP rekeys is the
+ * signature of the defect that made this path exist. */
+std::atomic<uint64_t> g_eapol_enc_rx{0}, g_eapol_enc_tx{0};
 std::atomic<uint64_t> g_ccmp_tx_frames{0}, g_ccmp_tx_ns{0};
 std::atomic<uint64_t> g_ccmp_rx_frames{0}, g_ccmp_rx_ns{0};
 
@@ -277,6 +281,11 @@ void note_gtk() {
   g_have_gtk = true;
   g_group_replay.reset();
 }
+
+/* Declared here and defined below with the rest of the transmit path: the
+ * receive path needs it for the group rekey's answer, which is encrypted
+ * exactly as a data frame is. */
+bool air_msdu(const uint8_t* msdu, size_t len, const uint8_t da[6]);
 
 /* ---- UP: one received MPDU --------------------------------------------- */
 
@@ -405,7 +414,68 @@ void rx_frame(const uint8_t* mpdu, size_t len, int8_t rssi, uint32_t now) {
     return;
   }
   if (!pairwise) g_group_rx.fetch_add(1);
+
+  /* AN EAPOL-KEY FRAME INSIDE THE CIPHER IS THE GROUP REKEY, and it is the
+   * state machine's, not the host's. Handing it to the TAP instead is what
+   * this harness did on its first WPA2 run against hostapd, which answered
+   * none of its four message 1s and then threw the station off the BSS -
+   * see StationSm::on_decrypted_msdu.
+   *
+   * Only a frame addressed to US: a group-addressed EAPOL-Key is not part of
+   * any handshake this station is in. */
+  std::vector<uint8_t> reply;
+  if (to_us && g_sm.on_decrypted_msdu(plain.data(), plain_len, now, &reply)) {
+    g_eapol_enc_rx.fetch_add(1);
+    if (!reply.empty()) {
+      /* The answer is encrypted too, under the pairwise key, exactly as a
+       * data frame is. It is addressed to the BSSID because the AP is both
+       * the receiver and the destination of an EAPOL-Key frame. */
+      std::vector<uint8_t> out;
+      devourer::sta::append_llc_snap(out, 0x888e);
+      out.insert(out.end(), reply.begin(), reply.end());
+      if (air_msdu(out.data(), out.size(), g_sm.bssid()))
+        g_eapol_enc_tx.fetch_add(1);
+    }
+    /* A rekey installs a new GTK, and its PN space restarts with it. */
+    note_gtk();
+    return;
+  }
   tap_up(da, sa, plain.data(), plain_len);
+}
+
+/* ---- DOWN: one MSDU onto the air --------------------------------------- */
+
+/* Frame and (on a protected link) encrypt one MSDU for `da`, and queue it.
+ * Returns false when the cipher refused. Caller holds g_mu.
+ *
+ * Shared by the host's traffic and by the group rekey's answer, which is the
+ * reason it is a function: the rekey reply must be encrypted exactly the way
+ * a data frame is, and a second copy of this would be a second chance to get
+ * the PN space wrong. */
+bool air_msdu(const uint8_t* msdu, size_t len, const uint8_t da[6]) {
+  const bool protect = g_sm.security() != StationSm::Security::Open;
+  std::vector<uint8_t> hdr = devourer::sta::data_hdr_to_ds(
+      g_sm.bssid(), g_own, da, protect, g_data_seq.next());
+
+  if (!protect) {
+    hdr.insert(hdr.end(), msdu, msdu + len);
+    g_tx_plain.fetch_add(1);
+    enqueue(std::move(hdr));
+    return true;
+  }
+  std::vector<uint8_t> f(devourer::sta::ccmp_encrypted_len(hdr.size(), len));
+  const size_t n = devourer::sta::ccmp_encrypt(
+      g_crypto, g_sm.supplicant().tk(), hdr.data(), hdr.size(), g_own,
+      g_tx_pn, /*key_id=*/0, msdu, len, f.data(), f.size());
+  if (n == 0) { g_tx_enc_fail.fetch_add(1); return false; }
+  /* Only after the cipher succeeded: a PN burned on a frame that was never
+   * aired is harmless, but a PN reused because the failure path skipped the
+   * increment is not. */
+  g_tx_pn++;
+  f.resize(n);
+  g_tx_enc.fetch_add(1);
+  enqueue(std::move(f));
+  return true;
 }
 
 /* ---- DOWN: one Ethernet frame from the host ---------------------------- */
@@ -429,28 +499,7 @@ void tap_down_one(const uint8_t* eth, size_t len) {
    * MAC is the ordinary cause, which is worth being able to see. */
   if (std::memcmp(sa, g_own, 6) != 0) { g_tap_drop.fetch_add(1); return; }
 
-  const bool protect = g_sm.security() != StationSm::Security::Open;
-  std::vector<uint8_t> hdr = devourer::sta::data_hdr_to_ds(
-      g_sm.bssid(), g_own, da, protect, g_data_seq.next());
-
-  if (!protect) {
-    hdr.insert(hdr.end(), msdu, msdu + m);
-    g_tx_plain.fetch_add(1);
-    enqueue(std::move(hdr));
-    return;
-  }
-  std::vector<uint8_t> f(devourer::sta::ccmp_encrypted_len(hdr.size(), m));
-  const size_t n = devourer::sta::ccmp_encrypt(
-      g_crypto, g_sm.supplicant().tk(), hdr.data(), hdr.size(), g_own,
-      g_tx_pn, /*key_id=*/0, msdu, m, f.data(), f.size());
-  if (n == 0) { g_tx_enc_fail.fetch_add(1); g_tap_drop.fetch_add(1); return; }
-  /* Only after the cipher succeeded: a PN burned on a frame that was never
-   * aired is harmless, but a PN reused because the failure path skipped the
-   * increment is not. */
-  g_tx_pn++;
-  f.resize(n);
-  g_tx_enc.fetch_add(1);
-  enqueue(std::move(f));
+  if (!air_msdu(msdu, m, da)) g_tap_drop.fetch_add(1);
 }
 
 /* ---- the scan and the reconnect policy ---------------------------------- */
@@ -664,6 +713,11 @@ void report() {
                g_sm.rx_malformed, g_sm.tx_dropped);
   const devourer::sta::Supplicant& sup = g_sm.supplicant();
   std::fprintf(stderr,
+               "  group rekey (EAPOL inside the cipher): received=%llu,"
+               " answered=%llu\n",
+               (unsigned long long)g_eapol_enc_rx.load(),
+               (unsigned long long)g_eapol_enc_tx.load());
+  std::fprintf(stderr,
                "  four-way: mic_failures=%u replays=%u retransmits=%u"
                " malformed=%u out_of_state=%u ignored=%u crypto_errors=%u\n",
                sup.mic_failures, sup.replays, sup.retransmits, sup.malformed,
@@ -762,20 +816,25 @@ int main(int argc, char** argv) {
   g_dev = dev.get();
   if (!g_dev) return 1;
 
+  g_rt = devourer::build_stream_radiotap(devourer::parse_tx_mode_str("6M"));
+  g_dev->InitWrite(SelectedChannel{g_chan, 0, CHANNEL_WIDTH_20});
+
   /* THE STATION'S ADDRESS IS THE ADAPTER'S, NOT A CHOICE. See the note at the
    * top of this file: on MT7612U a station that transmits from any other
    * address is deaf, because the auto-response engine matches address 1
    * against MT_MAC_ADDR. Refusing outright is better than running with an
-   * invented address and reporting a link that cannot work. */
+   * invented address and reporting a link that cannot work.
+   *
+   * AFTER InitWrite, not before. CreateRadio performs no bring-up - the
+   * device handle behind this call does not exist until InitWrite has run,
+   * and asking early returns false, which this then reports as "the radio
+   * does not know its own MAC". Measured, on the first on-air run. */
   if (!g_dev->GetPermanentMacAddress(g_own)) {
     std::fprintf(stderr,
                  "sta_client: the radio does not report its MAC address - a "
                  "station cannot invent one, see src/mt7612u/station.cpp\n");
     return 1;
   }
-
-  g_rt = devourer::build_stream_radiotap(devourer::parse_tx_mode_str("6M"));
-  g_dev->InitWrite(SelectedChannel{g_chan, 0, CHANNEL_WIDTH_20});
 
   {
     std::lock_guard<std::mutex> l(g_mu);
@@ -804,16 +863,13 @@ int main(int argc, char** argv) {
    * chip test - that is what station_mode_ok is for, and it is the one line
    * a second backend has to satisfy instead of editing this file. */
   const devourer::AdapterCaps caps = g_dev->GetAdapterCaps();
-  bool armed = false;
-  if (caps.station_mode_ok) {
-    const devourer::MacAddr own{{g_own[0], g_own[1], g_own[2],
-                                 g_own[3], g_own[4], g_own[5]}};
-    /* The BSSID is not known until a BSS is selected, so the identity is
-     * armed with the one we end up joining - see the loop below. This first
-     * call only proves the seam accepts our own address. */
-    armed = g_dev->SetStationIdentity(own, own);
-    if (armed) g_dev->ClearStationIdentity();
-  }
+  /* NOT ARMED HERE. The BSSID is not known until a BSS has been selected, so
+   * the only call that can be made at startup is SetStationIdentity(own,
+   * own) - which the seam REFUSES, correctly and by contract ("`own` and
+   * `bssid` must both be unicast and must differ"). The first on-air run
+   * made exactly that call and logged "station identity refused: own ==
+   * bssid", which looks like a capability failure and is a harness bug. The
+   * identity is armed in the loop below, once, for the BSS actually joined. */
 
   std::thread tap_rd;
   if (g_tap_fd >= 0) {
@@ -829,10 +885,10 @@ int main(int argc, char** argv) {
 
   std::fprintf(stderr,
                "sta_client up: own %02x:%02x:%02x:%02x:%02x:%02x ssid '%s' "
-               "%s ch%u station_mode_ok=%d identity_seam=%s\n",
+               "%s ch%u station_mode_ok=%d\n",
                g_own[0], g_own[1], g_own[2], g_own[3], g_own[4], g_own[5],
                g_ssid.c_str(), g_psk.empty() ? "OPEN" : "WPA2-PSK", g_chan,
-               (int)caps.station_mode_ok, armed ? "OK" : "not armed");
+               (int)caps.station_mode_ok);
 
   uint8_t tuned = g_chan;
   uint8_t bssid_armed[6] = {0};
@@ -861,7 +917,13 @@ int main(int argc, char** argv) {
         const devourer::MacAddr bss{{bssid_armed[0], bssid_armed[1],
                                      bssid_armed[2], bssid_armed[3],
                                      bssid_armed[4], bssid_armed[5]}};
-        g_dev->SetStationIdentity(own, bss);
+        const bool ok = g_dev->SetStationIdentity(own, bss);
+        std::fprintf(stderr,
+                     "  station identity %s for BSSID "
+                     "%02x:%02x:%02x:%02x:%02x:%02x\n",
+                     ok ? "armed" : "REFUSED", bssid_armed[0], bssid_armed[1],
+                     bssid_armed[2], bssid_armed[3], bssid_armed[4],
+                     bssid_armed[5]);
       }
       std::vector<uint8_t> f;
       while (g_sm.pop_tx(&f)) {

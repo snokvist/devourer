@@ -275,8 +275,14 @@ class StationSm {
      * separately from a frame that was addressed wrongly. */
     if (fc0 != kFcData && !is_qos_data(fc0)) { rx_ignored++; return; }
     if (!(fc1 & kFcFromDs) || (fc1 & kFcToDs)) { rx_ignored++; return; }
-    /* The four-way is never protected: the keys it carries are what
-     * protection would need. */
+    /* The FOUR-WAY is never protected - the keys it carries are what
+     * protection would need - so a protected data frame is not one of its
+     * messages and this machine cannot read it anyway: it holds no cipher.
+     *
+     * THE GROUP KEY HANDSHAKE IS A DIFFERENT MATTER, and this refusal used
+     * to be the end of the story for it. It runs AFTER the PTK is installed
+     * and is therefore protected like any other data frame. The caller
+     * decrypts and hands the plaintext back through on_decrypted_msdu(). */
     if (fc1 & kFcProtected) { rx_ignored++; return; }
     const size_t hlen = data_hdr_len(fc0, fc1);
     if (len < hlen + kLlcSnapLen) { rx_malformed++; return; }
@@ -287,6 +293,43 @@ class StationSm {
     }
     if (!(llc[6] == 0x88 && llc[7] == 0x8e)) { rx_ignored++; return; }
     on_eapol(llc + kLlcSnapLen, len - hlen - kLlcSnapLen, now_ms);
+  }
+
+  /* One DECRYPTED MSDU - LLC/SNAP followed by its payload - that arrived
+   * from our AP addressed to this station. Returns true when it was an
+   * EAPOL-Key frame and has been consumed; the caller gives anything else to
+   * the host.
+   *
+   * WHY THIS EXISTS, MEASURED RATHER THAN ANTICIPATED. on_rx() refuses every
+   * protected data frame, which is right for the four-way (it runs before
+   * there is a key) and WRONG for the GROUP KEY HANDSHAKE, which runs after
+   * the PTK is installed and is protected like any other data frame. Against
+   * hostapd on 2026-09-21 the four-way completed and then:
+   *
+   *     WPA: pairwise key handshake completed (RSN)
+   *     WPA: group key handshake failed (RSN) after 4 tries
+   *     AP-STA-DISCONNECTED
+   *
+   * All four of its message 1s were counted as rx_ignored here. A station
+   * that cannot answer a rekey is thrown off by every AP that performs one,
+   * which is most of them - and the link looks healthy right up until it
+   * ends.
+   *
+   * `out_reply` takes the EAPOL-Key body to send back. It is a BODY and not
+   * a frame because the answer has to be encrypted, and the cipher belongs
+   * to the caller - see eapol_reply().
+   *
+   * The caller has already verified the frame's MIC, which is a stronger
+   * statement than "the Protected bit was set", so nothing is given up by
+   * taking the plaintext. */
+  bool on_decrypted_msdu(const uint8_t* msdu, size_t len, uint32_t now_ms,
+                         std::vector<uint8_t>* out_reply) {
+    if (!msdu || !is_ethertype_snap(msdu, len)) return false;
+    if (!(msdu[6] == 0x88 && msdu[7] == 0x8e)) return false;
+    std::vector<uint8_t> reply =
+        eapol_reply(msdu + kLlcSnapLen, len - kLlcSnapLen, now_ms);
+    if (out_reply) *out_reply = std::move(reply);
+    return true;
   }
 
   /* Drive timeouts and retransmissions. Call it as often as convenient; it
@@ -439,7 +482,14 @@ class StationSm {
     sup_.start(*crypto_, pmk_, own_, bssid_, snonce_);
   }
 
-  void on_eapol(const uint8_t* eapol, size_t len, uint32_t now_ms) {
+  /* One EAPOL-Key frame in, the EAPOL-Key body to send back out (or empty).
+   *
+   * THE REPLY IS A BODY AND NOT A FRAME because the two callers need
+   * different framing: the four-way is unprotected and this machine can
+   * build it, while a group rekey's answer must be encrypted and this
+   * machine holds no cipher. The caller with the keys does that half. */
+  std::vector<uint8_t> eapol_reply(const uint8_t* eapol, size_t len,
+                                   uint32_t now_ms) {
     std::vector<uint8_t> reply;
 
     /* An EAPOL-Key frame on an open link is never ours: the supplicant was
@@ -447,21 +497,10 @@ class StationSm {
      * against. Counted as ignored rather than dropped silently, because "the
      * AP is trying to key us and we are configured open" is a configuration
      * mismatch worth being able to see. */
-    if (security_ != Security::Wpa2Psk) { rx_ignored++; return; }
-    if (state_ != State::FourWay && state_ != State::Connected) return;
+    if (security_ != Security::Wpa2Psk) { rx_ignored++; return {}; }
+    if (state_ != State::FourWay && state_ != State::Connected) return {};
     eapol_rx++;
     const Supplicant::Verdict v = sup_.on_eapol(eapol, len, &reply);
-    if (v != Supplicant::Verdict::Reply &&
-        v != Supplicant::Verdict::Retransmit)
-      return;
-    if (reply.empty()) return;
-
-    std::vector<uint8_t> m = data_hdr_to_ds(bssid_, own_, bssid_,
-                                            /*protect=*/false, seq_.next());
-    append_llc_snap(m, 0x888e);
-    m.insert(m.end(), reply.begin(), reply.end());
-    queue(std::move(m));
-    eapol_tx++;
 
     /* The deadline moves only when the handshake moved. A retransmission we
      * answered again is not progress, and letting it push the give-up out
@@ -472,6 +511,22 @@ class StationSm {
       state_ = State::Connected;
       last_beacon_ms_ = now_ms;
     }
+    if (v != Supplicant::Verdict::Reply &&
+        v != Supplicant::Verdict::Retransmit)
+      return {};
+    if (!reply.empty()) eapol_tx++;
+    return reply;
+  }
+
+  void on_eapol(const uint8_t* eapol, size_t len, uint32_t now_ms) {
+    const std::vector<uint8_t> reply = eapol_reply(eapol, len, now_ms);
+
+    if (reply.empty()) return;
+    std::vector<uint8_t> m = data_hdr_to_ds(bssid_, own_, bssid_,
+                                            /*protect=*/false, seq_.next());
+    append_llc_snap(m, 0x888e);
+    m.insert(m.end(), reply.begin(), reply.end());
+    queue(std::move(m));
   }
 
   void fail(Failure why, uint16_t status) {

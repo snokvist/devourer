@@ -98,6 +98,7 @@ void reset_all() {
   g_tap_tx = 0; g_tap_rx = 0; g_tap_drop = 0;
   g_tx_enc = 0; g_tx_enc_fail = 0; g_tx_plain = 0;
   g_crc_err = 0; g_amsdu_drop = 0; g_frag_drop = 0;
+  g_eapol_enc_rx = 0; g_eapol_enc_tx = 0;
 }
 
 /* Drain whatever the station queued, stripping the radiotap prefix the real
@@ -341,6 +342,25 @@ struct Ap {
             devourer::sta::kKiMic | devourer::sta::kKiSecure |
             devourer::sta::kKiEncrypted,
         16, replay, anonce, nullptr, w.data(), w.size(), &crypto, ptk);
+  }
+
+  /* An EAPOL-Key frame PROTECTED under the pairwise key - which is how a
+   * real AP sends a group rekey, because it runs after the PTK is
+   * installed. The cleartext eapol_frame() above is the four-way's shape and
+   * is not this one. */
+  std::vector<uint8_t> eapol_protected(const std::vector<uint8_t>& body) {
+    std::vector<uint8_t> pt;
+    devourer::sta::append_llc_snap(pt, 0x888e);
+    pt.insert(pt.end(), body.begin(), body.end());
+    std::vector<uint8_t> hdr = devourer::sta::data_hdr_from_ds(
+        kStaMac, kBssid, kBssid, /*protect=*/true, seq.next());
+    std::vector<uint8_t> m(
+        devourer::sta::ccmp_encrypted_len(hdr.size(), pt.size()));
+    const size_t n = devourer::sta::ccmp_encrypt(
+        crypto, ptk + 32, hdr.data(), hdr.size(), kBssid, tx_pn++, 0,
+        pt.data(), pt.size(), m.data(), m.size());
+    m.resize(n);
+    return m;
   }
 
   /* A UNICAST frame encrypted under the GROUP key. Not a contrivance: an AP
@@ -714,15 +734,53 @@ void test_group_rekey() {
   }
   check(g_group_rx.load() == 5, "five group frames under the first GTK");
 
+  /* THE REKEY ARRIVES INSIDE THE CIPHER, because that is where a real AP
+   * puts it - it runs after the PTK is installed. Sending it in cleartext
+   * here, which the first version of this cell did, tests the four-way's
+   * path and leaves the one that matters unreached: against hostapd all
+   * four of its message 1s were counted as rx_ignored and the AP threw the
+   * station off the BSS ("group key handshake failed (RSN) after 4 tries").
+   * A green cell and a dead link. */
   uint8_t gtk2[16];
   std::memset(gtk2, 0xa7, sizeof gtk2);
-  const std::vector<uint8_t> rk = ap.eapol_frame(ap.group_msg1(gtk2, 2));
+  const std::vector<uint8_t> rk =
+      ap.eapol_protected(ap.group_msg1(gtk2, 2));
   rx_frame(rk.data(), rk.size(), -40, 0);
+  check(g_eapol_enc_rx.load() == 1,
+        "the protected rekey is recognised as EAPOL, not handed to the host");
+  check(tap_read().empty(), "...so nothing of it reaches the host");
   check(g_have_gtk && std::memcmp(g_gtk_seen, gtk2, 16) == 0,
         "the new GTK is installed");
   check(g_gtk_seen_id == 2, "...at its new key id");
-  pump_tx();
-  check(!drain_tx().empty(), "...and the rekey is answered");
+
+  /* AND THE ANSWER IS ENCRYPTED TOO. An AP that gets a cleartext message 2
+   * to a protected message 1 drops it, which is the same failure with an
+   * extra round trip. */
+  check(g_eapol_enc_tx.load() == 1, "the rekey is answered");
+  const std::vector<std::vector<uint8_t>> ans = drain_tx();
+  check(ans.size() == 1, "...with exactly one frame");
+  if (ans.size() == 1) {
+    check((ans[0][1] & devourer::sta::kFcProtected) != 0,
+          "...and it is PROTECTED");
+    uint8_t plain[256];
+    size_t plain_len = 0;
+    uint64_t pn = 0;
+    const bool ok = devourer::sta::ccmp_decrypt(
+        ap.crypto, ap.ptk + 32, ans[0].data(), ans[0].size(), 24,
+        ans[0].data() + 10, plain, sizeof plain, &plain_len, &pn);
+    check(ok, "...the AP decrypts it");
+    if (ok) {
+      check(plain_len > devourer::sta::kLlcSnapLen &&
+                plain[6] == 0x88 && plain[7] == 0x8e,
+            "...and it is an EAPOL-Key frame");
+      devourer::sta::EapolKey k;
+      check(devourer::sta::parse_eapol_key(
+                plain + devourer::sta::kLlcSnapLen,
+                plain_len - devourer::sta::kLlcSnapLen, &k) &&
+                devourer::sta::eapol_mic_ok(ap.crypto, ap.ptk, k),
+            "...whose MIC the AP accepts");
+    }
+  }
 
   const std::vector<uint8_t> g = ap.group_to_bss(arp, sizeof arp);
   rx_frame(g.data(), g.size(), -40, 0);
