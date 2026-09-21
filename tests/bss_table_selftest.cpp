@@ -91,10 +91,20 @@ void test_only_beacons_are_observed() {
   BssTable t;
   const uint8_t a[6] = {0x02, 0, 0, 0, 0, 0x01};
 
+  /* A 26-byte deauth is refused on LENGTH, not on subtype - parse_beacon
+   * needs 36 - so this arm alone would survive deleting the subtype check.
+   * Kept because a short frame must also be refused, and followed by a
+   * FULL-LENGTH frame whose only fault is its subtype. */
   std::vector<uint8_t> d =
       devourer::sta::build_deauth(a, a, 7);
   check(t.observe(d.data(), d.size(), -40, 1) == nullptr,
-        "a deauth is not observed as a BSS");
+        "a short deauth is not observed as a BSS");
+
+  std::vector<uint8_t> longd = beacon(a, "one", 6, true);
+  longd[0] = devourer::sta::kFcDeauth;
+  check(t.observe(longd.data(), longd.size(), -40, 1) == nullptr,
+        "a FULL-LENGTH deauth is not observed either - this is the arm that "
+        "tests the subtype rather than the length");
 
   std::vector<uint8_t> f = beacon(a, "one", 6, true);
   f[0] = devourer::sta::kFcAssocResp;

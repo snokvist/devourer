@@ -30,7 +30,6 @@
 //   DEVOURER_WPA2_PSK=devourer123 DEVOURER_BCN_TU=25 DEVOURER_TX_WITH_RX=thread \
 //   build/ap_wpa2 [sec]
 #include <atomic>
-#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -50,7 +49,6 @@
 #include <linux/if.h>
 #include <linux/if_tun.h>
 #include <sys/ioctl.h>
-#include <unistd.h>
 
 #include "sta/BssTable.h"
 #include "sta/Ccmp.h"
@@ -224,11 +222,13 @@ static void append_ies(std::vector<uint8_t>& m, bool ssid, bool beacon = false) 
 
 /* THE BEACON THIS AP AIRS, in one place.
  *
- * The first ten bytes are NOT 802.11: they are the MediaTek beacon-offload
- * header StartBeacon expects, and the frame control is at offset 10. That is
- * worth knowing before reading the literal, and it is why kBeaconHdrLen
- * exists - a parser handed this buffer from byte 0 reads the offload header
- * as a frame control and refuses it.
+ * The first ten bytes are NOT 802.11: they are a RADIOTAP header, which is
+ * what StartBeacon's contract accepts ("strips the header if present" - see
+ * beacon_split in src/mt7612u/beacon.cpp), and the frame control is at offset
+ * 10. An earlier version of this comment called it a MediaTek beacon-offload
+ * header, which it is not. That is worth knowing before reading the literal,
+ * and it is why kBeaconHdrLen exists - a parser handed this buffer from byte
+ * 0 reads the radiotap header as a frame control and refuses it.
  *
  * `--self-test`'s cross-role cell parses what this returns, so the station
  * side is tested against the bytes main() actually transmits. It used to be a
@@ -686,9 +686,11 @@ static std::vector<uint8_t> ccmp_tx(const uint8_t* sta, uint16_t eth,
   std::vector<uint8_t> hdr = devourer::sta::data_hdr_from_ds(
       sta, kBssid, kBssid, /*protect=*/true, g_seq.next());
   uint64_t pn = st->tx_pn++;   /* one PN space per station */
-  // Non-QoS AAD (qos_tid defaults to -1): this AP airs plain data frames, and
-  // that is what has been validated on air. A station sending QoS data needs
-  // the other form - the two are not interchangeable, and ctest ccmp_framing
+  // A NON-QoS header, so ccmp_aad/ccmp_nonce derive the non-QoS form from the
+  // frame itself - there is no qos_tid parameter any more, and has not been
+  // since the AAD started reading the TID out of the header it is given. This
+  // AP airs plain data frames, which is what has been validated on air; a
+  // station sending QoS data needs the other form, and ctest ccmp_framing
   // asserts that a frame built under one does not verify under the other.
   std::vector<uint8_t> m(devourer::sta::ccmp_encrypted_len(hdr.size(),
                                                            pt.size()));
@@ -1091,7 +1093,13 @@ static void on_rx(const Packet& p) {
       st->rx_replay.reset();
       st->tx_pn = 1;          // a new key is a new PN space, both directions
       send_msg3(*st, true);
-    } else if ((ki & 0x0100) && (ki & 0x0200)) {        // msg4: MIC + secure
+    } else if ((ki & 0x0100) && (ki & 0x0200) && (ki & 0x0008) &&
+               !(ki & 0x0040)) {                        // msg4: pairwise MIC+secure
+      /* PAIRWISE, and not Install. MIC+secure alone is ALSO the shape of a
+       * group handshake's message 2 (key info 0x0302), which a station sends
+       * in answer to a group rekey - unreachable today because this AP never
+       * sends a group message 1, and a latent misclassification the moment it
+       * does. Found by a branch-wide review. */
       std::lock_guard<std::mutex> l(g_hs_mu);
       devourer::sta::Station* st = g_stas.find(sta);
       /* 12.7.6.5: msg4 must echo msg3's counter - or one of the recent ones,

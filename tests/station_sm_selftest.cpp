@@ -447,10 +447,18 @@ void test_frames_from_elsewhere_are_ignored() {
   devourer::sta::put_le16(n, 0);
   devourer::sta::put_le16(n, 2);
   devourer::sta::put_le16(n, 0);
-  n[4] ^= 0xff;                                   /* addr1: someone else */
+  /* THE LAST OCTET of addr1. Flipping byte 0 sets the group bit and makes the
+   * frame a BROADCAST, which is addressed to this station as much as to
+   * anyone - it then survives the unicast filter and is dropped only by the
+   * `if (to_us)` inside the auth branch, so deleting the filter would not
+   * change the outcome. This cell asserted exactly that until 2026-09-21. */
+  const uint32_t before = sm.rx_not_for_us;
+  n[9] ^= 0xff;
   sm.on_rx(n.data(), n.size(), 0);
   check(sm.state() == StationSm::State::Authenticating,
         "an auth response for another station is ignored");
+  check(sm.rx_not_for_us == before + 1,
+        "...by the address filter, which counted it");
 }
 
 /* The four-way is never protected. A PROTECTED frame claiming to be EAPOL

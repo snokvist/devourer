@@ -69,9 +69,29 @@ void test_seq() {
   check(c.next() == 0, "the counter wraps to 0, not to 4096");
 
   /* A short buffer must be refused, not written past. */
+  /* THE SHORT-BUFFER GUARD IS NOT ASSERTABLE FROM HERE, and saying so is
+   * better than an assertion that cannot fail. assign_seq writes only at
+   * offsets 22 and 23, which for a 10-byte buffer is precisely the overflow
+   * the guard prevents - so `tiny[0] == 0` is true whether the guard exists
+   * or not. Deleting `if (frame.size() < 24) return;` is caught by the
+   * sanitizer job (ctest `build-sanitizers`), not by this file.
+   *
+   * What IS assertable is the positive: the minimum legal buffer gets its
+   * sequence number and nothing else is touched. */
   std::vector<uint8_t> tiny(10, 0);
   assign_seq(tiny, 7);
-  check(tiny[0] == 0, "assign_seq refuses a buffer too short to hold a header");
+  check(tiny.size() == 10, "assign_seq on a short buffer changes nothing "
+                           "observable - the guard is proved by ASan, not here");
+
+  std::vector<uint8_t> exact(24, 0);
+  assign_seq(exact, 7);
+  check(exact[22] == 0x70 && exact[23] == 0x00,
+        "a 24-byte buffer - the minimum legal header - IS numbered");
+  for (size_t i = 0; i < 22; i++)
+    if (exact[i] != 0) {
+      check(false, "assign_seq touches nothing but the sequence control");
+      break;
+    }
 }
 
 /* The IE walker is the one function here that reads attacker-controlled

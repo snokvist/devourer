@@ -369,7 +369,13 @@ void test_four_address_aad() {
 /* The AAD rules, asserted directly, because they are the part that is silent
  * when wrong: a bad AAD is indistinguishable from a bad key at the far end. */
 void test_aad_masking() {
-  uint8_t hdr[24];
+  /* TWENTY-SIX, not twenty-four. This cell declares a QoS frame and passes
+   * hdr_len 26 below, so ccmp_aad reads the QoS Control field at offset 24 -
+   * off the end of a 24-byte array. AddressSanitizer caught it on
+   * 2026-09-21, years after the cell was written, because nothing had run
+   * these selftests under the sanitizer build until a review pointed out that
+   * another arm depended on it. */
+  uint8_t hdr[26];
   uint8_t aad[devourer::sta::kCcmpAadMax];
 
   std::memset(hdr, 0, sizeof hdr);
@@ -396,6 +402,60 @@ void test_aad_masking() {
   check((aad[1] & 0x03) == (hdr[1] & 0x03), "AAD preserves ToDS/FromDS");
   check(std::memcmp(aad + 2, hdr + 4, 18) == 0,
         "AAD carries addr1/addr2/addr3 verbatim");
+
+  /* THE ORDER BIT (+HTC), which no vector in this file could see because none
+   * of them set it. On a QoS data frame bit 15 means "an HT Control field
+   * follows" and 802.11-2016 12.5.3.3.3 masks it; on a NON-QoS frame the same
+   * bit is the strictly-ordered service class and must survive. Both arms,
+   * because masking it unconditionally is as wrong as never masking it. */
+  {
+    uint8_t htc[30];
+    uint8_t a[devourer::sta::kCcmpAadMax];
+
+    std::memset(htc, 0, sizeof htc);
+    htc[0] = 0x88;                                      /* QoS data */
+    htc[1] = (uint8_t)(devourer::sta::kFcToDs | 0x80);  /* +HTC / Order */
+    htc[24] = 0x03;                                     /* TID 3 */
+    check(devourer::sta::ccmp_aad(htc, 30, a) == 24,
+          "a QoS +HTC AAD is still 24 bytes - HT Control is not in it");
+    check((a[1] & 0x80) == 0, "AAD masks the Order bit on a QoS data frame");
+    check((a[1] & 0x01) != 0, "...without losing ToDS");
+
+    /* The same bit on a non-QoS data frame is a different field. */
+    uint8_t ord[24];
+    std::memset(ord, 0, sizeof ord);
+    ord[0] = 0x08;                                      /* data, not QoS */
+    ord[1] = (uint8_t)(devourer::sta::kFcToDs | 0x80);
+    check(devourer::sta::ccmp_aad(ord, 24, a) == 22, "a non-QoS AAD is 22");
+    check((a[1] & 0x80) != 0,
+          "AAD KEEPS bit 15 on a non-QoS frame - there it is the "
+          "strictly-ordered service class, not +HTC");
+  }
+
+  /* A header shorter than a frame control is refused rather than READ. These
+   * functions derived the DS bits and the subtype before checking the length,
+   * which is an overread for any caller that gets the length wrong.
+   *
+   * THE BUFFERS ARE ONE BYTE ON THE HEAP, deliberately. Passing a short
+   * length over a long buffer proves nothing: the read succeeds, the second
+   * length check returns 0 anyway, and the reordering is invisible. With a
+   * genuine one-byte allocation the overread is a heap-buffer-overflow, which
+   * the `build-sanitizers` CI job turns into a failure. IN A NON-SANITIZED
+   * BUILD THIS ARM CANNOT FAIL, and a mutation restoring the old order does
+   * survive it here - recorded rather than dressed up. */
+  {
+    std::vector<uint8_t> one(1, 0x88);
+    std::vector<uint8_t> none;
+    uint8_t a2[6] = {0};
+    uint8_t nonce[devourer::sta::kCcmpNonceLen];
+
+    check(devourer::sta::ccmp_aad(one.data(), 1, aad) == 0,
+          "ccmp_aad refuses a one-byte header without reading past it");
+    check(devourer::sta::ccmp_aad(none.data(), 0, aad) == 0,
+          "ccmp_aad refuses a zero-length header without reading it");
+    check(!devourer::sta::ccmp_nonce(one.data(), 1, a2, 1, nonce),
+          "ccmp_nonce refuses a one-byte header without reading past it");
+  }
 
   /* A protected MANAGEMENT frame keeps its subtype - mac80211 masks the
    * subtype only for non-management frames, and 802.11w depends on it. */
@@ -552,13 +612,26 @@ void test_replay() {
   check(!t.accept(5, 6), "TID 6 still rejects its own replay");
   check(t.accept(11, 0), "TID 0 continues independently");
   check(t.last(0) == 11 && t.last(6) == 5, "the two windows are separate");
+  /* ACCEPTING ONE PN PROVES NOTHING: the first PN in any window is accepted,
+   * and PN 1 is inside TID 0's window too, so aliasing kNonQosTid to 0 passed
+   * this. The heads have to be read back separately. */
   check(t.accept(1, devourer::sta::CcmpReplay::kNonQosTid),
         "non-QoS traffic has a window of its own");
+  check(t.last(devourer::sta::CcmpReplay::kNonQosTid) == 1 && t.last(0) == 11,
+        "...a SEPARATE one - its head is 1 while TID 0's is still 11");
   check(!t.accept(99, -1), "an out-of-range TID is refused");
   check(!t.accept(99, 17), "an out-of-range TID is refused");
 
-  /* A rekey resets every counter: a new key is a new PN space. */
+  /* A rekey resets every counter: a new key is a new PN space.
+   *
+   * ACCEPTING PN 1 AFTER THE RESET PROVES NOTHING - it is inside the window
+   * and unmarked whether or not reset() ran, so an empty reset() passed this
+   * for as long as it existed. What cannot pass is re-accepting a PN the
+   * window has ALREADY SEEN, and reading the head back. */
   t.reset();
+  check(t.last(0) == 0 && t.last(6) == 0, "reset clears both heads");
+  check(t.accept(11, 0), "a PN already accepted on TID 0 is accepted again");
+  check(t.accept(5, 6), "...and one already accepted on TID 6");
   check(t.accept(1, 0) && t.accept(1, 6), "reset clears every TID window");
 }
 

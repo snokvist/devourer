@@ -963,6 +963,14 @@ endif()
 # library and for platforms on which this AP harness is not built.
 find_package(OpenSSL QUIET)
 if(OpenSSL_FOUND)
+    # The name does not end in "Selftest", so the aggregate at the bottom of
+    # this file does not collect it - and it registers a ctest, which makes it
+    # a "Not Run" failure on any host that builds only `selftests` and has
+    # OpenSSL. That is the exact defect 903c69e fixed for ApWpa2; it escapes
+    # the mingw job today only because OpenSSL is absent there, which is luck
+    # rather than design. Added to the aggregate explicitly instead of
+    # renaming, because `CcmpSwBench` is a BENCHMARK whose ctest mode is one
+    # flag - the name is right and the aggregate is what was wrong.
     add_executable(CcmpSwBench tests/ccmp_sw_bench.cpp)
     target_include_directories(CcmpSwBench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
     target_link_libraries(CcmpSwBench PRIVATE OpenSSL::Crypto)
@@ -1694,3 +1702,10 @@ foreach(_dvr_t IN LISTS _dvr_targets)
         add_dependencies(selftests ${_dvr_t})
     endif()
 endforeach()
+# CcmpSwBench registers a ctest but is a benchmark, so its name does not match
+# the convention above. Named here rather than renamed: a target that
+# registers a test and is not collected reports "Not Run", which is the
+# failure this aggregate exists to prevent.
+if(TARGET CcmpSwBench)
+    add_dependencies(selftests CcmpSwBench)
+endif()

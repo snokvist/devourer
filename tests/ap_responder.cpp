@@ -131,9 +131,15 @@ static std::vector<uint8_t> build_dhcp_reply(const uint8_t* sta, const uint8_t* 
 // CCK basic rates (1/2/5.5/11) do not exist on 5 GHz — advertising them makes a
 // 5 GHz station skip the BSS with "rate sets do not match" (silent, only in
 // wpa_supplicant -d), so no association on any 5 GHz channel.
-// Now src/sta/Dot11.h's, byte for byte - a station advertises the same set in
-// its probe and association requests, and a disagreement between the two sides
-// of this project would be invisible until an association silently failed.
+// Now src/sta/Dot11.h's, byte for byte.
+//
+// NOT the same set a station advertises, and that stopped being true on
+// 2026-09-21: append_supported_rates() is the AP's on-air-validated set and
+// deliberately omits 6, 9, 12 and 48 Mbps, while a STATION sends
+// append_supported_rates_sta(), which carries the mandatory OFDM rates
+// because an AP whose basic set includes one the station did not advertise
+// refuses the association with status 18. Do not "restore" the AP set on the
+// station side; that is the bug 03d2478 fixed.
 static void append_rates(std::vector<uint8_t>& m) {
   if (g_chan <= 14) devourer::sta::append_supported_rates(m);
   else devourer::sta::append_supported_rates_5g(m);

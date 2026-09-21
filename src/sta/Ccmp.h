@@ -9,7 +9,9 @@
  * that implement them, because each one was a debugging session: the AAD masks
  * the FC subtype/retry/pwr-mgmt/more-data bits and sets Protected, and masks
  * the sequence number while KEEPING the fragment number; the nonce is
- * 0 | A2 | PN as six big-endian bytes; and the CCMP header carries the 48-bit
+ * Flags | A2 | PN as six big-endian bytes, where Flags carries the QoS TID
+ * and the management bit (it said `0 |` here until the 2b.1 fix, and the
+ * summary outlived the code); and the CCMP header carries the 48-bit
  * PN split across two discontiguous ranges with an ext-IV bit that is not
  * optional.
  *
@@ -69,17 +71,42 @@ constexpr size_t kCcmpNonceLen = 13;
  * short for what the frame control claims.
  */
 inline size_t ccmp_aad(const uint8_t* hdr, size_t hdr_len, uint8_t* aad) {
-  const bool four_addr =
-      (hdr[1] & (kFcToDs | kFcFromDs)) == (kFcToDs | kFcFromDs);
-  const bool qos = is_qos_data(hdr[0]);
-  const bool mgmt = (hdr[0] & 0x0c) == 0x00; /* type 0 = management */
-  const size_t need = 24 + (four_addr ? 6 : 0) + (qos ? 2 : 0);
-  uint16_t fc = (uint16_t)(hdr[0] | (hdr[1] << 8));
-  size_t n;
+  bool four_addr, qos, mgmt;
+  size_t need, n;
+  uint16_t fc;
+
+  /* THE LENGTH CHECK COMES FIRST. It used to run after the three reads
+   * below, which is a one-byte out-of-bounds read on a caller that passes a
+   * short buffer - not reachable from the air through any in-tree caller,
+   * because ccmp_decrypt proves the length first, but a precondition a
+   * function checks AFTER dereferencing is not a precondition. */
+  if (hdr_len < 24) return 0;
+  four_addr = (hdr[1] & (kFcToDs | kFcFromDs)) == (kFcToDs | kFcFromDs);
+  qos = is_qos_data(hdr[0]);
+  mgmt = (hdr[0] & 0x0c) == 0x00; /* type 0 = management */
+  need = 24 + (four_addr ? 6 : 0) + (qos ? 2 : 0);
+  fc = (uint16_t)(hdr[0] | (hdr[1] << 8));
 
   if (hdr_len < need) return 0;
   if (!mgmt) fc &= (uint16_t)~0x0070u;             /* subtype: data/control */
   fc &= (uint16_t)~(0x0800u | 0x1000u | 0x2000u);  /* retry, pwr mgmt, more data */
+  /* THE ORDER BIT, masked for a QoS data frame and ONLY for one.
+   *
+   * On a QoS data frame bit 15 means "+HTC: an HT Control field follows", it
+   * is set per transmission, and 802.11-2016 12.5.3.3.3 masks it - Linux does
+   * the same inside its is_data_qos branch (net/mac80211/wpa.c,
+   * "Retry, PwrMgt, MoreData, Order (if Qos Data)"). On a NON-QoS frame the
+   * same bit is the strictly-ordered service class and is NOT masked, which
+   * is why this is not folded into the line above.
+   *
+   * This mask was missing until 2026-09-21, and the module disagreed with
+   * itself: data_hdr_len() already adds four bytes for HT Control. Every
+   * +HTC QoS frame therefore failed its MIC - refused, not accepted, and
+   * indistinguishable from a wrong key, which is the failure mode this file's
+   * own comments keep warning about. No station reaches it through the
+   * devourer AP, which advertises no HT; a station talking to a real AP
+   * would. */
+  if (qos) fc &= (uint16_t)~0x8000u;
   fc |= 0x4000u;                                   /* protected */
   aad[0] = (uint8_t)(fc & 0xff);
   aad[1] = (uint8_t)(fc >> 8);
@@ -132,12 +159,16 @@ inline size_t ccmp_aad(const uint8_t* hdr, size_t hdr_len, uint8_t* aad) {
  * matching ccmp_aad's zero return. */
 inline bool ccmp_nonce(const uint8_t* hdr, size_t hdr_len,
                        const uint8_t a2[6], uint64_t pn, uint8_t* nonce) {
-  const bool four_addr =
-      (hdr[1] & (kFcToDs | kFcFromDs)) == (kFcToDs | kFcFromDs);
-  const bool qos = is_qos_data(hdr[0]);
-  const bool mgmt = (hdr[0] & 0x0c) == 0x00; /* type 0 = management */
-  const size_t need = 24 + (four_addr ? 6 : 0) + (qos ? 2 : 0);
+  bool four_addr, qos, mgmt;
+  size_t need;
   uint8_t flags = 0;
+
+  /* Length first, for the reason ccmp_aad gives. */
+  if (hdr_len < 24) return false;
+  four_addr = (hdr[1] & (kFcToDs | kFcFromDs)) == (kFcToDs | kFcFromDs);
+  qos = is_qos_data(hdr[0]);
+  mgmt = (hdr[0] & 0x0c) == 0x00; /* type 0 = management */
+  need = 24 + (four_addr ? 6 : 0) + (qos ? 2 : 0);
 
   if (hdr_len < need) return false;
   if (qos) flags = (uint8_t)(hdr[four_addr ? 30 : 24] & 0x0f);

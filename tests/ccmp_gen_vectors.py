@@ -75,11 +75,18 @@ def is_qos(fc0):
 
 
 def hdr_len_of(hdr):
+    # Mirrors src/sta/Dot11.h data_hdr_len(), INCLUDING the HT Control field a
+    # QoS frame with the Order bit carries. This helper omitted that until
+    # 2026-09-21 - the same omission ccmp_aad had, in the file that exists to
+    # be independent of it, which is how a missing Order mask went unnoticed
+    # in both.
     n = 24
     if (hdr[1] & 0x03) == 0x03:
         n += 6
     if is_qos(hdr[0]):
         n += 2
+        if hdr[1] & 0x80:
+            n += 4
     return n
 
 
@@ -94,6 +101,8 @@ def ccmp_aad(hdr):
     fc &= ~0x0800              # retry
     fc &= ~0x1000              # pwr mgmt
     fc &= ~0x2000              # more data
+    if qos:
+        fc &= ~0x8000          # +HTC/Order, masked for QoS data only
     fc |= 0x4000               # protected
     seq = (hdr[22] | (hdr[23] << 8)) & 0x000F
     aad = bytes([fc & 0xFF, fc >> 8]) + bytes(hdr[4:22]) + \
@@ -183,6 +192,18 @@ CASES = [
      bytes.fromhex('8841000002424475d600aabbccddeeff02424475d6002010') +
      bytes.fromhex('0500'),
      bytes.fromhex('aaaa030000000806') + b'qos-tid-5-body'),
+
+    # QoS WITH THE ORDER BIT (+HTC): fc1 = 0xC1, so an HT Control field
+    # follows the QoS Control and data_hdr_len() reports 30. The AAD must MASK
+    # bit 15 here - it does not on a non-QoS frame, where the same bit is the
+    # strictly-ordered service class - and it did not until 2026-09-21, so
+    # every +HTC frame failed its MIC against any conforming peer. No vector
+    # in this file set the bit, which is why nothing noticed.
+    ('qos_order_htc', bytes.fromhex('101112131415161718191a1b1c1d1e1f'),
+     bytes.fromhex('aabbccddeeff'), 0x0000000000aa, 5,
+     bytes.fromhex('88c1000002424475d600aabbccddeeff02424475d6003050') +
+     bytes.fromhex('0300') + bytes.fromhex('00000000'),
+     bytes.fromhex('aaaa030000000800') + b'htc-ordered'),
 
     # 4-address QoS: the AAD gains A4 as well as the TID, 30 octets in all.
     # Nothing in the tree builds one yet, which is exactly why it is here -

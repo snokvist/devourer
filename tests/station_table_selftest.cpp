@@ -389,6 +389,26 @@ void test_forward_decision() {
   to_ds(h, BSSID, kA, kB, /*qos=*/true);
   check(decide_forward(h, 24, BSSID, t).what == Disposition::Malformed,
         "a QoS header declared as 24 bytes is Malformed, not guessed at");
+
+  /* A HEADER TOO SHORT FOR A FRAME CONTROL. decide_forward derived the DS
+   * bits and the QoS flag before checking the length, so a caller that got
+   * the length wrong caused a one-byte overread. One-byte HEAP buffers,
+   * because a short length over a long buffer proves nothing - the read
+   * succeeds and the verdict is Malformed either way. The overread is a
+   * heap-buffer-overflow the `build-sanitizers` CI job fails on; IN A
+   * NON-SANITIZED BUILD THIS ARM CANNOT FAIL, and that is stated rather than
+   * implied. */
+  {
+    std::vector<uint8_t> one(1, 0x88);
+    std::vector<uint8_t> none;
+
+    check(decide_forward(one.data(), 1, BSSID, t).what ==
+              Disposition::Malformed,
+          "a one-byte header is Malformed without being read past");
+    check(decide_forward(none.data(), 0, BSSID, t).what ==
+              Disposition::Malformed,
+          "a zero-length header is Malformed without being read");
+  }
   check(decide_forward(h, 24, BSSID, t).da == nullptr,
         "...and hands back no destination to act on");
 }

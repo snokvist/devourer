@@ -203,13 +203,21 @@ ip link set "$STA_IF" up 2>/dev/null || {
 # POWER SAVE OFF - a precondition these AP harnesses impose and had never
 # stated, because THE AP CANNOT SERVE A POWER-SAVING STATION AT ALL.
 #
-# This is a capability gap, not a harness convenience. Verified by reading the
-# three beacon builders (ap_responder.cpp:275-285, ap_wpa2.cpp:482-490,
-# mt7612u_beacon_stop_check.cpp:62-86): NONE of them appends a TIM element,
-# although src/sta/Dot11.h defines kEidTim. A beacon without a TIM is not a
-# conforming AP beacon (802.11-2016 9.4.2.6) and gives a dozing station no
-# DTIM schedule to wake on; nothing is buffered either, so a reply enqueued in
-# on_rx and sent from the main loop airs while the station is asleep.
+# This is a capability gap, not a harness convenience. CORRECTED 2026-09-21:
+# this used to say NONE of the beacon builders appends a TIM element. Two of
+# them now do - ap_responder.cpp's append_beacon_ies and ap_wpa2.cpp's
+# append_ies(..., beacon=true) both call devourer::sta::append_tim - and the
+# line citations were stale as well.
+#
+# THE GATE STILL STANDS, for the reason underneath the TIM: what these APs
+# advertise in it is "nothing buffered for anyone", and they mean it. There is
+# no per-AID buffer and no DTIM release; a reply enqueued in on_rx and sent
+# from the main loop airs whenever the main loop gets to it, which for a
+# dozing station is whenever it happens to be asleep. A conforming TIM with no
+# buffering behind it is not the same capability as power-save support.
+#
+# So do not read "the beacons have a TIM now" as a reason to drop this gate.
+# Measured: power_save on -> 0/60 pings and a dropped link; off -> 60/60.
 #
 # Measured, open network, 60 pings at 1/s, one run per arm:
 #

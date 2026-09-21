@@ -246,11 +246,19 @@ struct ForwardDecision {
 inline ForwardDecision decide_forward(const uint8_t* hdr, size_t hdr_len,
                                       const uint8_t bssid[6],
                                       const StationTable& table) {
-  const uint8_t fc0 = hdr[0], fc1 = hdr[1];
-  const bool four_addr =
-      (fc1 & (kFcToDs | kFcFromDs)) == (kFcToDs | kFcFromDs);
-  const bool qos = is_qos_data(fc0);
-  const size_t need = 24 + (four_addr ? 6 : 0) + (qos ? 2 : 0);
+  uint8_t fc0, fc1;
+  bool four_addr, qos;
+  size_t need;
+
+  /* Length first: this read the frame control before checking the length,
+   * which is a one-byte overread for a caller that passes a short buffer.
+   * Same correction as ccmp_aad's, for the same reason. */
+  if (hdr_len < 24) return {Disposition::Malformed, nullptr};
+  fc0 = hdr[0];
+  fc1 = hdr[1];
+  four_addr = (fc1 & (kFcToDs | kFcFromDs)) == (kFcToDs | kFcFromDs);
+  qos = is_qos_data(fc0);
+  need = 24 + (four_addr ? 6 : 0) + (qos ? 2 : 0);
 
   if (hdr_len < need) return {Disposition::Malformed, nullptr};
   /* BOTH HALVES OF "this is a fragment".
