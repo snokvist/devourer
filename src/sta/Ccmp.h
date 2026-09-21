@@ -202,6 +202,21 @@ inline uint64_t ccmp_header_pn(const uint8_t* ccmp_hdr) {
          ((uint64_t)ccmp_hdr[6] << 32) | ((uint64_t)ccmp_hdr[7] << 40);
 }
 
+/* Which key this frame was protected with: the top two bits of the CCMP
+ * header's fourth octet (802.11-2016 12.5.3.2).
+ *
+ * A RECEIVER MUST READ THIS AND NOT INFER IT. The obvious inference - group
+ * address means the group key - is wrong in both directions: an AP may
+ * unicast under the GTK during a rekey, and a station that guesses by address
+ * fails the MIC and reports it as an attack. The AP harness had the mirror of
+ * this bug and it cost a whole BSS's broadcast traffic (see ccmp_group_tx in
+ * tests/ap_wpa2.cpp: "a group frame sent at key id 0 is looked up as the
+ * PAIRWISE key at the station and fails its MIC with no diagnostic at either
+ * end"). */
+inline uint8_t ccmp_key_id(const uint8_t* ccmp_hdr) {
+  return (uint8_t)((ccmp_hdr[3] >> 6) & 0x03);
+}
+
 /* Protect one MPDU.
  *
  * `hdr` is the frame header and `hdr_len` its true length - 24, 26 for QoS, 30

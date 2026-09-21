@@ -155,22 +155,42 @@ class BssTable {
    * which is a confusing place to fail. Skipping it in selection turns that
    * into "no candidate".
    *
-   * WPA2-PSK only, on purpose: it is the one suite this project speaks, and a
-   * `require_rsn` argument with one caller would be configuration for a value
-   * that does not vary. An open-network selector can be a second function when
-   * something needs one.
-   *
    * Ties break on the most recently heard, so a stale entry never beats a live
    * one at equal signal.
    */
   const BssEntry* select(const std::string& ssid) const {
+    return best_matching(ssid, /*want_rsn=*/true);
+  }
+
+  /* The same question for a station configured for an OPEN network.
+   *
+   * Two named entry points rather than one `require_rsn` argument, which is
+   * what the comment that used to live above select() asked for - "an
+   * open-network selector can be a second function when something needs one",
+   * and Phase 4's `open` cell is the something. The loop is shared, so the
+   * two cannot drift in the tie-break or the eviction-safe iteration.
+   *
+   * "Open" is `!privacy`, not `!has_rsn`. A WEP BSS carries no RSN element
+   * and is not joinable by a station with no keys, and WPA1 lives in a vendor
+   * element this parser does not read at all - the Privacy capability bit is
+   * the one test that covers every protected BSS. StationSm::join refuses the
+   * same way, so a hand-picked entry gets the same answer as a selected one.
+   */
+  const BssEntry* select_open(const std::string& ssid) const {
+    return best_matching(ssid, /*want_rsn=*/false);
+  }
+
+ private:
+  /* The body both selectors share. `want_rsn` picks the joinability test:
+   * WPA2-PSK-CCMP without MFP required, or no encryption at all. */
+  const BssEntry* best_matching(const std::string& ssid, bool want_rsn) const {
     const BssEntry* best = nullptr;
 
     for (int i = 0; i < kMaxBss; i++) {
       if (!used_[i]) continue;
       const BssEntry& e = slots_[i];
       if (e.info.ssid != ssid) continue;
-      if (!e.info.rsn_ccmp_psk) continue;
+      if (want_rsn ? !e.info.rsn_ccmp_psk : e.info.privacy) continue;
       if (!best || e.rssi > best->rssi ||
           (e.rssi == best->rssi && e.last_seen_ms > best->last_seen_ms))
         best = &e;
@@ -178,7 +198,6 @@ class BssTable {
     return best;
   }
 
- private:
   int index_of(const uint8_t bssid[6]) const {
     for (int i = 0; i < kMaxBss; i++)
       if (used_[i] && std::memcmp(slots_[i].info.bssid, bssid, 6) == 0)

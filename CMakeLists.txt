@@ -1068,6 +1068,39 @@ if(OpenSSL_FOUND AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
         ${CMAKE_CURRENT_SOURCE_DIR}/tests
         ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
     add_test(NAME ap_wpa2_headless COMMAND ApWpa2Selftest --self-test)
+
+    # tests/sta_client.cpp headless - the STATION harness (Phase 4).
+    #
+    # The mirror of ApWpa2Selftest above, and it exists for the same reason:
+    # everything this harness owns is the part src/sta/ deliberately refused
+    # to guess at - the scan, the reconnect policy, and which key the data
+    # plane uses per frame - and none of it has any other test. Without this
+    # target those three would live only inside an on-air script, which is
+    # the exact gap Phase 2b recorded as its largest carried-forward defect.
+    #
+    # `sta_client --self-test` returns before libusb is opened, so ctest needs
+    # no adapter, no root and no airtime. It drives the real rx_frame() with
+    # real frames from a fixture authenticator and reads the real transmit
+    # queue back.
+    #
+    # Same guards as ApWpa2Selftest, for the same reasons: OpenSSL because
+    # the CryptoOps is tests/openssl_crypto_ops.h, and Linux because the TAP
+    # forwarder includes <linux/if_tun.h> unconditionally. And the name ends
+    # in "Selftest" so the `selftests` aggregate collects it - a registered
+    # test whose binary the mingw job never built is a "Not Run" failure,
+    # which is what 903c69e fixed for ApWpa2 and 2fef219 for CcmpSwBench.
+    add_executable(StaClientSelftest
+        tests/sta_client.cpp
+        examples/common/env_config.cpp
+        examples/common/usb_select.cpp
+    )
+    target_link_libraries(StaClientSelftest PUBLIC devourer
+                          PRIVATE PkgConfig::libusb OpenSSL::Crypto)
+    target_include_directories(StaClientSelftest PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
+    add_test(NAME sta_client_headless COMMAND StaClientSelftest --self-test)
 endif()
 
 # src/sta/Dot11.h - the management-frame module the AP harnesses and a station

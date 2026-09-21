@@ -61,6 +61,23 @@ class StationSm {
 
   /* Three transmissions of each management frame, 300 ms apart. An AP that
    * has not answered three probes in a second is not going to. */
+  /* WHICH KIND OF BSS THIS STATION IS CONFIGURED FOR.
+   *
+   * Not a hypothetical second mode: without an open path a station that never
+   * reaches Connected cannot say whether authentication/association or the
+   * key exchange is what failed, because on a WPA2 BSS the two halves come up
+   * together or not at all. The AP side of this tree has had the same ladder
+   * since the beginning - tests/ap_responder.cpp is the open AP and
+   * tests/ap_wpa2.cpp the protected one - and the station half did not.
+   *
+   * Open costs this file almost nothing: it skips the four-way and takes no
+   * CryptoOps, which is the same property the open AP harness has (it links
+   * no crypto library at all). */
+  enum class Security : uint8_t {
+    Open,
+    Wpa2Psk,
+  };
+
   static constexpr int kMaxTries = 3;
   static constexpr uint32_t kMgmtTimeoutMs = 300;
   /* The authenticator drives the four-way and retransmits it; this side only
@@ -95,7 +112,40 @@ class StationSm {
      * every attempt and every roam, making the PTK a function of the ANonce
      * alone. It is an argument to join(). */
     have_pmk_ = pmk_from_psk(crypto, psk, ssid, pmk_);
+    security_ = Security::Wpa2Psk;
+    /* CONFIGURED EVEN WHEN THE PMK DERIVATION FAILED, on purpose. Gating this
+     * on have_pmk_ would make the NoPmk branch in join() unreachable - the
+     * caller would get NotConfigured, which names the wrong thing - and a
+     * caller that ignores this return value is exactly the one that needs the
+     * accurate diagnosis. */
+    configured_ = true;
     return have_pmk_;
+  }
+
+  /* The same station on an OPEN BSS: no PSK, no PMK, no four-way, and no
+   * CryptoOps - which is why this overload takes none. See the Security enum
+   * for why an open path is worth having at all.
+   *
+   * It is a separate function rather than a null `psk` because a null
+   * passphrase reads like a caller's mistake, and because the WPA2 form needs
+   * a CryptoOps this one has no use for. */
+  bool configure_open(const std::string& ssid, const uint8_t own[6]) {
+    crypto_ = nullptr;
+    security_ = Security::Open;
+    ssid_ = ssid;
+    std::memcpy(own_, own, 6);
+    /* A station reconfigured from WPA2 to open must not keep the old PMK
+     * sitting in memory for the rest of the process's life.
+     *
+     * NO TEST PINS THIS, AND NONE CAN. have_pmk_ is cleared either way, so
+     * every observable behaviour is identical with the wipe deleted - a
+     * mutation removing it survives the whole suite, which is recorded here
+     * rather than hidden. It is the same defence-in-depth rule the destructor
+     * follows, and its value is against a core dump, not against a caller. */
+    secure_wipe(pmk_, sizeof pmk_);
+    have_pmk_ = false;
+    configured_ = true;
+    return true;
   }
 
   /* Begin an association with this BSS.
@@ -104,12 +154,28 @@ class StationSm {
    * Supplicant::start, which explains at length why this library takes it
    * rather than inventing it. */
   bool join(const BssEntry& bss, const uint8_t snonce[32], uint32_t now_ms) {
-    if (!crypto_) { fail(Failure::NotConfigured, 0); return false; }
-    if (!have_pmk_) { fail(Failure::NoPmk, 0); return false; }
+    if (!configured_) { fail(Failure::NotConfigured, 0); return false; }
     /* Refuse a BSS this station cannot finish with, rather than authenticating
      * and discovering it at the four-way. BssTable::select already filters on
      * this; join() is also reachable with a hand-picked entry. */
-    if (!bss.info.rsn_ccmp_psk) { fail(Failure::AssocRefused, 0); return false; }
+    if (security_ == Security::Wpa2Psk) {
+      if (!have_pmk_) { fail(Failure::NoPmk, 0); return false; }
+      if (!bss.info.rsn_ccmp_psk) { fail(Failure::AssocRefused, 0); return false; }
+      /* The SNonce is only read on this path, so it is only required on this
+       * path - but a WPA2 join without one would start the supplicant with a
+       * nonce of whatever was in the buffer, which for a caller that
+       * configures once and joins repeatedly is the PREVIOUS association's.
+       * See the comment in configure() about why it is an argument at all. */
+      if (!snonce) { fail(Failure::NotConfigured, 0); return false; }
+    } else if (bss.info.privacy) {
+      /* An open station cannot carry traffic on a BSS that encrypts it. The
+       * Privacy bit is set by WEP, WPA and RSN alike, so this one test covers
+       * every protected BSS without parsing any of them. Refusing here rather
+       * than at the data plane is the difference between "no candidate" and
+       * an association that succeeds and then passes nothing. */
+      fail(Failure::AssocRefused, 0);
+      return false;
+    }
 
     /* THE QUEUE IS CLEARED. Without this, frames still queued for the BSS we
      * gave up on are transmitted at the one we just joined - addressed to the
@@ -118,7 +184,7 @@ class StationSm {
      * it until a review built the case that does not. */
     tx_.clear();
     std::memcpy(bssid_, bss.info.bssid, 6);
-    std::memcpy(snonce_, snonce, 32);
+    if (security_ == Security::Wpa2Psk) std::memcpy(snonce_, snonce, 32);
     channel_ = bss.info.channel;
     aid_ = 0;
     fail_ = Failure::None;
@@ -277,6 +343,14 @@ class StationSm {
   const uint8_t* bssid() const { return bssid_; }
   const Supplicant& supplicant() const { return sup_; }
   bool keyed() const { return state_ == State::Connected && sup_.ptk_valid(); }
+  Security security() const { return security_; }
+  /* Associated and able to carry data. On a WPA2 BSS that is keyed(); on an
+   * open one there is no key, so a data plane gated on keyed() would never
+   * transmit at all. This is the predicate a caller wants. */
+  bool connected() const {
+    return state_ == State::Connected &&
+           (security_ == Security::Open || sup_.ptk_valid());
+  }
 
   uint32_t auth_tx = 0;
   uint32_t assoc_tx = 0;
@@ -311,7 +385,8 @@ class StationSm {
      * refused. Channel 0 means the beacon omitted the element, and 2.4 GHz is
      * the safe default - its rate set is the superset. */
     std::vector<uint8_t> m =
-        build_assoc_req(own_, bssid_, ssid_, /*rsn=*/true,
+        build_assoc_req(own_, bssid_, ssid_,
+                        /*rsn=*/security_ == Security::Wpa2Psk,
                         /*five_ghz=*/channel_ > 14);
     /* build_assoc_req returns an empty vector for an SSID it cannot encode.
      * Sending a truncated association request would be worse than failing. */
@@ -351,15 +426,28 @@ class StationSm {
     if (r.aid == 0) { fail(Failure::AssocRefused, r.status); return; }
 
     aid_ = r.aid;
-    state_ = State::FourWay;
     last_tx_ms_ = now_ms;
     last_beacon_ms_ = now_ms;
+    /* An open association is complete the moment the AP accepts it - there is
+     * no key exchange to wait for, so FourWay would be a state nothing could
+     * ever leave. */
+    if (security_ == Security::Open) {
+      state_ = State::Connected;
+      return;
+    }
+    state_ = State::FourWay;
     sup_.start(*crypto_, pmk_, own_, bssid_, snonce_);
   }
 
   void on_eapol(const uint8_t* eapol, size_t len, uint32_t now_ms) {
     std::vector<uint8_t> reply;
 
+    /* An EAPOL-Key frame on an open link is never ours: the supplicant was
+     * never started, so it holds no PMK and has nothing to verify a MIC
+     * against. Counted as ignored rather than dropped silently, because "the
+     * AP is trying to key us and we are configured open" is a configuration
+     * mismatch worth being able to see. */
+    if (security_ != Security::Wpa2Psk) { rx_ignored++; return; }
     if (state_ != State::FourWay && state_ != State::Connected) return;
     eapol_rx++;
     const Supplicant::Verdict v = sup_.on_eapol(eapol, len, &reply);
@@ -393,6 +481,8 @@ class StationSm {
   }
 
   CryptoOps* crypto_ = nullptr;
+  Security security_ = Security::Wpa2Psk;
+  bool configured_ = false;
   State state_ = State::Idle;
   Failure fail_ = Failure::None;
   std::string ssid_;

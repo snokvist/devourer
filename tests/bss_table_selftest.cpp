@@ -314,6 +314,50 @@ void test_wanted_ssid_survives_a_flood() {
   check(u.find(target) != nullptr, "...without evicting the first");
 }
 
+/* select_open() - the same question for a station with no keys (Phase 4).
+ *
+ * The two selectors must disagree about every BSS: one that offers WPA2-PSK
+ * is useless to an open station and vice versa. A single function answering
+ * both would make the `open` cell of the on-air harness pass against a
+ * protected AP, associate, and then carry nothing.
+ */
+void test_select_open() {
+  BssTable t;
+  const uint8_t protect[6] = {0x02, 0, 0, 0, 0, 0x11};
+  const uint8_t plain[6] = {0x02, 0, 0, 0, 0, 0x12};
+  const uint8_t wep[6] = {0x02, 0, 0, 0, 0, 0x13};
+
+  /* Same SSID on all three, so the ONLY thing that can separate them is the
+   * joinability test - not the name. */
+  std::vector<uint8_t> a = beacon(protect, "net", 6, /*rsn=*/true);
+  std::vector<uint8_t> b = beacon(plain, "net", 6, /*rsn=*/false);
+  t.observe(a.data(), a.size(), -30, 1000);       /* the STRONGER one */
+  t.observe(b.data(), b.size(), -70, 1000);
+
+  const BssEntry* o = t.select_open("net");
+  check(o != nullptr, "an open BSS is selectable by select_open");
+  if (o) check(std::memcmp(o->info.bssid, plain, 6) == 0,
+               "...and it is the OPEN one, not the stronger protected one");
+
+  const BssEntry* w = t.select("net");
+  check(w != nullptr, "the protected BSS is still selectable by select");
+  if (w) check(std::memcmp(w->info.bssid, protect, 6) == 0,
+               "...and it is the protected one");
+
+  /* A WEP BSS: Privacy set, no RSN element at all. Neither selector may
+   * offer it - select() because there is no RSN, select_open() because the
+   * link is encrypted with a key this station does not have. Testing
+   * !has_rsn instead of !privacy would hand it to the open station. */
+  std::vector<uint8_t> c = beacon(wep, "wepnet", 6, /*rsn=*/false);
+  c[24 + 10] |= 0x10;                             /* capability: Privacy */
+  t.observe(c.data(), c.size(), -20, 1000);
+  check(t.find(wep) != nullptr && t.find(wep)->info.privacy,
+        "the WEP BSS is observed, with Privacy set");
+  check(t.select_open("wepnet") == nullptr,
+        "...and select_open refuses it although it carries no RSN");
+  check(t.select("wepnet") == nullptr, "...and select refuses it too");
+}
+
 }  // namespace
 
 int main() {
@@ -321,6 +365,7 @@ int main() {
   test_only_beacons_are_observed();
   test_expire();
   test_select();
+  test_select_open();
   test_mfp_required_is_skipped();
   test_eviction_when_full();
   test_wanted_ssid_survives_a_flood();

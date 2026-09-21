@@ -41,25 +41,29 @@ const uint8_t kOwn[6] = {0x02, 0x11, 0x22, 0x33, 0x44, 0x01};
 const char* kSsid = "devourerAP";
 const char* kPsk = "devourer123";
 
-std::vector<uint8_t> beacon(const uint8_t bssid[6], uint8_t chan) {
+std::vector<uint8_t> beacon(const uint8_t bssid[6], uint8_t chan,
+                            bool rsn = true) {
   static const uint8_t bcast[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
   std::vector<uint8_t> m =
       devourer::sta::mgmt_hdr(devourer::sta::kFcBeacon, bcast, bssid, bssid);
 
   m.insert(m.end(), 8, 0);
   devourer::sta::put_le16(m, 100);
-  devourer::sta::put_le16(m, 0x0011);            /* ESS | Privacy */
+  /* Privacy tracks the RSN element. An open BSS that still set the bit would
+   * be refused by the open path for the right reason by accident, which is
+   * the sort of agreement that makes a cell unfalsifiable. */
+  devourer::sta::put_le16(m, (uint16_t)(rsn ? 0x0011 : 0x0001));
   devourer::sta::append_ssid(m, kSsid);
   devourer::sta::append_supported_rates(m);
   devourer::sta::append_ds_params(m, chan);
-  devourer::sta::append_rsn_ccmp_psk(m);
+  if (rsn) devourer::sta::append_rsn_ccmp_psk(m);
   return m;
 }
 
 /* Put a BSS in a table and hand back the entry, so join() is always reached
  * the way a real station reaches it. */
-const BssEntry* discovered(BssTable& t, uint8_t chan = 6) {
-  std::vector<uint8_t> b = beacon(kBssid, chan);
+const BssEntry* discovered(BssTable& t, uint8_t chan = 6, bool rsn = true) {
+  std::vector<uint8_t> b = beacon(kBssid, chan, rsn);
   return t.observe(b.data(), b.size(), -40, 0);
 }
 
@@ -80,7 +84,14 @@ struct FixtureAp {
    * doing exactly that survived this file. This knob makes the status field
    * the only thing that can refuse. */
   bool aid_even_when_refused = false;
+  /* An AP on an OPEN BSS sends no message 1. The knob exists so an open cell
+   * can choose either: quiet, which is what a real open AP does, or noisy,
+   * which is the configuration mismatch an open station must survive. */
+  bool sends_msg1 = true;
   bool saw_auth = false, saw_assoc = false, saw_msg4 = false;
+  /* The association request as it went out, so a cell can read the bytes
+   * rather than infer them from the outcome. */
+  std::vector<uint8_t> last_assoc;
 
   FixtureAp() {
     devourer::sta::pmk_from_psk(crypto, kPsk, kSsid, pmk);
@@ -117,6 +128,7 @@ struct FixtureAp {
     }
     if (fc0 == devourer::sta::kFcAssocReq) {
       saw_assoc = true;
+      last_assoc = f;
       std::vector<uint8_t> m = mgmt(devourer::sta::kFcAssocResp);
       devourer::sta::put_le16(m, 0x0011);
       devourer::sta::put_le16(m, assoc_status);
@@ -193,7 +205,8 @@ void pump(StationSm& sm, FixtureAp& ap, uint32_t now_ms, int rounds = 8) {
       const std::vector<uint8_t> r = ap.respond(f);
       if (!r.empty()) sm.on_rx(r.data(), r.size(), now_ms);
       /* The AP sends message 1 unprompted once it has associated us. */
-      if (f[0] == devourer::sta::kFcAssocReq && ap.assoc_status == 0) {
+      if (f[0] == devourer::sta::kFcAssocReq && ap.assoc_status == 0 &&
+          ap.sends_msg1) {
         const std::vector<uint8_t> m1 = ap.eapol_frame(ap.msg1());
         sm.on_rx(m1.data(), m1.size(), now_ms);
       }
@@ -776,6 +789,164 @@ void test_join_refuses_an_unusable_bss() {
   check(sm.pending_tx() == 0, "...without sending anything");
 }
 
+/* A CryptoOps whose PBKDF2 refuses, which is the only way to reach the NoPmk
+ * branch: OpenSSL's does not fail for any passphrase a caller can supply.
+ * Without it that branch is unreachable from this file and deleting it costs
+ * nothing - which is what "the test could not fail" means. */
+struct NoPbkdf2Crypto : OpenSslCryptoOps {
+  bool pbkdf2_sha1(const char*, const uint8_t*, size_t, unsigned, uint8_t*,
+                   size_t) override {
+    return false;
+  }
+};
+
+/* configure() reports the failure, and join() must then name it NoPmk rather
+ * than authenticating at an AP it can never finish a handshake with. */
+void test_no_pmk() {
+  NoPbkdf2Crypto crypto;
+  BssTable table;
+  StationSm sm;
+  uint8_t snonce[32];
+
+  std::memset(snonce, 0x7a, 32);
+  check(!sm.configure(crypto, kSsid, kPsk, kOwn),
+        "configure reports a failed PMK derivation");
+  discovered(table);
+  const BssEntry* bss = table.select(kSsid);
+  if (!bss) { check(false, "BSS discovered"); return; }
+  check(!sm.join(*bss, snonce, 0), "join refuses");
+  check(sm.fail_reason() == StationSm::Failure::NoPmk,
+        "...naming NoPmk, not NotConfigured");
+  check(sm.pending_tx() == 0, "...without airing an authentication request");
+}
+
+/* ---- the open-network path (Phase 4) ----------------------------------
+ *
+ * WHY IT EXISTS: without it a station that never reaches Connected cannot
+ * say whether the failure is in authentication/association or in the key
+ * exchange, because on a WPA2 BSS the two halves come up together or not at
+ * all. Phase 4's on-air harness runs an `open` cell first for exactly that
+ * reason, mirroring the AP side's ap_responder/ap_wpa2 ladder.
+ */
+void test_open_association() {
+  BssTable table;
+  StationSm sm;
+  FixtureAp ap;
+
+  ap.sends_msg1 = false;                 /* a real open AP keys nothing */
+  check(sm.configure_open(kSsid, kOwn), "configure_open succeeds");
+  check(sm.security() == StationSm::Security::Open, "...and says it is open");
+
+  discovered(table, 6, /*rsn=*/false);
+  const BssEntry* bss = table.select_open(kSsid);
+  check(bss != nullptr, "an open BSS is selectable by select_open");
+  check(table.select(kSsid) == nullptr,
+        "...and NOT by select(), which wants WPA2-PSK");
+  if (!bss) return;
+
+  /* A null SNonce, deliberately: the open path must not read it. Passing a
+   * real one would leave a mutation that deleted the Open branch of the copy
+   * undetectable. */
+  check(sm.join(*bss, nullptr, 0), "join starts without an SNonce");
+  pump(sm, ap, 0);
+
+  check(ap.saw_auth && ap.saw_assoc, "the AP saw both requests");
+  check(sm.state() == StationSm::State::Connected,
+        "the station connects with no four-way");
+  check(sm.connected(), "connected() is true");
+  check(!sm.keyed(), "...and keyed() is FALSE - there is no key");
+  check(sm.aid() == ap.aid, "...with the AID the AP allocated");
+  check(sm.eapol_tx == 0 && sm.eapol_rx == 0, "no EAPOL in either direction");
+  check(sm.supplicant().state() == devourer::sta::Supplicant::State::Idle,
+        "the supplicant was never started");
+
+  /* THE WIRE BYTES, not the outcome. An association request that still
+   * carried the RSN element, or still claimed Privacy, would associate
+   * against this fixture exactly as happily - the fixture does not look - and
+   * would be refused by a real open AP. */
+  check(!ap.last_assoc.empty(), "the association request was captured");
+  if (ap.last_assoc.size() >= 28) {
+    const uint16_t cap = devourer::sta::get_le16(ap.last_assoc.data() + 24);
+    size_t ie_len = 0;
+    check((cap & 0x0010) == 0, "...with the Privacy capability bit CLEAR");
+    check((cap & 0x0001) != 0, "...and ESS still set");
+    check(devourer::sta::find_ie(ap.last_assoc.data() + 28,
+                                 ap.last_assoc.size() - 28,
+                                 devourer::sta::kEidRsn, &ie_len) == nullptr,
+          "...and no RSN element");
+  }
+}
+
+/* An open station on a BSS that encrypts. It must refuse before
+ * authenticating: associating would succeed and every data frame would then
+ * be dropped by one side or the other, with no diagnostic anywhere. */
+void test_open_station_refuses_a_protected_bss() {
+  BssTable table;
+  StationSm sm;
+
+  sm.configure_open(kSsid, kOwn);
+  discovered(table, 6, /*rsn=*/true);
+  check(table.select_open(kSsid) == nullptr,
+        "select_open skips a BSS that advertises Privacy");
+
+  /* select_open refusing is not enough - join() is reachable with a
+   * hand-picked entry, which is how a caller with a configured BSSID gets
+   * here. Both gates are tested because either alone can be deleted. */
+  BssEntry e{};
+  std::memcpy(e.info.bssid, kBssid, 6);
+  e.info.ssid = kSsid;
+  e.info.privacy = true;
+  check(!sm.join(e, nullptr, 0), "join() refuses it too");
+  check(sm.state() == StationSm::State::Failed, "...and says so");
+  check(sm.pending_tx() == 0, "...without airing an authentication request");
+}
+
+/* The configuration mismatch: an open station at an AP that tries to key it.
+ * The supplicant holds no PMK and cannot verify a MIC, so feeding it an
+ * EAPOL-Key frame would either crash or invent a reply. It is counted and
+ * dropped, and the link stays up. */
+void test_open_station_ignores_eapol() {
+  BssTable table;
+  StationSm sm;
+  FixtureAp ap;
+
+  ap.sends_msg1 = true;                  /* the mismatch, on purpose */
+  sm.configure_open(kSsid, kOwn);
+  discovered(table, 6, /*rsn=*/false);
+  const BssEntry* bss = table.select_open(kSsid);
+  if (!bss) { check(false, "open BSS discovered"); return; }
+  sm.join(*bss, nullptr, 0);
+  pump(sm, ap, 0);
+
+  const uint32_t ignored_before = sm.rx_ignored;
+  const std::vector<uint8_t> m1 = ap.eapol_frame(ap.msg1());
+  sm.on_rx(m1.data(), m1.size(), 0);
+
+  check(sm.rx_ignored > ignored_before, "the EAPOL-Key frame is counted");
+  check(sm.eapol_rx == 0, "...and never reaches the supplicant");
+  check(sm.pending_tx() == 0, "...and is not answered");
+  check(sm.state() == StationSm::State::Connected, "...and the link stays up");
+}
+
+/* A WPA2 join with no SNonce. The station used to memcpy 32 bytes from
+ * whatever the caller passed; a caller that configures once and joins
+ * repeatedly would have reused the PREVIOUS association's nonce, which is the
+ * defect configure()'s comment already warns about from the other direction. */
+void test_wpa2_join_needs_an_snonce() {
+  OpenSslCryptoOps crypto;
+  BssTable table;
+  StationSm sm;
+
+  sm.configure(crypto, kSsid, kPsk, kOwn);
+  discovered(table);
+  const BssEntry* bss = table.select(kSsid);
+  if (!bss) { check(false, "BSS discovered"); return; }
+  check(!sm.join(*bss, nullptr, 0), "a WPA2 join without an SNonce is refused");
+  check(sm.fail_reason() == StationSm::Failure::NotConfigured,
+        "...as NotConfigured");
+  check(sm.pending_tx() == 0, "...without airing anything");
+}
+
 }  // namespace
 
 int main() {
@@ -796,6 +967,11 @@ int main() {
   test_leave();
   test_rx_counters();
   test_join_refuses_an_unusable_bss();
+  test_no_pmk();
+  test_open_association();
+  test_open_station_refuses_a_protected_bss();
+  test_open_station_ignores_eapol();
+  test_wpa2_join_needs_an_snonce();
 
   if (g_fail) {
     std::printf("station_sm_selftest: %d failure(s)\n", g_fail);
