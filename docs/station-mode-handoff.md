@@ -61,8 +61,18 @@ no threads, no sockets:
   station-side request builders, sequence counter, data-frame headers.
 
 Tested headless by `ctest`: `ccmp_framing`, `dot11_frames`,
-`ccmp_software_roundtrip`. **71/71 green.** Both selftests were verified
-capable of failing by injecting the defect they exist to catch.
+`ccmp_software_roundtrip`, and since Phase 2b `station_table` and
+`ap_wpa2_headless` — the last of which runs the WPA2 AP harness itself with
+no radio. **75/75 green.** Every selftest here was verified capable of failing
+by injecting the defect it exists to catch.
+
+`ccmp_framing` also carries `tests/ccmp_kernel_vectors.h`: sixteen protected
+QoS data frames the LINUX KERNEL encrypted, all eight TIDs in both directions,
+captured off a two-radio `mac80211_hwsim` rig by
+`tests/ccmp_capture_vectors.sh` (no hardware, no bench). They are the
+independent check the generated vectors are not — generator and header share
+one reading of the spec, which is how a CCM nonce with a zero flags octet
+stayed green through the whole suite.
 
 Both AP harnesses (`tests/ap_responder.cpp`, `tests/ap_wpa2.cpp`) are switched
 onto these modules. That is the load-bearing property: a station module only a

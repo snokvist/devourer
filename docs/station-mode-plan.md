@@ -627,7 +627,7 @@ after it; nothing in Phase 3 depends on it.
 
 | # | Item | Gate |
 |---|---|---|
-| 2b.1 | ~~Fix the CCMP nonce flags octet~~ **DONE 2026-09-20** | Gate met: mutation reintroducing `nonce[0] = 0` fails 8 checks (4 vector cells + 4 direct assertions in `test_nonce_flags()`); regeneration changed only the two QoS vectors. **Not met:** vectors still come from `ccmp_gen_vectors.py` (fixed in the same pass, so they are a regression gate, not an independent one), and interop is unproven because this AP advertises neither WMM nor HT, so no station sends it QoS. Annex J, and an on-air TID 1..7 cell, ride with the WMM work |
+| 2b.1 | ~~Fix the CCMP nonce flags octet~~ **DONE 2026-09-20, interop CLOSED 2026-09-21** | Gate met: mutation reintroducing `nonce[0] = 0` fails 8 checks (4 vector cells + 4 direct assertions in `test_nonce_flags()`); regeneration changed only the two QoS vectors. The interop half, originally "not met", is now closed by `tests/ccmp_kernel_vectors.h` — sixteen QoS frames the Linux kernel encrypted, all eight TIDs, captured off a virtual `mac80211_hwsim` rig; the same mutation breaks 14 of the 16 and leaves the two TID-0 ones green. An on-air TID 1..7 cell still rides with the WMM work |
 | 2b.2 | ~~Per-station table in `src/sta/`~~ **DONE 2026-09-20** — `src/sta/StationTable.h`, `tests/station_table_selftest.cpp`, ctest 74 | Gate met: `test_two_stations_are_independent()` holds two PTKs, two TX PN spaces and two CCMP windows, and a mutation collapsing `add()` to slot 0 is caught. 4 mutations run, 3 caught; the survivor (deleting `add()`'s redundant wipe) is recorded in the test rather than hidden. **Wired and device-verified 2026-09-20**: `tests/ap_wpa2.cpp` runs on the table, and TWO STATIONS ASSOCIATED AT ONCE — see "The two-station cell" below. `ap_responder.cpp` and `ul_trigger_ap.cpp` still use their own `g_sta` |
 | 2b.3 | ~~Pass the real SA; read addr3~~ **DONE** | `data_da`/`data_sa`/`data_da_is_group` in `Dot11.h`; relayed header byte-compared against Table 9-26 by hand, not against the builder. The cell caught its own author — the first version passed `data_hdr_to_ds`'s arguments in the wrong order and failed eight checks |
 | 2b.4 | ~~Real DHCP address pool + binding table~~ **DONE** | The station table IS the binding table: address = `192.168.99.(1 + aid)`, so nothing can outlive its lease or be double-allocated. On air: `DHCP: ACK 192.168.99.2 to aid=1` and `192.168.99.3 to aid=2` |
@@ -659,16 +659,101 @@ aborting rather than reporting a number about a different interface.
 
 **Still open, carried out of the phase rather than closed inside it:**
 
-- `tests/ap_wpa2.cpp` has no ctest target of its own. `decide_forward` and the
-  802.3 translation are now covered headlessly, but the handshake, the relay's
-  crypto and the TAP paths are exercised only on the bench.
+- ~~`tests/ap_wpa2.cpp` has no ctest target of its own.~~ **CLOSED
+  2026-09-21**, see below.
 - The AID→IP derivation couples identity to a reusable slot index, so an
   unauthenticated deauth costs more here than on a normal AP, where a lease is
   keyed on MAC. Inherent to the "table IS the binding table" simplification.
-- 2b.1's nonce fix is still interop-unproven: the AP advertises neither WMM nor
-  HT, so no station sends it a QoS frame. Annex J vectors and an on-air TID
-  1–7 cell ride with the WMM work.
+- ~~2b.1's nonce fix is still interop-unproven.~~ **CLOSED 2026-09-21**, see
+  below. An on-air TID 1..7 cell still rides with the WMM work, but it is no
+  longer the only thing that could close this.
 - Two stations, not seven, and no churn during traffic.
+
+### The two carried-forward items, closed 2026-09-21
+
+Both were closed before starting Phase 3, on the reasoning that a phase should
+not inherit a hole that a later phase is expected to repeat.
+
+**The nonce interop gap.** Closed with vectors the LINUX KERNEL produced, not
+with a second reading of the standard. `tests/ccmp_capture_vectors.sh` builds
+a two-radio `mac80211_hwsim` rig — no hardware, so the shared bench is
+untouched — runs hostapd with `wmm_enabled=1` and wpa_supplicant over it,
+sends one datagram per user priority in each direction, and cuts sixteen
+protected QoS data frames into `tests/ccmp_kernel_vectors.h`. All eight TIDs,
+both directions. The MIC is the oracle: CCM authenticates the AAD and the
+nonce, so one wrong bit in either fails the tag. Each vector is proved twice —
+the kernel's MIC must verify under our framing, and re-encrypting the
+recovered plaintext must reproduce the captured MPDU byte for byte.
+
+`ping -Q` does not give TID control (setting IP_TOS sets `sk_priority` through
+`ip_tos2prio[]` before `cfg80211_classify8021d` ever looks at the DSCP), which
+is why `tests/ccmp_tid_send.py` sets `SO_PRIORITY` to 256+tid instead. The
+first attempt produced TIDs 0,1,4,5,7 and was nearly accepted as coverage.
+
+Nine mutations of `src/sta/Ccmp.h`, one at a time. The original defect —
+`nonce[0] = 0` — now fails 15 kernel-vector assertions and leaves the two
+TID-0 vectors green, which is the shape of its survival. Four more are caught
+(PN endianness, the QoS subtype mask, the CCMP header's reserved byte and its
+Ext IV bit). Three are **not** caught by these vectors and stay covered by the
+direct assertion cells: the nonce's Management bit (the capture has no
+protected management frames — no PMF), the AAD's fragment-number masking (no
+fragments), and its retry masking (no retransmissions). The ninth — dropping
+the `& 0x0f` that keeps only the TID out of the QoS Control field — **survived
+the entire file, kernel frames included**, because every frame anywhere in
+this tree carries a plain TID with a zero upper nibble. `test_qos_aad` now
+builds its own header with EOSP, ack policy 3 and A-MSDU-present set. A real
+WMM/HT station sets those bits constantly.
+
+**The missing ctest target.** `ap_wpa2 --self-test` is ctest cell 75. It
+returns before libusb is opened: no adapter, no root, no airtime, no
+`/dev/net/tun`. Twelve cells in `tests/ap_wpa2_selftest.inc` drive the real
+`on_rx()` with synthetic frames and read the real transmit queue back, playing
+the supplicant end to end — the two-station handshake, a forged msg2, the key
+replay counter's window, a duplicate msg2, the relay, a data replay, a MIC
+failure, a QoS uplink, the group flood, both refusals, the ARP responder, and
+the TAP in both directions.
+
+It found a defect the day it was written. `decide_forward()` refused a
+fragment by testing the **More Fragments bit alone** — and that bit is CLEAR
+on the LAST fragment of a fragmented MSDU. The tail of another MSDU, carrying
+no LLC/SNAP header, was forwarded to a peer as a whole frame while every
+counter read success. The comment claiming this "cannot reach this AP while it
+advertises neither WMM nor HT" was wrong twice: fragmentation has no
+relationship to either, and any legacy station with a fragmentation threshold
+set produces it. Both halves are checked now.
+
+Thirteen mutations of the AP, one at a time; twelve caught. The one survivor
+is a wrong CCM nonce, and it is recorded in the cell rather than hidden: this
+file is a round trip, both ends call the same `ccmp_encrypt`/`ccmp_decrypt`,
+so a wrong TID is wrong identically in both directions and the MIC still
+verifies — which is precisely how the 2b.1 defect survived. The kernel vectors
+are what catch it. One earlier survivor was fixed rather than recorded:
+pinning the relay's PN to a constant passed every assertion in the file, and
+two frames under one key at one PN is keystream reuse. A cell now relays twice
+and requires the second PN to be greater.
+
+**Reviews.** Two adversarial Flash reviews, one per gate, eight findings
+between them, all eight verified against the tree before acting and all eight
+real. The first found that `ccmp_decrypt` had no output-capacity parameter at
+all while `ccmp_encrypt` had always had one — a fixed-size buffer one full-MTU
+frame away from a stack smash, in a function that processes frames from the
+air and writes the plaintext out before the tag is checked. It is a required
+argument now, with `ccmp_decrypted_len()` to size it and a negative arm that
+refuses one byte too few. The second found the new ctest target guarded only
+by `OpenSSL_FOUND` while `ap_wpa2.cpp` includes `<linux/if_tun.h>`
+unconditionally (it would break the macOS build matrix), and named so that the
+`selftests` aggregate the mingw job builds would not collect it — measured in
+both arms rather than reasoned about.
+
+**On air**, because three of the changes touch the AP's live path. MT7612U 1-1
+as the AP, RTL8812AU 8-1 as the station: ch36 **14/14**, ch6 **14/14** on the
+second run and **13/14** on the first. The 13/14 was one lost echo out of six
+in the WPA2 cell; the ledger read `fragmented=0, A-MSDU=0, MIC failures=0,
+replays rejected=0` — none of the counters the new checks would move — the
+cell then ran three more times at 0% loss with an identical ledger, and the
+bench cell measures this link at 0.4% loss over 3487 packets. Six packets is a
+small sample in either direction; the ledger is the evidence, not the ping
+count.
 
 ### Phase 2b review ledger
 
@@ -693,8 +778,9 @@ exists to correct, committed while correcting it.
 **Resolved from the boundary review** in `873dff0`: the replay-counter window,
 the PTK-before-MIC ordering, the give-up path freeing its record, the
 fragmentation and A-MSDU refusal, the ledger arithmetic, and four test
-defects. **Carried forward, not resolved:** `ap_wpa2.cpp` has no ctest target
-at all, so 2b.4–2b.7 rest on narrated bench runs; the relay decision should
+defects. **Carried forward, not resolved at the time:** `ap_wpa2.cpp` had no ctest
+target at all, so 2b.4–2b.7 rested on narrated bench runs (closed 2026-09-21 —
+see "The two carried-forward items" above); the relay decision should
 move into a pure function in `src/sta/` so it can be tested headlessly and so
 2b.8 can reuse it rather than writing a second copy; and the AID→IP derivation
 couples identity to a reusable slot index, which makes an unauthenticated
@@ -777,8 +863,13 @@ particular run established:
   ~~The relay does not exist.~~ Superseded by 2b.7.
 - **No group-addressed traffic.** ~~The GTK transmit path does not exist.~~
   Superseded by 2b.6.
-- **Non-QoS only.** The AP advertises neither WMM nor HT, so this says nothing
-  about the 2b.1 nonce fix, which remains interop-unproven. **Still true.**
+- **Non-QoS only.** The AP advertises neither WMM nor HT, so this run says
+  nothing about the 2b.1 nonce fix. **Still true of the on-air evidence** —
+  but the fix is no longer interop-unproven: `tests/ccmp_kernel_vectors.h`
+  pins it against sixteen QoS frames the Linux kernel encrypted, at all eight
+  TIDs, and `ap_wpa2 --self-test` exercises the AP'''s own QoS receive path
+  headlessly. What is still owed on air is a station sending TID 1..7, which
+  rides with the WMM work.
 - **Two stations, not seven**, and no churn: no station deauthenticated and
   re-associated while another held a key. **Still true.**
 

@@ -369,16 +369,42 @@ cells and four direct assertions in the new `test_nonce_flags()`. The
 round-trip cell passes under the mutation, which is the point — encrypt and
 decrypt share the wrong nonce, so a round trip is structurally blind to this.
 
-**What is NOT proven: interop.** The fix is verified by construction and by
-mutation, not against another implementation. The honest reason is worth
-recording, because it is also why the defect survived: **this AP advertises
-neither WMM nor HT** (no WMM IE anywhere in `tests/ap_responder.cpp` or
-`tests/ap_wpa2.cpp`, and `kEidHtCaps` is defined in `src/sta/Dot11.h:72` but
-never used), so a conforming station associates non-QoS and never sends a QoS
-frame. The one test that could have caught this independently cannot run
-against this AP at all. Until WMM is advertised, the Annex J vectors are the
-only available independent check, and an on-air cell with a station sending
-TID 1..7 is the gate that should be attached to the WMM work.
+**Interop: CLOSED 2026-09-21, from the other side.** This paragraph used to
+say interop was unproven and would stay unproven until the AP advertised WMM.
+The first half was true; the second was a failure of imagination.
+
+The obstacle was real and is worth keeping on the record, because it is also
+why the defect survived: **this AP advertises neither WMM nor HT** (no WMM IE
+anywhere in `tests/ap_responder.cpp` or `tests/ap_wpa2.cpp`, and `kEidHtCaps`
+is defined in `src/sta/Dot11.h:72` but never used), so a conforming station
+associates non-QoS and never sends it a QoS frame. No station on the bench can
+produce the case.
+
+But the frames do not have to be addressed to this AP to test our framing.
+`tests/ccmp_capture_vectors.sh` stands up two `mac80211_hwsim` radios, runs
+hostapd with `wmm_enabled=1` and wpa_supplicant over them, sends one datagram
+per user priority in each direction, and cuts sixteen protected QoS data
+frames out of the capture into `tests/ccmp_kernel_vectors.h` — all eight TIDs,
+both directions, no hardware and no bench time. `test_kernel_vectors()` then
+requires the kernel's MIC to verify under our AAD and nonce, and requires
+re-encrypting the recovered plaintext to reproduce the captured MPDU byte for
+byte.
+
+Reintroducing `nonce[0] = 0` now breaks 14 of those 16 vectors and leaves the
+two TID-0 ones green — exactly the shape of the defect's two-month survival.
+
+Two honest limits. mac80211 is an **interop reference, not the
+specification**: if the kernel and this header misread the same clause the
+same way, nothing here notices. That is a small risk for a stack that
+interoperates with every commercial AP, and Annex J remains a drop-in upgrade.
+And the capture contains no protected management frames (no PMF was
+configured), no fragments and no retransmissions, so the nonce's Management
+bit and the AAD's fragment/retry masking are still pinned only by the direct
+assertion cells. Both limits are recorded at the mutation table in
+`tests/ccmp_selftest.cpp`.
+
+An on-air TID 1..7 cell still rides with the WMM work. It is no longer the
+only thing that could close this.
 
 ### The defect, as originally recorded
 
