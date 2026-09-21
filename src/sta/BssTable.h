@@ -5,10 +5,17 @@
  * freshest view of each, and answers the only question the association state
  * machine actually asks: given an SSID, which BSS should I join?
  *
- * Fixed capacity, no allocation per beacon, and it takes frames straight off
- * the air — every field comes from `parse_beacon`, which bounds-checks
- * everything and resets its output so a frame that omits an element cannot
- * leave the previous BSS's value in place.
+ * Fixed capacity, and it takes frames straight off the air — every field
+ * comes from `parse_beacon`, which bounds-checks everything and resets its
+ * output so a frame that omits an element cannot leave the previous BSS's
+ * value in place.
+ *
+ * NOT allocation-free, despite the sibling module this shape was inherited
+ * from: `BssInfo::ssid` is a std::string, so an SSID longer than the
+ * short-string buffer heap-allocates on every beacon that carries it. Stated
+ * rather than claimed away, because the claim was here first and was wrong.
+ * It is a handful of allocations a second on a busy channel, which is
+ * nothing next to the CCMP work a station does per frame.
  *
  * WHAT IT DELIBERATELY DOES NOT DO. It does not scan: it has no notion of
  * channels, dwell times or probe requests, because those need a radio and this
@@ -48,6 +55,21 @@ class BssTable {
   static constexpr int capacity() { return kMaxBss; }
   int count() const { return count_; }
 
+  /* The network this station is looking for.
+   *
+   * WITHOUT IT THE EVICTION RULE IS AN ATTACK. The victim is the entry heard
+   * from longest ago, and a real AP beacons roughly ten times a second - so a
+   * neighbour (or an attacker) emitting beacons for sixteen fabricated BSSIDs
+   * as fast as the radio allows keeps every fabricated entry at age zero and
+   * makes the GENUINE AP the oldest entry, every time. The table thrashes and
+   * select() returns nothing for most of the window in which the station is
+   * trying to associate.
+   *
+   * An entry whose SSID matches this is never evicted. Empty by default, so a
+   * caller that does not set it gets the old behaviour and the old exposure. */
+  void set_wanted(const std::string& ssid) { wanted_ = ssid; }
+  const std::string& wanted() const { return wanted_; }
+
   void clear() {
     for (int i = 0; i < kMaxBss; i++) used_[i] = false;
     count_ = 0;
@@ -80,7 +102,9 @@ class BssTable {
     if (!parse_beacon(frame, len, &info)) return nullptr;
 
     int i = index_of(info.bssid);
-    if (i < 0) i = allocate(now_ms);
+    if (i < 0) i = allocate(now_ms, info.ssid);
+    /* allocate() evicts rather than refusing, so it only fails when every
+     * slot is protected - sixteen BSSIDs airing the wanted SSID at once. */
     if (i < 0) return nullptr;
 
     const uint32_t seen = used_[i] ? slots_[i].frames : 0;
@@ -170,18 +194,33 @@ class BssTable {
    * from longest ago, with the weakest signal breaking a tie — the two things
    * that make a BSS least likely to be the one being looked for.
    */
-  int allocate(uint32_t now_ms) {
+  bool protected_slot(int i) const {
+    return !wanted_.empty() && slots_[i].info.ssid == wanted_;
+  }
+
+  int allocate(uint32_t now_ms, const std::string& incoming_ssid) {
     for (int i = 0; i < kMaxBss; i++)
       if (!used_[i]) return i;
 
-    int victim = 0;
-    for (int i = 1; i < kMaxBss; i++) {
+    int victim = -1;
+    for (int i = 0; i < kMaxBss; i++) {
+      if (protected_slot(i)) continue;
+      if (victim < 0) { victim = i; continue; }
       const uint32_t age_v = (uint32_t)(now_ms - slots_[victim].last_seen_ms);
       const uint32_t age_i = (uint32_t)(now_ms - slots_[i].last_seen_ms);
 
       if (age_i > age_v ||
           (age_i == age_v && slots_[i].rssi < slots_[victim].rssi))
         victim = i;
+    }
+    /* Every slot holds the wanted SSID. Admitting a seventeenth BSS for that
+     * SSID by evicting one of them gains nothing, so refuse - unless the
+     * incoming frame is NOT for the wanted network, in which case it has no
+     * claim on the table at all and is simply dropped, which is the same
+     * thing. */
+    if (victim < 0) {
+      (void)incoming_ssid;
+      return -1;
     }
     used_[victim] = false;
     count_--;
@@ -191,6 +230,7 @@ class BssTable {
   BssEntry slots_[kMaxBss];
   bool used_[kMaxBss] = {false};
   int count_ = 0;
+  std::string wanted_;
 };
 
 }  // namespace sta

@@ -256,6 +256,54 @@ void test_eviction_when_full() {
   check(t.count() == 0 && t.find(wanted) == nullptr, "clear() empties it");
 }
 
+/* THE EVICTION RULE IS AN ATTACK WITHOUT set_wanted().
+ *
+ * The victim is the entry heard from longest ago. A real AP beacons about ten
+ * times a second, so its age is nearly always zero-ish - but an attacker
+ * emitting beacons for sixteen fabricated BSSIDs as fast as the radio allows
+ * keeps every fabricated entry at age zero and makes the GENUINE AP the
+ * oldest, every time. The table thrashes and select() returns nothing for
+ * most of the window in which the station is trying to associate. */
+void test_wanted_ssid_survives_a_flood() {
+  BssTable t;
+  const uint8_t target[6] = {0x02, 0, 0, 0, 0, 0x77};
+  std::vector<uint8_t> want = beacon(target, "target", 6, true);
+
+  /* THE NEGATIVE ARM FIRST, so the positive one is not a coincidence: with no
+   * wanted SSID set, the flood evicts the network being looked for. */
+  t.observe(want.data(), want.size(), -30, 1000);
+  for (int i = 0; i < BssTable::capacity() * 2; i++) {
+    const uint8_t id[6] = {0x02, 0, 0, 0, 1, (uint8_t)i};
+    std::vector<uint8_t> f = beacon(id, "flood", 6, true);
+    t.observe(f.data(), f.size(), -30, (uint32_t)(2000 + i));
+  }
+  check(t.select("target") == nullptr,
+        "unprotected, a flood evicts the wanted network");
+
+  /* And with it set, the same flood cannot touch it. */
+  BssTable u;
+  u.set_wanted("target");
+  u.observe(want.data(), want.size(), -30, 1000);
+  for (int i = 0; i < BssTable::capacity() * 4; i++) {
+    const uint8_t id[6] = {0x02, 0, 0, 0, 1, (uint8_t)i};
+    std::vector<uint8_t> f = beacon(id, "flood", 6, true);
+    u.observe(f.data(), f.size(), -30, (uint32_t)(2000 + i));
+  }
+  check(u.select("target") != nullptr,
+        "with set_wanted(), the flood cannot evict it");
+  check(u.find(target) != nullptr, "...and it is still findable by BSSID");
+  check(u.count() == BssTable::capacity(),
+        "...and the table is still full of the flood, as it should be");
+
+  /* The protection is not a leak: a second BSS airing the wanted SSID is
+   * admitted, because that is a real roaming candidate. */
+  const uint8_t second[6] = {0x02, 0, 0, 0, 0, 0x78};
+  std::vector<uint8_t> also = beacon(second, "target", 36, true);
+  u.observe(also.data(), also.size(), -20, 9000);
+  check(u.find(second) != nullptr, "a second BSS for the wanted SSID is admitted");
+  check(u.find(target) != nullptr, "...without evicting the first");
+}
+
 }  // namespace
 
 int main() {
@@ -265,6 +313,7 @@ int main() {
   test_select();
   test_mfp_required_is_skipped();
   test_eviction_when_full();
+  test_wanted_ssid_survives_a_flood();
 
   if (g_fail) {
     std::printf("bss_table_selftest: %d failure(s)\n", g_fail);

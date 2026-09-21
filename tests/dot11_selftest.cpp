@@ -264,8 +264,84 @@ void test_station_builders() {
   const uint8_t* p = find_ie(pr.data() + 24, pr.size() - 24, kEidSsid, &len);
   check(p && len == 10, "a directed probe carries the SSID");
   p = find_ie(pr.data() + 24, pr.size() - 24, kEidSupportedRates, &len);
-  check(p && len == 8 && p[0] == 0x8c,
-        "a 5 GHz probe advertises OFDM basic rates, not CCK");
+  check(p && len == 8, "a 5 GHz probe advertises eight rates");
+  /* NO CCK on 5 GHz, which is what this cell has always been about. The rates
+   * are OFDM 6..54. */
+  check(p && p[0] == 0x0c && p[7] == 0x6c,
+        "a 5 GHz probe advertises OFDM 6..54, not CCK");
+  /* AND NONE OF THEM IS MARKED BASIC. A station's Supported Rates element
+   * says what the STATION can do; the basic set is the AP's statement about
+   * its BSS, and mac80211 sets no basic bit in a station's requests either.
+   * This used to reuse the AP's 5 GHz builder, which marks four of them
+   * basic. */
+  for (size_t i = 0; p && i < len; i++)
+    if (p[i] & 0x80) {
+      check(false, "a station's own rate set marks nothing BASIC");
+      break;
+    }
+  check(find_ie(pr.data() + 24, pr.size() - 24, kEidExtSupportedRates, &len) ==
+            nullptr,
+        "a 5 GHz probe needs no Extended Supported Rates - eight rates fit");
+
+  /* 2.4 GHz: the mandatory OFDM rates 6, 12 and 24 must be advertised, or an
+   * AP whose basic set includes them refuses the association with status 18.
+   * The AP's builder omits 6, 9, 12 and 48 for reasons of its own, which is
+   * why a station has its own. 24 (0x30) lands in the extended element. */
+  {
+    std::vector<uint8_t> g = build_probe_req(kOwn, "devourerAP", 6, false);
+    size_t sl = 0, el = 0;
+    const uint8_t* sr =
+        find_ie(g.data() + 24, g.size() - 24, kEidSupportedRates, &sl);
+    const uint8_t* er =
+        find_ie(g.data() + 24, g.size() - 24, kEidExtSupportedRates, &el);
+    bool has6 = false, has12 = false, has24 = false;
+
+    check(sr && sl == 8, "a 2.4 GHz probe carries eight supported rates");
+    check(er && el == 4, "...and four more in Extended Supported Rates");
+    for (size_t i = 0; sr && i < sl; i++) {
+      if ((sr[i] & 0x7f) == 0x0c) has6 = true;
+      if ((sr[i] & 0x7f) == 0x18) has12 = true;
+      if ((sr[i] & 0x7f) == 0x30) has24 = true;
+    }
+    for (size_t i = 0; er && i < el; i++) {
+      if ((er[i] & 0x7f) == 0x0c) has6 = true;
+      if ((er[i] & 0x7f) == 0x18) has12 = true;
+      if ((er[i] & 0x7f) == 0x30) has24 = true;
+    }
+    check(has6 && has12 && has24,
+          "the mandatory OFDM rates 6, 12 and 24 are advertised");
+    check(sr && (sr[0] & 0x7f) == 0x02,
+          "...and 1 Mbps CCK is still there for a 2.4 GHz BSS");
+    for (size_t i = 0; sr && i < sl; i++)
+      if (sr[i] & 0x80) {
+        check(false, "a 2.4 GHz station marks none of its rates BASIC");
+        break;
+      }
+  }
+
+  /* THE ASSOCIATION REQUEST, not just the probe. This is the frame an AP
+   * refuses with status 18 when a mandatory rate is missing, and testing only
+   * the probe left a mutation that reverted it to the AP's set alive. */
+  {
+    std::vector<uint8_t> a =
+        build_assoc_req(kOwn, kBssid, "devourerAP", true, false);
+    size_t sl = 0, el = 0;
+    const uint8_t* sr =
+        find_ie(a.data() + 28, a.size() - 28, kEidSupportedRates, &sl);
+    const uint8_t* er =
+        find_ie(a.data() + 28, a.size() - 28, kEidExtSupportedRates, &el);
+    bool has6 = false, has12 = false;
+
+    check(sr && sl == 8 && er && el == 4,
+          "a 2.4 GHz association request carries twelve rates in two elements");
+    for (size_t i = 0; sr && i < sl; i++) {
+      if ((sr[i] & 0x7f) == 0x0c) has6 = true;
+      if ((sr[i] & 0x7f) == 0x18) has12 = true;
+      if (sr[i] & 0x80) { check(false, "assoc request marks nothing BASIC"); break; }
+    }
+    check(has6 && has12,
+          "the association request advertises the mandatory 6 and 12 Mbps");
+  }
 
   std::vector<uint8_t> wildcard = build_probe_req(kOwn, "", 0, false);
   p = find_ie(wildcard.data() + 24, wildcard.size() - 24, kEidSsid, &len);

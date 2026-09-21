@@ -308,7 +308,10 @@ void test_forged_mic_is_rejected() {
 
   /* One bit, in the MIC field. Everything else about this frame is correct —
    * the counter advances, the ANonce matches, the key data unwraps. */
-  m3[devourer::sta::kEapolMicOff] ^= 0x01;
+  /* THE LAST BYTE, not the first. Flipping a bit in the first eight would be
+   * caught by a comparison that only looked at half the MIC - and a mutation
+   * doing exactly that would have passed this cell. */
+  m3[devourer::sta::kEapolMicOff + devourer::sta::kEapolMicLen - 1] ^= 0x01;
   out.clear();
   check(sup.on_eapol(m3.data(), m3.size(), &out) ==
             Supplicant::Verdict::MicFailed,
@@ -397,6 +400,113 @@ void test_group_rekey_replay_rejected() {
   check(sup.on_eapol(g2.data(), g2.size(), &out) == Supplicant::Verdict::Reply,
         "a greater counter installs the new GTK");
   check(std::memcmp(sup.gtk(), gtk3, 16) == 0, "...and it is the new key");
+}
+
+/* MESSAGE 3 MUST CARRY A GTK, and a key-data field that does not yield one
+ * must not complete the handshake.
+ *
+ * In RSN, message 3 always carries the GTK KDE. A station that accepted one
+ * without it would end up Connected, keyed, and unable to decrypt a single
+ * broadcast frame - with no counter moved and nothing to diagnose from. The
+ * walker used to return one `false` for "absent" and "truncated", and this
+ * caller read it as "fine". */
+void test_msg3_without_a_usable_gtk_is_refused() {
+  const char* names[] = {"no GTK KDE at all", "a truncated GTK KDE"};
+
+  for (int variant = 0; variant < 2; variant++) {
+    Authenticator ap;
+    Supplicant sup;
+    OpenSslCryptoOps crypto;
+    uint8_t snonce[32];
+    std::vector<uint8_t> out;
+    char label[96];
+
+    std::memset(snonce, 0x7a, 32);
+    ap.init();
+    sup.start(crypto, ap.pmk, kSpa, kAa, snonce);
+    const std::vector<uint8_t> m1 = ap.msg1();
+    sup.on_eapol(m1.data(), m1.size(), &out);
+    if (!ap.on_msg2(out)) { check(false, "setup: msg2"); return; }
+
+    /* Key data that is correctly wrapped and correctly MIC'd - the ONLY thing
+     * wrong is what is inside it. */
+    std::vector<uint8_t> kd;
+    devourer::sta::append_rsn_ccmp_psk(kd);
+    if (variant == 1) {
+      /* A GTK KDE whose declared length runs past the key data. */
+      const uint8_t hdr[8] = {0xdd, 0x30, 0x00, 0x0f, 0xac, 0x01, 1, 0x00};
+      kd.insert(kd.end(), hdr, hdr + 8);
+      kd.insert(kd.end(), ap.gtk, ap.gtk + 16);
+    }
+    if (kd.size() % 8) {
+      kd.push_back(0xdd);
+      while (kd.size() % 8) kd.push_back(0x00);
+    }
+    std::vector<uint8_t> w(kd.size() + 8);
+    const int n = OpenSslCryptoOps::key_wrap(ap.ptk + 16, 16, kd.data(),
+                                             kd.size(), w.data());
+    w.resize(n > 0 ? (size_t)n : 0);
+    const std::vector<uint8_t> m3 = devourer::sta::build_eapol_key(
+        devourer::sta::kKeyDescVersionCcmp | devourer::sta::kKiPairwise |
+            devourer::sta::kKiInstall | devourer::sta::kKiAck |
+            devourer::sta::kKiMic | devourer::sta::kKiSecure |
+            devourer::sta::kKiEncrypted,
+        16, ap.replay + 1, ap.anonce, nullptr, w.data(), w.size(), &ap.crypto,
+        ap.ptk);
+
+    out.clear();
+    std::snprintf(label, sizeof label, "msg3 with %s is refused",
+                  names[variant]);
+    check(sup.on_eapol(m3.data(), m3.size(), &out) ==
+              Supplicant::Verdict::Malformed,
+          label);
+    check(!sup.ptk_valid(), "...and installs no PTK");
+    check(!sup.gtk_valid(), "...and no GTK");
+    check(sup.state() != Supplicant::State::Done,
+          "...and does NOT complete the handshake");
+    check(out.empty(), "...and sends no message 4");
+  }
+}
+
+/* A retransmission is answered with the reply that answered THAT message, not
+ * with whatever was cached last. Without the message-type check, a message 1
+ * replayed at a message 3's counter collects a message 4. */
+void test_retransmit_is_matched_to_its_message() {
+  Authenticator ap;
+  Supplicant sup;
+  OpenSslCryptoOps crypto;
+  std::vector<uint8_t> out;
+
+  check(handshake(ap, sup, crypto), "the four-way completes");
+  const uint64_t at = sup.replay_counter();
+
+  /* A message 1 quoting the counter that message 3 was authenticated at. */
+  std::vector<uint8_t> m1 = devourer::sta::build_eapol_key(
+      devourer::sta::kKeyDescVersionCcmp | devourer::sta::kKiPairwise |
+          devourer::sta::kKiAck,
+      16, at, ap.anonce, nullptr, nullptr, 0, nullptr, nullptr);
+  out.clear();
+  check(sup.on_eapol(m1.data(), m1.size(), &out) ==
+            Supplicant::Verdict::Replayed,
+        "a msg1 at msg3's counter is a replay, not a retransmission");
+  check(out.empty(), "...and collects no cached message 4");
+}
+
+/* Key material does not outlive the object. forget() is what the destructor
+ * calls; asserting on a live object is the only way to see it at all. */
+void test_forget_wipes_key_material() {
+  Authenticator ap;
+  Supplicant sup;
+  OpenSslCryptoOps crypto;
+  uint8_t zero[48] = {0};
+
+  check(handshake(ap, sup, crypto), "the four-way completes");
+  check(std::memcmp(sup.ptk(), zero, 48) != 0, "there is a PTK to wipe");
+  sup.forget();
+  check(std::memcmp(sup.ptk(), zero, 48) == 0, "forget() wipes the PTK");
+  check(std::memcmp(sup.gtk(), zero, 16) == 0, "...and the GTK");
+  check(!sup.ptk_valid() && !sup.gtk_valid(), "...and says so");
+  check(sup.state() == Supplicant::State::Idle, "...and goes back to Idle");
 }
 
 /* A group message whose MIC does not verify installs nothing either — the
@@ -620,15 +730,92 @@ void test_replay_counter_rules() {
   check(out == first, "...with the identical reply");
   check(sup.retransmits == 1, "...and counted as one");
 
-  /* A lower counter is refused outright. */
+  /* A LOWER COUNTER ON AN UNAUTHENTICATED MESSAGE 1 IS NOT REFUSED, and this
+   * is deliberate. The counter in a MIC-less frame is worth nothing: the
+   * first draft of this file remembered it, and one forged message 1 quoting
+   * 2^64-1 then refused every genuine EAPOL-Key for the rest of the
+   * association. Nothing is installed from a message 1, so answering a
+   * low-counter one costs a message 2 and no security; refusing it would cost
+   * the whole association. */
   std::vector<uint8_t> older = ap.msg1();
   devourer::sta::eapol_put_be64(older.data() + devourer::sta::kEapolReplayOff,
                                 0);
   out.clear();
   check(sup.on_eapol(older.data(), older.size(), &out) ==
+            Supplicant::Verdict::Reply,
+        "a low-counter msg1 is answered, because its counter is unauthenticated");
+  check(sup.replay_counter() == 0,
+        "...and the AUTHENTICATED counter has not moved - nothing has been");
+
+  /* ONCE SOMETHING IS AUTHENTICATED, the rule bites. Finish the handshake and
+   * the same trick is refused. */
+  Authenticator ap2;
+  Supplicant s2;
+  OpenSslCryptoOps c2;
+  check(handshake(ap2, s2, c2), "a second handshake completes");
+  const uint64_t authed = s2.replay_counter();
+  check(authed != 0, "...and authenticated a counter");
+
+  std::vector<uint8_t> low = ap2.msg1();
+  devourer::sta::eapol_put_be64(low.data() + devourer::sta::kEapolReplayOff,
+                                authed - 1);
+  out.clear();
+  check(s2.on_eapol(low.data(), low.size(), &out) ==
             Supplicant::Verdict::Replayed,
-        "a lower counter is refused");
+        "a counter below the last AUTHENTICATED one is refused");
   check(out.empty(), "...with no reply at all");
+  check(s2.replays == 1, "...and counted");
+}
+
+/* THE DEFECT TWO REVIEWS FOUND IN THE FIRST DRAFT OF THIS MODULE.
+ *
+ * Message 1 has no MIC. If accepting one advances the replay counter, a
+ * single forged frame quoting the top of the counter space refuses every
+ * genuine EAPOL-Key from then on - and the station does not notice, because
+ * it is already keyed: it stays Connected while its rekey path is dead, and
+ * the failure only shows up as "multicast stopped working" at the next GTK
+ * rotation. */
+void test_forged_msg1_cannot_poison_the_counter() {
+  Authenticator ap;
+  Supplicant sup;
+  OpenSslCryptoOps crypto;
+  std::vector<uint8_t> out;
+  uint8_t gtk2[16], ptk_before[48];
+
+  check(handshake(ap, sup, crypto), "the four-way completes");
+  std::memcpy(ptk_before, sup.ptk(), 48);
+  std::memset(gtk2, 0x62, 16);
+
+  /* Anyone can build this: it needs the BSSID, our address, and no key. */
+  std::vector<uint8_t> forged = devourer::sta::build_eapol_key(
+      devourer::sta::kKeyDescVersionCcmp | devourer::sta::kKiPairwise |
+          devourer::sta::kKiAck,
+      16, 0xffffffffffffffffULL, ap.anonce, nullptr, nullptr, 0, nullptr,
+      nullptr);
+  const uint64_t authed = sup.replay_counter();
+  sup.on_eapol(forged.data(), forged.size(), &out);
+
+  check(sup.replay_counter() == authed,
+        "A FORGED MESSAGE 1 DOES NOT ADVANCE THE AUTHENTICATED COUNTER");
+  check(sup.state() == Supplicant::State::Done,
+        "...and does not take a working station out of Done");
+  check(std::memcmp(sup.ptk(), ptk_before, 48) == 0,
+        "...nor disturb the installed PTK");
+
+  /* THE PROOF THAT IT MATTERS: the AP's next group rekey still works. Before
+   * the fix this was refused as a replay and the GTK never rotated again. */
+  const std::vector<uint8_t> g = ap.group1_next(gtk2, 2);
+  out.clear();
+  check(sup.on_eapol(g.data(), g.size(), &out) == Supplicant::Verdict::Reply,
+        "...and the AP's next group rekey is still accepted");
+  check(std::memcmp(sup.gtk(), gtk2, 16) == 0, "...and installs the new GTK");
+
+  /* And the genuine four-way can still be restarted, which is the other half
+   * of what the poisoned counter broke. */
+  std::vector<uint8_t> m1 = ap.msg1();
+  out.clear();
+  check(sup.on_eapol(m1.data(), m1.size(), &out) == Supplicant::Verdict::Reply,
+        "a genuine msg1 is still answered after the forgery");
 }
 
 /* Message 1 arriving on a working association must not disturb it. It is
@@ -717,26 +904,34 @@ void test_gtk_kde() {
   const uint8_t good[24] = {0xdd, 0x16, 0x00, 0x0f, 0xac, 0x01, 0x02, 0x00,
                             1, 2, 3, 4, 5, 6, 7, 8,
                             9, 10, 11, 12, 13, 14, 15, 16};
-  check(devourer::sta::find_gtk_kde(good, sizeof good, &g), "a GTK KDE parses");
+  check(devourer::sta::find_gtk_kde(good, sizeof good, &g) ==
+            devourer::sta::KdeResult::Found,
+        "a GTK KDE parses");
   check(g.gtk_len == 16, "...with a 16-byte key");
   check(g.key_id == 2, "...and its key id");
   check(g.gtk[0] == 1 && g.gtk[15] == 16, "...and the key bytes");
 
-  /* Truncated: the length runs past the buffer. Stop, do not read on. */
-  check(!devourer::sta::find_gtk_kde(good, 12, &g),
-        "a KDE truncated by the buffer is refused");
+  /* Truncated: the length runs past the buffer. Stop, do not read on - and
+   * say MALFORMED, not "no GTK here", because the two mean opposite things to
+   * the caller. */
+  check(devourer::sta::find_gtk_kde(good, 12, &g) ==
+            devourer::sta::KdeResult::Malformed,
+        "a KDE truncated by the buffer is MALFORMED");
 
   /* A vendor OUI is not ours and must not be mistaken for a GTK. */
   std::memcpy(kd, good, sizeof good);
   kd[2] = 0x00; kd[3] = 0x50; kd[4] = 0xf2;
-  check(!devourer::sta::find_gtk_kde(kd, sizeof good, &g),
-        "a vendor OUI is not read as a GTK KDE");
+  check(devourer::sta::find_gtk_kde(kd, sizeof good, &g) ==
+            devourer::sta::KdeResult::Absent,
+        "a vendor OUI is ABSENT, not malformed - it is a well-formed KDE that "
+        "simply is not ours");
 
   /* A declared length too small to hold a key. */
   std::memcpy(kd, good, sizeof good);
   kd[1] = 0x08;
-  check(!devourer::sta::find_gtk_kde(kd, sizeof good, &g),
-        "a KDE too short for a key is refused");
+  check(devourer::sta::find_gtk_kde(kd, sizeof good, &g) ==
+            devourer::sta::KdeResult::Malformed,
+        "a KDE too short for a key is MALFORMED");
 
   /* And no KDE at all is a clean false, not a crash: an RSN element followed
    * by 802.11i padding is exactly what message 3 carries when there is no
@@ -745,8 +940,9 @@ void test_gtk_kde() {
   devourer::sta::append_rsn_ccmp_psk(rsn);
   rsn.push_back(0xdd);
   while (rsn.size() % 8) rsn.push_back(0x00);
-  check(!devourer::sta::find_gtk_kde(rsn.data(), rsn.size(), &g),
-        "key data with no GTK KDE returns false rather than reading on");
+  check(devourer::sta::find_gtk_kde(rsn.data(), rsn.size(), &g) ==
+            devourer::sta::KdeResult::Absent,
+        "key data with no GTK KDE is ABSENT rather than read on");
 }
 
 }  // namespace
@@ -760,12 +956,16 @@ int main() {
   test_forged_mic_is_rejected();
   test_group_rekey_replay_rejected();
   test_group_forged_mic_rejected();
+  test_msg3_without_a_usable_gtk_is_refused();
+  test_retransmit_is_matched_to_its_message();
+  test_forget_wipes_key_material();
   test_anonce_mismatch_rejected();
   test_unencrypted_key_data_rejected();
   test_descriptor_version_refused();
   test_mic_refuses_other_descriptor_versions();
   test_group_rekey_before_four_way();
   test_replay_counter_rules();
+  test_forged_msg1_cannot_poison_the_counter();
   test_msg1_on_a_live_association();
 
   if (g_fail) {

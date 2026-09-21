@@ -186,6 +186,40 @@ inline void append_supported_rates(std::vector<uint8_t>& m) {
   append_ie(m, kEidSupportedRates, r, sizeof r);
 }
 
+/* THE STATION'S OWN RATE SET, which is what the note above says a station
+ * needs rather than widening the AP's validated one.
+ *
+ * 802.11-2007 onwards makes 6, 12 and 24 Mbps the mandatory OFDM rates, and a
+ * conforming AP whose basic-rate set includes one the station did not
+ * advertise refuses the association with status 18 ("does not support all
+ * data rates in the BSSBasicRateSet"). The AP's set omits 6, 9, 12 and 48 for
+ * on-air-validated reasons of its own; a station claiming the same thing is
+ * claiming it cannot do the mandatory rates.
+ *
+ * A Supported Rates element holds at most eight; the rest go in Extended
+ * Supported Rates, which is what append_ext_supported_rates_sta is for. None
+ * are marked BASIC - that is the AP's statement to make, not a station's. */
+inline void append_supported_rates_sta(std::vector<uint8_t>& m,
+                                       bool five_ghz) {
+  static const uint8_t g[] = {0x02, 0x04, 0x0b, 0x16,
+                              0x0c, 0x12, 0x18, 0x24};
+  static const uint8_t a[] = {0x0c, 0x12, 0x18, 0x24,
+                              0x30, 0x48, 0x60, 0x6c};
+
+  if (five_ghz) append_ie(m, kEidSupportedRates, a, sizeof a);
+  else append_ie(m, kEidSupportedRates, g, sizeof g);
+}
+
+/* 2.4 GHz only: the four OFDM rates that did not fit above. A 5 GHz station
+ * has all eight of its rates in the Supported Rates element already, and an
+ * empty Extended Supported Rates element is malformed. */
+inline void append_ext_supported_rates_sta(std::vector<uint8_t>& m,
+                                           bool five_ghz) {
+  static const uint8_t g[] = {0x30, 0x48, 0x60, 0x6c};
+
+  if (!five_ghz) append_ie(m, kEidExtSupportedRates, g, sizeof g);
+}
+
 /* 5 GHz has no CCK, so the basic set is OFDM-only. Airing CCK rates as BASIC
  * on a 5 GHz BSS is a spec violation a strict station may refuse outright. */
 inline void append_supported_rates_5g(std::vector<uint8_t>& m) {
@@ -500,8 +534,11 @@ inline std::vector<uint8_t> build_probe_req(const uint8_t own[6],
    * that is silently missing its SSID element - which is invalid, and which a
    * peer drops without comment. */
   if (!append_ssid(m, ssid)) return {};
-  if (five_ghz) append_supported_rates_5g(m);
-  else append_supported_rates(m);
+  /* The STATION set here too: an AP may answer a probe request based on the
+   * rates it advertises, and the two requests should not claim different
+   * capabilities. */
+  append_supported_rates_sta(m, five_ghz);
+  append_ext_supported_rates_sta(m, five_ghz);
   /* The DS Parameter Set is a 2.4 GHz element (802.11-2016 9.4.2.4); a 5 GHz
    * probe carries no channel element. */
   if (chan && !five_ghz) append_ds_params(m, chan);
@@ -530,8 +567,11 @@ inline std::vector<uint8_t> build_assoc_req(const uint8_t own[6],
   put_le16(m, (uint16_t)(0x0001 | (rsn ? 0x0010 : 0))); /* ESS | Privacy */
   put_le16(m, listen_interval);
   if (!append_ssid(m, ssid)) return {};
-  if (five_ghz) append_supported_rates_5g(m);
-  else append_supported_rates(m);
+  /* The STATION set, not the AP's: an association request that omits 6 and 12
+   * Mbps can be refused with status 18 by any AP whose basic set includes
+   * them. See append_supported_rates_sta. */
+  append_supported_rates_sta(m, five_ghz);
+  append_ext_supported_rates_sta(m, five_ghz);
   /* The RSN element goes AFTER the rates, and anything that follows it must
    * still be emitted — PR #335's review found its assoc-request truncating the
    * HT/VHT/ExtCap tail on a non-default cipher path. There is no tail here

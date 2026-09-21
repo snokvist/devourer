@@ -54,8 +54,9 @@ class StationSm {
     AssocRefused,
     Deauthenticated,
     HandshakeTimeout,
-    HandshakeFailed,
+    BeaconLost,
     NoPmk,
+    NotConfigured,
   };
 
   /* Three transmissions of each management frame, 300 ms apart. An AP that
@@ -65,42 +66,87 @@ class StationSm {
   /* The authenticator drives the four-way and retransmits it; this side only
    * answers, so its timeout is a give-up, not a retry schedule. */
   static constexpr uint32_t kHandshakeTimeoutMs = 3000;
+  /* Ten beacon intervals at the usual 100 TU. Long enough that a few lost
+   * beacons mean nothing, short enough that a station does not sit Connected
+   * to an AP that has been switched off. */
+  static constexpr uint32_t kBeaconLossMs = 1024;
+  /* THE TRANSMIT QUEUE IS BOUNDED. Three authentication retries plus one
+   * in-flight EAPOL reply is the most this machine legitimately owes, and
+   * every frame in here is produced in response to a received one - so an
+   * unbounded queue is an unbounded allocation an attacker controls. */
+  static constexpr size_t kMaxTxQueue = 8;
 
-  /* `snonce` is the caller's, for the reason Supplicant::start documents at
-   * length: there is no RNG in this library, and a stub that looked like one
-   * would be worse than an argument somebody has to fill in. */
+  ~StationSm() { secure_wipe(pmk_, sizeof pmk_); }
+
   bool configure(CryptoOps& crypto, const std::string& ssid, const char* psk,
-                 const uint8_t own[6], const uint8_t snonce[32]) {
+                 const uint8_t own[6]) {
     crypto_ = &crypto;
     ssid_ = ssid;
     std::memcpy(own_, own, 6);
-    std::memcpy(snonce_, snonce, 32);
     /* PBKDF2 once, here, rather than per association attempt: it is 4096
      * HMAC-SHA1 iterations and the answer only depends on the passphrase and
-     * the SSID, neither of which changes between retries. */
+     * the SSID, neither of which changes between retries.
+     *
+     * THE SNONCE IS NOT HERE, and that is the whole reason this comment
+     * exists. It used to be, next to the PMK, and the two have opposite
+     * lifetimes: the PMK is fixed for the network and the SNonce must be
+     * fresh for every association. A caller doing the obvious thing -
+     * configure once, join repeatedly - would have reused one nonce across
+     * every attempt and every roam, making the PTK a function of the ANonce
+     * alone. It is an argument to join(). */
     have_pmk_ = pmk_from_psk(crypto, psk, ssid, pmk_);
     return have_pmk_;
   }
 
-  /* Begin an association with this BSS. */
-  bool join(const BssEntry& bss, uint32_t now_ms) {
-    if (!crypto_) return false;
+  /* Begin an association with this BSS.
+   *
+   * `snonce` must be UNPREDICTABLE AND FRESH FOR THIS ATTEMPT - see
+   * Supplicant::start, which explains at length why this library takes it
+   * rather than inventing it. */
+  bool join(const BssEntry& bss, const uint8_t snonce[32], uint32_t now_ms) {
+    if (!crypto_) { fail(Failure::NotConfigured, 0); return false; }
     if (!have_pmk_) { fail(Failure::NoPmk, 0); return false; }
     /* Refuse a BSS this station cannot finish with, rather than authenticating
      * and discovering it at the four-way. BssTable::select already filters on
      * this; join() is also reachable with a hand-picked entry. */
     if (!bss.info.rsn_ccmp_psk) { fail(Failure::AssocRefused, 0); return false; }
 
+    /* THE QUEUE IS CLEARED. Without this, frames still queued for the BSS we
+     * gave up on are transmitted at the one we just joined - addressed to the
+     * old BSSID, on the new channel, after the radio has retuned. Every test
+     * in station_sm_selftest drained the queue between steps, so nothing saw
+     * it until a review built the case that does not. */
+    tx_.clear();
     std::memcpy(bssid_, bss.info.bssid, 6);
+    std::memcpy(snonce_, snonce, 32);
     channel_ = bss.info.channel;
     aid_ = 0;
     fail_ = Failure::None;
     status_ = 0;
-    sup_ = Supplicant{};
+    sup_.forget();
     state_ = State::Authenticating;
     tries_ = 0;
+    last_beacon_ms_ = now_ms;
     send_auth(now_ms);
     return true;
+  }
+
+  /* Leave cleanly: tell the AP, drop the keys, and go back to Idle.
+   *
+   * An association this side simply abandons stays alive at the AP until it
+   * times the station out, holding an AID and, on this project's own AP, a
+   * slot in a seven-entry table. */
+  void leave(uint16_t reason = 3) {
+    if (state_ == State::Idle) return;
+    if (state_ != State::Authenticating) {
+      std::vector<uint8_t> m = build_deauth(own_, bssid_, reason);
+      assign_seq(m, seq_.next());
+      queue(std::move(m));
+    }
+    sup_.forget();
+    state_ = State::Idle;
+    fail_ = Failure::None;
+    aid_ = 0;
   }
 
   /* One received frame. `len` is the true MPDU length with no FCS. */
@@ -114,11 +160,24 @@ class StationSm {
 
     /* EVERYTHING must come from the BSS we are talking to and be addressed to
      * this station (or broadcast). Without the addr2 check, any frame from any
-     * AP on the channel drives this machine. */
-    if (std::memcmp(a2, bssid_, 6) != 0) return;
+     * AP on the channel drives this machine.
+     *
+     * THE DROPS ARE COUNTED. On real hardware this is the only address filter
+     * in the system - the MT7612U RX path runs promiscuous - so most of a busy
+     * channel lands here, and a station that connects to nothing has to be
+     * able to say whether it heard its AP at all. */
+    if (std::memcmp(a2, bssid_, 6) != 0) { rx_not_our_bss++; return; }
     const bool to_us = std::memcmp(a1, own_, 6) == 0;
     const bool bcast = (a1[0] & 0x01) != 0;
-    if (!to_us && !bcast) return;
+    if (!to_us && !bcast) { rx_not_for_us++; return; }
+
+    /* A beacon from our own BSS is the liveness signal. Counted before the
+     * switch because it is the one frame type that matters in every state. */
+    if (fc0 == kFcBeacon || fc0 == kFcProbeResp) {
+      beacons_rx++;
+      last_beacon_ms_ = now_ms;
+      return;
+    }
 
     switch (fc0) {
       case kFcAuth:
@@ -145,15 +204,22 @@ class StationSm {
         break;
     }
 
-    /* Data frames: the only one this machine cares about is EAPOL. */
-    if (fc0 != kFcData && !is_qos_data(fc0)) return;
-    if (!(fc1 & kFcFromDs) || (fc1 & kFcToDs)) return;
-    if (fc1 & kFcProtected) return;   /* the four-way is never protected */
+    /* Data frames: the only one this machine cares about is EAPOL. Anything
+     * else is somebody's traffic, not a protocol error, so it is counted
+     * separately from a frame that was addressed wrongly. */
+    if (fc0 != kFcData && !is_qos_data(fc0)) { rx_ignored++; return; }
+    if (!(fc1 & kFcFromDs) || (fc1 & kFcToDs)) { rx_ignored++; return; }
+    /* The four-way is never protected: the keys it carries are what
+     * protection would need. */
+    if (fc1 & kFcProtected) { rx_ignored++; return; }
     const size_t hlen = data_hdr_len(fc0, fc1);
-    if (len < hlen + kLlcSnapLen) return;
+    if (len < hlen + kLlcSnapLen) { rx_malformed++; return; }
     const uint8_t* llc = frame + hlen;
-    if (!(llc[0] == 0xaa && llc[1] == 0xaa && llc[2] == 0x03)) return;
-    if (!(llc[6] == 0x88 && llc[7] == 0x8e)) return;   /* ethertype 0x888E */
+    if (!(llc[0] == 0xaa && llc[1] == 0xaa && llc[2] == 0x03)) {
+      rx_ignored++;
+      return;
+    }
+    if (!(llc[6] == 0x88 && llc[7] == 0x8e)) { rx_ignored++; return; }
     on_eapol(llc + kLlcSnapLen, len - hlen - kLlcSnapLen, now_ms);
   }
 
@@ -179,6 +245,15 @@ class StationSm {
          * actually moved the handshake forward. */
         if (since >= kHandshakeTimeoutMs) fail(Failure::HandshakeTimeout, 0);
         return;
+      case State::Connected:
+        /* BEACON SUPERVISION. Without it Connected has no exit but a deauth,
+         * and an AP that is switched off leaves the station reporting a link
+         * that does not exist - the caller sees keyed() forever and has no
+         * hook to notice. A beacon is the cheapest liveness signal there is;
+         * the station is already receiving them. */
+        if ((uint32_t)(now_ms - last_beacon_ms_) >= kBeaconLossMs)
+          fail(Failure::BeaconLost, 0);
+        return;
       default:
         return;
     }
@@ -193,6 +268,7 @@ class StationSm {
   }
 
   size_t pending_tx() const { return tx_.size(); }
+  static constexpr size_t tx_capacity() { return kMaxTxQueue; }
   State state() const { return state_; }
   Failure fail_reason() const { return fail_; }
   uint16_t status() const { return status_; }
@@ -206,12 +282,24 @@ class StationSm {
   uint32_t assoc_tx = 0;
   uint32_t eapol_tx = 0;
   uint32_t eapol_rx = 0;
+  uint32_t beacons_rx = 0;
+  uint32_t rx_not_our_bss = 0;
+  uint32_t rx_not_for_us = 0;
+  uint32_t rx_ignored = 0;
+  uint32_t rx_malformed = 0;
+  uint32_t tx_dropped = 0;
 
  private:
+  /* One place that enforces the bound, so no future sender can forget it. */
+  void queue(std::vector<uint8_t> m) {
+    if (tx_.size() >= kMaxTxQueue) { tx_dropped++; return; }
+    tx_.push_back(std::move(m));
+  }
+
   void send_auth(uint32_t now_ms) {
     std::vector<uint8_t> m = build_auth_req(own_, bssid_);
     assign_seq(m, seq_.next());
-    tx_.push_back(std::move(m));
+    queue(std::move(m));
     last_tx_ms_ = now_ms;
     tries_++;
     auth_tx++;
@@ -229,7 +317,7 @@ class StationSm {
      * Sending a truncated association request would be worse than failing. */
     if (m.empty()) { fail(Failure::AssocRefused, 0); return; }
     assign_seq(m, seq_.next());
-    tx_.push_back(std::move(m));
+    queue(std::move(m));
     last_tx_ms_ = now_ms;
     tries_++;
     assoc_tx++;
@@ -265,6 +353,7 @@ class StationSm {
     aid_ = r.aid;
     state_ = State::FourWay;
     last_tx_ms_ = now_ms;
+    last_beacon_ms_ = now_ms;
     sup_.start(*crypto_, pmk_, own_, bssid_, snonce_);
   }
 
@@ -283,15 +372,18 @@ class StationSm {
                                             /*protect=*/false, seq_.next());
     append_llc_snap(m, 0x888e);
     m.insert(m.end(), reply.begin(), reply.end());
-    tx_.push_back(std::move(m));
+    queue(std::move(m));
     eapol_tx++;
 
     /* The deadline moves only when the handshake moved. A retransmission we
      * answered again is not progress, and letting it push the give-up out
      * would let a stuck authenticator hold this state open forever. */
     if (v == Supplicant::Verdict::Reply) last_tx_ms_ = now_ms;
-    if (sup_.state() == Supplicant::State::Done && sup_.ptk_valid())
+    if (sup_.state() == Supplicant::State::Done && sup_.ptk_valid() &&
+        state_ == State::FourWay) {
       state_ = State::Connected;
+      last_beacon_ms_ = now_ms;
+    }
   }
 
   void fail(Failure why, uint16_t status) {
@@ -314,6 +406,7 @@ class StationSm {
   uint16_t status_ = 0;
   int tries_ = 0;
   uint32_t last_tx_ms_ = 0;
+  uint32_t last_beacon_ms_ = 0;
   SeqCounter seq_;
   Supplicant sup_;
   std::vector<std::vector<uint8_t>> tx_;

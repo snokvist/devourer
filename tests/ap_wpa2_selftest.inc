@@ -853,9 +853,9 @@ static void test_library_station_associates() {
   /* A fixed SNonce: this is a test, and Supplicant::start says in as many
    * words that a real one must be unpredictable. */
   for (int i = 0; i < 32; i++) snonce[i] = (uint8_t)(0xc0 + i);
-  check(sm.configure(g_crypto, kSsid, g_psk, kStaS, snonce),
+  check(sm.configure(g_crypto, kSsid, g_psk, kStaS),
         "library station: configure derives the PMK from the AP's own PSK");
-  check(sm.join(*e, 0), "library station: join starts");
+  check(sm.join(*e, snonce, 0), "library station: join starts");
 
   /* Pump both queues until neither moves. No clock advances, so nothing here
    * can pass because of a timeout. */

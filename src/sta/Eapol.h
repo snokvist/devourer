@@ -31,9 +31,14 @@ namespace devourer {
 namespace sta {
 
 /* An EAPOL-Key frame is 99 bytes before its key data. The offsets below are
- * 802.11-2016 12.7.2 and are used by both roles, so they live here once
- * rather than as magic numbers in an authenticator and a supplicant that can
- * disagree. */
+ * 802.11-2016 12.7.2.
+ *
+ * DO NOT CONVERT tests/ap_wpa2.cpp ONTO THESE. That authenticator hand-rolls
+ * every one of these offsets inline, it was written months earlier, and it
+ * shares no code with this header - which is exactly what makes
+ * `test_library_station_associates()` a real oracle. Two implementations from
+ * one set of constants cannot disagree, and cannot catch a misreading either.
+ * The duplication is the test. */
 inline constexpr size_t kEapolKeyFixedLen = 99;
 inline constexpr size_t kEapolMicOff = 81;
 inline constexpr size_t kEapolMicLen = 16;
@@ -119,8 +124,7 @@ inline void eapol_put_be64(uint8_t* p, uint64_t v) {
 inline bool parse_eapol_key(const uint8_t* eapol, size_t len, EapolKey* out) {
   size_t body_len, total, kdlen;
 
-  if (!eapol || !out || len < 4 + kEapolKeyFixedLen - 4) return false;
-  if (len < kEapolKeyFixedLen) return false;
+  if (!eapol || !out || len < kEapolKeyFixedLen) return false;
   if (eapol[1] != 3) return false;             /* packet type: EAPOL-Key */
   body_len = eapol_be16(eapol + 2);
   /* The body starts at offset 4; the fixed part is 95 bytes of body. */
@@ -289,6 +293,19 @@ struct GtkKde {
   size_t gtk_len = 0;
 };
 
+/* THREE OUTCOMES, NOT TWO. "there is no GTK KDE here" and "a KDE in here is
+ * truncated or claims an impossible key length" are completely different
+ * facts: the first can be legitimate, the second is hostile input. They were
+ * one `false` return until 2026-09-21, and the two callers read that same
+ * false in opposite ways - one carried on and completed the handshake, the
+ * other refused the frame. A station left `Connected` and keyed with no group
+ * key, no counter moved and nothing to diagnose from. */
+enum class KdeResult : uint8_t {
+  Found,
+  Absent,     /* well-formed key data with no GTK KDE in it */
+  Malformed,  /* a KDE that runs past the buffer or declares a bad length */
+};
+
 /* Walk the key-data field for the GTK KDE (00-0F-AC type 1).
  *
  * The key data is a sequence of elements: a KDE is `0xDD len 00 0F AC type`
@@ -297,20 +314,21 @@ struct GtkKde {
  * - this region comes out of an AES unwrap of attacker-supplied bytes, and a
  * failed unwrap that was not checked would hand this loop pure noise.
  *
- * Returns false when there is no GTK KDE, which is not always an error: msg3
- * of a 4-way carries one, and a station that only wants the PTK does not have
- * to care.
+ * Returns Absent when the key data is well formed and simply carries no GTK
+ * KDE, and Malformed when something in it does not add up. The caller decides
+ * what Absent means for the message it arrived in.
  */
-inline bool find_gtk_kde(const uint8_t* kd, size_t len, GtkKde* out) {
+inline KdeResult find_gtk_kde(const uint8_t* kd, size_t len, GtkKde* out) {
   size_t i = 0;
 
-  if (!kd || !out) return false;
+  if (!kd || !out) return KdeResult::Malformed;
   while (i + 2 <= len) {
     const uint8_t eid = kd[i];
     const size_t elen = kd[i + 1];
 
     if (eid == 0x00) { i++; continue; }        /* padding */
-    if (i + 2 + elen > len) return false;      /* truncated: stop, do not guess */
+    if (i + 2 + elen > len)
+      return KdeResult::Malformed;             /* truncated: stop, do not guess */
     if (eid == 0xdd && elen >= 4 && kd[i + 2] == 0x00 && kd[i + 3] == 0x0f &&
         kd[i + 4] == 0xac && kd[i + 5] == 0x01) {
       /* The KDE length counts OUI(3) + data type(1) + data. The GTK KDE's
@@ -320,17 +338,31 @@ inline bool find_gtk_kde(const uint8_t* kd, size_t len, GtkKde* out) {
        * short and silently truncates the key. */
       const size_t body = elen - 4;            /* keyid/tx octet + reserved + key */
 
-      if (body < 2 + 16 || body > 2 + 32) return false;
+      if (body < 2 + 16 || body > 2 + 32) return KdeResult::Malformed;
       *out = GtkKde{};
       out->key_id = (uint8_t)(kd[i + 6] & 0x03);
       out->tx = (kd[i + 6] & 0x04) != 0;
       out->gtk_len = body - 2;
       std::memcpy(out->gtk, kd + i + 8, out->gtk_len);
-      return true;
+      return KdeResult::Found;
     }
     i += 2 + elen;
   }
-  return false;
+  return KdeResult::Absent;
+}
+
+/* Overwrite key material so it does not outlive the object holding it.
+ *
+ * Through a volatile pointer, because a compiler is entitled to delete a
+ * memset whose result is never read - which is every memset in a destructor.
+ * docs/station-mode-scope.md lists "keys zeroized on teardown" among the
+ * PR #335 review items, and src/sta/StationTable.h has done it for the AP
+ * side since Phase 2b; this is the station half of the same rule.
+ */
+inline void secure_wipe(void* p, size_t n) {
+  volatile uint8_t* v = static_cast<volatile uint8_t*>(p);
+
+  while (n--) *v++ = 0;
 }
 
 }  // namespace sta

@@ -212,7 +212,7 @@ void test_full_association() {
   uint8_t snonce[32];
 
   std::memset(snonce, 0x7a, 32);
-  check(sm.configure(crypto, kSsid, kPsk, kOwn, snonce),
+  check(sm.configure(crypto, kSsid, kPsk, kOwn),
         "configure derives the PMK");
   const BssEntry* bss = table.select(kSsid);
   check(bss == nullptr, "nothing is selectable before a beacon");
@@ -221,7 +221,7 @@ void test_full_association() {
   check(bss != nullptr, "the BSS is selectable after one beacon");
   if (!bss) return;
 
-  check(sm.join(*bss, 0), "join starts");
+  check(sm.join(*bss, snonce, 0), "join starts");
   check(sm.state() == StationSm::State::Authenticating,
         "...in Authenticating");
   check(sm.pending_tx() == 1, "...with an authentication request queued");
@@ -254,10 +254,10 @@ void test_auth_timeout() {
   std::vector<uint8_t> f;
 
   std::memset(snonce, 0x7a, 32);
-  sm.configure(crypto, kSsid, kPsk, kOwn, snonce);
+  sm.configure(crypto, kSsid, kPsk, kOwn);
   const BssEntry* bss = discovered(table);
   if (!bss) { check(false, "beacon"); return; }
-  sm.join(*bss, 0);
+  sm.join(*bss, snonce, 0);
 
   /* Below the deadline nothing happens: a tick is not a retransmission. */
   sm.tick(StationSm::kMgmtTimeoutMs - 1);
@@ -288,11 +288,11 @@ void test_auth_refused() {
   uint8_t snonce[32];
 
   std::memset(snonce, 0x7a, 32);
-  sm.configure(crypto, kSsid, kPsk, kOwn, snonce);
+  sm.configure(crypto, kSsid, kPsk, kOwn);
   ap.auth_status = 1;                             /* unspecified failure */
   const BssEntry* bss = discovered(table);
   if (!bss) { check(false, "beacon"); return; }
-  sm.join(*bss, 0);
+  sm.join(*bss, snonce, 0);
   pump(sm, ap, 0);
 
   check(sm.state() == StationSm::State::Failed, "a refused auth fails");
@@ -309,11 +309,11 @@ void test_assoc_refused() {
   uint8_t snonce[32];
 
   std::memset(snonce, 0x7a, 32);
-  sm.configure(crypto, kSsid, kPsk, kOwn, snonce);
+  sm.configure(crypto, kSsid, kPsk, kOwn);
   ap.assoc_status = 17;                           /* cannot handle more STAs */
   const BssEntry* bss = discovered(table);
   if (!bss) { check(false, "beacon"); return; }
-  sm.join(*bss, 0);
+  sm.join(*bss, snonce, 0);
   pump(sm, ap, 0);
 
   check(sm.state() == StationSm::State::Failed, "a refused association fails");
@@ -333,12 +333,12 @@ void test_assoc_refused_with_a_plausible_aid() {
   uint8_t snonce[32];
 
   std::memset(snonce, 0x7a, 32);
-  sm.configure(crypto, kSsid, kPsk, kOwn, snonce);
+  sm.configure(crypto, kSsid, kPsk, kOwn);
   ap.assoc_status = 12;                           /* denied, unspecified */
   ap.aid_even_when_refused = true;
   const BssEntry* bss = discovered(table);
   if (!bss) { check(false, "beacon"); return; }
-  sm.join(*bss, 0);
+  sm.join(*bss, snonce, 0);
   pump(sm, ap, 0);
 
   check(sm.state() == StationSm::State::Failed,
@@ -360,11 +360,11 @@ void test_assoc_success_with_zero_aid() {
   uint8_t snonce[32];
 
   std::memset(snonce, 0x7a, 32);
-  sm.configure(crypto, kSsid, kPsk, kOwn, snonce);
+  sm.configure(crypto, kSsid, kPsk, kOwn);
   ap.aid = 0;
   const BssEntry* bss = discovered(table);
   if (!bss) { check(false, "beacon"); return; }
-  sm.join(*bss, 0);
+  sm.join(*bss, snonce, 0);
   pump(sm, ap, 0);
 
   check(sm.state() == StationSm::State::Failed,
@@ -381,10 +381,10 @@ void test_deauth_during_handshake() {
   std::vector<uint8_t> f;
 
   std::memset(snonce, 0x7a, 32);
-  sm.configure(crypto, kSsid, kPsk, kOwn, snonce);
+  sm.configure(crypto, kSsid, kPsk, kOwn);
   const BssEntry* bss = discovered(table);
   if (!bss) { check(false, "beacon"); return; }
-  sm.join(*bss, 0);
+  sm.join(*bss, snonce, 0);
 
   /* Auth and assoc only: stop before the four-way finishes. */
   while (sm.pop_tx(&f)) {
@@ -418,10 +418,10 @@ void test_frames_from_elsewhere_are_ignored() {
   uint8_t snonce[32];
 
   std::memset(snonce, 0x7a, 32);
-  sm.configure(crypto, kSsid, kPsk, kOwn, snonce);
+  sm.configure(crypto, kSsid, kPsk, kOwn);
   const BssEntry* bss = discovered(table);
   if (!bss) { check(false, "beacon"); return; }
-  sm.join(*bss, 0);
+  sm.join(*bss, snonce, 0);
 
   /* A perfectly good authentication response, from the wrong AP. */
   std::vector<uint8_t> m = ap.mgmt(devourer::sta::kFcAuth);
@@ -464,10 +464,10 @@ void test_protected_eapol_ignored() {
   std::vector<uint8_t> f;
 
   std::memset(snonce, 0x7a, 32);
-  sm.configure(crypto, kSsid, kPsk, kOwn, snonce);
+  sm.configure(crypto, kSsid, kPsk, kOwn);
   const BssEntry* bss = discovered(table);
   if (!bss) { check(false, "beacon"); return; }
-  sm.join(*bss, 0);
+  sm.join(*bss, snonce, 0);
   while (sm.pop_tx(&f)) {
     const std::vector<uint8_t> r = ap.respond(f);
     if (!r.empty()) sm.on_rx(r.data(), r.size(), 0);
@@ -499,10 +499,10 @@ void test_handshake_timeout() {
   std::vector<uint8_t> f;
 
   std::memset(snonce, 0x7a, 32);
-  sm.configure(crypto, kSsid, kPsk, kOwn, snonce);
+  sm.configure(crypto, kSsid, kPsk, kOwn);
   const BssEntry* bss = discovered(table);
   if (!bss) { check(false, "beacon"); return; }
-  sm.join(*bss, 0);
+  sm.join(*bss, snonce, 0);
   while (sm.pop_tx(&f)) {
     const std::vector<uint8_t> r = ap.respond(f);
     if (!r.empty()) sm.on_rx(r.data(), r.size(), 0);
@@ -531,10 +531,10 @@ void test_retransmission_does_not_extend_the_deadline() {
   std::vector<uint8_t> f;
 
   std::memset(snonce, 0x7a, 32);
-  sm.configure(crypto, kSsid, kPsk, kOwn, snonce);
+  sm.configure(crypto, kSsid, kPsk, kOwn);
   const BssEntry* bss = discovered(table);
   if (!bss) { check(false, "beacon"); return; }
-  sm.join(*bss, 0);
+  sm.join(*bss, snonce, 0);
   while (sm.pop_tx(&f)) {
     const std::vector<uint8_t> r = ap.respond(f);
     if (!r.empty()) sm.on_rx(r.data(), r.size(), 0);
@@ -565,6 +565,189 @@ void test_retransmission_does_not_extend_the_deadline() {
         "...as a handshake timeout");
 }
 
+/* JOINING A SECOND BSS MUST NOT AIR THE FIRST ONE'S FRAMES.
+ *
+ * join() reset everything except the transmit queue, so auth requests still
+ * queued for the BSS we gave up on went out at the one we just joined -
+ * addressed to the old BSSID, after the radio had retuned to the new channel.
+ * Every other cell here drains the queue between steps, which is exactly why
+ * none of them saw it. */
+void test_join_clears_the_transmit_queue() {
+  OpenSslCryptoOps crypto;
+  BssTable table;
+  StationSm sm;
+  uint8_t snonce[32];
+  std::vector<uint8_t> f;
+  const uint8_t kOther[6] = {0x02, 0x42, 0x75, 0x05, 0xd6, 0x99};
+
+  std::memset(snonce, 0x7a, 32);
+  sm.configure(crypto, kSsid, kPsk, kOwn);
+  const BssEntry* bss = discovered(table);
+  if (!bss) { check(false, "beacon"); return; }
+  sm.join(*bss, snonce, 0);
+
+  /* Three unanswered authentication requests pile up, unread. */
+  uint32_t now = 0;
+  for (int i = 0; i < 2; i++) { now += StationSm::kMgmtTimeoutMs; sm.tick(now); }
+  check(sm.pending_tx() == 3, "three auth requests are queued for the first BSS");
+
+  BssEntry other = *bss;
+  std::memcpy(other.info.bssid, kOther, 6);
+  sm.join(other, snonce, now);
+  check(sm.pending_tx() == 1,
+        "join() clears the queue - only the new BSS's request is pending");
+  check(sm.pop_tx(&f) && std::memcmp(f.data() + 4, kOther, 6) == 0,
+        "...and it is addressed to the BSS we actually joined");
+}
+
+/* THE QUEUE IS BOUNDED. Every frame in it is produced in answer to a received
+ * one, so an unbounded queue is an unbounded allocation an attacker controls:
+ * one captured EAPOL frame replayed at the current counter is answered every
+ * time. */
+void test_transmit_queue_is_bounded() {
+  OpenSslCryptoOps crypto;
+  BssTable table;
+  StationSm sm;
+  FixtureAp ap;
+  uint8_t snonce[32];
+  std::vector<uint8_t> f;
+
+  std::memset(snonce, 0x7a, 32);
+  sm.configure(crypto, kSsid, kPsk, kOwn);
+  const BssEntry* bss = discovered(table);
+  if (!bss) { check(false, "beacon"); return; }
+  sm.join(*bss, snonce, 0);
+  while (sm.pop_tx(&f)) {
+    const std::vector<uint8_t> r = ap.respond(f);
+    if (!r.empty()) sm.on_rx(r.data(), r.size(), 0);
+    if (f[0] == devourer::sta::kFcAssocReq) break;
+  }
+  const std::vector<uint8_t> m1 = ap.eapol_frame(ap.msg1());
+  sm.on_rx(m1.data(), m1.size(), 0);
+
+  /* The caller never drains. An attacker replays the same frame. */
+  for (int i = 0; i < 2000; i++) sm.on_rx(m1.data(), m1.size(), 0);
+  check(sm.pending_tx() <= StationSm::tx_capacity(),
+        "the transmit queue never exceeds its capacity");
+  check(sm.tx_dropped > 0, "...and the drops are counted, not silent");
+}
+
+/* CONNECTED HAS AN EXIT. Without beacon supervision the only way out is a
+ * deauth from an AP that may have been switched off, and the caller sees
+ * keyed() forever. */
+void test_beacon_loss() {
+  OpenSslCryptoOps crypto;
+  BssTable table;
+  StationSm sm;
+  FixtureAp ap;
+  uint8_t snonce[32];
+
+  std::memset(snonce, 0x7a, 32);
+  sm.configure(crypto, kSsid, kPsk, kOwn);
+  const BssEntry* bss = discovered(table);
+  if (!bss) { check(false, "beacon"); return; }
+  sm.join(*bss, snonce, 0);
+  pump(sm, ap, 0);
+  check(sm.state() == StationSm::State::Connected, "the station connects");
+
+  /* Beacons keep arriving: nothing happens, however long it runs. */
+  uint32_t now = 0;
+  for (int i = 0; i < 20; i++) {
+    now += StationSm::kBeaconLossMs / 2;
+    std::vector<uint8_t> b = beacon(kBssid, 6);
+    sm.on_rx(b.data(), b.size(), now);
+    sm.tick(now);
+  }
+  check(sm.state() == StationSm::State::Connected,
+        "a beaconing AP keeps the station connected indefinitely");
+  check(sm.beacons_rx == 20, "...and the beacons are counted");
+
+  /* They stop. */
+  sm.tick(now + StationSm::kBeaconLossMs - 1);
+  check(sm.state() == StationSm::State::Connected, "...it waits out the window");
+  sm.tick(now + StationSm::kBeaconLossMs);
+  check(sm.state() == StationSm::State::Failed, "a silent AP ends the link");
+  check(sm.fail_reason() == StationSm::Failure::BeaconLost,
+        "...saying the beacon was lost, not that the handshake timed out");
+  check(!sm.keyed(), "...and keyed() stops claiming a link that is gone");
+}
+
+/* leave() tells the AP rather than letting it time the station out - which on
+ * this project's own AP holds an AID and one of seven table slots. */
+void test_leave() {
+  OpenSslCryptoOps crypto;
+  BssTable table;
+  StationSm sm;
+  FixtureAp ap;
+  uint8_t snonce[32];
+  std::vector<uint8_t> f;
+
+  std::memset(snonce, 0x7a, 32);
+  sm.configure(crypto, kSsid, kPsk, kOwn);
+  const BssEntry* bss = discovered(table);
+  if (!bss) { check(false, "beacon"); return; }
+  sm.join(*bss, snonce, 0);
+  pump(sm, ap, 0);
+  check(sm.state() == StationSm::State::Connected, "the station connects");
+
+  sm.leave(3);
+  check(sm.state() == StationSm::State::Idle, "leave() goes back to Idle");
+  check(!sm.keyed(), "...and drops the keys");
+  check(sm.aid() == 0, "...and the AID");
+  check(sm.pop_tx(&f), "...having queued a frame");
+  check(f[0] == devourer::sta::kFcDeauth, "...which is a deauthentication");
+  check(std::memcmp(f.data() + 4, kBssid, 6) == 0, "...addressed to the AP");
+  sm.leave(3);
+  check(sm.pending_tx() == 0, "leaving twice sends nothing the second time");
+}
+
+/* The RX filter counts what it discards. On hardware this is the only address
+ * filter in the system, so "it did not associate" must come with a number
+ * saying whether the AP was ever heard. */
+void test_rx_counters() {
+  OpenSslCryptoOps crypto;
+  BssTable table;
+  StationSm sm;
+  FixtureAp ap;
+  uint8_t snonce[32];
+
+  std::memset(snonce, 0x7a, 32);
+  sm.configure(crypto, kSsid, kPsk, kOwn);
+  const BssEntry* bss = discovered(table);
+  if (!bss) { check(false, "beacon"); return; }
+  sm.join(*bss, snonce, 0);
+
+  std::vector<uint8_t> m = ap.mgmt(devourer::sta::kFcAuth);
+  devourer::sta::put_le16(m, 0);
+  devourer::sta::put_le16(m, 2);
+  devourer::sta::put_le16(m, 0);
+
+  std::vector<uint8_t> foreign = m;
+  foreign[10] ^= 0xff;
+  sm.on_rx(foreign.data(), foreign.size(), 0);
+  check(sm.rx_not_our_bss == 1, "a frame from another BSS is counted");
+
+  std::vector<uint8_t> elsewhere = m;
+  /* The LAST octet of addr1, not the first: flipping byte 0 sets the
+   * group bit and turns the frame into a broadcast, which is addressed to
+   * this station as much as to anyone. The first version of this cell did
+   * exactly that and measured the wrong counter. */
+  elsewhere[9] ^= 0xff;
+  sm.on_rx(elsewhere.data(), elsewhere.size(), 0);
+  check(sm.rx_not_for_us == 1, "a frame for another station is counted");
+
+  /* Somebody else's data traffic, correctly addressed to us: not an error,
+   * but it must not be confused with one. */
+  std::vector<uint8_t> d = devourer::sta::data_hdr_from_ds(
+      kOwn, kBssid, kBssid, /*protect=*/false, 1);
+  devourer::sta::append_llc_snap(d, 0x0800);
+  d.insert(d.end(), 20, 0x41);
+  sm.on_rx(d.data(), d.size(), 0);
+  check(sm.rx_ignored == 1, "a non-EAPOL data frame is counted separately");
+  check(sm.rx_not_our_bss == 1 && sm.rx_not_for_us == 1,
+        "...and does not move the address counters");
+}
+
 /* join() must refuse a BSS this station cannot finish with, rather than
  * authenticating and discovering it three frames later. */
 void test_join_refuses_an_unusable_bss() {
@@ -574,13 +757,13 @@ void test_join_refuses_an_unusable_bss() {
   uint8_t snonce[32];
 
   std::memset(snonce, 0x7a, 32);
-  sm.configure(crypto, kSsid, kPsk, kOwn, snonce);
+  sm.configure(crypto, kSsid, kPsk, kOwn);
 
   BssEntry open{};
   std::memcpy(open.info.bssid, kBssid, 6);
   open.info.ssid = kSsid;
   open.info.rsn_ccmp_psk = false;
-  check(!sm.join(open, 0), "an open BSS is refused by join()");
+  check(!sm.join(open, snonce, 0), "an open BSS is refused by join()");
   check(sm.state() == StationSm::State::Failed, "...and says so");
   check(sm.pending_tx() == 0, "...without sending anything");
 }
@@ -599,6 +782,11 @@ int main() {
   test_protected_eapol_ignored();
   test_handshake_timeout();
   test_retransmission_does_not_extend_the_deadline();
+  test_join_clears_the_transmit_queue();
+  test_transmit_queue_is_bounded();
+  test_beacon_loss();
+  test_leave();
+  test_rx_counters();
   test_join_refuses_an_unusable_bss();
 
   if (g_fail) {

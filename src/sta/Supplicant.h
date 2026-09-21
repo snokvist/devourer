@@ -20,6 +20,9 @@
  *   - a message arriving in a state that cannot use it  out_of_state
  *   - anything malformed, over-long, or a descriptor
  *     version whose MIC is a different algorithm        malformed
+ *   - a well-formed EAPOL-Key this role does not handle ignored
+ *   - our own CryptoOps failing, which is not the
+ *     frame's fault and must not read as an attack      crypto_errors
  *
  * THE TWO DEFECTS THIS IS BUILT NOT TO REPEAT, both of which shipped in a
  * reviewed PR (#335) and are the phase's acceptance criteria:
@@ -33,6 +36,17 @@
  *      captured group message 1 reinstalls an OLD GTK - which, with its own PN
  *      space reset, is keystream reuse across every group frame since. Only a
  *      STRICTLY GREATER counter installs anything.
+ *
+ * AND A THIRD, FOUND BY REVIEW OF THE FIRST DRAFT OF THIS FILE. Message 1
+ * carries no MIC - anyone who can hear the BSSID can build one - and the
+ * first draft let it advance the replay counter. One forged frame quoting
+ * 2^64-1 therefore refused every genuine EAPOL-Key for the rest of the
+ * association, silently: the station stayed Connected and keyed while its
+ * rekey path was dead, so the next GTK rotation simply stopped working. The
+ * counter now advances ONLY where a MIC has verified. What an unauthenticated
+ * message 1 can still do is replace the candidate PTK of a handshake in
+ * flight - wpa_supplicant has the same exposure, and it costs an association
+ * attempt, not a working link.
  */
 #ifndef DEVOURER_STA_SUPPLICANT_H
 #define DEVOURER_STA_SUPPLICANT_H
@@ -56,20 +70,22 @@ class Supplicant {
     WaitMsg1,   /* started; nothing derived yet */
     WaitMsg3,   /* msg1 seen, candidate PTK derived, msg2 sent */
     Done,       /* PTK and GTK installed, msg4 sent */
-    Failed,     /* an unrecoverable protocol error; start() again */
   };
 
   /* What on_eapol() did with the frame. `Reply` means `out` holds an EAPOL
    * frame body for the caller to wrap in a to-DS data frame and send. */
   enum class Verdict : uint8_t {
-    Ignored,      /* not an EAPOL-Key this role handles */
+    Ignored,      /* a well-formed EAPOL-Key this role does not handle */
     Malformed,
+    CryptoError,  /* our own CryptoOps failed; not the frame's fault */
     MicFailed,
     Replayed,
-    Retransmit,   /* equal counter: `out` holds the same reply as before */
+    Retransmit,   /* equal counter, same message: `out` holds the same reply */
     OutOfState,
     Reply,        /* `out` holds msg2, msg4, or group msg2 */
   };
+
+  ~Supplicant() { forget(); }
 
   /* Begin a handshake.
    *
@@ -77,26 +93,45 @@ class Supplicant {
    * lazy. `libdevourer` has no random-number dependency and CryptoOps offers
    * none, so the alternative is a stub that looks like entropy and is not.
    * Making it an argument puts the requirement where somebody has to read it:
-   * THE SNONCE MUST BE UNPREDICTABLE. A constant, a counter or a timestamp
-   * makes the PTK derivable from the air by anyone who knows the PSK - which
-   * on a PSK network is every other station.
+   * THE SNONCE MUST BE UNPREDICTABLE, AND FRESH PER ASSOCIATION. A constant, a
+   * counter or a timestamp makes the PTK derivable from the air by anyone who
+   * knows the PSK - which on a PSK network is every other station.
    */
   void start(CryptoOps& crypto, const uint8_t pmk[32], const uint8_t own[6],
              const uint8_t bssid[6], const uint8_t snonce[32]) {
+    forget();
     crypto_ = &crypto;
     std::memcpy(pmk_, pmk, 32);
     std::memcpy(own_, own, 6);
     std::memcpy(bssid_, bssid, 6);
     std::memcpy(snonce_, snonce, 32);
     state_ = State::WaitMsg1;
+  }
+
+  /* Drop every key this object holds. Called by start() and the destructor;
+   * a caller that is finished early may call it directly. */
+  void forget() {
+    secure_wipe(pmk_, sizeof pmk_);
+    secure_wipe(snonce_, sizeof snonce_);
+    secure_wipe(anonce_, sizeof anonce_);
+    secure_wipe(ptk_, sizeof ptk_);
+    secure_wipe(cand_ptk_, sizeof cand_ptk_);
+    secure_wipe(gtk_, sizeof gtk_);
+    if (!last_reply_.empty())
+      secure_wipe(last_reply_.data(), last_reply_.size());
+    last_reply_.clear();
+    state_ = State::Idle;
+    crypto_ = nullptr;
     rx_replay_ = 0;
     rx_replay_set_ = false;
+    answered_replay_ = 0;
+    answered_ = false;
+    answered_kind_ = Kind::None;
     ptk_valid_ = false;
+    cand_valid_ = false;
     gtk_valid_ = false;
-    last_reply_.clear();
-    std::memset(ptk_, 0, sizeof ptk_);
-    std::memset(cand_ptk_, 0, sizeof cand_ptk_);
-    std::memset(anonce_, 0, sizeof anonce_);
+    gtk_len_ = 0;
+    gtk_key_id_ = 0;
   }
 
   /* Feed one EAPOL frame — the bytes after the LLC/SNAP header of an 0x888E
@@ -105,8 +140,7 @@ class Supplicant {
                    std::vector<uint8_t>* out) {
     EapolKey k;
 
-    if (!crypto_ || state_ == State::Idle || state_ == State::Failed)
-      return note(Verdict::OutOfState);
+    if (!crypto_ || state_ == State::Idle) return note(Verdict::OutOfState);
     if (!parse_eapol_key(eapol, len, &k)) return note(Verdict::Malformed);
     /* Version 1 is TKIP's HMAC-MD5 and version 3 is AES-CMAC. Treating either
      * as version 2 means computing the MIC with the wrong algorithm, and the
@@ -119,29 +153,42 @@ class Supplicant {
     /* Key data longer than an MSDU can hold is not a frame anyone sent. */
     if (k.key_data_len > kMaxKeyData) return note(Verdict::Malformed);
 
-    /* THE REPLAY GATE, ahead of every branch below so no message type can be
-     * added later that forgets it. Strictly greater installs; equal is a
-     * retransmission and is answered but installs NOTHING; lower is refused.
+    const Kind kind = classify(k);
+    if (kind == Kind::None) return note(Verdict::Ignored);
+
+    /* THE REPLAY GATE, ahead of every branch below so no message type added
+     * later can forget it.
      *
-     * Answering an equal counter is what lets an authenticator that does not
-     * increment on retransmission (802.11-2016 12.7.6.4 permits either) finish
-     * its handshake. Installing on one is the PR #335 defect. */
-    if (rx_replay_set_ && k.replay <= rx_replay_) {
-      if (k.replay == rx_replay_ && !last_reply_.empty()) {
-        retransmits++;
-        if (out) *out = last_reply_;
-        return Verdict::Retransmit;
-      }
-      return note(Verdict::Replayed);
+     * `rx_replay_` is the last counter this station AUTHENTICATED - it moves
+     * in on_msg3 and on_group1 and nowhere else. Message 1 has no MIC, so
+     * letting it move this would let one forged frame refuse every genuine
+     * message for the rest of the association. That is not hypothetical: the
+     * first draft did exactly that, and two independent reviews found it.
+     *
+     * Strictly greater is required to install anything. Equal is answered
+     * with the cached reply and installs NOTHING, which is what lets an
+     * authenticator that does not increment on retransmission (802.11-2016
+     * 12.7.6.4 permits either) finish its handshake; installing on one is the
+     * PR #335 defect. The cached reply is returned only for the SAME message
+     * type that produced it, so a msg1 replayed at a msg3's counter does not
+     * get a msg4 back. */
+    if (rx_replay_set_ && k.replay <= rx_replay_)
+      return retransmit_or_replay(k, kind, out);
+    /* A repeat of something answered but never authenticated: a retransmitted
+     * message 1. */
+    if (answered_ && k.replay == answered_replay_ && kind == answered_kind_ &&
+        !last_reply_.empty()) {
+      retransmits++;
+      if (out) *out = last_reply_;
+      return Verdict::Retransmit;
     }
 
-    if (k.pairwise()) {
-      if (k.ack() && !k.has_mic()) return on_msg1(k, out);
-      if (k.ack() && k.has_mic() && k.install()) return on_msg3(k, out);
-      return note(Verdict::Ignored);
+    switch (kind) {
+      case Kind::Msg1: return on_msg1(k, out);
+      case Kind::Msg3: return on_msg3(k, out);
+      case Kind::Group1: return on_group1(k, out);
+      default: return note(Verdict::Ignored);
     }
-    if (k.ack() && k.has_mic() && k.secure()) return on_group1(k, out);
-    return note(Verdict::Ignored);
   }
 
   State state() const { return state_; }
@@ -153,58 +200,84 @@ class Supplicant {
   const uint8_t* gtk() const { return gtk_; }
   size_t gtk_len() const { return gtk_len_; }
   uint8_t gtk_key_id() const { return gtk_key_id_; }
+  /* The last counter this station AUTHENTICATED, not the last it saw. */
   uint64_t replay_counter() const { return rx_replay_; }
-  const uint8_t* snonce() const { return snonce_; }
 
   uint32_t mic_failures = 0;
   uint32_t replays = 0;
   uint32_t retransmits = 0;
   uint32_t malformed = 0;
   uint32_t out_of_state = 0;
+  uint32_t ignored = 0;
+  uint32_t crypto_errors = 0;
 
  private:
   /* An MSDU is 2304 bytes; key data larger than that never crossed a link. */
   static constexpr size_t kMaxKeyData = 2048;
 
+  enum class Kind : uint8_t { None, Msg1, Msg3, Group1 };
+
+  static Kind classify(const EapolKey& k) {
+    if (k.pairwise()) {
+      if (k.ack() && !k.has_mic()) return Kind::Msg1;
+      if (k.ack() && k.has_mic() && k.install()) return Kind::Msg3;
+      return Kind::None;
+    }
+    if (k.ack() && k.has_mic() && k.secure()) return Kind::Group1;
+    return Kind::None;
+  }
+
   Verdict note(Verdict v) {
     switch (v) {
       case Verdict::Malformed: malformed++; break;
+      case Verdict::CryptoError: crypto_errors++; break;
       case Verdict::MicFailed: mic_failures++; break;
       case Verdict::Replayed: replays++; break;
       case Verdict::OutOfState: out_of_state++; break;
+      case Verdict::Ignored: ignored++; break;
       default: break;
     }
     return v;
   }
 
-  /* Message 1: ANonce, no MIC, nothing to verify. Accepted in WaitMsg1 and in
-   * Done — an authenticator may rekey the pairwise key at any time.
+  Verdict retransmit_or_replay(const EapolKey& k, Kind kind,
+                               std::vector<uint8_t>* out) {
+    if (k.replay == rx_replay_ && kind == answered_kind_ && answered_ &&
+        k.replay == answered_replay_ && !last_reply_.empty()) {
+      retransmits++;
+      if (out) *out = last_reply_;
+      return Verdict::Retransmit;
+    }
+    return note(Verdict::Replayed);
+  }
+
+  /* Message 1: ANonce, no MIC, nothing to verify.
    *
-   * NOTHING INSTALLED IS TOUCHED. The PTK is derived into a CANDIDATE and the
-   * live one is left alone, because message 1 is unauthenticated: anyone can
-   * send it, and a station that re-derived over its working key would lose the
-   * link to a single forged frame. The candidate is promoted in on_msg3, after
-   * a MIC computed with it verifies.
+   * NOTHING INSTALLED IS TOUCHED, AND THE STATE DOES NOT GO BACKWARDS. The
+   * PTK is derived into a CANDIDATE and the live one is left alone; a station
+   * that is already Done stays Done, because on_group1 requires Done and an
+   * unauthenticated frame must not be able to switch the group-rekey path
+   * off. The candidate is promoted in on_msg3, after a MIC computed with it
+   * verifies.
    */
   Verdict on_msg1(const EapolKey& k, std::vector<uint8_t>* out) {
-    if (state_ != State::WaitMsg1 && state_ != State::WaitMsg3 &&
-        state_ != State::Done)
-      return note(Verdict::OutOfState);
     std::memcpy(anonce_, k.nonce, 32);
     if (!derive_ptk(*crypto_, pmk_, bssid_, own_, anonce_, snonce_, cand_ptk_))
-      return note(Verdict::Malformed);
+      return note(Verdict::CryptoError);
+    cand_valid_ = true;
 
     std::vector<uint8_t> rsn;
     append_rsn_ccmp_psk(rsn);
-    /* append_rsn_ccmp_psk writes a whole element; the key data carries the
-     * element, EID and length included. */
+    /* The key data carries the whole RSN element, EID and length included -
+     * a conforming authenticator compares it with the one in the association
+     * request. */
     std::vector<uint8_t> e = build_eapol_key(
         (uint16_t)(kKeyDescVersionCcmp | kKiPairwise | kKiMic), 16, k.replay,
         snonce_, nullptr, rsn.data(), rsn.size(), crypto_, cand_ptk_);
-    if (e.empty()) return note(Verdict::Malformed);
+    if (e.empty()) return note(Verdict::CryptoError);
 
-    accept(k.replay, e);
-    state_ = State::WaitMsg3;
+    answer(Kind::Msg1, k.replay, e);
+    if (state_ == State::WaitMsg1) state_ = State::WaitMsg3;
     if (out) *out = e;
     return Verdict::Reply;
   }
@@ -212,7 +285,10 @@ class Supplicant {
   /* Message 3: the GTK, and the confirmation that the authenticator holds the
    * same PTK. Everything is checked before anything is installed. */
   Verdict on_msg3(const EapolKey& k, std::vector<uint8_t>* out) {
-    if (state_ != State::WaitMsg3) return note(Verdict::OutOfState);
+    /* Gated on the CANDIDATE, not on the state: a message 1 that arrived on a
+     * working association leaves the state at Done deliberately, and its
+     * message 3 still has to be processable. */
+    if (!cand_valid_) return note(Verdict::OutOfState);
 
     /* 12.7.6.4: the ANonce in message 3 must equal the one in message 1, or
      * the authenticator is not the party we derived against. Checked BEFORE
@@ -230,32 +306,52 @@ class Supplicant {
      * hiccup — it is a frame whose MIC verified but whose key data did not,
      * which should not be possible and is refused rather than parsed. */
     GtkKde g;
-    bool have_gtk = false;
-    if (k.encrypted() && k.key_data_len) {
-      if (k.key_data_len < 16 || (k.key_data_len % 8) != 0)
-        return note(Verdict::Malformed);
-      std::vector<uint8_t> plain(k.key_data_len - 8);
-      if (!crypto_->aes_key_unwrap(cand_ptk_ + 16, 16, k.key_data,
-                                   k.key_data_len, plain.data()))
-        return note(Verdict::Malformed);
-      have_gtk = find_gtk_kde(plain.data(), plain.size(), &g);
-    } else if (k.key_data_len) {
-      /* Unencrypted key data in message 3 is a downgrade: the GTK would be in
-       * the clear. Refuse rather than read it. */
+    if (!k.encrypted() || k.key_data_len == 0) {
+      /* Unencrypted key data in message 3 is a downgrade - the GTK would be
+       * in the clear - and message 3 with no key data at all carries no GTK,
+       * which in RSN it always does. Both are refused rather than completed
+       * into a station that is keyed with no group key.
+       *
+       * DELETING THIS CHECK CHANGES NO OUTCOME, and that is recorded rather
+       * than hidden: a mutation removing it survives the whole test suite,
+       * because plaintext key data fails the AES unwrap below on its
+       * integrity check and an absent one fails the length check. It stays
+       * because "the unwrap happened to refuse it" is a different reason from
+       * "we do not accept an unprotected GTK", and only one of those survives
+       * a future edit to the unwrap path. */
+      return note(Verdict::Malformed);
+    }
+    if (k.key_data_len < 16 || (k.key_data_len % 8) != 0)
+      return note(Verdict::Malformed);
+    std::vector<uint8_t> plain(k.key_data_len - 8);
+    if (!crypto_->aes_key_unwrap(cand_ptk_ + 16, 16, k.key_data,
+                                 k.key_data_len, plain.data()))
+      return note(Verdict::Malformed);
+    /* Absent and Malformed are both refusals HERE - see the note at
+     * KdeResult. A message 3 with no GTK would otherwise complete the
+     * handshake into a station that can decrypt no broadcast at all, with
+     * nothing counted and nothing to look at. */
+    if (find_gtk_kde(plain.data(), plain.size(), &g) != KdeResult::Found) {
+      secure_wipe(plain.data(), plain.size());
       return note(Verdict::Malformed);
     }
 
     std::vector<uint8_t> e = build_eapol_key(
         (uint16_t)(kKeyDescVersionCcmp | kKiPairwise | kKiMic | kKiSecure), 16,
         k.replay, nullptr, nullptr, nullptr, 0, crypto_, cand_ptk_);
-    if (e.empty()) return note(Verdict::Malformed);
+    if (e.empty()) {
+      secure_wipe(plain.data(), plain.size());
+      return note(Verdict::CryptoError);
+    }
 
     /* INSTALL LAST. Up to here a failure has cost nothing. */
     std::memcpy(ptk_, cand_ptk_, 48);
     ptk_valid_ = true;
-    if (have_gtk) install_gtk(g);
-    accept(k.replay, e);
+    install_gtk(g);
+    authenticated(k.replay);
+    answer(Kind::Msg3, k.replay, e);
     state_ = State::Done;
+    secure_wipe(plain.data(), plain.size());
     if (out) *out = e;
     return Verdict::Reply;
   }
@@ -275,16 +371,23 @@ class Supplicant {
                                  plain.data()))
       return note(Verdict::Malformed);
     GtkKde g;
-    if (!find_gtk_kde(plain.data(), plain.size(), &g))
+    if (find_gtk_kde(plain.data(), plain.size(), &g) != KdeResult::Found) {
+      secure_wipe(plain.data(), plain.size());
       return note(Verdict::Malformed);
+    }
 
     std::vector<uint8_t> e = build_eapol_key(
         (uint16_t)(kKeyDescVersionCcmp | kKiMic | kKiSecure), 16, k.replay,
         nullptr, nullptr, nullptr, 0, crypto_, ptk_);
-    if (e.empty()) return note(Verdict::Malformed);
+    if (e.empty()) {
+      secure_wipe(plain.data(), plain.size());
+      return note(Verdict::CryptoError);
+    }
 
     install_gtk(g);
-    accept(k.replay, e);
+    authenticated(k.replay);
+    answer(Kind::Group1, k.replay, e);
+    secure_wipe(plain.data(), plain.size());
     if (out) *out = e;
     return Verdict::Reply;
   }
@@ -296,11 +399,19 @@ class Supplicant {
     gtk_valid_ = true;
   }
 
-  /* One place that advances the replay counter and caches the reply, so the
-   * two can never disagree about which message the cached reply answers. */
-  void accept(uint64_t replay, const std::vector<uint8_t>& reply) {
+  /* THE ONLY PLACE rx_replay_ MOVES, and both call sites have verified a MIC
+   * before reaching it. */
+  void authenticated(uint64_t replay) {
     rx_replay_ = replay;
     rx_replay_set_ = true;
+  }
+
+  /* The retransmission cache, kept with the message type it answered so a
+   * different message quoting the same counter cannot collect it. */
+  void answer(Kind kind, uint64_t replay, const std::vector<uint8_t>& reply) {
+    answered_kind_ = kind;
+    answered_replay_ = replay;
+    answered_ = true;
     last_reply_ = reply;
   }
 
@@ -317,9 +428,13 @@ class Supplicant {
   size_t gtk_len_ = 0;
   uint8_t gtk_key_id_ = 0;
   bool ptk_valid_ = false;
+  bool cand_valid_ = false;
   bool gtk_valid_ = false;
   uint64_t rx_replay_ = 0;
   bool rx_replay_set_ = false;
+  uint64_t answered_replay_ = 0;
+  bool answered_ = false;
+  Kind answered_kind_ = Kind::None;
   std::vector<uint8_t> last_reply_;
 };
 
