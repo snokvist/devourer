@@ -263,6 +263,122 @@ void test_keyed_accepts_wait_msg4() {
   a->state = HsState::Done;     check(a->keyed(), "Done is keyed");
 }
 
+
+/* ---------------------------------------------------------- decide_forward
+ *
+ * The relay decision, which four Phase 2b gates depend on and which had NO
+ * headless coverage: it lived inline in tests/ap_wpa2.cpp, a file in no test
+ * target, so every branch rested on a narrated two-adapter bench run. These
+ * cells are what that run cannot be asked to do repeatedly - the refusals in
+ * particular, which no station on the bench can even produce, because the AP
+ * advertises neither WMM nor HT. */
+
+using devourer::sta::Disposition;
+using devourer::sta::decide_forward;
+
+/* Build a to-DS data header: addr1 = BSSID, addr2 = SA, addr3 = DA. */
+static void to_ds(uint8_t* h, const uint8_t* bssid, const uint8_t* sa,
+                  const uint8_t* da, bool qos = false) {
+  std::memset(h, 0, 26);
+  h[0] = qos ? 0x88 : 0x08;
+  h[1] = devourer::sta::kFcToDs;
+  std::memcpy(h + 4, bssid, 6);
+  std::memcpy(h + 10, sa, 6);
+  std::memcpy(h + 16, da, 6);
+}
+
+void test_forward_decision() {
+  const uint8_t BSSID[6] = {0x02, 0x42, 0x75, 0x05, 0xd6, 0x00};
+  const uint8_t GRP[6]   = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+  const uint8_t MCAST[6] = {0x01, 0x00, 0x5e, 0x00, 0x00, 0x01};
+  const uint8_t OFF[6]   = {0x02, 0x99, 0x99, 0x99, 0x99, 0x99};
+  uint8_t h[32];
+
+  StationTable t;
+  t.add(kA);
+  t.add(kB);
+
+  /* --- the four destinations ------------------------------------------- */
+  to_ds(h, BSSID, kA, BSSID);
+  check(decide_forward(h, 24, BSSID, t).what == Disposition::Local,
+        "a frame for the AP's own address is Local");
+
+  to_ds(h, BSSID, kA, kB);
+  {
+    devourer::sta::ForwardDecision d = decide_forward(h, 24, BSSID, t);
+    check(d.what == Disposition::Relay, "a frame for another station is Relay");
+    check(d.da && std::memcmp(d.da, kB, 6) == 0, "...and da points at addr3");
+  }
+
+  to_ds(h, BSSID, kA, OFF);
+  check(decide_forward(h, 24, BSSID, t).what == Disposition::OffBss,
+        "a frame for an unassociated address is OffBss");
+
+  to_ds(h, BSSID, kA, GRP);
+  check(decide_forward(h, 24, BSSID, t).what == Disposition::Group,
+        "a broadcast destination is Group");
+  to_ds(h, BSSID, kA, MCAST);
+  check(decide_forward(h, 24, BSSID, t).what == Disposition::Group,
+        "a multicast destination is Group too - the low bit of octet 0, not ff:ff");
+
+  /* A station that deauthenticates stops being a relay target. This is the
+   * coupling between the table's lifetime and the forwarding decision, and it
+   * is the one a bench run would have to tear down an adapter to show. */
+  to_ds(h, BSSID, kA, kB);
+  t.remove(kB);
+  check(decide_forward(h, 24, BSSID, t).what == Disposition::OffBss,
+        "after B deauthenticates, a frame for B is no longer relayable");
+  t.add(kB);
+  check(decide_forward(h, 24, BSSID, t).what == Disposition::Relay,
+        "...and is relayable again once B re-associates");
+
+  /* --- the refusals ----------------------------------------------------- */
+  to_ds(h, BSSID, kA, kB);
+  h[1] |= devourer::sta::kFcMoreFrag;
+  check(decide_forward(h, 24, BSSID, t).what == Disposition::RefuseFragmented,
+        "More Fragments is refused rather than forwarded");
+
+  /* The refusal must win over the destination: a FRAGMENTED frame for the AP
+   * itself is still not something to hand to a parser expecting a whole MSDU. */
+  to_ds(h, BSSID, kA, BSSID);
+  h[1] |= devourer::sta::kFcMoreFrag;
+  check(decide_forward(h, 24, BSSID, t).what == Disposition::RefuseFragmented,
+        "a fragmented frame for the AP is refused, not Local");
+
+  to_ds(h, BSSID, kA, kB, /*qos=*/true);
+  h[24] = 0x80;                       /* A-MSDU Present */
+  check(decide_forward(h, 26, BSSID, t).what == Disposition::RefuseAmsdu,
+        "A-MSDU Present is refused rather than forwarded");
+
+  /* A QoS frame WITHOUT the A-MSDU bit is ordinary traffic. If the mask were
+   * wrong - testing the TID nibble, say - this would refuse everything. */
+  to_ds(h, BSSID, kA, kB, /*qos=*/true);
+  h[24] = 0x05;                       /* TID 5, no A-MSDU */
+  check(decide_forward(h, 26, BSSID, t).what == Disposition::Relay,
+        "a QoS frame with a TID but no A-MSDU bit still relays");
+
+  /* The A-MSDU bit is read at offset 30 on a four-address frame. Reading it
+   * at 24 there would take an address byte for a flags byte. */
+  std::memset(h, 0, sizeof h);
+  h[0] = 0x88;
+  h[1] = devourer::sta::kFcToDs | devourer::sta::kFcFromDs;
+  std::memcpy(h + 16, kB, 6);
+  h[24] = 0x80;                       /* an ADDRESS byte, not the QoS Control */
+  h[30] = 0x00;                       /* the real QoS Control: no A-MSDU */
+  check(decide_forward(h, 32, BSSID, t).what == Disposition::Relay,
+        "four-address: the A-MSDU bit is read at 30, not 24");
+  h[30] = 0x80;
+  check(decide_forward(h, 32, BSSID, t).what == Disposition::RefuseAmsdu,
+        "four-address: the real A-MSDU bit at 30 is honoured");
+
+  /* --- fails closed on a short header ----------------------------------- */
+  to_ds(h, BSSID, kA, kB, /*qos=*/true);
+  check(decide_forward(h, 24, BSSID, t).what == Disposition::Malformed,
+        "a QoS header declared as 24 bytes is Malformed, not guessed at");
+  check(decide_forward(h, 24, BSSID, t).da == nullptr,
+        "...and hands back no destination to act on");
+}
+
 } // namespace
 
 int main() {
@@ -276,6 +392,7 @@ int main() {
   test_removal_wipes_key_material();
   test_churn_does_not_exhaust_the_table();
   test_keyed_accepts_wait_msg4();
+  test_forward_decision();
 
   if (failures) {
     std::fprintf(stderr, "station_table_selftest: %d failure(s)\n", failures);

@@ -38,6 +38,7 @@
 #include <cstring>
 
 #include "sta/Ccmp.h"
+#include "sta/Dot11.h"
 
 namespace devourer {
 namespace sta {
@@ -196,6 +197,69 @@ private:
   Station slots_[kMaxStations];
   bool used_[kMaxStations];
 };
+
+/* ------------------------------------------------------------------ forward
+ *
+ * WHERE DOES THIS FRAME GO? One pure function, so the answer can be tested
+ * without a radio.
+ *
+ * This logic lived inline in tests/ap_wpa2.cpp, which is in no test target at
+ * all - hand-built, never run by ctest - so the relay decision that four Phase
+ * 2b gates depend on rested entirely on narrated bench runs. A boundary review
+ * named that as the cost of putting forwarding logic in the harness rather
+ * than in src/sta/. It also has a second consumer coming: a TAP forwarder needs
+ * the identical decision, and writing it twice is how the two drift.
+ *
+ * Pure: it reads the header and the table and returns a verdict. No I/O, no
+ * allocation, no crypto, nothing to mock. */
+enum class Disposition : uint8_t {
+  RefuseFragmented,  /* More Fragments set - see below */
+  RefuseAmsdu,       /* A-MSDU Present set - see below */
+  Malformed,         /* header shorter than its own frame control claims */
+  Local,             /* destined for the AP itself */
+  Group,             /* group destination: answer locally AND flood */
+  Relay,             /* destined for another associated station */
+  OffBss,            /* destined somewhere this BSS cannot reach */
+};
+
+struct ForwardDecision {
+  Disposition what;
+  const uint8_t* da;   /* into `hdr`; null when Malformed */
+};
+
+/* WHY TWO REFUSALS RATHER THAN A REASSEMBLER.
+ *
+ * CCMP is per-MPDU. A fragment decrypts and passes the replay window on its
+ * own - and then fragment 0's plaintext is parsed as a whole MSDU and
+ * forwarded with More Fragments CLEARED, while fragments 1..n carry no
+ * LLC/SNAP header at all. The peer receives corruption while every counter
+ * reads success. An A-MSDU frame fails the same way through a different
+ * misparse: its first subframe header is read as LLC/SNAP and the forwarded
+ * copy drops the bit that said otherwise.
+ *
+ * Refusing both converts an unbounded silent-corruption surface into two
+ * counters. Neither can reach this AP while it advertises neither WMM nor HT,
+ * but "unreachable today" is not a reason to forward something wrong. */
+inline ForwardDecision decide_forward(const uint8_t* hdr, size_t hdr_len,
+                                      const uint8_t bssid[6],
+                                      const StationTable& table) {
+  const uint8_t fc0 = hdr[0], fc1 = hdr[1];
+  const bool four_addr =
+      (fc1 & (kFcToDs | kFcFromDs)) == (kFcToDs | kFcFromDs);
+  const bool qos = is_qos_data(fc0);
+  const size_t need = 24 + (four_addr ? 6 : 0) + (qos ? 2 : 0);
+
+  if (hdr_len < need) return {Disposition::Malformed, nullptr};
+  if (fc1 & kFcMoreFrag) return {Disposition::RefuseFragmented, nullptr};
+  if (qos && (hdr[four_addr ? 30 : 24] & 0x80))
+    return {Disposition::RefuseAmsdu, nullptr};
+
+  const uint8_t* da = data_da(hdr, fc1);
+  if (da[0] & 0x01) return {Disposition::Group, da};
+  if (std::memcmp(da, bssid, 6) == 0) return {Disposition::Local, da};
+  if (table.find(da)) return {Disposition::Relay, da};
+  return {Disposition::OffBss, da};
+}
 
 } // namespace sta
 } // namespace devourer

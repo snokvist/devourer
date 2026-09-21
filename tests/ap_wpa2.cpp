@@ -824,35 +824,29 @@ static void on_rx(const Packet& p) {
            * tree read before 2b.3. A group DA - a station's broadcast ARP, its
            * DHCP DISCOVER - still reaches the local responders, because those
            * are exactly the requests this AP answers. */
-          /* REFUSE WHAT WE CANNOT FORWARD INTACT (2b.7's stated position).
+          /* WHERE DOES THIS FRAME GO? The decision - and the two refusals
+           * that go with it - is sta::decide_forward(), a pure function in
+           * src/sta/ with its own ctest. It used to live here, inline, in a
+           * file that no test target builds, so four Phase 2b gates rested on
+           * a narrated bench run. Moving it out is also what lets a TAP
+           * forwarder reuse the same decision instead of writing a second
+           * copy that drifts.
            *
-           * CCMP is per-MPDU, so a fragment decrypts and passes the replay
-           * window on its own - and then fragment 0's plaintext is parsed as
-           * a whole MSDU and relayed with More Fragments CLEARED, while
-           * fragments 1..n carry no LLC/SNAP at all. The peer receives
-           * corruption and every counter reads success. An A-MSDU frame is
-           * the same story: its first subframe header is misread as LLC/SNAP
-           * and the relayed copy loses the bit that said otherwise.
-           *
-           * Neither can reach this AP today - it advertises neither WMM nor
-           * HT - but nothing rejected them and nothing wrote the refusal
-           * down. A reassembler is not the minimal complete answer here; two
-           * counters and a documented refusal are. */
-          if (fc1 & devourer::sta::kFcMoreFrag) {
+           * The refusals are deliberately checked BEFORE the destination: a
+           * fragmented frame addressed to the AP itself is still not
+           * something to hand a parser that expects a whole MSDU. */
+          const devourer::sta::ForwardDecision fwd =
+              devourer::sta::decide_forward(d, (size_t)hlen, kBssid, g_stas);
+          switch (fwd.what) {
+          case devourer::sta::Disposition::RefuseFragmented:
             g_frag_drop.fetch_add(1);
             return;
-          }
-          if (devourer::sta::is_qos_data(fc0)) {
-            const bool four = (fc1 & (devourer::sta::kFcToDs |
-                                      devourer::sta::kFcFromDs)) ==
-                              (devourer::sta::kFcToDs | devourer::sta::kFcFromDs);
-            if (d[four ? 30 : 24] & 0x80) {     /* A-MSDU Present */
-              g_amsdu_drop.fetch_add(1);
-              return;
-            }
-          }
-          const uint8_t* da = devourer::sta::data_da(d, fc1);
-          if (devourer::sta::data_da_is_group(d, fc1)) {
+          case devourer::sta::Disposition::RefuseAmsdu:
+            g_amsdu_drop.fetch_add(1);
+            return;
+          case devourer::sta::Disposition::Malformed:
+            return;
+          case devourer::sta::Disposition::Group:
             g_to_group.fetch_add(1);
             /* Answer it locally AND flood it to the BSS. A station's broadcast
              * is both a request this AP may answer (ARP for the AP's own
@@ -872,13 +866,15 @@ static void on_rx(const Packet& p) {
                 g_group_drop.fetch_add(1);
               }
             }
-          } else if (std::memcmp(da, kBssid, 6) == 0) {
+            break;
+          case devourer::sta::Disposition::Local:
             g_to_ap.fetch_add(1);
             handle_plain(sta, pt.data(), (int)ptlen);    // decrypted -> ARP/ICMP
-          } else if (g_stas.find(da)) {
-            /* Destined for another station on this BSS: relay it. */
+            break;
+          case devourer::sta::Disposition::Relay: {
             g_to_peer.fetch_add(1);
-            std::vector<uint8_t> f = ccmp_relay(da, sta, pt.data(), (int)ptlen);
+            std::vector<uint8_t> f =
+                ccmp_relay(fwd.da, sta, pt.data(), (int)ptlen);
             if (!f.empty()) {
               enqueue(std::move(f));
               g_relayed.fetch_add(1);
@@ -888,8 +884,11 @@ static void on_rx(const Packet& p) {
                * under the wrong key would be worse than losing it. */
               g_relay_drop.fetch_add(1);
             }
-          } else {
+            break;
+          }
+          case devourer::sta::Disposition::OffBss:
             g_to_elsewhere.fetch_add(1);
+            break;
           }
         } else {
           g_replayed.fetch_add(1);
