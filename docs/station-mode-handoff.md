@@ -10,7 +10,19 @@ the next person should distrust.
 
 Worktree `.claude/worktrees/mt7612u-station-scope`, branch
 `worktree-mt7612u-station-scope`, based on `origin/master` at `14a4881`.
-Nothing is pushed and no PR exists.
+
+**Pushed to the FORK only**, as
+`fork/feature/mt7612u-station-mode`, with a draft PR at
+<https://github.com/snokvist/devourer/pull/3>. `origin` is **OpenIPC/devourer**
+— upstream — so a bare `gh pr create` targets the wrong repository. Nothing
+goes upstream until the whole workstream is finished.
+
+```sh
+git push fork HEAD:refs/heads/feature/mt7612u-station-mode
+```
+
+The commit list below stops at Phase 1; `git log --oneline` is the current
+one.
 
 ```
 082c89d tests: adversarial review round 5 - two gate checks could not fail
@@ -46,7 +58,9 @@ that tree up; nothing here depends on it any more.
 | 1 — shared frame + crypto layer | **DONE, GATE CLOSED.** 14/14 twice on each band against independent silicon. See below. |
 | 2 — the `IRadio` seam | **Implemented.** Seam + caps flag + MT7612U implementation + five bring-up gates + a headless selftest. R5 and R6 both measured; `station_mode_ok` is **true** for MT7612U. `docs/mt7612u-station-identity.md` — read its retraction section before quoting any number. The R6 table was re-taken 2026-09-20 under the corrected single-variable harness and holds. |
 | 3 — pure station logic | **DONE 2026-09-21.** BSS table, association state machine, EAPOL/4-way supplicant, all headless. Both acceptance negatives present and load-bearing. Pinned against a captured hostapd/wpa_supplicant four-way. |
-| 4–6 | Not started. |
+| 4 — the harness | **DONE 2026-09-21.** `tests/sta_client.cpp` (+ its `.inc`, ctest `sta_client_headless`) and `tests/mt7612u_sta_onair.sh`. **15/15 on ch6** against hostapd on an RTL8812AU; `bench` 2/2 separately. No backend branch anywhere in it, which is the phase's acceptance property. |
+| 5 — validation | **Half done by accident.** The Phase 4 harness needed something to associate to, and the honest choice was hostapd on non-MediaTek silicon — so the independent-witness run already exists and already found a defect. Still owed: devourer-to-devourer, 5 GHz, throughput, a soak. |
+| 6 — the Realtek arm | Not started. |
 
 ## What exists now
 
@@ -67,12 +81,22 @@ no threads, no sockets:
 - `Supplicant.h` — the four-way and the group rekey, as a state machine.
 - `BssTable.h` — one record per BSSID, and which of them to join.
 - `StationSm.h` — authenticate, associate, four-way, connected, and every way
-  that stops.
+  that stops. **Open networks too, since Phase 4** (`configure_open`), which
+  the plan had always required and the module had never had.
+
+And the harness that drives them, which is deliberately NOT library code:
+
+- `tests/sta_client.cpp` — devourer as a station. The scanner, the reconnect
+  policy and the per-frame key selection, all three of which Phase 3 wrote
+  down that it was refusing to guess at. **It contains no backend branch**,
+  which is Phase 4's whole acceptance test and is checkable by reading.
 
 Tested headless by `ctest`: `ccmp_framing`, `dot11_frames`,
 `ccmp_software_roundtrip`, `station_table`, `ap_wpa2_headless` — which runs
-the WPA2 AP harness itself with no radio — and, since Phase 3, `supplicant`,
-`station_sm` and `bss_table`. **78/78 green.** Every selftest here was
+the WPA2 AP harness itself with no radio — `supplicant`, `station_sm`,
+`bss_table`, and since Phase 4 `sta_client_headless`, which runs the STATION
+harness with no radio against a fixture authenticator. **79/79 green, and
+77/77 under `-DDEVOURER_SANITIZE=address+undefined`.** Every selftest here was
 verified capable of failing by injecting the defect it exists to catch.
 
 `supplicant` carries `tests/eapol_kernel_vectors.h` in the same spirit: the
@@ -101,15 +125,54 @@ for the Phase 0 measurement.
 
 ## The rig, and how to reproduce the on-air cells
 
-| role | part | sysfs | notes |
-|---|---|---|---|
-| AP | MT7612U `0e8d:7612` | `7-1` | USB **2.0** link; firmware from `/lib/firmware/mediatek` |
-| station | RTL8812AU `0bda:8812` | `1-1` | the **in-tree rtw88** driver: module `rtw88_8812au`, sysfs driver name `rtw_8812au` (both spellings are in this tree; they name different things). **Independent silicon**, which is the witness `docs/mt7612u-ap-mode.md` says it lacked |
+**Sysfs paths move between sessions. Check them first** (`lsusb -t`, or the
+`idVendor`/`idProduct` under `/sys/bus/usb/devices/*`); every recipe below
+takes them as arguments precisely because they are not stable. As of
+2026-09-21 on this bench: MT7612U at `1-1`, RTL8812CU at `5-1`, RTL8812AU at
+`8-1`.
+
+### The AP harness — devourer SERVES, a kernel driver joins
+
+| role | part | notes |
+|---|---|---|
+| AP | MT7612U `0e8d:7612` | firmware from `/lib/firmware/mediatek` |
+| station | RTL8812AU `0bda:8812` | the **in-tree rtw88** driver: module `rtw88_8812au`, sysfs driver name `rtw_8812au` (both spellings are in this tree; they name different things). **Independent silicon**, which is the witness `docs/mt7612u-ap-mode.md` says it lacked |
 
 ```sh
-sudo AP_SYSFS=7-1 STA_SYSFS=1-1 CH=6  FW_DIR=/lib/firmware/mediatek tests/mt7612u_ap_onair.sh all
-sudo AP_SYSFS=7-1 STA_SYSFS=1-1 CH=36 FW_DIR=/lib/firmware/mediatek tests/mt7612u_ap_onair.sh all
+sudo AP_SYSFS=1-1 STA_SYSFS=8-1 CH=6  FW_DIR=/lib/firmware/mediatek tests/mt7612u_ap_onair.sh all
+sudo AP_SYSFS=1-1 STA_SYSFS=8-1 CH=36 FW_DIR=/lib/firmware/mediatek tests/mt7612u_ap_onair.sh all
 ```
+
+### The station harness — devourer JOINS, hostapd serves
+
+The roles are **swapped**, and so are the variable names: `STA_SYSFS` is the
+MT7612U devourer claims and `AP_SYSFS` is the kernel-driven adapter hostapd
+drives. Getting these the wrong way round is the first mistake to check.
+
+```sh
+sudo STA_SYSFS=1-1 AP_SYSFS=8-1 CH=6 FW_DIR=/lib/firmware/mediatek \
+     tests/mt7612u_sta_onair.sh all        # open + wpa2 + reconnect = 15 checks
+sudo STA_SYSFS=1-1 AP_SYSFS=8-1 CH=6 tests/mt7612u_sta_onair.sh bench
+```
+
+Three things it encodes that are not obvious:
+
+1. **The AP runs in a network namespace.** Both radios are on one host, so
+   with both interfaces in the root namespace and both addresses in one
+   subnet the kernel routes between them locally and the ping never touches
+   the air — a data-plane cell that passes with the antennas unplugged. The
+   PHY is moved with `iw phy <phy> set netns`; a cfg80211 interface cannot be
+   moved with `ip link set netns`. Every cell asserts `ip route get` first.
+2. **`ip netns del` on a namespace that still holds the PHY DESTROYS it.**
+   Measured: the USB device stays bound and enumerated, the phy disappears
+   from `/sys/class/ieee80211` entirely, and only a bus re-enumeration brings
+   it back. The script moves the phy out first and refuses to delete the
+   namespace otherwise. If you are ever left with a vanished adapter:
+   `sudo sh -c 'echo 0 > /sys/bus/usb/devices/8-1/authorized'` then `1`.
+3. **ch6 only.** The RTL8812AU's 5 GHz channels are all `no IR` in this
+   regulatory domain, so hostapd will not serve them here. The AP harness
+   reaches ch36 because *devourer* airs that beacon; this one needs a kernel
+   AP.
 
 That is the whole recipe now. **`tests/ap_onair_rtl_sta.sh` is gone** — every
 check in it was strictly weaker than the equivalent above (substring SSID
@@ -197,6 +260,29 @@ require it:
   so a Realtek AP would report a length bug as MIC failures. Fix the trim
   before trusting it outside MediaTek — this matters at Phase 6.
 
+## What the station's on-air runs showed
+
+`tests/mt7612u_sta_onair.sh` reads **15/15 on ch6** against hostapd on an
+RTL8812AU — the MT7612U authenticates, associates, runs the four-way as the
+supplicant, answers group rekeys, carries an encrypted data plane, notices
+the AP going away and re-joins by itself when it comes back.
+
+**The first WPA2 run failed, and that is the most valuable thing in this
+section.** hostapd logged *"group key handshake failed (RSN) after 4 tries"*
+and threw the station off the BSS. `StationSm::on_rx` refused every protected
+data frame — correct for the four-way, which runs before there is a key, and
+wrong for the group key handshake, which runs after the PTK is installed and
+is protected like any other data frame. Nothing in this tree could have found
+it: this project's own AP never sends a group message 1. See the Phase 4
+section of `docs/station-mode-plan.md`.
+
+Numbers, with their counterpart in the same breath (`bench`, 1400 B, 15 s):
+3340/3377 replies at 1.1% loss, 3.67% of a core incremental, CCMP 5915 ns per
+transmitted frame and 15143 ns per received one. **`reply_pps` is a LATENCY
+figure** — a flood ping is round-trip bound — and nothing in this tree
+measures throughput. The 2.5× receive-over-transmit asymmetry is reported
+because it was measured, not because it is understood.
+
 ## Open, carried forward
 
 1. **The ~20 ms No-Ack unicast cost.** `docs/mt7612u-tx-retry.md`: the MAC
@@ -217,6 +303,19 @@ require it:
 4. **`SetStationIdentity` is provisional.** It ships with one implementation;
    `docs/station-mode-scope.md` argues the position honestly and Phase 2's gate
    should weigh landing the Realtek arm alongside it.
+5. **The channel sweep is written and not exercised on air.** Every station
+   cell runs on one configured channel. `scan_step`'s multi-channel branch
+   has a headless cell and no on-air one, and the rule that keeps it from
+   retuning under a live association is enforced by construction rather than
+   by a test against a real retune.
+6. **No duplicate filter on the station's receive path.** A retried frame the
+   MAC delivers twice is handed to the host twice. The CCMP replay window
+   catches it on a protected link, which is every link this project ships;
+   an open link has nothing. Not observed causing trouble, and not defended.
+7. **No 802.11w**, unchanged, and now with an on-air consequence: the
+   `reconnect` cell stops the AP rather than sending a deauth, partly because
+   an unauthenticated deauth is exactly what this station cannot tell from a
+   forged one.
 
 ## The rule this work runs under
 

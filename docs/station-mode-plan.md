@@ -1041,7 +1041,177 @@ in the style of `mt7612u_ap_onair.sh`: `open`, `wpa2`, `reconnect`, `bench`.
 **Acceptance.** The harness contains no backend branch — see "the end goal"
 above; this is the structural test, and it is checkable by reading.
 
-**Status:** not started.
+### Phase 4 — COMPLETE 2026-09-21
+
+**Status: DONE.** `tests/sta_client.cpp` + `tests/sta_client_selftest.inc`
+(ctest `sta_client_headless`, 17 cells) and `tests/mt7612u_sta_onair.sh`.
+**15/15 on ch6** against hostapd on an RTL8812AU, `open` 5, `wpa2` 5,
+`reconnect` 5; `bench` 2/2 separately.
+
+**The acceptance property holds and is checkable by reading:** there is no
+chip test anywhere in `sta_client.cpp`. The two places the silicon genuinely
+differs go through the library — the trailing FCS via `tests/rx_mpdu.h`, and
+the identity via `IRadio::SetStationIdentity` gated on
+`AdapterCaps::station_mode_ok`.
+
+**What the harness owns, which is exactly what Phase 3 wrote down that it was
+refusing to guess at:** the scanner (`scan_step`/`probe`, feeding `BssTable`),
+the reconnect policy (`supervise`), and which key the data plane uses per
+frame. All three are now covered headlessly; none of them was before.
+
+#### The library gap this phase found first: StationSm was WPA2-only
+
+The plan has named an `open` cell since it was written, and there was no open
+path — `configure()` derived a PMK unconditionally, `join()` refused any BSS
+without `rsn_ccmp_psk`, and every association request carried an RSN element.
+That is a missing *rung*, not a missing feature: on a WPA2 BSS association
+and the key exchange come up together or not at all, so a station that fails
+cannot say which half broke. The AP side has had the ladder since the
+beginning (`ap_responder` / `ap_wpa2`). Added: `StationSm::configure_open`
+(no PSK, no PMK, **no CryptoOps** — an open station links no crypto, exactly
+as `ap_responder` does not) and `BssTable::select_open`, which is the second
+function the comment above `select()` asked for. "Open" is `!privacy`, not
+`!has_rsn`: a WEP BSS carries no RSN element and is not joinable either.
+
+#### THE FINDING OF THIS PHASE: the group rekey arrives inside the cipher
+
+hostapd, on the first WPA2 on-air run:
+
+```
+WPA: pairwise key handshake completed (RSN)
+EAPOL-4WAY-HS-COMPLETED
+WPA: group key handshake failed (RSN) after 4 tries
+AP-STA-DISCONNECTED
+```
+
+`StationSm::on_rx` refuses every protected data frame under a comment reading
+"the four-way is never protected: the keys it carries are what protection
+would need". That sentence is true, and it is about the **four-way**. The
+**group key handshake** runs *after* the PTK is installed and is protected
+like any other data frame, so the refusal swallowed the entire handshake —
+all four of hostapd's message 1s landed in `rx_ignored`. A station that
+cannot answer a rekey is thrown off the BSS by every AP that performs one,
+and **the link reports itself healthy right up until it ends**: the first run
+read `associations=2, reconnects=1` in thirty seconds with every crypto
+counter at zero.
+
+Not reachable through this project's own AP, which never sends a group
+message 1 — so nothing in this tree could have found it. This is the single
+strongest argument in the whole workstream for the independent-witness rule
+that Phase 5 states and `docs/mt7612u-ap-mode.md` admits it broke.
+
+Fixed by splitting framing from decision: `StationSm::eapol_reply()` returns
+the EAPOL-Key **body**, and `on_decrypted_msdu()` is the entry for a frame
+the caller has already unprotected. The reply is a body and not a frame
+because the two callers need different framing — the four-way's answer is
+cleartext and the machine can build it, a rekey's must be encrypted and the
+machine holds no cipher. Measured after: *"group key handshake completed
+(RSN)"* twice in 75 s, one association, `reconnects=0`.
+
+**And the cell that covered this was green throughout.** `test_group_rekey`
+fed message 1 in *cleartext*, because that is the shape the fixture already
+built — so it exercised the four-way's path and left the one that matters
+unreached. That is this phase's contribution to the "which assertion could
+not fail" ledger, and it is a sharper form than the earlier ones: the cell
+did not merely pass for another reason, it tested **a different code path
+than its name claims**.
+
+#### Four more defects, each found by something other than reading
+
+- **The re-join backoff was armed on the first pass through `supervise()`**,
+  so a freshly started station sat idle for a full second before it would
+  even look at the scan table. Found by the headless cells before any
+  hardware; on a bench it would have read as "the AP is slow to answer".
+- **`GetPermanentMacAddress` was called before `InitWrite`**, where the
+  device handle does not exist yet. Reported as *"the radio does not report
+  its MAC address"*, which names the wrong thing entirely.
+- **The startup `SetStationIdentity(own, own)` is refused by contract** —
+  the two must differ. It looked like a capability failure and was a harness
+  bug. The identity is armed once, for the BSS actually joined.
+- **`rx_ignored` was counting every protected data frame**, which on a
+  working link is all of them: a 60-second run carrying 75 frames reported
+  `ignored=75`, reading as 75 protocol errors. That counter set is the *only*
+  thing that answers "why did nothing associate" on a promiscuous receiver,
+  so it now has its own `rx_protected`.
+- **`reconnects` counted retries, not losses.** An on-air run that dropped
+  the link exactly once, with the AP off for eight seconds, reported
+  `reconnects=6`. The first latch has to be cleared by every join attempt or
+  a second loss could never be noticed, so it counts attempts; a second latch
+  set at association makes the number mean what its name says. Now `1`.
+- **The bench cell passed while measuring nothing.** `ccmp.profile` reported
+  `tx_frames=0` over 3365 encrypted round trips: the profiling `CryptoOps`
+  was written and never instantiated, and the only graded check was the reply
+  count, which says nothing about whether the cipher was timed. The cell now
+  fails on a zero-frame profile.
+
+#### Mutations
+
+11 on the open-network path (10 killed), 20 on the harness (20 killed, after
+two cells were rewritten because they could not fail — see `580aff5`). **One
+recorded survivor**, stated at the line rather than implied by its absence:
+`configure_open`'s `secure_wipe` of the PMK is unobservable, because
+`have_pmk_` is cleared either way. It is defence against a core dump, not
+against a caller.
+
+And a **harness bug worth carrying**: the first sweep restored files with
+`shutil.copy2`, which preserves the mtime — so the restored file looked older
+than the object built from the mutated one, make never rebuilt it, and the
+"clean" tree afterwards still ran a mutated binary. It came back as seven
+failures in a suite that had just been green. Suspect the build before the
+test; see `feedback-a-hand-maintained-dependency-list-yields-false-passes`.
+
+#### What the on-air harness does that the AP one does not
+
+**The AP lives in a network namespace.** Both radios are on one host, so with
+both interfaces in the root namespace and both addresses in one subnet the
+kernel routes between them *locally* and the ping never touches the air — a
+data-plane cell that passes with the antennas unplugged. The PHY is moved
+with `iw phy <phy> set netns` (a cfg80211 interface cannot be moved with
+`ip link set netns`), and every cell asserts `ip route get` before measuring.
+
+**And `ip netns del` on a namespace that still holds the PHY destroys it.**
+Measured by doing exactly that: the USB device stayed bound and enumerated,
+`/sys/class/ieee80211` lost the phy entirely, and only a bus re-enumeration
+brought it back. The delete is conditional on the move having worked.
+
+#### Numbers, with their adversarial counterpart
+
+`bench`, ch6, 1400-byte payload, 15 s, MT7612U station against hostapd:
+
+| | |
+|---|---|
+| replies | 3340/3377, 1.1% loss |
+| station CPU | 3.67% of a core (incremental over a paired idle window) |
+| system | 0.168 cores incremental |
+| `ccmp_tx_ns_per_frame` | 5915 |
+| `ccmp_rx_ns_per_frame` | 15143 |
+
+**What this is not.** A flood ping is round-trip bound, so `reply_pps` (223)
+is a *latency* figure and not link throughput — nothing in this tree measures
+throughput. The receive path costs 2.5× the transmit path per frame and
+**that asymmetry is unexplained**; it is reported because it was measured,
+not because it is understood.
+
+#### Carried out of Phase 4
+
+- **No 802.11w still.** Unchanged from Phase 3, and now it has an on-air
+  consequence worth naming: the `reconnect` cell stops the AP rather than
+  sending a deauth, partly because a deauth exercises a path that needs no
+  supervision at all — and partly because an unauthenticated deauth is
+  exactly what this station cannot tell from a forged one.
+- **The channel sweep is written but not exercised on air.** Every cell runs
+  on one configured channel, which is what `DEVOURER_STA_SCAN_CHANNELS`
+  defaults to. `scan_step`'s multi-channel branch has a headless cell and no
+  on-air one; retuning under a live association is refused by construction
+  (`supervise` returns the joined channel once the machine leaves
+  Idle/Failed) and that construction is untested against a real retune.
+- **One band.** ch6 only: the RTL8812AU's 5 GHz channels are all `no IR` in
+  this regulatory domain, so hostapd cannot serve them here. The AP harness
+  reads 14/14 on ch36 because *devourer* airs the beacon there; this harness
+  needs a kernel AP and therefore needs a different regdomain or a different
+  AP adapter to reach 5 GHz.
+- **`aes_key_unwrap`'s output-size contract** is still unstated in
+  `CryptoOps.h`. Carried forward unchanged from Phase 3.
 
 ## Phase 5 — validation, independent witness first
 
@@ -1052,7 +1222,20 @@ should not repeat that. Then devourer-to-devourer against `ap_wpa2.cpp` on a
 second adapter, which is the FPV shape. Then throughput and latency, each
 number with its adversarial counterpart in the same breath.
 
-**Status:** not started.
+**Status: the independent-witness half is DONE, ahead of schedule and by
+accident.** Phase 4's harness needed *something* to associate to in order to
+have any cells at all, and the honest choice was hostapd on non-MediaTek
+silicon rather than this project's own AP — so `tests/mt7612u_sta_onair.sh`
+already IS the independent-witness run, 15/15 on ch6, and it found the group
+rekey defect on its first attempt. What Phase 5 still owes:
+
+- **devourer-to-devourer**, MT7612U station against `ap_wpa2.cpp` on a second
+  adapter. That is the FPV shape and it is the one this project ships.
+- **5 GHz**, which this bench cannot serve from a kernel AP (see Phase 4's
+  carried-forward list).
+- **Throughput**, which nothing in this tree measures yet, and latency under
+  load. Each with its adversarial counterpart in the same breath.
+- **A soak.** Every figure above comes from runs of 45–75 seconds.
 
 ## Phase 6 — the Realtek arm, deferred to its own issue
 

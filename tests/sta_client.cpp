@@ -74,6 +74,7 @@
 #include <thread>
 #include <vector>
 
+#include <csignal>
 #include <fcntl.h>
 #include <linux/if.h>
 #include <linux/if_tun.h>
@@ -137,7 +138,11 @@ std::atomic<uint64_t> g_sent{0}, g_send_fail{0}, g_q_drop{0};
 /* ---- the station core, under one mutex --------------------------------- */
 
 std::mutex g_mu;
-devourer::test::OpenSslCryptoOps g_crypto;
+/* Defined below, next to the profiling counters it feeds. Declared here
+ * because g_crypto IS one: it was a plain OpenSslCryptoOps until the first
+ * bench run reported ccmp_tx_ns_per_frame=0 over 3365 encrypted round trips
+ * - the profiling subclass existed and nothing ever instantiated it. */
+struct ProfilingCrypto;
 BssTable g_bss;
 StationSm g_sm;
 uint8_t g_own[6] = {0};
@@ -165,6 +170,12 @@ bool g_gave_up = false;
  * iteration - so without a latch it would count one lost link as hundreds of
  * reconnect attempts and re-arm the backoff on every pass. */
 bool g_failed_noted = false;
+/* And a SECOND latch, because the first one is cleared by every join attempt
+ * so that a later loss can be noticed at all. Without this, every failed
+ * retry while the AP is off counts as another lost link: an on-air run that
+ * dropped the link exactly ONCE reported reconnects=6, which is the number
+ * of times it TRIED, not the number of times it lost anything. */
+bool g_was_associated = false;
 
 /* ---- the ledger --------------------------------------------------------- */
 
@@ -184,6 +195,17 @@ std::atomic<uint64_t> g_ccmp_rx_frames{0}, g_ccmp_rx_ns{0};
 
 int g_tap_fd = -1;
 
+/* A CLEAN STOP, because the ledger below IS the diagnostic and a harness
+ * that prints nothing when interrupted is no use at all. The on-air script
+ * ends a cell by killing this process once it has taken its measurements, and
+ * without a handler that meant the run's counters - the only thing that can
+ * distinguish "we never heard the AP" from "we heard it and it said no" -
+ * were lost exactly when a cell had failed and someone wanted to know why.
+ *
+ * sig_atomic_t and a bare store: the only thing legal in a handler. */
+volatile std::sig_atomic_t g_stop = 0;
+extern "C" void on_signal(int) { g_stop = 1; }
+
 /* ---- small helpers ------------------------------------------------------ */
 
 uint32_t now_ms() {
@@ -201,6 +223,8 @@ struct ProfilingCrypto : devourer::test::OpenSslCryptoOps {
   bool aes_ccm(bool encrypt, const uint8_t key[16], const uint8_t nonce[13],
                const uint8_t* aad, size_t aad_len, const uint8_t* in,
                size_t in_len, uint8_t* out, uint8_t* tag) override {
+    /* DEVOURER_CCMP_PROFILE off is the normal path and pays nothing but a
+     * predictable branch. */
     if (!g_ccmp_profile)
       return devourer::test::OpenSslCryptoOps::aes_ccm(
           encrypt, key, nonce, aad, aad_len, in, in_len, out, tag);
@@ -220,6 +244,9 @@ struct ProfilingCrypto : devourer::test::OpenSslCryptoOps {
     return ok;
   }
 };
+
+/* THE ONE the whole harness uses. */
+ProfilingCrypto g_crypto;
 
 void enqueue(std::vector<uint8_t> mpdu) {
   std::vector<uint8_t> f;
@@ -256,6 +283,7 @@ int8_t rssi_dbm(uint8_t raw) {
  * cryptographic error rather than a tidiness one. */
 void on_association() {
   g_failed_noted = false;
+  g_was_associated = true;
   g_tx_pn = 1;
   g_rx_replay.reset();
   g_group_replay.reset();
@@ -550,8 +578,11 @@ uint8_t supervise(uint32_t now) {
     g_failed_noted = true;
     /* Counted separately from a first join, so the on-air `reconnect` cell
      * can assert that a RECOVERY happened rather than that a first
-     * association eventually did. */
-    if (g_associations.load() > 0) g_reconnects.fetch_add(1);
+     * association eventually did. ONCE PER LOST LINK, not once per retry. */
+    if (g_was_associated) {
+      g_was_associated = false;
+      g_reconnects.fetch_add(1);
+    }
     if (!g_reconnect) { g_gave_up = true; return g_chan; }
     /* THE BACKOFF IS FOR A RE-JOIN, NOT FOR THE FIRST ATTEMPT. Arming it
      * unconditionally made every run - including the very first - sit idle
@@ -708,9 +739,10 @@ void report() {
                g_sm.beacons_rx);
   std::fprintf(stderr,
                "  refused by the address filter: not-our-bss=%u,"
-               " not-for-us=%u, ignored=%u, malformed=%u, tx-dropped=%u\n",
+               " not-for-us=%u, ignored=%u, malformed=%u, tx-dropped=%u"
+               " (protected data, handled here: %u)\n",
                g_sm.rx_not_our_bss, g_sm.rx_not_for_us, g_sm.rx_ignored,
-               g_sm.rx_malformed, g_sm.tx_dropped);
+               g_sm.rx_malformed, g_sm.tx_dropped, g_sm.rx_protected);
   const devourer::sta::Supplicant& sup = g_sm.supplicant();
   std::fprintf(stderr,
                "  group rekey (EAPOL inside the cipher): received=%llu,"
@@ -892,8 +924,10 @@ int main(int argc, char** argv) {
 
   uint8_t tuned = g_chan;
   uint8_t bssid_armed[6] = {0};
+  std::signal(SIGINT, on_signal);
+  std::signal(SIGTERM, on_signal);
   const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(sec);
-  while (std::chrono::steady_clock::now() < end) {
+  while (!g_stop && std::chrono::steady_clock::now() < end) {
     const uint32_t now = now_ms();
     const uint8_t want = supervise(now);
     if (want && want != tuned) {

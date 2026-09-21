@@ -476,6 +476,36 @@ void test_frames_from_elsewhere_are_ignored() {
 
 /* The four-way is never protected. A PROTECTED frame claiming to be EAPOL
  * cannot be one, because the keys it carries are what protection would need. */
+/* A protected data frame is the caller's to decrypt, and is counted apart
+ * from a protocol error. It used to land in rx_ignored, which on a working
+ * link is EVERY data frame - a 60-second on-air run carrying 75 frames
+ * reported ignored=75, and that counter set is the one thing that answers
+ * "why did nothing associate". */
+void test_protected_data_is_counted_apart() {
+  OpenSslCryptoOps crypto;
+  BssTable table;
+  StationSm sm;
+  FixtureAp ap;
+  uint8_t snonce[32];
+
+  std::memset(snonce, 0x7a, 32);
+  sm.configure(crypto, kSsid, kPsk, kOwn);
+  discovered(table);
+  const BssEntry* bss = table.select(kSsid);
+  if (!bss) { check(false, "BSS discovered"); return; }
+  sm.join(*bss, snonce, 0);
+  pump(sm, ap, 0);
+  check(sm.state() == StationSm::State::Connected, "connected");
+
+  const uint32_t ignored = sm.rx_ignored;
+  std::vector<uint8_t> f = devourer::sta::data_hdr_from_ds(
+      kOwn, kBssid, kBssid, /*protect=*/true, 7);
+  f.insert(f.end(), 40, 0x11);
+  sm.on_rx(f.data(), f.size(), 0);
+  check(sm.rx_protected == 1, "a protected data frame is counted as protected");
+  check(sm.rx_ignored == ignored, "...and NOT as ignored");
+}
+
 void test_protected_eapol_ignored() {
   OpenSslCryptoOps crypto;
   BssTable table;
@@ -959,6 +989,7 @@ int main() {
   test_deauth_during_handshake();
   test_frames_from_elsewhere_are_ignored();
   test_protected_eapol_ignored();
+  test_protected_data_is_counted_apart();
   test_handshake_timeout();
   test_retransmission_does_not_extend_the_deadline();
   test_join_clears_the_transmit_queue();

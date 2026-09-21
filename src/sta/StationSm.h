@@ -282,8 +282,13 @@ class StationSm {
      * THE GROUP KEY HANDSHAKE IS A DIFFERENT MATTER, and this refusal used
      * to be the end of the story for it. It runs AFTER the PTK is installed
      * and is therefore protected like any other data frame. The caller
-     * decrypts and hands the plaintext back through on_decrypted_msdu(). */
-    if (fc1 & kFcProtected) { rx_ignored++; return; }
+     * decrypts and hands the plaintext back through on_decrypted_msdu().
+     *
+     * COUNTED SEPARATELY FROM rx_ignored, because on a working link this is
+     * EVERY DATA FRAME and lumping it in destroyed the one counter set that
+     * answers "why did nothing associate". A 60-second on-air run carrying
+     * 75 frames reported ignored=75, which reads as 75 protocol errors. */
+    if (fc1 & kFcProtected) { rx_protected++; return; }
     const size_t hlen = data_hdr_len(fc0, fc1);
     if (len < hlen + kLlcSnapLen) { rx_malformed++; return; }
     const uint8_t* llc = frame + hlen;
@@ -403,6 +408,9 @@ class StationSm {
   uint32_t rx_not_our_bss = 0;
   uint32_t rx_not_for_us = 0;
   uint32_t rx_ignored = 0;
+  /* Protected data frames, which this machine cannot read and the caller is
+   * expected to decrypt. Ordinary traffic on a keyed link, NOT an error. */
+  uint32_t rx_protected = 0;
   uint32_t rx_malformed = 0;
   uint32_t tx_dropped = 0;
 

@@ -85,6 +85,7 @@ void reset_all() {
   g_join_attempts = 0;
   g_gave_up = false;
   g_failed_noted = false;
+  g_was_associated = false;
   g_reconnect = true;
   g_rejoin_backoff_ms = 1000;
   g_scan_chans.clear();
@@ -922,6 +923,42 @@ void test_reconnect_after_beacon_loss() {
   check(g_replays.load() == 0, "...and is not rejected as a replay");
 }
 
+/* ONE LOST LINK IS ONE RECONNECT, however many times the retry fails.
+ *
+ * The first latch has to be cleared by every join attempt, or a SECOND loss
+ * could never be noticed - so on its own it counts attempts, not losses. An
+ * on-air run that dropped the link exactly once while the AP was off for
+ * eight seconds reported reconnects=6, which is how many times it tried. */
+void test_a_lost_link_is_counted_once() {
+  reset_all();
+  {
+    std::lock_guard<std::mutex> l(g_mu);
+    g_sm.configure(g_crypto, kSsid, kPsk, g_own);
+    g_rejoin_backoff_ms = 100;
+  }
+  Ap ap;
+  associate(ap, /*rsn=*/true);
+  check(g_reconnects.load() == 0, "no reconnect while the link is up");
+
+  uint32_t now = StationSm::kBeaconLossMs + 1;
+  tick(now);
+  check(g_sm.state() == StationSm::State::Failed, "the link drops");
+
+  /* The AP stays OFF. Every re-join therefore authenticates into silence and
+   * times out, which is exactly the on-air shape. */
+  for (int i = 0; i < 6; i++) {
+    supervise(now);
+    pump_tx();
+    drain_tx();                            /* nothing answers */
+    now += StationSm::kMgmtTimeoutMs * (StationSm::kMaxTries + 1);
+    tick(now);
+    now += 200;
+  }
+  check(g_joins.load() > 1, "it kept trying");
+  check(g_reconnects.load() == 1,
+        "...and the lost link is still counted exactly once");
+}
+
 /* With reconnect off, the harness gives up - and says so by not joining
  * again. The control arm for the cell above: without it, "it re-joined"
  * could just be what this code always does. */
@@ -1122,6 +1159,7 @@ int self_test() {
   selftest::test_a_stale_bss_is_not_joined();
   selftest::test_rssi_conversion();
   selftest::test_reconnect_after_beacon_loss();
+  selftest::test_a_lost_link_is_counted_once();
   selftest::test_reconnect_can_be_disabled();
   selftest::test_tap_refuses_a_foreign_source();
   selftest::test_no_data_before_association();

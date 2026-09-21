@@ -1071,18 +1071,43 @@ inside the MIC and therefore invisible to any test where both ends are ours:
 Key Length 16 where 802.11-2016 12.7.6.3 requires 0, and 802.1X version 2
 where wpa_supplicant ships 1.
 
-**Phase 4 — the harness.**
+**Phase 4 — the harness. DONE 2026-09-21.**
 `tests/sta_client.cpp` plus `tests/mt7612u_sta_onair.sh`, graded pass/fail per
 cell in the style of `mt7612u_ap_onair.sh`: `open`, `wpa2`, `reconnect`,
-`bench`.
+`bench`. **15/15 on ch6** against hostapd on an RTL8812AU, plus a headless
+ctest target (`sta_client_headless`, 17 cells) that drives the same receive
+path with no radio.
 
-**Phase 5 — validation, independent witness first.**
+**Two things this section did not anticipate, recorded rather than quietly
+amended** (the full account is in `docs/station-mode-plan.md`):
+
+- **An `open` cell needs an open STATION, and Phase 3 built a WPA2-only one.**
+  `configure()` derived a PMK unconditionally, `join()` refused any BSS
+  without `rsn_ccmp_psk`, and every association request carried an RSN
+  element. `StationSm::configure_open` and `BssTable::select_open` close it —
+  the latter being exactly the "second function" the comment above `select()`
+  said would be written when something needed one.
+- **The group key handshake is PROTECTED, and `StationSm` refused every
+  protected data frame.** hostapd's four message 1s were all counted as
+  `rx_ignored`, the AP gave up and deauthenticated us, and every crypto
+  counter on this side read zero throughout. Found on the first WPA2 on-air
+  run, by an implementation that has never read this repository.
+
+**Phase 5 — validation, independent witness first. HALF DONE 2026-09-21.**
 Against **hostapd on non-MediaTek silicon** before anything else. The AP work's
 stated weakness is that its station was the same silicon
 (`docs/mt7612u-ap-mode.md`, "What this does not show"); the station work should
 not repeat it. Then devourer-to-devourer (`ap_wpa2.cpp` on a second adapter) —
 the FPV shape. Then throughput and latency, each number with its adversarial
 counterpart in the same breath.
+
+The independent-witness half arrived with Phase 4 rather than after it: the
+harness needed *something* to associate to before it could have any cells at
+all, and the honest choice was hostapd rather than this project's own AP. It
+paid for itself on the first WPA2 run. What is still owed is
+devourer-to-devourer, 5 GHz (which this bench cannot serve from a kernel AP —
+the RTL8812AU's 5 GHz channels are all `no IR` here), throughput, and a soak
+longer than the 45–90 second runs every current figure comes from.
 
 **Phase 6 — deferred, separate issue: the Realtek arm.**
 `SetStationIdentity` on Jaguar1/2/3, using PR #335's `StationMode.cpp` as the
