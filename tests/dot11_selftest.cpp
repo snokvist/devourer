@@ -794,6 +794,76 @@ static void test_relay_addressing() {
         "4-address SA is addr4, not addr2");
 }
 
+/* Phase 2b.8 — 802.11 MSDU <-> Ethernet II.
+ *
+ * The round trip is the weakest possible test on its own: an encoder and a
+ * decoder that share a misreading round-trip perfectly, which is exactly how
+ * the CCM nonce stayed green for this long. So the cells below assert the
+ * WIRE BYTES by hand first, and only then round-trip. */
+static void test_eth_translation() {
+  const uint8_t DA[6] = {0x02, 0xbb, 0, 0, 0, 0x02};
+  const uint8_t SA[6] = {0x02, 0xaa, 0, 0, 0, 0x01};
+  const uint8_t payload[4] = {0xde, 0xad, 0xbe, 0xef};
+
+  /* An MSDU as it appears on air: LLC/SNAP then payload. */
+  uint8_t msdu[12] = {0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x08, 0x00,
+                      0xde, 0xad, 0xbe, 0xef};
+  uint8_t eth[64];
+  size_t n = devourer::sta::msdu_to_eth(DA, SA, msdu, sizeof msdu,
+                                        eth, sizeof eth);
+  check(n == 14 + 4, "an MSDU becomes an Ethernet frame 6 bytes shorter");
+  check(std::memcmp(eth, DA, 6) == 0, "Ethernet DA comes first");
+  check(std::memcmp(eth + 6, SA, 6) == 0, "then the SA");
+  check(eth[12] == 0x08 && eth[13] == 0x00,
+        "then the ethertype, lifted out of the SNAP header");
+  check(std::memcmp(eth + 14, payload, 4) == 0, "then the payload, unchanged");
+
+  /* And back. The addresses come out through the out-parameters, because the
+   * caller needs them for the 802.11 header rather than for the MSDU. */
+  uint8_t back[64], bda[6], bsa[6];
+  size_t m = devourer::sta::eth_to_msdu(eth, n, back, sizeof back, bda, bsa);
+  check(m == sizeof msdu, "and back to the same length");
+  check(std::memcmp(back, msdu, sizeof msdu) == 0,
+        "byte-for-byte the MSDU we started with");
+  check(std::memcmp(bda, DA, 6) == 0 && std::memcmp(bsa, SA, 6) == 0,
+        "with the addresses handed back out");
+
+  /* --- refusals, all of which must return 0 rather than truncate -------- */
+  uint8_t small[8];
+  check(devourer::sta::msdu_to_eth(DA, SA, msdu, sizeof msdu,
+                                   small, sizeof small) == 0,
+        "msdu_to_eth refuses an output buffer that cannot hold the result");
+  check(devourer::sta::eth_to_msdu(eth, n, small, sizeof small, bda, bsa) == 0,
+        "eth_to_msdu refuses the same way");
+
+  /* An MSDU that is not an ethertype SNAP carries no ethertype at bytes 6..7,
+   * so rewriting it would invent one. Other LLC encodings are real. */
+  uint8_t not_snap[12];
+  std::memcpy(not_snap, msdu, sizeof msdu);
+  not_snap[2] = 0x04;                       /* control field, not 0x03 */
+  check(devourer::sta::msdu_to_eth(DA, SA, not_snap, sizeof not_snap,
+                                   eth, sizeof eth) == 0,
+        "a non-SNAP MSDU is refused, not reinterpreted");
+  not_snap[2] = 0x03; not_snap[3] = 0x01;   /* non-zero OUI */
+  check(devourer::sta::msdu_to_eth(DA, SA, not_snap, sizeof not_snap,
+                                   eth, sizeof eth) == 0,
+        "a SNAP header with a non-zero OUI is refused too");
+
+  check(devourer::sta::msdu_to_eth(DA, SA, msdu, 7, eth, sizeof eth) == 0,
+        "an MSDU shorter than its own SNAP header is refused");
+  check(devourer::sta::eth_to_msdu(eth, 13, back, sizeof back, bda, bsa) == 0,
+        "an Ethernet frame shorter than its own header is refused");
+
+  /* A zero-payload frame is legal and must survive both ways rather than
+   * being refused as if it were truncated. */
+  uint8_t bare[8] = {0xaa, 0xaa, 0x03, 0, 0, 0, 0x86, 0xdd};
+  n = devourer::sta::msdu_to_eth(DA, SA, bare, sizeof bare, eth, sizeof eth);
+  check(n == 14, "an MSDU with no payload becomes a bare Ethernet header");
+  check(eth[12] == 0x86 && eth[13] == 0xdd, "carrying its ethertype");
+  m = devourer::sta::eth_to_msdu(eth, n, back, sizeof back, bda, bsa);
+  check(m == 8 && std::memcmp(back, bare, 8) == 0, "and round-trips");
+}
+
 int main() {
   test_tim();
   test_fcs_trim();
@@ -809,6 +879,7 @@ int main() {
   test_rsn_real_world();
   test_data_seq();
   test_relay_addressing();
+  test_eth_translation();
 
   if (g_fail) {
     std::printf("dot11_selftest: %d failure(s)\n", g_fail);

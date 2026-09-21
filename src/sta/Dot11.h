@@ -608,6 +608,73 @@ inline bool is_qos_data(uint8_t fc0) { return (fc0 & 0x8c) == 0x88; }
  * 4-address frame, +4 for HT Control when the Order bit is set
  * (802.11-2016 9.2.4.1.10). Getting this wrong reads the LLC header at the
  * wrong offset and silently drops the frame. */
+/* ------------------------------------------------- 802.11 <-> 802.3 (2b.8)
+ *
+ * The translation a TAP forwarder needs, and the half that did not exist.
+ * `append_llc_snap` above encodes the 8-byte LLC/SNAP header and
+ * tests/ap_responder.cpp decodes it inline, but NEITHER builds or parses the
+ * 14-byte Ethernet II header, which is the actual work. The scope decision
+ * put this in src/sta/ because it has two consumers that must not disagree:
+ * a Linux TAP bridge, and Android's in-process path, which needs the
+ * identical conversion and can never have a netdev at all.
+ *
+ * An 802.11 MSDU is LLC/SNAP(8) + payload, and its addresses live in the
+ * 802.11 header. An Ethernet II frame is DA(6) + SA(6) + ethertype(2) +
+ * payload. So the conversion moves addresses in from outside, and the
+ * ethertype up out of the SNAP header.
+ *
+ * Both directions return 0 rather than truncating or guessing. A silent
+ * truncation here would produce a frame that looks well-formed and decodes to
+ * nonsense at the far end. */
+inline constexpr size_t kEthHdrLen = 14;
+inline constexpr size_t kLlcSnapLen = 8;
+
+/* True for the exact SNAP header 802.11 uses to carry an ethertype:
+ * AA AA 03 with a zero OUI. Anything else is a payload this translation has
+ * no business rewriting - other LLC encodings exist and carry no ethertype at
+ * bytes 6..7. */
+inline bool is_ethertype_snap(const uint8_t* msdu, size_t len) {
+  return len >= kLlcSnapLen && msdu[0] == 0xaa && msdu[1] == 0xaa &&
+         msdu[2] == 0x03 && msdu[3] == 0x00 && msdu[4] == 0x00 &&
+         msdu[5] == 0x00;
+}
+
+/* MSDU -> Ethernet II. Returns bytes written into `out`, or 0. */
+inline size_t msdu_to_eth(const uint8_t da[6], const uint8_t sa[6],
+                          const uint8_t* msdu, size_t msdu_len,
+                          uint8_t* out, size_t out_cap) {
+  if (!da || !sa || !msdu || !out) return 0;
+  if (!is_ethertype_snap(msdu, msdu_len)) return 0;
+  const size_t payload = msdu_len - kLlcSnapLen;
+  if (out_cap < kEthHdrLen + payload) return 0;
+  std::memcpy(out, da, 6);
+  std::memcpy(out + 6, sa, 6);
+  out[12] = msdu[6];                 /* ethertype, straight out of the SNAP */
+  out[13] = msdu[7];
+  std::memcpy(out + kEthHdrLen, msdu + kLlcSnapLen, payload);
+  return kEthHdrLen + payload;
+}
+
+/* Ethernet II -> MSDU. The addresses come OUT through `out_da`/`out_sa`,
+ * because the caller needs them for the 802.11 header, not for the MSDU.
+ * Returns bytes written into `out`, or 0. */
+inline size_t eth_to_msdu(const uint8_t* eth, size_t eth_len,
+                          uint8_t* out, size_t out_cap,
+                          uint8_t out_da[6], uint8_t out_sa[6]) {
+  if (!eth || !out) return 0;
+  if (eth_len < kEthHdrLen) return 0;
+  const size_t payload = eth_len - kEthHdrLen;
+  if (out_cap < kLlcSnapLen + payload) return 0;
+  if (out_da) std::memcpy(out_da, eth, 6);
+  if (out_sa) std::memcpy(out_sa, eth + 6, 6);
+  out[0] = 0xaa; out[1] = 0xaa; out[2] = 0x03;
+  out[3] = 0x00; out[4] = 0x00; out[5] = 0x00;
+  out[6] = eth[12];
+  out[7] = eth[13];
+  std::memcpy(out + kLlcSnapLen, eth + kEthHdrLen, payload);
+  return kLlcSnapLen + payload;
+}
+
 /* Direction-aware addressing — 802.11-2016 Table 9-26.
  *
  * An AP that relays needs the DESTINATION of a frame, and the destination is
