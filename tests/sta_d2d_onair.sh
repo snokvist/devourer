@@ -46,7 +46,8 @@
 #
 # Env: STA_SYSFS (the MT7612U sta_client claims), AP_SYSFS (the adapter
 # ap_wpa2 claims), AP_VID/AP_PID, CH, CH5, PSK, FW_DIR, SECS, NS, APTAP,
-# STATAP, AIRGAP_SECS, BENCH_SECS, BENCH_PAYLOAD, BENCH_PPS.
+# STATAP, AIRGAP_SECS, BEACONS_MIN, PING_N, PING_MIN, BENCH_SECS,
+# BENCH_PAYLOAD, BENCH_PPS.
 
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -79,6 +80,15 @@ STATAP="${STATAP:-dvsta0}"
 # the two bring-ups, the 25 s it waits to be sure nothing joined, and the
 # ping that has to be lost.
 AIRGAP_SECS="${AIRGAP_SECS:-60}"
+# The falsifier's own control: how many beacons the station must have heard
+# from ANYONE to prove its receiver was awake while it found nothing of ours.
+# This bench's ch6 carries ~40 a second.
+BEACONS_MIN="${BEACONS_MIN:-20}"
+# The data-plane ping: how many, and how many must arrive. See the note in
+# ping_cell for why this is a majority over twenty rather than zero loss
+# over six.
+PING_N="${PING_N:-20}"
+PING_MIN="${PING_MIN:-16}"
 BENCH_SECS="${BENCH_SECS:-15}"
 # The bench PACES its traffic, and that is a finding rather than a
 # convenience: this link's measured ceiling is about twenty round trips a
@@ -112,7 +122,7 @@ chan_freq() {   # $1 = channel -> MHz on stdout, empty if unmappable
 }
 
 AP_PID_RUN=""; STA_PID_RUN=""
-NM_TAP=""
+NS_OURS=no
 
 cleanup() {
   # The AP first and with SIGTERM, not SIGKILL. ap_wpa2 beacons AUTONOMOUSLY -
@@ -124,12 +134,23 @@ cleanup() {
   wait 2>/dev/null
   ip addr flush dev "$STATAP" 2>/dev/null
   ip link del "$STATAP" 2>/dev/null
-  # Safe here in a way it is NOT in mt7612u_sta_onair.sh: nothing but a TAP
-  # ever enters this namespace, because devourer holds both radios over
-  # libusb and neither has a phy to move.
-  ip netns del "$NS" 2>/dev/null
+  # ONLY A NAMESPACE THIS RUN CREATED. Deleting it is safe in a way it is NOT
+  # in mt7612u_sta_onair.sh - nothing but a TAP ever enters this one, because
+  # devourer holds both radios over libusb and neither has a phy to move -
+  # but "safe to delete" is not the same as "ours to delete", and this used
+  # to remove any namespace that happened to carry the name.
+  if [ "$NS_OURS" = yes ]; then
+    ip netns del "$NS" 2>/dev/null
+    NS_OURS=no
+  fi
+  return 0
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+# AND IT MUST STOP. With INT and TERM on the same trap as EXIT, bash runs
+# cleanup and then CARRIES ON: Ctrl-C during a cell killed both endpoints, the
+# cell reported "an endpoint exited", and the case statement went straight
+# into bringing the next one up. Found by review.
+trap 'cleanup; exit 130' INT TERM
 
 # --- preflight -------------------------------------------------------------
 
@@ -177,9 +198,26 @@ build_both() {
 
 # --- the AP ----------------------------------------------------------------
 
+# WE CREATE THE NAMESPACE OR WE REFUSE IT. This used to return success for
+# any pre-existing netns of the same name, and cleanup() then deleted it
+# unconditionally - so a run with NS set to something the operator was using
+# would take it over and then destroy it. A leftover of OUR OWN is safe to
+# remove, because nothing but a TAP ever goes in here; anything else is not
+# ours to judge.
 ns_up() {
-  ip netns list 2>/dev/null | grep -q "^$NS" && return 0
-  ip netns add "$NS"
+  if ip netns list 2>/dev/null | grep -q "^$NS"; then
+    local ifs
+    ifs=$(ip netns exec "$NS" ip -br link show 2>/dev/null |
+          grep -cv '^lo ') || ifs=0
+    if [ "${ifs:-0}" -gt 1 ]; then
+      say "netns $NS already exists and is NOT empty - refusing to use or delete it."
+      say "  Set NS=<other name>, or remove it yourself if it is a leftover."
+      return 1
+    fi
+    ip netns del "$NS" 2>/dev/null
+  fi
+  ip netns add "$NS" || return 1
+  NS_OURS=yes
 }
 
 ap_up() {   # $1 = channel, $2 = seconds, $3.. = extra env
@@ -250,8 +288,12 @@ sta_tap_up() {
     sleep 1
   done
   [ -d "/sys/class/net/$STATAP" ] || { bad "the station created no TAP"; return 1; }
+  # Not restored afterwards, and it does not need to be: the TAP is
+   # sta_client's and ceases to exist when it exits, so there is no device
+   # left for NetworkManager to manage. (The variable that used to record
+   # this was never read - a dead assignment the review caught.)
   command -v nmcli >/dev/null 2>&1 &&
-    nmcli device set "$STATAP" managed no >/dev/null 2>&1 && NM_TAP=yes
+    nmcli device set "$STATAP" managed no >/dev/null 2>&1 || true
   ip link set "$STATAP" up 2>/dev/null
   ip addr flush dev "$STATAP" 2>/dev/null
   ip addr add "$STAIP/24" dev "$STATAP" 2>/dev/null
@@ -293,20 +335,38 @@ ping_cell() {
   fi
   if [ "$dir" = up ]; then
     ping -c 1 -W 3 -I "$STATAP" "$APIP" >/dev/null 2>&1
-    ping -c 6 -W 2 -I "$STATAP" "$APIP" >"$OUT/$cell.$dir.ping" 2>&1
+    ping -c "$PING_N" -i 0.2 -W 2 -I "$STATAP" "$APIP" >"$OUT/$cell.$dir.ping" 2>&1
   else
     ip netns exec "$NS" ping -c 1 -W 3 -I "$APTAP" "$STAIP" >/dev/null 2>&1
-    ip netns exec "$NS" ping -c 6 -W 2 -I "$APTAP" "$STAIP" >"$OUT/$cell.$dir.ping" 2>&1
+    ip netns exec "$NS" ping -c "$PING_N" -i 0.2 -W 2 -I "$APTAP" "$STAIP" \
+        >"$OUT/$cell.$dir.ping" 2>&1
   fi
   if ! sta_alive || ! ap_alive; then
     bad "$cell: $label - an endpoint exited DURING the measurement (raise SECS, currently $SECS)"
     return 1
   fi
-  if grep -q " 0% packet loss" "$OUT/$cell.$dir.ping"; then
-    ok "$cell: $label ($(grep -oE 'rtt [^ ]+ = [0-9./]+' "$OUT/$cell.$dir.ping" | head -1))"
+  local p_rx p_loss
+  p_rx=$(sed -n 's/.* \([0-9][0-9]*\) received.*/\1/p' "$OUT/$cell.$dir.ping" | tail -1)
+  p_loss=$(sed -n 's/.* \([0-9.][0-9.]*%\) packet loss.*/\1/p' "$OUT/$cell.$dir.ping" | tail -1)
+  p_rx=${p_rx:-0}; p_loss=${p_loss:-unknown}
+  # A MAJORITY, OVER ENOUGH PACKETS TO MEAN SOMETHING - not zero over six.
+  #
+  # NEITHER END ARMS SetAckResponder, so this link has no link-layer
+  # retransmission in either direction and a frame lost to a neighbour's
+  # transmission is lost for good. Six packets with a zero-loss threshold
+  # made this cell a coin toss on a busy band: it read 0% four times and then
+  # 16.7% (one packet of six) and 50% (three of six) on channels that had
+  # just carried a clean run. That is the ROOM, and a cell that grades the
+  # room is a cell that will be ignored.
+  #
+  # What the threshold still catches is what the cell is for: a data plane
+  # that does not work at all reads 100% loss, and an association that comes
+  # up without carrying traffic reads the same. Both fail this, by a mile.
+  if [ "$p_rx" -ge "$PING_MIN" ] 2>/dev/null; then
+    ok "$cell: $label - $p_rx/$PING_N delivered, loss=$p_loss ($(grep -oE 'rtt [^ ]+ = [0-9./]+' "$OUT/$cell.$dir.ping" | head -1))"
     return 0
   fi
-  bad "$cell: $label lost packets ($(grep -oE '[0-9.]+% packet loss' "$OUT/$cell.$dir.ping" | head -1))"
+  bad "$cell: $label - only $p_rx/$PING_N delivered (loss=$p_loss, want >= $PING_MIN)"
   return 1
 }
 
@@ -423,7 +483,15 @@ cell_airgap() {
   local freq5 freq
   freq=$(chan_freq "$CH") || { bad "airgap: channel '$CH' is not one this harness can map"; return; }
   freq5=$(chan_freq "$CH5") || { bad "airgap: channel '$CH5' is not one this harness can map"; return; }
-  [ "$CH" != "$CH5" ] || { bad "airgap: CH and CH5 are both $CH - there is no gap to test"; return; }
+  # A REAL GAP, not merely a different number. CH=36 CH5=40 are adjacent
+  # 20 MHz channels whose skirts overlap, and the cell's conclusion - "these
+  # radios cannot hear each other" - would then be a guess. 40 MHz apart is
+  # the narrowest separation this asserts.
+  local gap
+  if [ "$freq" -gt "$freq5" ]; then gap=$(( freq - freq5 )); else gap=$(( freq5 - freq )); fi
+  [ "$gap" -ge 40 ] || {
+    bad "airgap: ch$CH and ch$CH5 are only ${gap} MHz apart - not a gap the conclusion can rest on"
+    return; }
   say "== airgap: AP on ch$CH5 ($freq5 MHz), station on ch$CH ($freq MHz) - the link MUST NOT form =="
 
   build_both || { bad "airgap: build"; return; }
@@ -441,15 +509,45 @@ cell_airgap() {
     bad "airgap: the station associated with an AP on a different channel - one of the two is not tuned where it was told"
     stop_both; return
   fi
-  ok "airgap: the station found nothing to join on ch$CH in 25s"
+
+  # BOTH ENDPOINTS ARE STILL RUNNING. Without this, a station that started,
+  # printed its banner and then died produces exactly the evidence this cell
+  # reads as success: no association, and a lost ping. The falsifier would
+  # report 4/4 having proved nothing - and it is the one cell the docs tell
+  # an operator to trust. Found by review; ping_cell has had this since the
+  # harness was written and cell_airgap did not inherit it.
+  if ! sta_alive || ! ap_alive; then
+    bad "airgap: an endpoint exited before the ping - the absence of a link proves nothing about the air"
+    stop_both; return
+  fi
+  ok "airgap: the station found nothing to join on ch$CH in 25s, with both endpoints still running"
 
   ping -c 4 -W 2 -I "$STATAP" "$APIP" >"$OUT/airgap.ping" 2>&1
+  if ! sta_alive || ! ap_alive; then
+    bad "airgap: an endpoint exited DURING the ping - the loss proves nothing about the air"
+    stop_both; return
+  fi
   if grep -q " 100% packet loss" "$OUT/airgap.ping"; then
     ok "airgap: the ping is lost, all four - so the 0% loss in the cells above is the RF link and not this host"
   else
     bad "airgap: $(grep -oE '[0-9.]+% packet loss' "$OUT/airgap.ping" | head -1) with the radios on different channels - the data plane is NOT going over the air, and every other cell here is void"
   fi
+
+  # AND THE RECEIVER WAS AWAKE WHILE IT FOUND NOTHING. A deaf radio produces
+  # the same two results above as a working radio on the wrong channel.
+  # Neighbour beacons are the cheapest available proof that the receiver
+  # works at all, and this bench's ch6 carries about forty a second - none of
+  # them ours. Read after the run, because the station prints its ledger on
+  # exit. A quiet channel needs BEACONS_MIN lowered DELIBERATELY, which is
+  # the point: it is the operator's call, not a silent pass.
   stop_both
+  local heard
+  heard=$(sed -n 's/.*beacons observed=\([0-9]*\).*/\1/p' "$OUT/sta.log" | tail -1)
+  if [ "${heard:-0}" -ge "$BEACONS_MIN" ] 2>/dev/null; then
+    ok "airgap: the station's receiver was working throughout - $heard beacons heard on ch$CH, none of them ours"
+  else
+    bad "airgap: the station heard only ${heard:-0} beacons on ch$CH (want >= $BEACONS_MIN) - a deaf receiver gives this cell its result for the wrong reason"
+  fi
 }
 
 # --- cell: software CCMP cost at both ends ---------------------------------
@@ -462,9 +560,14 @@ cell_airgap() {
 # measurements of one direction.
 cell_bench() {
   say "== bench: software CCMP cost at both ends (${BENCH_PAYLOAD}B, ${BENCH_SECS}s, ch$CH) =="
-  case "$BENCH_PAYLOAD" in
-    ''|*[!0-9]*) bad "bench: BENCH_PAYLOAD must be an integer"; return ;;
+  case "$BENCH_PAYLOAD$BENCH_PPS$BENCH_SECS" in
+    ''|*[!0-9]*) bad "bench: BENCH_PAYLOAD, BENCH_PPS and BENCH_SECS must all be integers"; return ;;
   esac
+  # BENCH_PPS=0 divides by zero in the interval below and yields `inf`, which
+  # ping accepts as "as fast as possible" - the flood this cell exists to
+  # avoid.
+  [ "$BENCH_PPS" -gt 0 ] && [ "$BENCH_SECS" -gt 0 ] || {
+    bad "bench: BENCH_PPS and BENCH_SECS must be positive"; return; }
   [ "$BENCH_PAYLOAD" -ge 0 ] && [ "$BENCH_PAYLOAD" -le 1400 ] || {
     bad "bench: BENCH_PAYLOAD must be 0..1400 (avoid IP fragmentation)"; return; }
   build_both || { bad "bench: build"; return; }
@@ -525,17 +628,25 @@ cell_bench() {
   # other harness printed ccmp_tx_ns_per_frame=0 over 3365 encrypted round
   # trips and passed, because replies say nothing about whether anything was
   # timed.
+  # FRAMES *AND* NANOSECONDS. Counting frames says the cipher ran; it does
+  # not say anything was TIMED, and a profile with tx_frames>0 and tx_ns=0
+  # prints 0 ns/frame and passes. That is the exact bug the original bench
+  # cell shipped with, one layer down. Found by review.
   local ok_counts=1 w
   for w in "$sprof" "$aprof"; do
-    local t r
+    local t r tn rn
     t=$(printf '%s' "$w" | sed -n 's/.*"tx_frames":\([0-9][0-9]*\).*/\1/p')
     r=$(printf '%s' "$w" | sed -n 's/.*"rx_frames":\([0-9][0-9]*\).*/\1/p')
-    [ "${t:-0}" -gt 0 ] 2>/dev/null && [ "${r:-0}" -gt 0 ] 2>/dev/null || ok_counts=0
+    tn=$(printf '%s' "$w" | sed -n 's/.*"tx_ns":\([0-9][0-9]*\).*/\1/p')
+    rn=$(printf '%s' "$w" | sed -n 's/.*"rx_ns":\([0-9][0-9]*\).*/\1/p')
+    [ "${t:-0}" -gt 0 ] 2>/dev/null && [ "${r:-0}" -gt 0 ] 2>/dev/null &&
+      [ "${tn:-0}" -gt 0 ] 2>/dev/null && [ "${rn:-0}" -gt 0 ] 2>/dev/null ||
+      ok_counts=0
   done
   if [ "$ok_counts" = 1 ]; then
-    ok "bench: the cipher was timed at BOTH ends"
+    ok "bench: the cipher was timed at BOTH ends (frames counted AND nanoseconds accumulated)"
   else
-    bad "bench: a profile counted zero frames - the ns/frame figures below are meaningless"
+    bad "bench: a profile counted zero frames or zero nanoseconds - the ns/frame figures below are meaningless"
   fi
   python3 - "$sprof" "$aprof" "$BENCH_PAYLOAD" "$BENCH_SECS" "$tx" "$rx" "$CH" <<'PYEOF' || true
 import json, sys
@@ -590,34 +701,63 @@ cell_flood() {
   tx=${tx:-0}; rx=${rx:-0}; loss=${loss:-unknown}
   stop_both
 
-  # THE STATION'S BOOKS. Everything its host handed it either went out
-  # encrypted or was refused at a named counter: not connected / malformed /
-  # not from our own address (g_tap_drop), the 128-frame queue cap, or the
-  # device.
-  local s_from s_tdrop s_enc s_qdrop s_sfail s_sum
-  s_from=$(led 'from host'); s_tdrop=$(sed -n 's/.*TAP: to host=[0-9]*, from host=[0-9]*, dropped=\([0-9]*\).*/\1/p' "$OUT/sta.log" | tail -1)
+  # FOUR EXACT IDENTITIES, two per end. Not bounds, and not sums over
+  # counters that overlap - the first version of this cell added the queue
+  # and device losses on top of `encrypted`, which already contains them
+  # because the station counts a frame as encrypted BEFORE handing it to the
+  # queue. It balanced only while both of those terms were zero, which on
+  # this bench they were. Two reviewers derived the same arithmetic
+  # independently; tests/sta_client_selftest.inc's test_the_books_close now
+  # pins both identities headlessly, with every confounding term made
+  # non-zero on purpose.
+  #
+  #   the host path:  from host == framed + dropped down
+  #   the send path:  queued    == aired + queue dropped + send failed
+  local s_from s_down s_enc s_plain s_q s_aired s_qdrop s_sfail
+  s_from=$(led 'from host'); s_down=$(led 'dropped down')
   s_enc=$(sed -n 's/.*tx: encrypted=\([0-9]*\).*/\1/p' "$OUT/sta.log" | tail -1)
+  s_plain=$(sed -n 's/.*, plaintext=\([0-9]*\).*/\1/p' "$OUT/sta.log" | tail -1)
+  s_q=$(led 'queued'); s_aired=$(led 'aired')
   s_qdrop=$(led 'queue dropped'); s_sfail=$(led 'send failed')
-  s_sum=$(( ${s_enc:-0} + ${s_tdrop:-0} + ${s_qdrop:-0} + ${s_sfail:-0} ))
-  if [ "${s_from:-0}" -gt 0 ] 2>/dev/null && [ "$s_sum" = "${s_from:-0}" ]; then
-    ok "flood: the station's books balance - $s_from from its host = $s_enc aired + $s_tdrop refused + $s_qdrop queue-dropped + $s_sfail send-failed"
+  if [ "${s_from:-0}" -gt 0 ] 2>/dev/null &&
+     [ $(( ${s_enc:-0} + ${s_plain:-0} + ${s_down:-0} )) = "${s_from:-0}" ] &&
+     [ "${s_q:-0}" -gt 0 ] 2>/dev/null &&
+     [ $(( ${s_aired:-0} + ${s_qdrop:-0} + ${s_sfail:-0} )) = "${s_q:-0}" ]; then
+    ok "flood: the station's books close - $s_from from its host = $s_enc encrypted + $s_plain plaintext + $s_down refused; $s_q queued = $s_aired aired + $s_qdrop queue-dropped + $s_sfail send-failed"
   else
-    bad "flood: the station's books do NOT balance - $s_from from its host, but aired+refused+dropped+failed = $s_sum ($s_enc/$s_tdrop/$s_qdrop/$s_sfail). Frames are being lost at no counter."
+    bad "flood: the station's books do NOT close - host: $s_from vs $s_enc+$s_plain+$s_down; queue: $s_q vs $s_aired+$s_qdrop+$s_sfail. Frames are being lost at no counter."
   fi
 
-  # THE AP'S BOOKS, the same identity from the other end.
-  local a_from a_sent a_qdrop a_sfail a_sum
-  a_from=$(sed -n 's/.*TAP: to host=[0-9]*, from host=\([0-9]*\).*/\1/p' "$OUT/ap.log" | tail -1)
+  # THE AP'S BOOKS, the same two identities from the other end. `framed` is
+  # its own counter rather than `frames sent` because the AP airs management
+  # frames its host never sent - beacons aside, auth, assoc, the four-way and
+  # the group flood all go through the same queue - so comparing the host's
+  # traffic against everything aired is a bound loose enough to hide exactly
+  # the loss this cell exists to catch.
+  local a_from a_framed a_down a_q a_sent a_qdrop a_sfail
+  a_from=$(apled 'from host'); a_framed=$(apled 'framed')
+  a_down=$(apled 'dropped down'); a_q=$(apled 'queued')
   a_sent=$(apled 'frames sent'); a_qdrop=$(apled 'queue dropped')
   a_sfail=$(apled 'send failed')
-  a_sum=$(( ${a_sent:-0} + ${a_qdrop:-0} + ${a_sfail:-0} ))
-  # The AP AIRS MORE THAN ITS HOST GIVES IT - beacons are the chip's, but
-  # auth, assoc, the four-way and the group flood all go through the same
-  # queue - so this is a bound, not an equality: nothing may vanish.
-  if [ "${a_from:-0}" -gt 0 ] 2>/dev/null && [ "$a_sum" -ge "${a_from:-0}" ]; then
-    ok "flood: the AP's books account for all $a_from frames from its host - $a_sent aired, $a_qdrop queue-dropped, $a_sfail refused by the device"
+  if [ "${a_from:-0}" -gt 0 ] 2>/dev/null &&
+     [ $(( ${a_framed:-0} + ${a_down:-0} )) = "${a_from:-0}" ] &&
+     [ "${a_q:-0}" -gt 0 ] 2>/dev/null &&
+     [ $(( ${a_sent:-0} + ${a_qdrop:-0} + ${a_sfail:-0} )) = "${a_q:-0}" ]; then
+    ok "flood: the AP's books close - $a_from from its host = $a_framed framed + $a_down refused; $a_q queued = $a_sent aired + $a_qdrop queue-dropped + $a_sfail send-failed"
   else
-    bad "flood: the AP's books do NOT account for its host's traffic - $a_from in, aired+dropped+failed = $a_sum ($a_sent/$a_qdrop/$a_sfail). Frames are being lost at no counter."
+    bad "flood: the AP's books do NOT close - host: $a_from vs $a_framed+$a_down; queue: $a_q vs $a_sent+$a_qdrop+$a_sfail. Frames are being lost at no counter."
+  fi
+
+  # AND THE SEND PATH WAS ACTUALLY EXERCISED. Both identities above are
+  # satisfied by a station that refused every single frame as "not connected"
+  # - from host == dropped down, everything else zero - which is not nothing,
+  # but it is not what the message above invites a reader to conclude.
+  local f_assoc f_rc
+  f_assoc=$(led 'associations'); f_rc=$(led 'reconnects')
+  if [ "${s_enc:-0}" -gt 0 ] 2>/dev/null && [ "${a_framed:-0}" -gt 0 ] 2>/dev/null; then
+    ok "flood: both ends framed traffic (station encrypted $s_enc, AP framed $a_framed; associations=$f_assoc reconnects=$f_rc)"
+  else
+    bad "flood: nothing was framed (station encrypted=$s_enc, AP framed=$a_framed) - the books balance over an empty link"
   fi
 
   say "  offered $tx, delivered $rx ($loss) = $(awk -v r="$rx" -v s="$BENCH_SECS" 'BEGIN{printf "%.0f", r/s}') round trips/s."
@@ -631,12 +771,12 @@ cell_flood() {
 case "$CELLS" in
   wpa2)    cell_link wpa2 "$CH";           want=8 ;;
   fiveghz) cell_link fiveghz "$CH5";       want=8 ;;
-  airgap)  cell_airgap;                    want=4 ;;
+  airgap)  cell_airgap;                    want=5 ;;
   bench)   cell_bench;                     want=3 ;;
-  flood)   cell_flood;                     want=2 ;;
+  flood)   cell_flood;                     want=3 ;;
   all)     cell_link wpa2 "$CH"; cleanup
            cell_link fiveghz "$CH5"; cleanup
-           cell_airgap;                    want=20 ;;
+           cell_airgap;                    want=21 ;;
   *)       echo "usage: $0 [wpa2|fiveghz|airgap|bench|flood|all]"; exit 2 ;;
 esac
 

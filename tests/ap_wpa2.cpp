@@ -93,6 +93,12 @@ static std::atomic<uint64_t> g_sent{0};
  * was counted, so the ledger's "frames sent" was the only transmit figure
  * and there was nothing to compare it against. */
 static std::atomic<uint64_t> g_q_drop{0}, g_send_fail{0};
+/* Every frame handed to enqueue(), so the transmit chain closes:
+ * queued == aired + queue dropped + send failed. */
+static std::atomic<uint64_t> g_q_in{0};
+/* Host frames this AP actually turned into an 802.11 frame. Without it the
+ * host-side identity has the losses but not the successes. */
+static std::atomic<uint64_t> g_tap_framed{0};
 static bool g_ccmp_profile = false;
 static std::atomic<uint64_t> g_ccmp_tx_frames{0}, g_ccmp_tx_bytes{0}, g_ccmp_tx_ns{0};
 static std::atomic<uint64_t> g_ccmp_rx_frames{0}, g_ccmp_rx_bytes{0}, g_ccmp_rx_ns{0};
@@ -182,6 +188,7 @@ static void enqueue(std::vector<uint8_t> mpdu) {
   f.insert(f.end(), g_rt.begin(), g_rt.end());
   f.insert(f.end(), mpdu.begin(), mpdu.end());
   std::lock_guard<std::mutex> lk(g_q_mu);
+  g_q_in.fetch_add(1);
   /* THE DROP IS COUNTED NOW, and finding out that it was not is the whole
    * reason this counter exists. Under a flood ping the AP's ledger read
    * "TAP: from host=1437, dropped=0" beside "frames sent=232" - 1205 frames
@@ -548,7 +555,13 @@ static uint16_t csum16(const uint8_t* d, int len) {
  * an address conflict, not redundancy. Without a TAP they own it, as before.
  */
 static int g_tap_fd = -1;
-static std::atomic<uint64_t> g_tap_tx{0}, g_tap_rx{0}, g_tap_drop{0};
+/* ONE COUNTER PER DIRECTION. `g_tap_drop` served both the radio->host path
+ * and the host->radio path, so "did everything the host handed us go
+ * somewhere named?" was not a question this ledger could answer - the sum it
+ * needed contained drops from the opposite direction. The station harness
+ * had the same defect and both were found by the same review. */
+static std::atomic<uint64_t> g_tap_tx{0}, g_tap_rx{0}, g_tap_drop{0},
+    g_tap_down_drop{0};
 
 static int tap_open(const char* name) {
   int fd = ::open("/dev/net/tun", O_RDWR);
@@ -670,18 +683,24 @@ static std::vector<uint8_t> ccmp_relay(const uint8_t* dst, const uint8_t* src,
  * nothing. */
 static void tap_down_one(const uint8_t* eth, size_t len) {
   uint8_t msdu[2048], da[6], sa[6];
+  /* COUNTED FIRST: "from host" must mean every frame the host handed us, or
+   * a malformed one is a loss that no total contains. */
+  g_tap_rx.fetch_add(1);
   const size_t m =
       devourer::sta::eth_to_msdu(eth, len, msdu, sizeof msdu, da, sa);
 
-  if (m == 0) { g_tap_drop.fetch_add(1); return; }
-  g_tap_rx.fetch_add(1);
+  if (m == 0) { g_tap_down_drop.fetch_add(1); return; }
 
   std::lock_guard<std::mutex> l(g_hs_mu);
   std::vector<uint8_t> f;
   if (da[0] & 0x01) {
     /* Group: one frame under the GTK reaches every station, so this is the
      * path that does NOT fan out. */
-    if (g_stas.count() == 0) return;
+    /* COUNTED. This return discarded a frame the host had already been
+     * credited with handing us, at no counter at all - the same silent loss
+     * as the uncounted queue cap, in the same function, found by the same
+     * review. No station means no group key anyone holds. */
+    if (g_stas.count() == 0) { g_tap_down_drop.fetch_add(1); return; }
     f = ccmp_group_tx(sa, msdu, (int)m);
   } else if (g_stas.find(da)) {
     f = ccmp_relay(da, sa, msdu, (int)m);
@@ -689,11 +708,11 @@ static void tap_down_one(const uint8_t* eth, size_t len) {
     /* The host sent something for an address that is not on this BSS.
      * Dropping is right: flooding a unicast would leak it to every
      * station. */
-    g_tap_drop.fetch_add(1);
+    g_tap_down_drop.fetch_add(1);
     return;
   }
-  if (!f.empty()) enqueue(std::move(f));
-  else g_tap_drop.fetch_add(1);
+  if (!f.empty()) { g_tap_framed.fetch_add(1); enqueue(std::move(f)); }
+  else g_tap_down_drop.fetch_add(1);
 }
 
 /* Caller holds g_hs_mu: every path into here runs inside the RX callback's
@@ -1217,6 +1236,21 @@ int main(int argc, char** argv) {
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
+  /* THE TAP CLOSES BEFORE THE LEDGER IS PRINTED, and the queue is drained
+   * after that. Otherwise the reader thread can frame and enqueue between the
+   * loop's last drain and the print, and the two identities the ledger states
+   * are off by whatever was in flight at that instant. */
+  const bool had_tap = g_tap_fd >= 0;      /* the ledger below asks AFTER the close */
+  if (g_tap_fd >= 0) { ::close(g_tap_fd); g_tap_fd = -1; }
+  if (tap_rd.joinable()) tap_rd.join();
+  {
+    std::vector<std::vector<uint8_t>> batch;
+    { std::lock_guard<std::mutex> l(g_q_mu); batch.swap(g_q); }
+    for (auto& f : batch) {
+      if (g_dev->send_packet(f.data(), f.size())) g_sent.fetch_add(1);
+      else g_send_fail.fetch_add(1);
+    }
+  }
   {
     std::lock_guard<std::mutex> l(g_hs_mu);
     fprintf(stderr, "sent=%llu stations=%d", (unsigned long long)g_sent.load(),
@@ -1269,11 +1303,20 @@ int main(int argc, char** argv) {
           (unsigned long long)g_relay_drop.load(),
           (unsigned long long)g_to_elsewhere.load(),
           (unsigned long long)g_group_tx.load());
-  if (g_tap_fd >= 0)
-    fprintf(stderr, "  TAP: to host=%llu, from host=%llu, dropped=%llu\n",
+  /* TWO IDENTITIES, printed so a caller can check them rather than believe
+   * them:
+   *   from host == framed + dropped down
+   *   queued    == aired + queue dropped + send failed
+   * Both hold exactly, because the TAP reader is stopped and the queue
+   * drained before this runs. */
+  if (had_tap)
+    fprintf(stderr, "  TAP: to host=%llu, from host=%llu, framed=%llu,"
+                    " dropped up=%llu, dropped down=%llu\n",
             (unsigned long long)g_tap_tx.load(),
             (unsigned long long)g_tap_rx.load(),
-            (unsigned long long)g_tap_drop.load());
+            (unsigned long long)g_tap_framed.load(),
+            (unsigned long long)g_tap_drop.load(),
+            (unsigned long long)g_tap_down_drop.load());
   fprintf(stderr,
           "  refused before relay: fragmented=%llu, A-MSDU=%llu,"
           " group flood cipher-refused=%llu\n",
@@ -1282,11 +1325,12 @@ int main(int argc, char** argv) {
           (unsigned long long)g_group_drop.load());
   fprintf(stderr,
           "  data plane: encrypted frames received=%llu, MIC failures=%llu, "
-          "replays rejected=%llu, frames sent=%llu, queue dropped=%llu, "
-          "send failed=%llu\n",
+          "replays rejected=%llu, queued=%llu, frames sent=%llu, "
+          "queue dropped=%llu, send failed=%llu\n",
           (unsigned long long)g_enc_rx.load(),
           (unsigned long long)g_mic_fail.load(),
           (unsigned long long)g_replayed.load(),
+          (unsigned long long)g_q_in.load(),
           (unsigned long long)g_sent.load(),
           (unsigned long long)g_q_drop.load(),
           (unsigned long long)g_send_fail.load());

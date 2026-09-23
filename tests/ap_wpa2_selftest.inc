@@ -787,12 +787,12 @@ static void test_tap(Supplicant& a, Supplicant& b) {
 
   /* An address on no station goes nowhere, rather than being flooded: a
    * flooded unicast is that frame leaked to every station on the BSS. */
-  const uint64_t dropped = g_tap_drop.load();
+  const uint64_t dropped = g_tap_down_drop.load();
   std::vector<uint8_t> nowhere = down;
   nowhere[5] = 0x7f;
   tap_down_one(nowhere.data(), nowhere.size());
   check(drain().empty(), "a frame for an unknown unicast address is not aired");
-  check(g_tap_drop.load() == dropped + 1, "...and is counted as a drop");
+  check(g_tap_down_drop.load() == dropped + 1, "...and is counted as a drop");
 
   g_tap_fd = saved;
   ::close(fds[0]);

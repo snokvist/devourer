@@ -113,6 +113,8 @@ favourable measurement without its adversarial counterpart in the same breath.
 | Phase 4 | `02a0f62` | Flash (hostile input + protocol) | **reachable OOB read** | 9 | yes — this commit |
 | Phase 4 | `02a0f62` | Flash (can any assertion fail?) | **a third shadowed cell** | 5 | yes — this commit |
 | Phase 4 | `02a0f62` | Flash (continuity + integration) | **a false doc claim, and a replay bypass** | 7 | yes — this commit |
+| Phase 5 | `a6678ba` | Flash (hostile input + correctness) | **the new ledger identity was arithmetically wrong** | 9 | yes — this commit |
+| Phase 5 | `a6678ba` | Flash (can any assertion fail?) | **the falsifier itself could pass vacuously** | 8 + a clean bill on `want=` | yes — this commit |
 
 ### Round 5 — the Phase 1 gate, 2026-09-20
 
@@ -1352,15 +1354,15 @@ rekey defect on its first attempt. What Phase 5 still owes:
   load. Each with its adversarial counterpart in the same breath. A ceiling
   and its attribution now exist (below); throughput itself does not.
 - **A soak.** Every figure here comes from runs of 45–90 seconds.
-- **The reviews.** Rule 2: this phase does not close until they are in the
-  ledger. None has been run on `tests/sta_d2d_onair.sh`.
+- ~~**The reviews.**~~ **DONE 2026-09-23** — two rows in the ledger, three
+  shared findings, all resolved. See below.
 
 ### Phase 5, the devourer-to-devourer half — 2026-09-23
 
 `tests/sta_d2d_onair.sh`: an MT7612U running `tests/sta_client.cpp` joins an
 RTL8812CU running `tests/ap_wpa2.cpp`. **No kernel 802.11 anywhere** — the
 whole stack is userspace at both ends, which is the shape this project ships.
-**20/20**: `wpa2` 8 on ch6, `fiveghz` 8 on ch36, `airgap` 4.
+**21/21**: `wpa2` 8 on ch6, `fiveghz` 8 on ch36, `airgap` 5.
 
 **It worked on the first attempt**, which is worth saying because nothing else
 in this workstream did: association, the four-way, and an encrypted ping in
@@ -1444,6 +1446,83 @@ Read together these say two different things, and the pair is the point:
 - Phase 4's **2.5× RX-over-TX CCMP asymmetry did not reproduce here.** On this
   link the station's transmit path costs *more* per frame than its receive
   path. Both figures were measured; neither is understood.
+
+#### The Phase 5 review round, and what two reviewers found
+
+Two Flash reviews on different angles, run against `a6678ba` and verified
+against the tree before acting. **They converged on the same three findings
+independently**, which is the first time in this workstream that has happened
+— and all three were in the cells this phase had just written to prove the
+harness honest.
+
+**The identity the commit was named after was arithmetically wrong.** The
+`flood` cell asserted `from host == encrypted + dropped + queue dropped + send
+failed` on the station. But `g_tx_enc` is incremented *before* the frame is
+handed to `enqueue()`, so the queue and device losses are **subsets** of
+`encrypted` and the sum counted them twice. Both reviewers derived the same
+condition: it holds iff `queue dropped + send failed + malformed == 0`, which
+on this bench they were. So the check passed, for a run in which all three
+confounding terms were zero, while being unable to state the identity it
+named. It would have false-FAILED the moment the station's own queue dropped
+anything — the exact load it exists for — and it masked silent loss exactly in
+proportion to the double count.
+
+**One counter was serving two directions.** `g_tap_drop` counted both "the
+host cannot be given this frame" and "this frame from the host cannot be
+aired", in both harnesses. No identity over the host path is expressible from
+a total that contains drops from the other direction. Split into
+`g_tap_drop` (up) and `g_tap_down_drop` (down), on both sides.
+
+**And the AP had a third silent drop, in the same function as the first two.**
+`tap_down_one`'s group path returns early when no station is associated —
+discarding a frame the host had already been credited with handing over, at no
+counter at all. It is the same shape as the uncounted queue cap this phase
+began by fixing, ten lines away, and the fix for that one did not find it.
+
+**The falsifier could pass vacuously.** `cell_airgap` is the cell every other
+cell's credibility rests on, and it was the one cell that did not inherit
+`ping_cell`'s liveness guards: a station that started, printed its banner and
+then died produces exactly its success evidence — no association, and a lost
+ping. It now checks both endpoints before and after the ping, and asserts a
+**positive control**: the station must have heard at least `BEACONS_MIN`
+beacons from *somebody* on its channel, because a deaf receiver gives this
+cell its answer for the wrong reason.
+
+Also fixed, each of them a smaller version of the same habit: `trap cleanup
+EXIT INT TERM` ran cleanup on Ctrl-C and then **carried on into the next
+cell**; `ns_up` adopted any pre-existing namespace of the right name and
+`cleanup` then deleted it, so the harness could destroy a namespace it did not
+create; "the cipher was timed" asserted frames > 0 but not nanoseconds > 0,
+which is the bug it was written to catch, one layer down; `BENCH_PPS=0`
+divided by zero into `inf` and produced the flood the cell exists to avoid;
+and the airgap accepted adjacent channels as a "gap".
+
+**Both identities are now pinned headlessly.** `test_the_books_close` in
+`tests/sta_client_selftest.inc` drives them with every confounding term made
+non-zero on purpose — a malformed frame, a foreign source, and 200 frames into
+a 128-deep queue. An on-air assertion that nothing can exercise offline is an
+assertion nobody has watched fail.
+
+**Mutations: 5 of 6 caught.** The rows were: counting `from host` after the
+malformed check again; putting a foreign source back in the up counter;
+dropping the not-connected refusal silently; not counting frames offered to
+the queue; and letting the queue cap drop silently again. The survivor is
+recorded rather than hidden: **the clean-exit drain's send failures** are
+counted in `main()`, which `--self-test` returns before reaching, so no
+headless cell can observe it. It is covered only by the on-air `flood` cell.
+
+#### What the data-plane cells assert, and why it is not zero loss
+
+`ping_cell` requires 16 of 20 delivered, not 6 of 6. **Neither end arms
+`SetAckResponder`**, so this link has no link-layer retransmission in either
+direction and a frame lost to a neighbour's transmission is lost for good. Six
+packets at a zero-loss threshold was a coin toss: it read 0% four times and
+then 16.7% (one of six) and 50% (three of six) on channels that had just
+carried a clean run. The underlying rate is about 5% per round trip, measured
+over 150 packets in the `bench` cell on both bands, twice, before and after
+this round's changes — 4.0% and 4.67% on ch36. Two to four losses in twenty is
+ordinary variation on that rate; a data plane that does not work reads 100%,
+and an association that carries nothing reads the same.
 
 #### The open question, stated rather than guessed at
 

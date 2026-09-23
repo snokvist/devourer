@@ -185,7 +185,21 @@ std::atomic<uint64_t> g_beacons{0}, g_probe_tx{0};
 std::atomic<uint64_t> g_joins{0}, g_associations{0}, g_reconnects{0};
 std::atomic<uint64_t> g_enc_rx{0}, g_mic_fail{0}, g_replays{0};
 std::atomic<uint64_t> g_group_rx{0}, g_plain_rx{0}, g_rx_short{0};
-std::atomic<uint64_t> g_tap_tx{0}, g_tap_rx{0}, g_tap_drop{0};
+/* ONE COUNTER PER DIRECTION, because one counter for both cannot state
+ * either books. `g_tap_drop` used to serve the radio->host path (a frame the
+ * host cannot be given) AND the host->radio path (not connected, foreign
+ * source, cipher refused), so "did everything the host handed us go somewhere
+ * named?" was not a question the ledger could answer: the sum it needed
+ * included drops from the opposite direction. Found by review, after a
+ * harness asserted that identity and it held only because both of the
+ * confounding terms happened to be zero. */
+std::atomic<uint64_t> g_tap_tx{0}, g_tap_rx{0}, g_tap_drop{0},
+    g_tap_down_drop{0};
+/* Every frame handed to enqueue(), so the transmit chain closes:
+ * queued == aired + queue dropped + send failed. Without it the ledger has
+ * the losses but not the total they are losses FROM, and management frames
+ * make `encrypted + plaintext` the wrong total. */
+std::atomic<uint64_t> g_q_in{0};
 std::atomic<uint64_t> g_tx_enc{0}, g_tx_enc_fail{0}, g_tx_plain{0};
 std::atomic<uint64_t> g_crc_err{0}, g_amsdu_drop{0}, g_frag_drop{0};
 /* The group rekey, which rides INSIDE the cipher and so is counted apart from
@@ -267,6 +281,7 @@ void enqueue(std::vector<uint8_t> mpdu) {
   f.insert(f.end(), g_rt.begin(), g_rt.end());
   f.insert(f.end(), mpdu.begin(), mpdu.end());
   std::lock_guard<std::mutex> lk(g_q_mu);
+  g_q_in.fetch_add(1);
   /* Bounded, like the AP's. Everything queued here is produced in response to
    * a received frame or a timer, so an unbounded queue is an unbounded
    * allocation the air controls. */
@@ -633,22 +648,26 @@ bool air_msdu(const uint8_t* msdu, size_t len, const uint8_t da[6],
  * so the headless cells can drive it with no TAP device and no thread. */
 void tap_down_one(const uint8_t* eth, size_t len) {
   uint8_t msdu[2048], da[6], sa[6];
+  /* COUNTED FIRST, and that ordering is the whole point of the counter.
+   * "from host" has to mean every frame the host handed us, or the books
+   * below cannot be closed: a malformed frame used to be dropped BEFORE this
+   * line, so it was a loss that no total included. */
+  g_tap_rx.fetch_add(1);
   const size_t m = devourer::sta::eth_to_msdu(eth, len, msdu, sizeof msdu, da,
                                               sa);
-  if (m == 0) { g_tap_drop.fetch_add(1); return; }
-  g_tap_rx.fetch_add(1);
+  if (m == 0) { g_tap_down_drop.fetch_add(1); return; }
 
   std::lock_guard<std::mutex> l(g_mu);
-  if (!g_sm.connected()) { g_tap_drop.fetch_add(1); return; }
+  if (!g_sm.connected()) { g_tap_down_drop.fetch_add(1); return; }
 
   /* THE SOURCE ADDRESS MUST BE OURS. A station's uplink carries its own
    * address in addr2, and the AP matches that against the association it
    * holds; a frame claiming someone else's is refused by any AP worth using
    * and would be an injection tool on one that is not. A TAP with the wrong
    * MAC is the ordinary cause, which is worth being able to see. */
-  if (std::memcmp(sa, g_own, 6) != 0) { g_tap_drop.fetch_add(1); return; }
+  if (std::memcmp(sa, g_own, 6) != 0) { g_tap_down_drop.fetch_add(1); return; }
 
-  if (!air_msdu(msdu, m, da)) g_tap_drop.fetch_add(1);
+  if (!air_msdu(msdu, m, da)) g_tap_down_drop.fetch_add(1);
 }
 
 /* ---- the scan and the reconnect policy ---------------------------------- */
@@ -894,17 +913,26 @@ void report() {
                (unsigned long long)g_amsdu_drop.load(),
                (unsigned long long)g_rx_short.load(),
                (unsigned long long)g_crc_err.load());
+  /* TWO IDENTITIES, and they are printed in the shape that lets a caller
+   * check them rather than believe them:
+   *   from host == encrypted + plaintext + dropped down
+   *   queued    == aired + queue dropped + send failed
+   * Both hold exactly, because the TAP reader is stopped and the queue
+   * drained before this runs. */
   std::fprintf(stderr,
-               "  TAP: to host=%llu, from host=%llu, dropped=%llu\n",
+               "  TAP: to host=%llu, from host=%llu, dropped up=%llu,"
+               " dropped down=%llu\n",
                (unsigned long long)g_tap_tx.load(),
                (unsigned long long)g_tap_rx.load(),
-               (unsigned long long)g_tap_drop.load());
+               (unsigned long long)g_tap_drop.load(),
+               (unsigned long long)g_tap_down_drop.load());
   std::fprintf(stderr,
                "  tx: encrypted=%llu (cipher refused %llu), plaintext=%llu,"
-               " aired=%llu, send failed=%llu, queue dropped=%llu\n",
+               " queued=%llu, aired=%llu, send failed=%llu, queue dropped=%llu\n",
                (unsigned long long)g_tx_enc.load(),
                (unsigned long long)g_tx_enc_fail.load(),
                (unsigned long long)g_tx_plain.load(),
+               (unsigned long long)g_q_in.load(),
                (unsigned long long)g_sent.load(),
                (unsigned long long)g_send_fail.load(),
                (unsigned long long)g_q_drop.load());
@@ -1111,17 +1139,27 @@ int main(int argc, char** argv) {
       enqueue(std::move(f));
     }
   }
+  /* THE TAP CLOSES BEFORE THE LEDGER IS PRINTED, not after, and the queue is
+   * drained after that. Otherwise the reader thread can encrypt and enqueue a
+   * frame between the last drain and report(), which lands in `encrypted` and
+   * in nothing else - and the two identities the ledger now states would be
+   * off by however many frames were in flight at the instant it printed. */
+  if (g_tap_fd >= 0) { ::close(g_tap_fd); g_tap_fd = -1; }
+  if (tap_rd.joinable()) tap_rd.join();
   {
     std::vector<std::vector<uint8_t>> batch;
     { std::lock_guard<std::mutex> l(g_q_mu); batch.swap(g_q); }
-    for (auto& f : batch) g_dev->send_packet(f.data(), f.size());
+    /* COUNTED, like every other send. This drain used to discard its result,
+     * so a failure here was the one transmit loss the ledger could not
+     * report - the same shape as the AP's uncounted queue cap. */
+    for (auto& f : batch) {
+      if (g_dev->send_packet(f.data(), f.size())) g_sent.fetch_add(1);
+      else g_send_fail.fetch_add(1);
+    }
   }
   if (caps.station_mode_ok) g_dev->ClearStationIdentity();
 
   report();
-
-  if (g_tap_fd >= 0) { ::close(g_tap_fd); g_tap_fd = -1; }
-  if (tap_rd.joinable()) tap_rd.join();
   g_dev->StopRxLoop();
   if (rx.joinable()) rx.join();
   return 0;

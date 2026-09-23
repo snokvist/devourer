@@ -94,7 +94,8 @@ void reset_all() {
   g_beacons = 0; g_probe_tx = 0; g_joins = 0; g_associations = 0;
   g_reconnects = 0; g_enc_rx = 0; g_mic_fail = 0; g_replays = 0;
   g_group_rx = 0; g_plain_rx = 0; g_rx_short = 0;
-  g_tap_tx = 0; g_tap_rx = 0; g_tap_drop = 0;
+  g_tap_tx = 0; g_tap_rx = 0; g_tap_drop = 0; g_tap_down_drop = 0;
+  g_q_in = 0;
   g_tx_enc = 0; g_tx_enc_fail = 0; g_tx_plain = 0;
   g_crc_err = 0; g_amsdu_drop = 0; g_frag_drop = 0;
   g_eapol_enc_rx = 0; g_eapol_enc_tx = 0;
@@ -1331,10 +1332,10 @@ void test_tap_refuses_a_foreign_source() {
   std::memcpy(e + 6, kBssid, 6);          /* not us */
   e[12] = 0x08;
   e[13] = 0x00;
-  const uint64_t dropped = g_tap_drop.load();
+  const uint64_t dropped = g_tap_down_drop.load();
   tap_down_one(e, sizeof e);
   check(drain_tx().empty(), "a frame with a foreign source is not aired");
-  check(g_tap_drop.load() == dropped + 1, "...and is counted as a drop");
+  check(g_tap_down_drop.load() == dropped + 1, "...and is counted as a drop");
 
   /* The control: the same frame with OUR address goes out. Without this the
    * cell passes for a tap_down_one() that airs nothing at all. */
@@ -1359,7 +1360,7 @@ void test_no_data_before_association() {
   e[13] = 0x00;
   tap_down_one(e, sizeof e);
   check(drain_tx().empty(), "nothing is aired before the association");
-  check(g_tap_drop.load() == 1, "...and the frame is counted as dropped");
+  check(g_tap_down_drop.load() == 1, "...and the frame is counted as dropped");
 
   /* And a protected frame that arrives BEFORE the four-way finishes must be
    * refused by the "are we connected" gate specifically.
@@ -1472,6 +1473,83 @@ void test_hostile_and_foreign_frames() {
   check(tap_read().empty(), "...and reaches nothing");
 }
 
+/* THE BOOKS CLOSE. The on-air `flood` cell in tests/sta_d2d_onair.sh asserts
+ * two identities over this ledger, and an on-air assertion that nothing can
+ * exercise offline is an assertion nobody has watched fail. Both of them
+ * were wrong when they were first written - they held only because every
+ * confounding term happened to be zero on the bench - and both are pinned
+ * here now, with the confounding terms made non-zero on purpose.
+ *
+ *   from host == encrypted + plaintext + dropped down
+ *   queued    == aired + queue dropped + send failed
+ */
+void test_the_books_close() {
+  reset_all();
+  {
+    std::lock_guard<std::mutex> l(g_mu);
+    g_sm.configure(g_crypto, kSsid, kPsk, g_own);
+  }
+  Ap ap;
+  associate(ap, /*rsn=*/true);
+  drain_tx();
+
+  uint8_t e[60] = {0};
+  std::memcpy(e, kPeer, 6);
+  std::memcpy(e + 6, kStaMac, 6);
+  e[12] = 0x08;
+  e[13] = 0x00;
+  for (int i = 0; i < 5; i++) tap_down_one(e, sizeof e);      /* aired */
+
+  /* A frame the host had no business sending: counted DOWN, not up. This is
+   * the term that used to land in the same counter as a failed write to the
+   * host and made the first identity unstatable. */
+  std::memcpy(e + 6, kBssid, 6);
+  tap_down_one(e, sizeof e);
+  std::memcpy(e + 6, kStaMac, 6);
+
+  /* And one the Ethernet parser refuses. It used to be dropped BEFORE
+   * `from host` was incremented, so it was a loss no total contained. */
+  tap_down_one(e, 6);
+
+  const uint64_t from = g_tap_rx.load();
+  const uint64_t down = g_tap_down_drop.load();
+  check(from == 7, "every frame the host handed us is counted, malformed included");
+  check(down == 2, "...and the two it could not air are counted as down-drops");
+  check(from == g_tx_enc.load() + g_tx_plain.load() + down,
+        "from host == encrypted + plaintext + dropped down");
+
+  /* THE SECOND IDENTITY, with the queue cap made to bite. The cap is 128 and
+   * nothing on the bench has ever reached it on this side, which is exactly
+   * why it needs a cell: the AP's identical cap was uncounted for a year and
+   * the flood that found it was the first thing to fill one. */
+  drain_tx();            /* empty the queue: the identity below is a DELTA,
+                          * because drain_tx() is the cells' stand-in for the
+                          * caller and does not count what it takes. */
+  const uint64_t q_in_before = g_q_in.load();
+  const uint64_t q_drop_before = g_q_drop.load();
+  const uint64_t sent_before = g_sent.load();
+  const uint64_t sfail_before = g_send_fail.load();
+  for (int i = 0; i < 200; i++) enqueue(std::vector<uint8_t>(32, 0xa5));
+  check(g_q_in.load() == q_in_before + 200, "every frame offered to the queue is counted");
+  check(g_q_drop.load() > q_drop_before,
+        "...and the ones the cap refused are counted as queue drops");
+
+  /* main() is what airs them, so stand in for it and close the chain.
+   * `aired` is only ever incremented on a successful send. */
+  size_t aired = 0;
+  {
+    std::vector<std::vector<uint8_t>> batch;
+    { std::lock_guard<std::mutex> l(g_q_mu); batch.swap(g_q); }
+    aired = batch.size();
+    g_sent.fetch_add(aired);
+  }
+  check(g_q_in.load() - q_in_before ==
+            (g_sent.load() - sent_before) + (g_q_drop.load() - q_drop_before) +
+                (g_send_fail.load() - sfail_before),
+        "queued == aired + queue dropped + send failed");
+  check(aired > 0 && aired < 200, "...and neither term was vacuous");
+}
+
 }  // namespace selftest
 
 namespace {
@@ -1514,6 +1592,7 @@ int self_test() {
   selftest::test_no_data_before_association();
   selftest::test_scan_selects_the_wanted_network();
   selftest::test_hostile_and_foreign_frames();
+  selftest::test_the_books_close();
 
   ::close(fds[0]);
   ::close(fds[1]);

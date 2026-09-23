@@ -59,7 +59,7 @@ that tree up; nothing here depends on it any more.
 | 2 — the `IRadio` seam | **Implemented.** Seam + caps flag + MT7612U implementation + five bring-up gates + a headless selftest. R5 and R6 both measured; `station_mode_ok` is **true** for MT7612U. `docs/mt7612u-station-identity.md` — read its retraction section before quoting any number. The R6 table was re-taken 2026-09-20 under the corrected single-variable harness and holds. |
 | 3 — pure station logic | **DONE 2026-09-21.** BSS table, association state machine, EAPOL/4-way supplicant, all headless. Both acceptance negatives present and load-bearing. Pinned against a captured hostapd/wpa_supplicant four-way. |
 | 4 — the harness | **DONE 2026-09-21.** `tests/sta_client.cpp` (+ its `.inc`, ctest `sta_client_headless`) and `tests/mt7612u_sta_onair.sh`. **16/16 on ch6** against hostapd on an RTL8812AU; `bench` 2/2 separately. No backend branch anywhere in it, which is the phase's acceptance property. |
-| 5 — validation | **Mostly done, NOT closed.** The independent-witness half exists (see Phase 4). devourer-to-devourer and 5 GHz landed 2026-09-23: `tests/sta_d2d_onair.sh`, **20/20**, MT7612U station against an RTL8812CU running `ap_wpa2`, ch6 and ch36, with a falsifier cell. Still owed before it closes: **throughput**, a **soak**, and **the reviews** (rule 2 — none has been run on the new harness). |
+| 5 — validation | **Mostly done, NOT closed.** The independent-witness half exists (see Phase 4). devourer-to-devourer and 5 GHz landed 2026-09-23: `tests/sta_d2d_onair.sh`, **21/21**, MT7612U station against an RTL8812CU running `ap_wpa2`, ch6 and ch36, with a falsifier cell. Two reviews are in the ledger and their three shared findings are fixed. Still owed before it closes: **throughput** and a **soak**. |
 | 6 — the Realtek arm | Not started. |
 
 ## What exists now
@@ -206,10 +206,10 @@ is the PID `tests/ap_wpa2.cpp` defaults to and the generation its AP path is
 validated on.
 
 ```sh
-sudo tests/sta_d2d_onair.sh              # wpa2 + fiveghz + airgap = 20 checks
+sudo tests/sta_d2d_onair.sh              # wpa2 + fiveghz + airgap = 21 checks
 sudo STA_SYSFS=1-1 AP_SYSFS=5-1 CH=6 CH5=36 tests/sta_d2d_onair.sh all
 sudo tests/sta_d2d_onair.sh bench        # paced; 3 checks
-sudo tests/sta_d2d_onair.sh flood        # the ceiling + both ledgers; 2 checks
+sudo tests/sta_d2d_onair.sh flood        # the ceiling + both ledgers; 3 checks
 ```
 
 What is different from the hostapd harness, and why:
@@ -225,14 +225,25 @@ What is different from the hostapd harness, and why:
    frames to it take the off-BSS branch instead of the "for this AP" one. It
    still works that way, which is exactly why a cell checks the address: the
    station prints the BSSID it armed, and the harness asserts it matches.
-4. **`airgap` is the falsifier.** Radios on different channels, same plumbing,
-   and the ping must be 100% lost. Run it after any change to the netns or
-   addressing, because it is the only thing that proves the other cells could
-   fail.
+4. **`airgap` is the falsifier.** Radios on different channels (at least
+   40 MHz apart), same plumbing, and the ping must be 100% lost. Run it after
+   any change to the netns or addressing, because it is the only thing that
+   proves the other cells could fail. It carries its own positive control -
+   the station must have heard `BEACONS_MIN` beacons from *somebody*, because
+   a deaf receiver gives this cell its answer for the wrong reason.
+5. **The data-plane cells tolerate loss, deliberately.** 16 of 20 delivered,
+   not 6 of 6. Neither end retransmits (see item 9 of the open list), the
+   underlying rate is ~5% per round trip on both bands, and a zero-loss
+   threshold over six packets was a coin toss. A dead data plane still reads
+   100%.
+6. **Both ledgers state two exact identities each**, and the `flood` cell
+   checks all four: `from host == framed + dropped down` and `queued == aired
+   + queue dropped + send failed`. `test_the_books_close` in
+   `tests/sta_client_selftest.inc` pins them headlessly.
 
 Two numbers to expect, and neither is throughput: a paced 10 pps of 1400 B
-loses ~27% on ch6 and ~4% on ch36 (the band, not the link — neither end arms
-`SetAckResponder`, so nothing is retransmitted), and a flood ceilings at ~21
+loses ~27% on ch6 and ~4–5% on ch36 (the band, not the link — neither end arms
+`SetAckResponder`, so nothing is retransmitted), and a flood ceilings at ~11–22
 round trips a second on **both** bands, because the station drops the
 association under load. See the plan's Phase 5 section for what that has been
 narrowed to and what it has not.
