@@ -1346,13 +1346,131 @@ silicon rather than this project's own AP — so `tests/mt7612u_sta_onair.sh`
 already IS the independent-witness run, 15/15 on ch6, and it found the group
 rekey defect on its first attempt. What Phase 5 still owes:
 
-- **devourer-to-devourer**, MT7612U station against `ap_wpa2.cpp` on a second
-  adapter. That is the FPV shape and it is the one this project ships.
-- **5 GHz**, which this bench cannot serve from a kernel AP (see Phase 4's
-  carried-forward list).
+- ~~**devourer-to-devourer**~~ **DONE 2026-09-23**, see below.
+- ~~**5 GHz**~~ **DONE 2026-09-23**, see below.
 - **Throughput**, which nothing in this tree measures yet, and latency under
-  load. Each with its adversarial counterpart in the same breath.
-- **A soak.** Every figure above comes from runs of 45–75 seconds.
+  load. Each with its adversarial counterpart in the same breath. A ceiling
+  and its attribution now exist (below); throughput itself does not.
+- **A soak.** Every figure here comes from runs of 45–90 seconds.
+- **The reviews.** Rule 2: this phase does not close until they are in the
+  ledger. None has been run on `tests/sta_d2d_onair.sh`.
+
+### Phase 5, the devourer-to-devourer half — 2026-09-23
+
+`tests/sta_d2d_onair.sh`: an MT7612U running `tests/sta_client.cpp` joins an
+RTL8812CU running `tests/ap_wpa2.cpp`. **No kernel 802.11 anywhere** — the
+whole stack is userspace at both ends, which is the shape this project ships.
+**20/20**: `wpa2` 8 on ch6, `fiveghz` 8 on ch36, `airgap` 4.
+
+**It worked on the first attempt**, which is worth saying because nothing else
+in this workstream did: association, the four-way, and an encrypted ping in
+both directions, with no change to either side's protocol code. The two ends
+were written three phases apart against the standard rather than against each
+other, and the standard is what they agreed on.
+
+**5 GHz is no longer blocked.** Phase 4 carried "one band" forward because the
+RTL8812AU's 5 GHz channels are all `no IR` here, so hostapd refuses to serve
+them. devourer programs its own synthesizer and asks no one, so both ends
+simply tune — ch36, 8/8, identical to ch6. **The operator owns compliance**;
+that is this project's standing position and the only reason the cell exists.
+
+**The AP's downlink through its TAP is finally under a graded cell.** Phase
+2b.8 closed on a narrated bench run and nothing scripted had ever driven
+`DEVOURER_AP_TAP`. The `AP -> station` ping is that path.
+
+#### The falsifier, and why it is a cell rather than a paragraph
+
+Every cell here could pass without an RF link: both TAPs are ordinary kernel
+interfaces on one host, and the netns plus `ip route get` are all that stand
+between this harness and a ping that never leaves the machine. **An assertion
+nobody has watched fail is a claim, not a check.** So `airgap` puts the two
+radios on different channels and runs the same plumbing: the TAP comes up, the
+route still leaves through it, and the ping must be lost, all four. It is.
+
+The AP's netns is also *cheap* here in a way it is not in
+`tests/mt7612u_sta_onair.sh`: devourer holds both radios over libusb, so there
+is no phy to move into the namespace and none to destroy by deleting it.
+
+#### THE FINDING OF THIS HALF: a ledger that could not be wrong
+
+Under a flood ping the AP's ledger read:
+
+```
+  TAP: to host=185, from host=1437, dropped=0
+  data plane: ... frames sent=232
+```
+
+1437 frames accepted from its host, 232 aired, **nothing reported lost.** The
+missing 1205 went into a 128-frame queue cap with no counter and into
+`send_packet` returning false with no counter — the identical cap that
+`tests/sta_client.cpp` has counted since Phase 4, in the copy that drifted.
+The ledger is the thing the on-air cells trust to tell an RF problem from a
+software one, and on the transmit side it could not report a loss at all.
+
+Both counters exist now, and the `flood` cell asserts the identity rather than
+the throughput: **everything a host handed an endpoint is either on the air or
+counted as lost, by name.** That check can fail — it did, before the fix — and
+it does not grade the room.
+
+`ap_wpa2` also gained a SIGINT/SIGTERM handler, for a related reason: the chip
+beacons autonomously, so only the process's own exit path calls `StopBeacon`,
+and everything the cells grade is printed after the run loop. A harness that
+killed the AP got no ledger and left a beacon airing until the adapter was
+re-enumerated. `sta_client` has had this since Phase 4.
+
+#### Numbers, with their adversarial counterparts
+
+| | ch6 | ch36 |
+|---|---|---|
+| paced 10 pps, 1400 B, 15 s | 109/150, **27% loss** | 144/150, **4% loss** |
+| flood ceiling, 1400 B, 15 s | 313/1471, 21 round trips/s | 324/1491, 22 round trips/s |
+| station CCMP tx / rx ns per frame | 14684 / 6432 | 11698 / 6668 |
+| AP CCMP tx / rx ns per frame | 6532 / 8041 | 5706 / 8273 |
+
+Read together these say two different things, and the pair is the point:
+
+- **The 27% loss at 10 pps on ch6 is the band, not the link.** The same pair,
+  the same load, the same code on ch36 loses 4%. This bench sits in a 2.4 GHz
+  band carrying ~39 neighbour beacons a second (counted with a third radio in
+  monitor mode). Neither harness arms `SetAckResponder`, so **there is no
+  link-layer retransmission in either direction** and a lost frame stays lost
+  — where the hostapd comparison is not like-for-like, because the kernel AP
+  retries.
+- **The ~21 round trips/s ceiling is NOT the band.** ch36 gives 22. It is
+  structural, and it is dominated by the station DROPPING THE ASSOCIATION
+  under load: of 1516 frames its host offered, 1057 were refused because the
+  station was not connected at the time. Per-frame delivery over the air was
+  fine in the same run — the station aired 459 and the AP received 435 (95%).
+- Phase 4's **2.5× RX-over-TX CCMP asymmetry did not reproduce here.** On this
+  link the station's transmit path costs *more* per frame than its receive
+  path. Both figures were measured; neither is understood.
+
+#### The open question, stated rather than guessed at
+
+**Why does the station lose the association under load?** `kBeaconLossMs` is
+1024 ms and `ap_wpa2` beacons at 25 TU, so tripping it means missing **forty
+consecutive beacons** — a full second with nothing from the AP. Idle, the same
+station sees ~33 beacons a second against the 38.6 a second an independent
+radio counts in the air, and holds the association indefinitely.
+
+What has been ruled out, by measurement rather than by argument:
+
+- **Not the adapter, and not the concurrent RX loop.** The same RTL8812CU,
+  same channel, same 6M rate, injecting from `txdemo`: 1500 frames, **zero**
+  send failures, both TX-only and with `DEVOURER_TX_WITH_RX=thread`. The
+  libusb-contention theory is dead.
+- **Not a software drop at the station's receiver.** `Mt7612uRxQueue` reports
+  zero drops in these runs; the beacons are not being discarded after arrival.
+- **Not the uplink.** 95% of what the station aired reached the AP.
+
+What is left, and untested: the frame size and the unicast/ACK/retry descriptor
+settings of the AP's transmit path (`RtlJaguar3Device::send_packet` fails by a
+**20 ms** bulk-OUT timeout, so 784 refusals in one run account for 15.7 s of a
+15-second window — that loop is timeout-bound, not airtime-bound), and whether
+the station's beacon timestamp being taken at PROCESSING time rather than at
+reception turns RX-callback starvation into apparent beacon loss.
+
+None of that is diagnosed, and none of it is written here as though it were.
 
 ## Phase 6 — the Realtek arm, deferred to its own issue
 

@@ -59,7 +59,7 @@ that tree up; nothing here depends on it any more.
 | 2 — the `IRadio` seam | **Implemented.** Seam + caps flag + MT7612U implementation + five bring-up gates + a headless selftest. R5 and R6 both measured; `station_mode_ok` is **true** for MT7612U. `docs/mt7612u-station-identity.md` — read its retraction section before quoting any number. The R6 table was re-taken 2026-09-20 under the corrected single-variable harness and holds. |
 | 3 — pure station logic | **DONE 2026-09-21.** BSS table, association state machine, EAPOL/4-way supplicant, all headless. Both acceptance negatives present and load-bearing. Pinned against a captured hostapd/wpa_supplicant four-way. |
 | 4 — the harness | **DONE 2026-09-21.** `tests/sta_client.cpp` (+ its `.inc`, ctest `sta_client_headless`) and `tests/mt7612u_sta_onair.sh`. **16/16 on ch6** against hostapd on an RTL8812AU; `bench` 2/2 separately. No backend branch anywhere in it, which is the phase's acceptance property. |
-| 5 — validation | **Half done by accident.** The Phase 4 harness needed something to associate to, and the honest choice was hostapd on non-MediaTek silicon — so the independent-witness run already exists and already found a defect. Still owed: devourer-to-devourer, 5 GHz, throughput, a soak. |
+| 5 — validation | **Mostly done, NOT closed.** The independent-witness half exists (see Phase 4). devourer-to-devourer and 5 GHz landed 2026-09-23: `tests/sta_d2d_onair.sh`, **20/20**, MT7612U station against an RTL8812CU running `ap_wpa2`, ch6 and ch36, with a falsifier cell. Still owed before it closes: **throughput**, a **soak**, and **the reviews** (rule 2 — none has been run on the new harness). |
 | 6 — the Realtek arm | Not started. |
 
 ## What exists now
@@ -198,6 +198,45 @@ Things the harness now encodes that each cost a run to learn:
 
 To free the MT7612U from the kernel: `echo 7-1:1.0 > /sys/bus/usb/drivers/mt76x2u/unbind`.
 
+### The devourer-to-devourer harness — no kernel 802.11 at either end
+
+`tests/sta_d2d_onair.sh`. `STA_SYSFS` is the MT7612U running `sta_client`;
+`AP_SYSFS` is the adapter running `ap_wpa2` — **an RTL8812CU**, because that
+is the PID `tests/ap_wpa2.cpp` defaults to and the generation its AP path is
+validated on.
+
+```sh
+sudo tests/sta_d2d_onair.sh              # wpa2 + fiveghz + airgap = 20 checks
+sudo STA_SYSFS=1-1 AP_SYSFS=5-1 CH=6 CH5=36 tests/sta_d2d_onair.sh all
+sudo tests/sta_d2d_onair.sh bench        # paced; 3 checks
+sudo tests/sta_d2d_onair.sh flood        # the ceiling + both ledgers; 2 checks
+```
+
+What is different from the hostapd harness, and why:
+
+1. **5 GHz works here.** devourer programs its own synthesizer regardless of
+   regulatory domain, so `fiveghz` (ch36) reads the same 8/8 as ch6. The
+   operator owns compliance.
+2. **The netns is cheap and safe.** Only the AP *process* goes into it, so the
+   only thing in the namespace is a TAP that dies with the process. There is
+   no phy to move and therefore no phy to destroy — the trap the hostapd
+   harness spends thirty lines guarding against does not exist here.
+3. **The AP's TAP must carry `ap_wpa2`'s BSSID** (`02:42:75:05:d6:00`), or
+   frames to it take the off-BSS branch instead of the "for this AP" one. It
+   still works that way, which is exactly why a cell checks the address: the
+   station prints the BSSID it armed, and the harness asserts it matches.
+4. **`airgap` is the falsifier.** Radios on different channels, same plumbing,
+   and the ping must be 100% lost. Run it after any change to the netns or
+   addressing, because it is the only thing that proves the other cells could
+   fail.
+
+Two numbers to expect, and neither is throughput: a paced 10 pps of 1400 B
+loses ~27% on ch6 and ~4% on ch36 (the band, not the link — neither end arms
+`SetAckResponder`, so nothing is retransmitted), and a flood ceilings at ~21
+round trips a second on **both** bands, because the station drops the
+association under load. See the plan's Phase 5 section for what that has been
+narrowed to and what it has not.
+
 ## What the on-air runs actually showed
 
 `tests/mt7612u_ap_onair.sh` reads **14/14 twice on 2.4 GHz (ch6) and twice on
@@ -255,10 +294,14 @@ require it:
   targets and changes nothing about what the AP transmits — so if that entry
   is produced by something this AP airs, the harness now passes without
   surfacing it.
-- **The ledger lies on Realtek.** `Packet::Data` carries a trailing FCS on
-  every Realtek generation and not on MT7612U, and `on_rx` does not trim it,
-  so a Realtek AP would report a length bug as MIC failures. Fix the trim
-  before trusting it outside MediaTek — this matters at Phase 6.
+- ~~**The ledger lies on Realtek.**~~ **RETRACTED 2026-09-23.** It said
+  `on_rx` does not trim the trailing FCS, so a Realtek AP would report a
+  length bug as MIC failures. The trim went in with `tests/rx_mpdu.h` and this
+  entry outlived it. `tests/ap_wpa2.cpp` has since been run as the AP on an
+  RTL8812CU with a MediaTek station decrypting every frame — 0 MIC failures
+  across every `sta_d2d_onair.sh` run. The comment saying the same thing in
+  the source is gone too; a warning about a fixed bug is worse than none,
+  because a reader trusts it.
 
 ## What the station's on-air runs showed
 
@@ -316,6 +359,24 @@ because it was measured, not because it is understood.
    `reconnect` cell stops the AP rather than sending a deauth, partly because
    an unauthenticated deauth is exactly what this station cannot tell from a
    forged one.
+8. **The station drops its association under load, and why is not known.**
+   Measured 2026-09-23 on the devourer-to-devourer link: a flood ping ceilings
+   at ~21 round trips a second on **both** bands, and the reason is that the
+   station is not connected for most of the window — 1057 of 1516 frames its
+   host offered were refused on that ground. Tripping `kBeaconLossMs` (1024 ms)
+   against a 25 TU beacon means **forty consecutive beacons missed**. Ruled
+   out by measurement: the adapter and the concurrent RX loop (`txdemo` on the
+   same AP adapter airs 1500 frames with zero send failures, with and without
+   `DEVOURER_TX_WITH_RX=thread`), a software drop at the station's receiver
+   (`Mt7612uRxQueue` reports zero), and the uplink (95% delivered). Not ruled
+   out: the AP's transmit descriptor settings, and whether taking the beacon
+   timestamp at PROCESSING time turns RX-callback starvation into apparent
+   beacon loss.
+9. **No link-layer retransmission anywhere on the devourer-to-devourer link.**
+   Neither `ap_wpa2` nor `sta_client` arms `SetAckResponder`, so a lost frame
+   stays lost. This is why 10 pps of 1400 B loses 27% on a busy ch6 and 4% on
+   ch36, and it is why the hostapd comparison is not like-for-like: the kernel
+   AP retries. Arming it is the obvious next experiment and has not been run.
 
 ## The rule this work runs under
 

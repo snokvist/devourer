@@ -31,6 +31,7 @@
 //   build/ap_wpa2 [sec]
 #include <atomic>
 #include <chrono>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -69,11 +70,29 @@
 
 static const uint8_t kBssid[6] = {0x02, 0x42, 0x75, 0x05, 0xd6, 0x00};
 static const char* kSsid = "devourerAP";
+
+/* A KILLED AP LEAVES NO LEDGER AND A BEACON STILL ON THE AIR.
+ *
+ * Everything below the run loop - the data-plane ledger the on-air cells
+ * grade, the CCMP profile, and the StopBeacon retry that the chip needs
+ * because it beacons autonomously - runs only when the loop ENDS. A harness
+ * that drives this AP for a cell and then kills it gets none of it, and the
+ * beacon keeps airing until the adapter is re-enumerated. tests/sta_client.cpp
+ * has had this since Phase 4; the AP did not, and the devourer-to-devourer
+ * harness is the first thing to notice, because it is the first caller that
+ * ever needed the AP's ledger at a time of its own choosing. */
+static volatile std::sig_atomic_t g_stop = 0;
+extern "C" void ap_on_signal(int) { g_stop = 1; }
 static IRadio* g_dev = nullptr;
 static std::vector<uint8_t> g_rt;
 static uint8_t g_chan = 6;
 static const char* g_psk = "devourer123";
 static std::atomic<uint64_t> g_sent{0};
+/* The two ways a frame this AP built never reaches the air: the transmit
+ * queue was full when it was enqueued, or send_packet refused it. Neither
+ * was counted, so the ledger's "frames sent" was the only transmit figure
+ * and there was nothing to compare it against. */
+static std::atomic<uint64_t> g_q_drop{0}, g_send_fail{0};
 static bool g_ccmp_profile = false;
 static std::atomic<uint64_t> g_ccmp_tx_frames{0}, g_ccmp_tx_bytes{0}, g_ccmp_tx_ns{0};
 static std::atomic<uint64_t> g_ccmp_rx_frames{0}, g_ccmp_rx_bytes{0}, g_ccmp_rx_ns{0};
@@ -163,7 +182,15 @@ static void enqueue(std::vector<uint8_t> mpdu) {
   f.insert(f.end(), g_rt.begin(), g_rt.end());
   f.insert(f.end(), mpdu.begin(), mpdu.end());
   std::lock_guard<std::mutex> lk(g_q_mu);
+  /* THE DROP IS COUNTED NOW, and finding out that it was not is the whole
+   * reason this counter exists. Under a flood ping the AP's ledger read
+   * "TAP: from host=1437, dropped=0" beside "frames sent=232" - 1205 frames
+   * accepted from the host, aired nowhere, and every counter in the ledger
+   * saying nothing was lost. They were discarded HERE, by this cap, in
+   * silence. tests/sta_client.cpp has counted the same cap since Phase 4;
+   * this file was the copy that drifted. */
   if (g_q.size() < 128) g_q.push_back(std::move(f));
+  else g_q_drop.fetch_add(1);
 }
 static devourer::sta::SeqCounter g_seq;
 // (da=sta, sa=bssid, bssid) for an AP answering; a station swaps the first two.
@@ -1177,12 +1204,17 @@ int main(int argc, char** argv) {
   }
   fprintf(stderr, "ap_wpa2 up: SSID %s WPA2-PSK '%s' ch%d beacon=%s\n",
           kSsid, g_psk, g_chan, bok ? "OK" : "FAIL");
+  std::signal(SIGINT, ap_on_signal);
+  std::signal(SIGTERM, ap_on_signal);
   auto end = std::chrono::steady_clock::now() + std::chrono::seconds(sec);
-  while (std::chrono::steady_clock::now() < end) {
+  while (!g_stop && std::chrono::steady_clock::now() < end) {
     hs_tick();                                   // 4-way retransmissions
     std::vector<std::vector<uint8_t>> batch;
     { std::lock_guard<std::mutex> l(g_q_mu); batch.swap(g_q); }
-    for (auto& f : batch) if (g_dev->send_packet(f.data(), f.size())) g_sent.fetch_add(1);
+    for (auto& f : batch) {
+      if (g_dev->send_packet(f.data(), f.size())) g_sent.fetch_add(1);
+      else g_send_fail.fetch_add(1);   /* refused by the device, and until now silent */
+    }
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
   {
@@ -1212,12 +1244,13 @@ int main(int argc, char** argv) {
    * RECEIVED an encrypted frame from one that received and failed to decrypt
    * them, because nothing counted either - so a 100%-ping-loss result had no
    * diagnosis attached. Printed unconditionally, at every exit. */
-  /* CAVEAT for a Realtek AP: Packet::Data carries a trailing FCS whenever
-   * RxAttrib.fcs_present is set, which every Realtek generation sets and
-   * MT7612U clears. on_rx does not trim it, so on Realtek every protected
-   * frame is 4 bytes long and would be counted here as a MIC failure rather
-   * than as the length bug it is. Fix the trim before trusting this ledger on
-   * anything but MediaTek. */
+  /* The caveat that used to stand here - "on Realtek every protected frame
+   * would be counted as a MIC failure, because on_rx does not trim the
+   * trailing FCS" - is OBSOLETE, and saying so is cheaper than leaving a
+   * warning about a fixed bug where a reader will trust it. on_rx trims via
+   * devourer::test::mpdu_len(p) (see tests/rx_mpdu.h), and the ledger has
+   * since been read off a Realtek AP - an RTL8812CU, Jaguar3 - with a
+   * MediaTek station decrypting every frame it sent. */
   /* COUNTED, NOT INFERRED. "to this AP" used to be computed as
    * g_enc_rx - g_to_peer - g_to_elsewhere, but g_enc_rx counts every protected
    * frame - group frames, MIC failures and replay rejections included - and
@@ -1249,11 +1282,14 @@ int main(int argc, char** argv) {
           (unsigned long long)g_group_drop.load());
   fprintf(stderr,
           "  data plane: encrypted frames received=%llu, MIC failures=%llu, "
-          "replays rejected=%llu, frames sent=%llu\n",
+          "replays rejected=%llu, frames sent=%llu, queue dropped=%llu, "
+          "send failed=%llu\n",
           (unsigned long long)g_enc_rx.load(),
           (unsigned long long)g_mic_fail.load(),
           (unsigned long long)g_replayed.load(),
-          (unsigned long long)g_sent.load());
+          (unsigned long long)g_sent.load(),
+          (unsigned long long)g_q_drop.load(),
+          (unsigned long long)g_send_fail.load());
 
   /* Retried, and the failure reported. StopBeacon can now genuinely fail (an
    * EP0 stall during teardown), IRadio.h says such a failure "must be retried
