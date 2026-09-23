@@ -200,6 +200,10 @@ std::atomic<uint64_t> g_tap_tx{0}, g_tap_rx{0}, g_tap_drop{0},
  * the losses but not the total they are losses FROM, and management frames
  * make `encrypted + plaintext` the wrong total. */
 std::atomic<uint64_t> g_q_in{0};
+/* The periodic counter dump - see the emission site in main(). Zero is off,
+ * which is every existing caller, so no figure already recorded moves. */
+uint32_t g_tick_ms = 0;
+uint32_t g_last_tick = 0;
 std::atomic<uint64_t> g_tx_enc{0}, g_tx_enc_fail{0}, g_tx_plain{0};
 std::atomic<uint64_t> g_crc_err{0}, g_amsdu_drop{0}, g_frag_drop{0};
 /* The group rekey, which rides INSIDE the cipher and so is counted apart from
@@ -983,6 +987,8 @@ int main(int argc, char** argv) {
     g_rejoin_backoff_ms = (uint32_t)std::strtoul(b, nullptr, 10);
   if (const char* p = std::getenv("DEVOURER_CCMP_PROFILE"))
     g_ccmp_profile = std::strcmp(p, "0") != 0;
+  if (const char* t = std::getenv("DEVOURER_STA_TICK_MS"))
+    g_tick_ms = (uint32_t)std::strtoul(t, nullptr, 10);
 
   auto logger = std::make_shared<Logger>();
   apply_logging_env(*logger);
@@ -1138,6 +1144,52 @@ int main(int argc, char** argv) {
     for (auto& f : batch) {
       if (g_dev->send_packet(f.data(), f.size())) g_sent.fetch_add(1);
       else g_send_fail.fetch_add(1);
+    }
+    /* A TIME SERIES, not just an exit ledger.
+     *
+     * Every counter this harness has is printed once, at exit, which answers
+     * "what happened" and not "when". Two questions needed "when" and could
+     * not be asked: whether the station's BEACON RECEPTION collapses while
+     * the link is loaded - and in which direction - and whether anything
+     * drifts over a soak. A run that ends with associations=4 does not say
+     * whether they were spread over an hour or all in one bad second.
+     *
+     * Off unless asked for, and one line per tick on the event plane, so a
+     * consumer can diff consecutive ticks without parsing the ledger. */
+    if (g_tick_ms) {
+      const uint32_t now_t = now;
+      if (now_t - g_last_tick >= g_tick_ms) {
+        g_last_tick = now_t;
+        std::lock_guard<std::mutex> l(g_mu);
+        std::printf(
+            "{\"ev\":\"sta.tick\",\"t_ms\":%u,\"state\":\"%s\","
+            "\"beacons\":%llu,\"beacons_ours\":%u,"
+            "\"associations\":%llu,\"reconnects\":%llu,"
+            "\"enc_rx\":%llu,\"enc_tx\":%llu,\"mic_fail\":%llu,"
+            "\"replays\":%llu,\"tap_to_host\":%llu,\"tap_from_host\":%llu,"
+            "\"aired\":%llu,\"send_fail\":%llu,\"q_drop\":%llu}\n",
+            now_t, state_name(g_sm.state()),
+            /* BOTH, and the pair is what makes the tick worth emitting.
+             * `beacons` is every BSS the scanner saw; `beacons_ours` is only
+             * the one we joined. A receiver too busy to decode beacons loses
+             * BOTH at the same rate. An AP that has stopped transmitting
+             * them loses only ours. Either counter alone cannot tell those
+             * apart, and the cell that reads this had exactly that hole. */
+            (unsigned long long)g_beacons.load(),
+            g_sm.beacons_rx,
+            (unsigned long long)g_associations.load(),
+            (unsigned long long)g_reconnects.load(),
+            (unsigned long long)g_enc_rx.load(),
+            (unsigned long long)g_tx_enc.load(),
+            (unsigned long long)g_mic_fail.load(),
+            (unsigned long long)g_replays.load(),
+            (unsigned long long)g_tap_tx.load(),
+            (unsigned long long)g_tap_rx.load(),
+            (unsigned long long)g_sent.load(),
+            (unsigned long long)g_send_fail.load(),
+            (unsigned long long)g_q_drop.load());
+        std::fflush(stdout);
+      }
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }

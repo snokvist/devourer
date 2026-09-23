@@ -1524,6 +1524,100 @@ this round's changes — 4.0% and 4.67% on ch36. Two to four losses in twenty is
 ordinary variation on that rate; a data plane that does not work reads 100%,
 and an association that carries nothing reads the same.
 
+#### Throughput, measured at last — and the asymmetry it exposed
+
+`tests/udp_blast.cpp` (ctest `udp_blast_selftest`, 6/6 mutations) and the
+`thru` cell. Nothing in this tree measured throughput before: every
+station-link figure came from a flood ping, which offers the next request
+only when the previous reply arrives.
+
+| ch6, 1400 B | 6M | MCS7 |
+|---|---|---|
+| uplink, station → AP | 3.96 Mbit/s @ 0.7%, knee at 4.90 | **19.85 Mbit/s @ 0.43%, no knee found** |
+| downlink, AP → station | 0.445 Mbit/s, zero above 2 Mbit/s offered | 0.445 Mbit/s, zero above 1 Mbit/s offered |
+
+The uplink at 6M knees at 4.90 Mbit/s, which is the 6M PHY ceiling for this
+payload almost exactly; at MCS7 it reaches 19.85 and the ladder ran out before
+the link did. **The station's transmit path is not a limit**: 19004 frames
+queued, 19004 aired, zero device refusals, zero queue drops.
+
+**The downlink does not move with the rate at all**, and the AP's ledger says
+why: at 1400 B it aired 601 of 4063 queued (14.8%), with 1168 device refusals
+and 2294 queue drops. `RtlJaguar3Device::send_packet` is a synchronous
+bulk-OUT with a 20 ms timeout, so those refusals cost 23.4 s of a ~40 s
+measurement — the send loop is timeout-bound, not airtime-bound. At a 200-byte
+payload the same AP aired 85% and the loss moved to the receive side, so the
+ceiling is a **bandwidth** ceiling of about half a megabit per second rather
+than a frame-rate one.
+
+#### The beacon, and what is and is not established about it
+
+The station re-associates repeatedly under downlink load, and everything the
+AP's host offers while it is unassociated is discarded — which is most of the
+missing downlink throughput. `kBeaconLossMs` is 1024 ms, so tripping it means
+missing forty consecutive beacons at 25 TU.
+
+**Established, by two methods and reproducibly:**
+
+- Under **downlink** load the station's reception of OUR beacons falls to
+  **8% of its idle rate** (two runs, 8% both times; idle is 39.1/s, exactly
+  the 25 TU rate).
+- Under **uplink** load — where the station is transmitting hard and the AP's
+  transmit path is idle — it is **98–100% of idle** (two runs). A busy
+  station is not the cause.
+- A third radio in monitor mode, with a control that passed immediately
+  before at exactly 36.0/s, read the AP's beacons at **1.7/s** under a
+  downlink flood.
+
+**NOT established: where the beacons are lost.** Every apparatus tried so far
+shares one confound — under a downlink flood *every* receiver on the channel
+is busy, so "few beacons seen" is satisfied both by an AP that stopped
+sending them and by a receiver too busy to decode them.
+
+The `beacons` cell tried to close that by comparing our beacons against
+NEIGHBOURS' beacons on the same radio in the same seconds. It gave
+**opposite verdicts on two consecutive runs** — neighbours at 87% of idle in
+one and 6% in the next — and the reason is that neighbour beacons arrive at
+about −82 dBm, so a strong local downlink moves the receiver's AGC and the
+control moves with the signal. **That control is not sound and the cell says
+so rather than reporting the ratio as a conclusion.**
+
+The experiment that would settle it is written and its apparatus is not
+working: count the AP's DATA frames and its BEACONS at a third radio in the
+same window (`/tmp` scratch, to be landed once it runs). A witness decoding
+thousands of the AP's data frames per second is not a witness too busy to
+decode a beacon. The RTL8812AU used as that witness has been deaf since it
+was claimed over libusb by `build/doctor`; it needs a physical replug.
+
+**Two fixes were tried and NEITHER removed the symptom**, which is recorded
+because a fix that did not work is worth as much as one that did:
+
+- `ap_wpa2`'s send loop now **backs off** on refusal instead of hammering,
+  which is what `send_packet`'s own contract asks of a caller ("the caller
+  backs off when these fail repeatedly ... hammering a non-draining endpoint
+  is exactly what wedged its USB core"). It never did.
+- It now also **caps the burst** at 16 frames per pass rather than handing the
+  chip up to 128 (~190 KB) in one go, on the theory that the beacon's
+  reserved page needs room in the same TX path.
+
+Both are defensible and both are kept. Neither moved the 8% figure.
+
+#### Three instruments misled this investigation, and that is the lesson
+
+In one session: a rate computed over the burst instead of the measurement
+window reported 5.82 Mbit/s for a link carrying nothing; an ad-hoc witness
+script grepped for a MAC address `tcpdump` never prints and concluded a
+working adapter was mute — a conclusion that survived an authorized toggle
+and was only overturned when the *reviewed* acceptance cell passed 8/8 on the
+same adapter minutes later; and the neighbour-beacon control moved with the
+load it was controlling for.
+
+The pattern is the same every time: **the apparatus was not checked against a
+case where it must give the answer already known.** The cells that did carry
+such a check — the beacon script's idle control, the `thru` cell's
+zero-datagram guard, the `airgap` falsifier — all refused to report rather
+than reporting something false. The ad-hoc scripts that did not, did.
+
 #### The open question, stated rather than guessed at
 
 **Why does the station lose the association under load?** `kBeaconLossMs` is

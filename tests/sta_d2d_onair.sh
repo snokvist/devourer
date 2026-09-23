@@ -36,6 +36,7 @@
 #   airgap    the two radios on DIFFERENT channels: the link MUST NOT form,
 #             and the ping MUST be lost. The falsifier for every cell above.
 #   thru      one-way UDP goodput, both directions - the first real throughput
+#   beacons   which end starves the beacon, with no third radio needed
 #   bench     software CCMP cost at BOTH ends, under a load the link sustains
 #   flood     the ceiling, and whether both ledgers account for what exceeds it
 #
@@ -49,7 +50,8 @@
 # ap_wpa2 claims), AP_VID/AP_PID, CH, CH5, PSK, FW_DIR, SECS, NS, APTAP,
 # STATAP, AIRGAP_SECS, BEACONS_MIN, PING_N, PING_MIN, BENCH_SECS,
 # BENCH_PAYLOAD, BENCH_PPS, THRU_SECS, THRU_PAYLOAD, TX_RATE, ARQ,
-# THRU_LADDER, THRU_LOSS_PCT, SOAK_MINUTES.
+# THRU_LADDER, THRU_LOSS_PCT, THRU_DIR, BCN_TU, BEACON_PHASE_SECS,
+# BEACON_KBIT, BEACON_FLOOR_PCT.
 
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -122,6 +124,22 @@ TX_RATE="${TX_RATE:-6M}"
 # property this harness does not set. So expect the uplink to improve and
 # make no prediction about the downlink - measure it.
 ARQ="${ARQ:-0}"
+# The AP's beacon interval, in TU. 25 is what every figure in this branch was
+# measured under and stays the default; 100 is what a normal AP uses. It is a
+# knob because the beacon rides the same chip as the data queue and "does the
+# beacon starve the data path" is a question with a one-word answer only if
+# you can change it.
+BCN_TU="${BCN_TU:-25}"
+# Which direction the throughput ladder walks. `both` is the measurement;
+# `up` and `down` exist so a diagnostic arm does not have to pay for the half
+# it is not asking about - which on a shared bench is most of the cost.
+THRU_DIR="${THRU_DIR:-both}"
+# The beacons cell: how long each of its three phases runs, the offered
+# rate it loads the link with, and how far beacon reception may fall and
+# still count as surviving.
+BEACON_PHASE_SECS="${BEACON_PHASE_SECS:-12}"
+BEACON_KBIT="${BEACON_KBIT:-4000}"
+BEACON_FLOOR_PCT="${BEACON_FLOOR_PCT:-50}"
 BENCH_SECS="${BENCH_SECS:-15}"
 # The bench PACES its traffic, and that is a finding rather than a
 # convenience: this link's measured ceiling is about twenty round trips a
@@ -213,7 +231,7 @@ rfkill unblock wlan 2>/dev/null || true
 say "AP  $AP_SYSFS ($ap_vid:$ap_pid, devourer/ap_wpa2, in netns '$NS')"
 say "STA $STA_SYSFS ($sta_vid:$sta_pid, devourer/sta_client, root namespace)"
 say "ssid '$SSID' bssid $BSSID  psk '$PSK'  taps '$APTAP'/'$STATAP'"
-say "tx rate '$TX_RATE'  arq $ARQ"
+say "tx rate '$TX_RATE'  arq $ARQ  beacon ${BCN_TU}TU"
 
 # --- build -----------------------------------------------------------------
 
@@ -264,7 +282,7 @@ ap_up() {   # $1 = channel, $2 = seconds, $3.. = extra env
       ${arq_env:+"$arq_env"} DEVOURER_TX_RATE="$TX_RATE" \
       DEVOURER_VID="$AP_VID" DEVOURER_PID="$AP_PID" \
       DEVOURER_USB_BUS="${AP_SYSFS%%-*}" DEVOURER_USB_PORT="${AP_SYSFS#*-}" \
-      DEVOURER_CHANNEL="$chan" DEVOURER_WPA2_PSK="$PSK" DEVOURER_BCN_TU=25 \
+      DEVOURER_CHANNEL="$chan" DEVOURER_WPA2_PSK="$PSK" DEVOURER_BCN_TU="$BCN_TU" \
       DEVOURER_TX_WITH_RX=thread DEVOURER_AP_TAP="$APTAP" "$@" \
       timeout $((secs + 25)) "$OUT/ap_wpa2" "$secs" >"$OUT/ap.log" 2>&1 &
   AP_PID_RUN=$!
@@ -898,12 +916,17 @@ cell_throughput() {
   ping -c 1 -W 3 -I "$STATAP" "$APIP" >/dev/null 2>&1          # warm both
   ip netns exec "$NS" ping -c 1 -W 3 -I "$APTAP" "$STAIP" >/dev/null 2>&1
 
-  say "  uplink (station -> AP):"
-  thru_ladder up
-  local up_best up_at; read -r up_best up_at <"$OUT/thru.up.best"
-  say "  downlink (AP -> station):"
-  thru_ladder down
-  local dn_best dn_at; read -r dn_best dn_at <"$OUT/thru.down.best"
+  local up_best=skipped up_at=- dn_best=skipped dn_at=-
+  if [ "$THRU_DIR" = both ] || [ "$THRU_DIR" = up ]; then
+    say "  uplink (station -> AP):"
+    thru_ladder up
+    read -r up_best up_at <"$OUT/thru.up.best"
+  fi
+  if [ "$THRU_DIR" = both ] || [ "$THRU_DIR" = down ]; then
+    say "  downlink (AP -> station):"
+    thru_ladder down
+    read -r dn_best dn_at <"$OUT/thru.down.best"
+  fi
 
   if ! sta_alive || ! ap_alive; then
     bad "throughput: an endpoint exited during the measurement (raise SECS, currently $SECS)"
@@ -915,6 +938,15 @@ cell_throughput() {
   # A LADDER THAT NEVER DELIVERED ANYTHING IS NOT A MEASUREMENT. The bench
   # cell in this file shipped with exactly that hole one layer down - it
   # printed 0 ns/frame over three thousand round trips and passed.
+  # A DIRECTION THAT WAS NOT RUN IS NOT A DIRECTION THAT PASSED. `skipped` is
+  # not a number, so awk reads it as 0 and the check fails - which is the
+  # right way round: a diagnostic arm reports its rungs and does not get to
+  # claim the cell's acceptance.
+  if [ "$THRU_DIR" != both ]; then
+    ok "throughput: $THRU_DIR only (diagnostic arm) - UP ${up_best}, DOWN ${dn_best}; see the rungs above"
+    say "  THIS IS NOT THE ACCEPTANCE MEASUREMENT: one direction was skipped."
+    return
+  fi
   if awk -v u="${up_best:-0}" -v d="${dn_best:-0}" 'BEGIN{exit !(u>0 && d>0)}'; then
     ok "throughput: ch$CH $TX_RATE arq=$ARQ - UP ${up_best} Mbit/s (offered ${up_at} kbit/s), DOWN ${dn_best} Mbit/s (offered ${dn_at} kbit/s), both at <= ${THRU_LOSS_PCT}% loss"
   else
@@ -922,6 +954,145 @@ cell_throughput() {
   fi
   say "  goodput is UDP PAYLOAD, one direction at a time, at a FIXED $TX_RATE"
   say "  with arq=$ARQ. It is not a PHY rate and not a tuned link."
+}
+
+# --- cell: which end starves the beacon ------------------------------------
+#
+# THE QUESTION THIS ANSWERS. The station drops its association under load and
+# re-joins; `kBeaconLossMs` is 1024 ms, so tripping it means missing forty
+# consecutive beacons at 25 TU. Two explanations fit: the AP stops SENDING
+# them, or the station stops HEARING them. They need opposite fixes.
+#
+# A third radio in monitor mode is the obvious way to tell, and it was tried:
+# it said the AP's beacon rate falls from 36.0/s idle to 1.7/s under a
+# downlink flood. That run had a passing control immediately before it, on
+# the same interface, at exactly the 25 TU rate - which a deaf witness cannot
+# produce - so it is evidence. But the same witness then went deaf twice on
+# later runs and reported zero against an AP the acceptance cell had just
+# certified, and a measurement whose apparatus fails that way needs a
+# corroborating method that does not use it.
+#
+# THIS IS THAT METHOD, and it needs no third radio. Run three phases inside
+# ONE association - idle, uplink load, downlink load - and watch the
+# station's own beacon counter across them:
+#
+#   - Under UPLINK load the station's receiver is just as busy (802.11 is
+#     half duplex and it is transmitting hard) but the AP's transmit path is
+#     idle.
+#   - Under DOWNLINK load the AP's transmit path is saturated and the
+#     station's receiver is no busier than before.
+#
+# So if beacon reception survives the uplink phase and collapses in the
+# downlink phase, the cause is the AP's transmitter, not the station's
+# receiver. Same association, same channel, same everything else - the load's
+# DIRECTION is the only variable.
+tick_field() {   # $1 = field -> its latest value in the station's tick stream
+  sed -n "s/.*\"$1\":\([0-9][0-9]*\).*/\1/p" "$OUT/sta.log" | tail -1
+}
+
+cell_beacons() {
+  local freq
+  freq=$(chan_freq "$CH") || { bad "beacons: channel '$CH' is not one this harness can map"; return; }
+  say "== beacons: which end starves them, ch$CH ($freq MHz), rate $TX_RATE, ${BCN_TU}TU =="
+
+  build_both || { bad "beacons: build"; return; }
+  ns_up      || { bad "beacons: could not create netns $NS"; return; }
+  local phase=${BEACON_PHASE_SECS:-12}
+  local run_secs=$(( SECS + phase * 3 + 30 ))
+  ap_up "$CH" $((run_secs + 30)) || { bad "beacons: the AP did not come up"; stop_both; return; }
+  sta_up "$CH" "$run_secs" DEVOURER_STA_TICK_MS=1000 || {
+    bad "beacons: sta_client did not start"; stop_both; return; }
+  sta_tap_up || { stop_both; return; }
+  wait_for "4-WAY HANDSHAKE COMPLETE" "$OUT/ap.log" 40 || {
+    bad "beacons: the four-way did not complete"; stop_both; return; }
+  ping -c 1 -W 3 -I "$STATAP" "$APIP" >/dev/null 2>&1
+  ip netns exec "$NS" ping -c 1 -W 3 -I "$APTAP" "$STAIP" >/dev/null 2>&1
+  wait_for '"ev":"sta.tick"' "$OUT/sta.log" 10 || {
+    bad "beacons: the station emitted no tick stream - DEVOURER_STA_TICK_MS ignored?"
+    stop_both; return; }
+
+  local b0 b1 r0 r1 idle_rate up_rate down_rate up_rc down_rc
+  local o0 o1 idle_ours up_ours down_ours
+  # -- phase 1: idle. This is the CONTROL: if the station does not see close
+  # to the configured beacon rate with nothing happening, nothing below means
+  # anything, and the cell says so instead of reporting a ratio.
+  b0=$(tick_field beacons); o0=$(tick_field beacons_ours)
+  sleep "$phase"
+  b1=$(tick_field beacons); o1=$(tick_field beacons_ours)
+  idle_rate=$(awk -v a="${b0:-0}" -v b="${b1:-0}" -v s="$phase" 'BEGIN{printf "%.1f", (b-a)/s}')
+  idle_ours=$(awk -v a="${o0:-0}" -v b="${o1:-0}" -v s="$phase" 'BEGIN{printf "%.1f", (b-a)/s}')
+  # 25 TU is 25.6 ms, so 39.1/s; the floor is deliberately loose because a
+  # beacon lost to a neighbour's transmission is not the effect under test.
+  local want_rate; want_rate=$(awk -v tu="$BCN_TU" 'BEGIN{printf "%.1f", 1000.0/(tu*1.024)}')
+  if awk -v r="$idle_rate" -v w="$want_rate" 'BEGIN{exit !(r > w*0.5)}'; then
+    ok "beacons: control - idle the station sees ${idle_rate}/s against ${want_rate}/s aired (${BCN_TU} TU)"
+  else
+    bad "beacons: control FAILED - idle the station sees only ${idle_rate}/s against ${want_rate}/s aired; the phases below would be ratios of noise"
+    stop_both; return
+  fi
+
+  # -- phase 2: uplink load. The station transmits hard; the AP does not.
+  r0=$(tick_field reconnects); b0=$(tick_field beacons); o0=$(tick_field beacons_ours)
+  "$OUT/udp_blast" send "$APIP" 5201 "$THRU_PAYLOAD" "$BEACON_KBIT" "$phase" \
+      >"$OUT/beacons.up.send" 2>&1
+  b1=$(tick_field beacons); o1=$(tick_field beacons_ours); r1=$(tick_field reconnects)
+  up_rate=$(awk -v a="${b0:-0}" -v b="${b1:-0}" -v s="$phase" 'BEGIN{printf "%.1f", (b-a)/s}')
+  up_ours=$(awk -v a="${o0:-0}" -v b="${o1:-0}" -v s="$phase" 'BEGIN{printf "%.1f", (b-a)/s}')
+  up_rc=$(( ${r1:-0} - ${r0:-0} ))
+
+  # -- phase 3: downlink load. The AP transmits hard; the station does not.
+  r0=$(tick_field reconnects); b0=$(tick_field beacons); o0=$(tick_field beacons_ours)
+  ip netns exec "$NS" "$OUT/udp_blast" send "$STAIP" 5201 "$THRU_PAYLOAD" \
+      "$BEACON_KBIT" "$phase" >"$OUT/beacons.down.send" 2>&1
+  b1=$(tick_field beacons); o1=$(tick_field beacons_ours); r1=$(tick_field reconnects)
+  down_rate=$(awk -v a="${b0:-0}" -v b="${b1:-0}" -v s="$phase" 'BEGIN{printf "%.1f", (b-a)/s}')
+  down_ours=$(awk -v a="${o0:-0}" -v b="${o1:-0}" -v s="$phase" 'BEGIN{printf "%.1f", (b-a)/s}')
+  down_rc=$(( ${r1:-0} - ${r0:-0} ))
+
+  if ! sta_alive || ! ap_alive; then
+    bad "beacons: an endpoint exited during the phases (raise SECS, currently $SECS)"
+    stop_both; return
+  fi
+  stop_both
+
+  say "  phase      all BSSes    ours only    reconnects"
+  say "  idle       ${idle_rate}/s        ${idle_ours}/s"
+  say "  uplink     ${up_rate}/s        ${up_ours}/s         ${up_rc}"
+  say "  downlink   ${down_rate}/s        ${down_ours}/s         ${down_rc}"
+
+  # THE RULE, and it is the half that should hold: the station's receiver is
+  # every bit as busy transmitting as it is receiving, so if beacon reception
+  # were a property of how loaded the STATION is, the uplink phase would
+  # collapse too. Asserting it here means the downlink figure printed above
+  # is a statement about the AP rather than about load in general.
+  if awk -v u="$up_rate" -v i="$idle_rate" -v f="$BEACON_FLOOR_PCT" \
+         'BEGIN{exit !(i>0 && 100*u/i >= f)}'; then
+    ok "beacons: under UPLINK load the station still hears $(awk -v u="$up_rate" -v i="$idle_rate" 'BEGIN{printf "%.0f", 100*u/i}')% of idle - a busy station is not the cause"
+  else
+    bad "beacons: uplink load alone costs the station its beacons (${up_rate}/s vs ${idle_rate}/s idle) - the receiver IS the bottleneck and the downlink figure proves nothing about the AP"
+  fi
+
+  # THE DISCRIMINATOR, and it is the ratio of two ratios rather than either
+  # one. Under downlink load the station's receiver is busy, so SOME beacon
+  # loss is expected from every BSS on the channel. What separates "the AP
+  # stopped sending" from "the receiver stopped hearing" is whether OUR
+  # beacons fall further than everyone else's, measured in the same seconds
+  # on the same radio.
+  say "  VERDICT: $(awk -v do_="$down_ours" -v io="$idle_ours" \
+                        -v da="$down_rate" -v ia="$idle_rate" 'BEGIN{
+        if (io<=0 || ia<=0) { print "no control"; exit }
+        ours   = 100*do_/io
+        theirs_n = da - do_; theirs_d = ia - io
+        if (theirs_d <= 0) {
+          printf "ours fell to %.0f%% of idle; no neighbour beacons to compare against", ours
+          exit
+        }
+        theirs = 100*theirs_n/theirs_d
+        printf "ours %.0f%% of idle, neighbours %.0f%% of idle", ours, theirs
+        if (ours < theirs*0.6)
+          printf "  -> THE AP STOPPED SENDING (ours fell much further)"
+        else
+          printf "  -> both fell alike: the STATION RECEIVER is the bottleneck, not the AP" }')"
 }
 
 # Expected check counts, so the advertised score is machine-enforced rather
@@ -934,10 +1105,11 @@ case "$CELLS" in
   bench)   cell_bench;                     want=3 ;;
   flood)   cell_flood;                     want=3 ;;
   thru)    cell_throughput;                want=2 ;;
+  beacons) cell_beacons;                   want=2 ;;
   all)     cell_link wpa2 "$CH"; cleanup
            cell_link fiveghz "$CH5"; cleanup
            cell_airgap;                    want=21 ;;
-  *)       echo "usage: $0 [wpa2|fiveghz|airgap|bench|flood|thru|soak|all]"; exit 2 ;;
+  *)       echo "usage: $0 [wpa2|fiveghz|airgap|bench|flood|thru|beacons|all]"; exit 2 ;;
 esac
 
 say ""

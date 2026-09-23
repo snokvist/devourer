@@ -29,6 +29,7 @@
 // Run: sudo DEVOURER_VID=0x2357 DEVOURER_PID=0x012d DEVOURER_CHANNEL=6 \
 //   DEVOURER_WPA2_PSK=devourer123 DEVOURER_BCN_TU=25 DEVOURER_TX_WITH_RX=thread \
 //   build/ap_wpa2 [sec]
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -96,6 +97,14 @@ static std::atomic<uint64_t> g_q_drop{0}, g_send_fail{0};
 /* Every frame handed to enqueue(), so the transmit chain closes:
  * queued == aired + queue dropped + send failed. */
 static std::atomic<uint64_t> g_q_in{0};
+/* How many times the send loop backed off rather than hammering a chip that
+ * was refusing. Its own counter, because "we waited" and "we lost a frame"
+ * are different events and the ledger already conflated enough of those. */
+static std::atomic<uint64_t> g_backoffs{0};
+/* How many frames the send loop hands the chip in one pass. See the note at
+ * the send site: the beacon shares this path and a full-batch burst starves
+ * it. */
+static constexpr size_t kTxBurst = 16;
 /* Host frames this AP actually turned into an 802.11 frame. Without it the
  * host-side identity has the losses but not the successes. */
 static std::atomic<uint64_t> g_tap_framed{0};
@@ -1240,16 +1249,75 @@ int main(int argc, char** argv) {
           kSsid, g_psk, g_chan, bok ? "OK" : "FAIL");
   std::signal(SIGINT, ap_on_signal);
   std::signal(SIGTERM, ap_on_signal);
+  int tx_backoff_ms = 0;
   auto end = std::chrono::steady_clock::now() + std::chrono::seconds(sec);
   while (!g_stop && std::chrono::steady_clock::now() < end) {
     hs_tick();                                   // 4-way retransmissions
     std::vector<std::vector<uint8_t>> batch;
     { std::lock_guard<std::mutex> l(g_q_mu); batch.swap(g_q); }
-    for (auto& f : batch) {
-      if (g_dev->send_packet(f.data(), f.size())) g_sent.fetch_add(1);
-      else g_send_fail.fetch_add(1);   /* refused by the device, and until now silent */
+    /* THE BACKOFF THE LIBRARY ASKS FOR, AND THIS HARNESS NEVER DID.
+     *
+     * RtlJaguar3Device::send_packet says it plainly at its definition: "The
+     * caller backs off when these fail repeatedly ... hammering a
+     * non-draining endpoint is exactly what wedged its USB core." This loop
+     * hammered. It took the whole batch and pushed every frame at a chip
+     * that was already refusing, each refusal costing a 20 ms blocking
+     * bulk-OUT timeout.
+     *
+     * WHAT THAT COST, measured with a third radio: THE AP STOPPED BEACONING.
+     * Idle it airs 36.0 beacons a second (25 TU, confirmed by an RTL8812AU
+     * in monitor mode); under a 4 Mbit/s downlink it aired 1.7 a second - 5%
+     * - because the beacon is DMA'd from a reserved page by the hardware at
+     * TBTT and cannot get out past a saturated TX path. The station's
+     * supervision then fires at 1024 ms, it re-associates, and everything
+     * the AP's host offers in the meantime is discarded. That is the whole
+     * of the "station drops its association under load" open question, and
+     * it was never the station.
+     *
+     * So: stop at the first refusal, put the rest back at the FRONT of the
+     * queue (they are not lost, and their order is the order they were
+     * built in), and give the chip time to drain. The backoff doubles to a
+     * ceiling, because a chip that refuses once usually refuses the next
+     * one too and each attempt costs 20 ms of this thread. */
+    /* AND A CEILING ON HOW MUCH GOES IN AT ONCE. The loop used to hand the
+     * chip the WHOLE batch - up to 128 frames, ~190 KB of 1476-byte MPDUs -
+     * in one uninterrupted burst. The beacon is DMA'd from a reserved page
+     * by the hardware at TBTT and has to find room in the same TX path, so a
+     * burst that fills it is a beacon that does not air. Measured: our
+     * beacons fall to 8% of their idle rate under a downlink load while
+     * NEIGHBOURS' beacons, decoded by the same receiver in the same seconds,
+     * stay at 87%.
+     *
+     * A cap costs nothing here - the loop runs every millisecond, so 16
+     * frames an iteration is 16000 a second, far above anything this AP
+     * sustains - and it leaves the chip room to breathe between bursts. */
+    const size_t burst = batch.size() < kTxBurst ? batch.size() : kTxBurst;
+    size_t i = 0;
+    for (; i < burst; i++) {
+      if (g_dev->send_packet(batch[i].data(), batch[i].size())) {
+        g_sent.fetch_add(1);
+        tx_backoff_ms = 0;
+      } else {
+        g_send_fail.fetch_add(1);
+        break;
+      }
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    if (i < batch.size()) {
+      /* Back at the front, ahead of anything enqueued while we were
+       * sending. Not through enqueue(): these were counted in g_q_in when
+       * they were first offered, and counting them twice would break the
+       * ledger identity the on-air cells check. The cap still applies -
+       * anything beyond it is a queue drop like any other. */
+      std::lock_guard<std::mutex> l(g_q_mu);
+      for (size_t k = batch.size(); k-- > i;) {
+        if (g_q.size() < 128) g_q.insert(g_q.begin(), std::move(batch[k]));
+        else g_q_drop.fetch_add(1);
+      }
+      tx_backoff_ms = tx_backoff_ms ? std::min(tx_backoff_ms * 2, 16) : 1;
+      g_backoffs.fetch_add(1);
+    }
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(tx_backoff_ms ? tx_backoff_ms : 1));
   }
   /* THE TAP CLOSES BEFORE THE LEDGER IS PRINTED, and the queue is drained
    * after that. Otherwise the reader thread can frame and enqueue between the
@@ -1341,14 +1409,15 @@ int main(int argc, char** argv) {
   fprintf(stderr,
           "  data plane: encrypted frames received=%llu, MIC failures=%llu, "
           "replays rejected=%llu, queued=%llu, frames sent=%llu, "
-          "queue dropped=%llu, send failed=%llu\n",
+          "queue dropped=%llu, send failed=%llu, backoffs=%llu\n",
           (unsigned long long)g_enc_rx.load(),
           (unsigned long long)g_mic_fail.load(),
           (unsigned long long)g_replayed.load(),
           (unsigned long long)g_q_in.load(),
           (unsigned long long)g_sent.load(),
           (unsigned long long)g_q_drop.load(),
-          (unsigned long long)g_send_fail.load());
+          (unsigned long long)g_send_fail.load(),
+          (unsigned long long)g_backoffs.load());
 
   /* Retried, and the failure reported. StopBeacon can now genuinely fail (an
    * EP0 stall during teardown), IRadio.h says such a failure "must be retried
