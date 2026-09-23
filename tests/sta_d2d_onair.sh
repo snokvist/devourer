@@ -35,6 +35,7 @@
 #   fiveghz   the same at 5 GHz (CH5, default 36) - unreachable with a kernel AP
 #   airgap    the two radios on DIFFERENT channels: the link MUST NOT form,
 #             and the ping MUST be lost. The falsifier for every cell above.
+#   thru      one-way UDP goodput, both directions - the first real throughput
 #   bench     software CCMP cost at BOTH ends, under a load the link sustains
 #   flood     the ceiling, and whether both ledgers account for what exceeds it
 #
@@ -47,7 +48,8 @@
 # Env: STA_SYSFS (the MT7612U sta_client claims), AP_SYSFS (the adapter
 # ap_wpa2 claims), AP_VID/AP_PID, CH, CH5, PSK, FW_DIR, SECS, NS, APTAP,
 # STATAP, AIRGAP_SECS, BEACONS_MIN, PING_N, PING_MIN, BENCH_SECS,
-# BENCH_PAYLOAD, BENCH_PPS.
+# BENCH_PAYLOAD, BENCH_PPS, THRU_SECS, THRU_PAYLOAD, TX_RATE, ARQ,
+# THRU_LADDER, THRU_LOSS_PCT, SOAK_MINUTES.
 
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -89,6 +91,37 @@ BEACONS_MIN="${BEACONS_MIN:-20}"
 # over six.
 PING_N="${PING_N:-20}"
 PING_MIN="${PING_MIN:-16}"
+# The throughput cell: how long each direction runs, and how big the UDP
+# payload is. 1400 avoids IP fragmentation over a 1500-byte TAP.
+THRU_SECS="${THRU_SECS:-15}"
+THRU_PAYLOAD="${THRU_PAYLOAD:-1400}"
+# The offered-rate ladder, in kbit/s, and the loss a rung may carry and
+# still count. 5% is loose, and deliberately so: neither end retransmits
+# (see ARQ), so the knee of a link like this is where loss climbs, not
+# where it appears.
+THRU_LADDER="${THRU_LADDER:-1000,2000,4000,6000,9000,14000,20000,30000}"
+THRU_LOSS_PCT="${THRU_LOSS_PCT:-5}"
+# THE TWO PERFORMANCE KNOBS, both off by default so every figure already
+# recorded stays reproducible.
+#
+# TX_RATE is the rate EVERY frame airs at, at both ends. The default is 6M
+# legacy - the most robust OFDM rate there is, and a 6 Mbit/s ceiling. There
+# is no rate control anywhere in this project's station path and there is not
+# going to be: choosing a rate from link statistics is the integrator's job.
+# What the harness owes is the ability to ask. Grammar is DEVOURER_TX_RATE's
+# (see CLAUDE.md): 6M, MCS7/40/SGI, VHT2SS_MCS3/80/LDPC, ...
+TX_RATE="${TX_RATE:-6M}"
+# ARQ=1 arms the AP's hardware ACK responder on the BSSID, which closes a
+# MAC-level retransmission loop for the STATION'S UPLINK: the station's MAC
+# retries until the AP acknowledges. The station side needs nothing - an
+# MT7612U auto-ACKs its own address from SetStationIdentity, measured at
+# 99.9% in Phase 0 (docs/mt7612u-station-identity.md, R6).
+#
+# NOT symmetric, and the asymmetry is the point: this arms the AP's RECEIVER
+# to answer, and whether the AP's TRANSMITTER asks for an ACK is a descriptor
+# property this harness does not set. So expect the uplink to improve and
+# make no prediction about the downlink - measure it.
+ARQ="${ARQ:-0}"
 BENCH_SECS="${BENCH_SECS:-15}"
 # The bench PACES its traffic, and that is a finding rather than a
 # convenience: this link's measured ceiling is about twenty round trips a
@@ -180,6 +213,7 @@ rfkill unblock wlan 2>/dev/null || true
 say "AP  $AP_SYSFS ($ap_vid:$ap_pid, devourer/ap_wpa2, in netns '$NS')"
 say "STA $STA_SYSFS ($sta_vid:$sta_pid, devourer/sta_client, root namespace)"
 say "ssid '$SSID' bssid $BSSID  psk '$PSK'  taps '$APTAP'/'$STATAP'"
+say "tx rate '$TX_RATE'  arq $ARQ"
 
 # --- build -----------------------------------------------------------------
 
@@ -187,6 +221,7 @@ build_both() {
   [ -f "$BUILD/libdevourer.a" ] || {
     say "no $BUILD/libdevourer.a - build the library first"; return 1; }
   local cf; cf=$(pkg-config --cflags --libs libusb-1.0) || return 1
+  g++ -std=c++20 -O2 "$ROOT/tests/udp_blast.cpp" -o "$OUT/udp_blast" || return 1
   local f
   for f in ap_wpa2 sta_client; do
     g++ -std=c++20 -O2 -I"$ROOT/src" -I"$ROOT/tests" -I"$ROOT/examples/common" \
@@ -223,7 +258,10 @@ ns_up() {
 ap_up() {   # $1 = channel, $2 = seconds, $3.. = extra env
   local chan="$1" secs="$2"; shift 2
   rm -f "$OUT/ap.log"
+  local arq_env=""
+  [ "$ARQ" = 1 ] && arq_env="DEVOURER_ACK_RESPONDER=$BSSID"
   ip netns exec "$NS" env \
+      ${arq_env:+"$arq_env"} DEVOURER_TX_RATE="$TX_RATE" \
       DEVOURER_VID="$AP_VID" DEVOURER_PID="$AP_PID" \
       DEVOURER_USB_BUS="${AP_SYSFS%%-*}" DEVOURER_USB_PORT="${AP_SYSFS#*-}" \
       DEVOURER_CHANNEL="$chan" DEVOURER_WPA2_PSK="$PSK" DEVOURER_BCN_TU=25 \
@@ -258,7 +296,8 @@ ap_up() {   # $1 = channel, $2 = seconds, $3.. = extra env
 sta_up() {   # $1 = channel, $2 = seconds, $3.. = extra env
   local chan="$1" secs="$2"; shift 2
   rm -f "$OUT/sta.log"
-  env DEVOURER_VID=0x0e8d DEVOURER_PID=0x7612 \
+  env DEVOURER_TX_RATE="$TX_RATE" \
+      DEVOURER_VID=0x0e8d DEVOURER_PID=0x7612 \
       DEVOURER_USB_BUS="${STA_SYSFS%%-*}" DEVOURER_USB_PORT="${STA_SYSFS#*-}" \
       DEVOURER_CHANNEL="$chan" DEVOURER_TX_WITH_RX=thread \
       DEVOURER_MT7612U_FW_DIR="$FW_DIR" \
@@ -765,6 +804,126 @@ cell_flood() {
   say "  and nothing in this tree measures the throughput of a station link."
 }
 
+# --- cell: throughput ------------------------------------------------------
+#
+# THE FIRST THING IN THIS TREE THAT MEASURES THROUGHPUT. Every station-link
+# figure before this one came from a flood ping, and a flood ping is
+# round-trip bound: it offers the next request only when the previous reply
+# arrives. `reply_pps` is a LATENCY figure wearing a throughput costume, and
+# it cannot tell a link that refuses to carry more from a link nobody asked
+# more of.
+#
+# A LADDER OF OFFERED RATES, not a blast. The first version of this cell
+# offered as fast as the socket would take it and measured 5.6 Gbit/s
+# OFFERED against 5.0 Mbit/s delivered - at which point what is being
+# measured is the kernel dropping on a TAP queue, and `lost` is dominated by
+# frames the radio never saw. The ladder finds the knee instead: the highest
+# offered rate the link carries with the loss still under THRU_LOSS_PCT.
+#
+# WHAT THE NUMBER IS: UDP payload goodput, one direction at a time. The
+# 802.11, LLC/SNAP, CCMP, IP and UDP headers are all excluded, so it is
+# strictly below what a radiotap capture would show - the honest direction to
+# err in. Both directions are measured separately because an AP's downlink
+# and a station's uplink are different code paths with different bugs.
+#
+# WHAT IT IS NOT: a PHY rate, and not a tuned link. Both ends air every frame
+# at a FIXED rate (TX_RATE) with no rate control, and unless ARQ=1 there is
+# no link-layer retransmission in either direction.
+thru_step() {   # $1 = direction (up|down), $2 = offered kbit -> echoes the recv JSON
+  local dir="$1" kbit="$2"
+  if [ "$dir" = up ]; then
+    ip netns exec "$NS" "$OUT/udp_blast" recv "$APIP" 5201 "$THRU_SECS" \
+        >"$OUT/thru.$dir.$kbit.recv" 2>&1 &
+    local rpid=$!
+    sleep 1
+    "$OUT/udp_blast" send "$APIP" 5201 "$THRU_PAYLOAD" "$kbit" "$THRU_SECS" \
+        >"$OUT/thru.$dir.$kbit.send" 2>&1
+    wait $rpid 2>/dev/null
+  else
+    "$OUT/udp_blast" recv "$STAIP" 5201 "$THRU_SECS" \
+        >"$OUT/thru.$dir.$kbit.recv" 2>&1 &
+    local rpid=$!
+    sleep 1
+    ip netns exec "$NS" "$OUT/udp_blast" send "$STAIP" 5201 "$THRU_PAYLOAD" \
+        "$kbit" "$THRU_SECS" >"$OUT/thru.$dir.$kbit.send" 2>&1
+    wait $rpid 2>/dev/null
+  fi
+  grep -h udp_blast.recv "$OUT/thru.$dir.$kbit.recv" 2>/dev/null | tail -1
+}
+
+# The knee: walk the ladder, print every rung, and return the best delivered
+# rate whose loss is still under the threshold. Printing every rung matters -
+# a single headline number hides whether the link degrades gracefully or
+# falls off a cliff, and those need different fixes.
+thru_ladder() {   # $1 = direction -> echoes "best_mbps best_kbit"
+  local dir="$1" kbit json mbps loss best=0 best_at=0
+  for kbit in $(printf '%s' "$THRU_LADDER" | tr ',' ' '); do
+    json=$(thru_step "$dir" "$kbit")
+    [ -n "$json" ] || { say "    ${dir} @${kbit}kbit: nothing received"; continue; }
+    mbps=$(printf '%s' "$json" | sed -n 's/.*"goodput_mbps":\([0-9.]*\).*/\1/p')
+    loss=$(printf '%s' "$json" | sed -n 's/.*"loss_pct":\([0-9.]*\).*/\1/p')
+    say "    ${dir} offered ${kbit} kbit/s -> delivered ${mbps:-0} Mbit/s, loss ${loss:-?}%"
+    printf '%s\n' "$json" | sed "s/udp_blast.recv/d2d.throughput.$dir/" >>"$OUT/thru.rows"
+    if awk -v l="${loss:-100}" -v t="$THRU_LOSS_PCT" 'BEGIN{exit !(l<=t)}'; then
+      if awk -v m="${mbps:-0}" -v b="$best" 'BEGIN{exit !(m>b)}'; then
+        best="$mbps"; best_at="$kbit"
+      fi
+    fi
+  done
+  # THROUGH A FILE, not stdout. The per-rung lines above are stdout too, so
+  # a caller reading this function's output with $( ) gets the whole table
+  # and then parses the first line as the answer - which is exactly what the
+  # first version of this cell did, and it reported "UP up Mbit/s".
+  printf '%s %s\n' "$best" "$best_at" >"$OUT/thru.$dir.best"
+}
+
+cell_throughput() {
+  local freq
+  freq=$(chan_freq "$CH") || { bad "throughput: channel '$CH' is not one this harness can map"; return; }
+  case "$THRU_SECS$THRU_PAYLOAD" in
+    ''|*[!0-9]*) bad "throughput: THRU_SECS and THRU_PAYLOAD must be integers"; return ;;
+  esac
+  local steps; steps=$(printf '%s' "$THRU_LADDER" | tr ',' ' ' | wc -w)
+  say "== throughput: UDP goodput, ${THRU_PAYLOAD}B, ${steps}-rung ladder x ${THRU_SECS}s each way, ch$CH ($freq MHz), rate $TX_RATE, arq=$ARQ =="
+
+  build_both || { bad "throughput: build"; return; }
+  ns_up      || { bad "throughput: could not create netns $NS"; return; }
+  rm -f "$OUT/thru.rows"
+  local run_secs=$(( SECS + (steps * (THRU_SECS + 2) * 2) + 30 ))
+  ap_up "$CH" $((run_secs + 30)) || { bad "throughput: the AP did not come up"; stop_both; return; }
+  sta_up "$CH" "$run_secs" || { bad "throughput: sta_client did not start"; stop_both; return; }
+  sta_tap_up || { stop_both; return; }
+  wait_for "4-WAY HANDSHAKE COMPLETE" "$OUT/ap.log" 40 || {
+    bad "throughput: the four-way did not complete"; stop_both; return; }
+  ping -c 1 -W 3 -I "$STATAP" "$APIP" >/dev/null 2>&1          # warm both
+  ip netns exec "$NS" ping -c 1 -W 3 -I "$APTAP" "$STAIP" >/dev/null 2>&1
+
+  say "  uplink (station -> AP):"
+  thru_ladder up
+  local up_best up_at; read -r up_best up_at <"$OUT/thru.up.best"
+  say "  downlink (AP -> station):"
+  thru_ladder down
+  local dn_best dn_at; read -r dn_best dn_at <"$OUT/thru.down.best"
+
+  if ! sta_alive || ! ap_alive; then
+    bad "throughput: an endpoint exited during the measurement (raise SECS, currently $SECS)"
+    stop_both; return
+  fi
+  ok "throughput: both endpoints survived the whole ladder, both directions"
+  stop_both
+
+  # A LADDER THAT NEVER DELIVERED ANYTHING IS NOT A MEASUREMENT. The bench
+  # cell in this file shipped with exactly that hole one layer down - it
+  # printed 0 ns/frame over three thousand round trips and passed.
+  if awk -v u="${up_best:-0}" -v d="${dn_best:-0}" 'BEGIN{exit !(u>0 && d>0)}'; then
+    ok "throughput: ch$CH $TX_RATE arq=$ARQ - UP ${up_best} Mbit/s (offered ${up_at} kbit/s), DOWN ${dn_best} Mbit/s (offered ${dn_at} kbit/s), both at <= ${THRU_LOSS_PCT}% loss"
+  else
+    bad "throughput: a direction never carried a rung under ${THRU_LOSS_PCT}% loss (up=${up_best} down=${dn_best}) - see the rungs above"
+  fi
+  say "  goodput is UDP PAYLOAD, one direction at a time, at a FIXED $TX_RATE"
+  say "  with arq=$ARQ. It is not a PHY rate and not a tuned link."
+}
+
 # Expected check counts, so the advertised score is machine-enforced rather
 # than counted by eye - a future edit that drops an ok()/bad() pair would
 # otherwise run one check fewer, exit 0, and still be read as "N/N".
@@ -774,10 +933,11 @@ case "$CELLS" in
   airgap)  cell_airgap;                    want=5 ;;
   bench)   cell_bench;                     want=3 ;;
   flood)   cell_flood;                     want=3 ;;
+  thru)    cell_throughput;                want=2 ;;
   all)     cell_link wpa2 "$CH"; cleanup
            cell_link fiveghz "$CH5"; cleanup
            cell_airgap;                    want=21 ;;
-  *)       echo "usage: $0 [wpa2|fiveghz|airgap|bench|flood|all]"; exit 2 ;;
+  *)       echo "usage: $0 [wpa2|fiveghz|airgap|bench|flood|thru|soak|all]"; exit 2 ;;
 esac
 
 say ""

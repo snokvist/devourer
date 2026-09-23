@@ -1001,7 +1001,22 @@ int main(int argc, char** argv) {
   g_dev = dev.get();
   if (!g_dev) return 1;
 
-  g_rt = devourer::build_stream_radiotap(devourer::parse_tx_mode_str("6M"));
+  /* THE RATE EVERY FRAME AIRS AT, and until now it was 6M legacy, hardcoded,
+   * with no way to ask for anything else. That is a reasonable default - it
+   * is the most robust OFDM rate there is, and a link that will not come up
+   * at 6M has a problem worth seeing - but it is also a 6 Mbit/s ceiling on
+   * a part that does 80 MHz VHT, and every throughput figure this project
+   * has ever quoted for a station link was measured under it.
+   *
+   * There is no rate control here and there is not going to be: this is a
+   * test harness, and picking a rate per frame from link statistics is the
+   * integrator's job (docs/station-mode-scope.md says so about the scanner
+   * and the reconnect policy for the same reason). What the harness owes is
+   * the ability to ASK, so the ceiling can be measured rather than assumed. */
+  const char* rate_s = std::getenv("DEVOURER_TX_RATE");
+  if (!rate_s || !*rate_s) rate_s = "6M";
+  g_rt = devourer::build_stream_radiotap(devourer::parse_tx_mode_str(rate_s));
+  std::fprintf(stderr, "  TX rate: %s\n", rate_s);
   g_dev->InitWrite(SelectedChannel{g_chan, 0, CHANNEL_WIDTH_20});
 
   /* THE STATION'S ADDRESS IS THE ADAPTER'S, NOT A CHOICE. See the note at the

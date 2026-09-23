@@ -1103,6 +1103,18 @@ if(OpenSSL_FOUND AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_test(NAME sta_client_headless COMMAND StaClientSelftest --self-test)
 endif()
 
+# tests/udp_blast.cpp - one-way UDP throughput, because nothing in this tree
+# measured throughput at all: every station-link figure so far came from a
+# flood ping, which is round-trip bound and therefore a LATENCY measurement.
+# No device and no library - it is BSD sockets and a sequence number - so it
+# builds and self-tests in every job. The cells pin the loss, reorder and
+# duplicate accounting against known answers over loopback; 6/6 mutations
+# caught, including one that only bites past the 1024-slot reorder window.
+if(UNIX)
+    add_executable(UdpBlast tests/udp_blast.cpp)
+    add_test(NAME udp_blast_selftest COMMAND UdpBlast --self-test)
+endif()
+
 # src/sta/Dot11.h - the management-frame module the AP harnesses and a station
 # share. Pure and header-only, so this needs neither OpenSSL nor libusb and
 # runs in every CI job. Covers the IE walker against truncated and hostile
