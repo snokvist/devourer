@@ -78,6 +78,9 @@ public:
    * call on a chip whose transmitter has stopped, which is the whole point. */
   void DumpChipState() override;
   uint32_t GetTxDmaStatus() override;
+  void DumpMacRegisters() override;
+  bool ReadPacketBuffer(int sel, uint32_t offset, uint8_t *out,
+                        size_t n) override;
   void ClearAckResponder() override;
   /* A-MPDU TX mode (IRadio contract; src/AmpduMode.h). Programs the 8822C
    * aggregate-fill timer (0x455) under _reg_mu (serialized against the coex

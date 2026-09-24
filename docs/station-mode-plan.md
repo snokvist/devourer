@@ -1894,6 +1894,91 @@ equivalent, which is why the part stays dead for the life of the process.
 A reset path is a fix for the SYMPTOM and worth having regardless of which
 candidate above turns out to be the cause.
 
+#### FIXED 2026-09-24: the beacon's page was being overwritten by data
+
+**Root cause, read directly out of the chip.** The TX FIFO's 128-byte pages
+are chained by the LLT (link list table). The auto-LLT init links every page
+to the next, `0 -> 1 -> ... -> 2047`, so the data ring runs on into the
+reserved region - and page `rsvd_boundary` (1938) is where the beacon lives.
+A sustained downlink is eventually allocated page 1938 and overwrites the
+beacon; the next TBTT reads a data frame where it expects a beacon descriptor,
+and the MAC latches `TXDMA_STATUS` `BIT_TXPKTBUF_REQ_ERR` and never transmits
+again. Read back through the packet-buffer debug window (a port of halmac
+`read_buf_88xx`):
+
+```
+healthy:   page 1938 = 59 00 30 85 00 10 00 00 ...   the beacon descriptor
+at fault:  page 1938 = 5a 5a 5a 5a 5a 5a 5a 5a ...   the injected data's fill
+```
+
+**The vendor driver's chip, on the same adapter, read live through its own
+`fifo_dump` while carrying 8 Mbit/s with zero loss:** of its 2048 LLT entries,
+exactly one structural entry differs from ours - `LLT[1937]`, which is `0`
+there (the ring wraps back to page 0) and `1938` here (the ring runs on into
+the beacon). The only other difference is the free list's live tail marker.
+
+**The fix is that one entry.** `HalmacJaguar3MacInit::terminate_acq_ring`
+writes `LLT[rsvd_boundary - 1] = 0` straight after the auto-LLT init, and
+reads it back rather than trusting the write. Library only; no knob.
+
+| measured on the RTL8812CU AP, MCS7, ch6 | before | after |
+|---|---|---|
+| downlink goodput, 1% loss | 0.445 Mbit/s | **24.3 Mbit/s** |
+| our beacon under downlink load | 8% of idle | **100% of idle** |
+| reconnects during a downlink phase | 1 per phase | **0** |
+| flood ping | ~21 round trips/s, 78-89% loss | **357/s, 1.1% loss** |
+| 2000-frame injection with the beacon armed | fault at frame ~172 | **2001/2001, no fault** |
+| plain `txdemo`, 8000 frames max duty | clean | **clean** (unaffected) |
+
+**HOW the vendor's chip gets that terminator is NOT established.** Its source
+only runs the same auto-init; one candidate is the firmware acting on the
+`GENERAL_INFO` H2C (`FW_TX_BOUNDARY`), a packet-type H2C this backend never
+sends. Writing the entry directly is what the evidence supports; porting
+`GENERAL_INFO` would be the higher-fidelity follow-up.
+
+**How it was found**, because the path is the transferable part: a
+TX-DMA watchdog showed the fault comes FIRST (172 frames sent, zero
+failures, then the fault); the latch point scaled with pages, not frames,
+predicted before measuring (1400 B -> 172 frames, 200 B -> 678); it needed
+the beacon engine (bisected: net_type=AP and EN_BCN_FUNCTION, not
+EN_BCNQ_DL or the RSVD_PAGE H2C); it moved earlier when the ring was
+pre-loaded; and with a 1000 TU beacon all 600 frames of a test went out
+before the next TBTT fired it. Then the vendor driver on the same adapter
+gave the answer key: a full MAC register diff, a usbmon descriptor diff, and
+finally its live LLT.
+
+**Ruled out on the way, each by measurement:** the TX queue mapping (a real
+defect, fixed in `3f92d08`, but not this one); the page allocation table;
+the LLT init sequence itself; the boundary registers; every vendor
+beacon-engine register (applied all at once - no change); the descriptor
+MACID; the RSVD_PAGE H2C; and a beacon keepalive, which could never have
+worked because re-issuing a beacon into a page the data ring owns does not
+protect it.
+
+**Three hypotheses I recorded in earlier commits were wrong**, and are
+corrected here rather than left standing: (1) that HIGH-queue page
+exhaustion caused the wedge - it was a consequence of the mis-queuing, and
+the queue fix moved the exhaustion to LOW without touching the wedge;
+(2) the `beacons` cell's "STARVED, not clobbered" message - the page WAS
+clobbered, and the message now says what it checks; (3) that my
+`control_tx.sh` was broken - it was right, see below.
+
+**One false fix, caught before it shipped.** Clearing `EN_BCNQ_DL` for the
+duration of the beacon download, as the vendor does for other reserved-page
+downloads, also made the fault disappear - because the beacon then never
+aired at all (`ours+0` every second; the station got in on probe responses
+and lost the link every second). The existing comment in `send_fw_page`
+keeping it set on USB was right. The lesson generalises: a fix that removes
+a fault by removing the thing that reads the corrupted state is not a fix.
+
+**Open, and flagged rather than quietly retuned:** the `wpa2` acceptance
+cell at the default 6M on ch6 now fails its 16-of-20 threshold about one run
+in three (14/20 twice in six). The same cell at MCS7 reads 19-20/20 every
+time, and 6M on ch6 was already this lossy BEFORE this fix (27% at 10 pps
+measured earlier the same day), so it is not a regression - it is a
+threshold I calibrated on ch36 applied to ch6. Why 6M legacy is less
+reliable than MCS7 on this bench is itself unexplained.
+
 #### A RETRACTION OF A RETRACTION, which is worth more than either
 
 Earlier this session an ad-hoc script concluded the AP adapter was mute.

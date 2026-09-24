@@ -131,6 +131,27 @@ public:
    * Returns 0 where unsupported, which is indistinguishable from healthy;
    * a caller that needs to tell those apart should ask the backend. */
   virtual uint32_t GetTxDmaStatus() { return 0; }
+  /* The whole MAC register window, 0x0000..0x0FFF, printed in the SAME
+   * format as the rtl88x2cu vendor driver's /proc/.../mac_reg_dump - one
+   * line per 16 bytes, "0x%04x 0x%08x  0x%08x  0x%08x  0x%08x" - so a dump
+   * from each can be diffed line by line. That is its whole purpose: the
+   * vendor driver's AP on an RTL8812CU carried an 8 Mbit/s downlink for 20 s
+   * with zero loss and zero TX faults, and this project's AP on the SAME
+   * adapter faults after one traversal of its TX page ring. Somewhere in this
+   * window is the difference. 1024 register reads over USB: diagnostic use
+   * only. No-op where unsupported. */
+  virtual void DumpMacRegisters() {}
+  /* Read the chip's internal packet memory through the debug window
+   * (REG_PKTBUF_DBG_CTRL + 0x8000..0x8FFF), a port of halmac read_buf_88xx.
+   * `sel` 0 = TX FIFO, 1 = the LLT (the linked list that chains TX pages).
+   * `offset` is in bytes from the start of that memory. Diagnostic: it
+   * borrows a shared debug window, so never call it on the send path.
+   * Returns false where unsupported. */
+  virtual bool ReadPacketBuffer(int sel, uint32_t offset, uint8_t *out,
+                                size_t n) {
+    (void)sel; (void)offset; (void)out; (void)n;
+    return false;
+  }
   /* The MAC carrier-sense gate, one bit at a time.
    *
    * SetCcaMode is all-or-nothing, and on Jaguar1 and Jaguar3 it is two

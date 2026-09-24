@@ -1879,6 +1879,54 @@ devourer::ThermalStatus RtlJaguar3Device::GetThermalStatus() {
  * that has already failed. The bit meanings are the ones StartBeacon sets:
  * EN_BCNQ_DL (FWHW_TXQ_CTRL BIT22), EN_BCN_FUNCTION | DIS_TSF_UDT
  * (BCN_CTRL bits 3 and 4) and port-0 net_type = AP (REG_CR [17:16]). */
+bool RtlJaguar3Device::ReadPacketBuffer(int sel, uint32_t offset,
+                                        uint8_t *out, size_t n) {
+  /* halmac read_buf_88xx: 4 KiB windows, TX FIFO based at window 0x780 and
+   * the LLT at 0x650, selected through the low 12 bits of 0x0140. */
+  uint32_t base;
+  if (sel == 0)
+    base = 0x780;
+  else if (sel == 1)
+    base = 0x650;
+  else
+    return false;
+  if (n % 4)
+    return false;
+  uint32_t win = (offset >> 12) + base;
+  uint32_t residue = offset & 0xFFF;
+  const uint16_t saved = _device.rtw_read16(0x0140);
+  const uint16_t hi = static_cast<uint16_t>(saved & 0xF000);
+  size_t got = 0;
+  while (got < n) {
+    _device.rtw_write16(0x0140, static_cast<uint16_t>(win | hi));
+    for (uint32_t a = 0x8000 + residue; a <= 0x8FFF && got < n; a += 4) {
+      const uint32_t v = _device.rtw_read<uint32_t>(static_cast<uint16_t>(a));
+      out[got + 0] = static_cast<uint8_t>(v);
+      out[got + 1] = static_cast<uint8_t>(v >> 8);
+      out[got + 2] = static_cast<uint8_t>(v >> 16);
+      out[got + 3] = static_cast<uint8_t>(v >> 24);
+      got += 4;
+    }
+    residue = 0;
+    win++;
+  }
+  _device.rtw_write16(0x0140, saved);
+  return true;
+}
+
+void RtlJaguar3Device::DumpMacRegisters() {
+  /* stdout-free on purpose: the event plane is stdout, and this is a
+   * diagnostic diff source, so it goes to stderr in the vendor's format. */
+  std::fprintf(stderr, "======= MAC REG =======\n");
+  for (uint32_t base = 0; base < 0x1000; base += 16) {
+    std::fprintf(stderr, "0x%04x", base);
+    for (uint32_t k = 0; k < 16; k += 4)
+      std::fprintf(stderr, " 0x%08x ",
+                   _device.rtw_read<uint32_t>(static_cast<uint16_t>(base + k)));
+    std::fprintf(stderr, "\n");
+  }
+}
+
 uint32_t RtlJaguar3Device::GetTxDmaStatus() {
   return _device.rtw_read<uint32_t>(REG_TXDMA_STATUS);
 }
@@ -1912,6 +1960,18 @@ void RtlJaguar3Device::DumpChipState() {
   _logger->info("j3 chipstate: FIFOPAGE_CTRL_2=0x{:04x} bcn_valid={} "
                 "TXDMA_STATUS=0x{:08x}",
                 pg_ctrl2, (bcn_valid >> 7) & 1, txdma);
+  /* THE RING BOUNDARIES, read back live. The TX page ring faults when data
+   * walks through the reserved region while the TBTT beacon engine is
+   * running; the registers that are supposed to keep it out are written once
+   * at init with the right values. These say whether they STAYED right. */
+  _logger->info("j3 chipstate: BCNQ_BDNY=0x{:04x} BCNQ_BDNY2(0x206)=0x{:04x} "
+                "BCNQ1_BDNY=0x{:04x} AUTO_LLT=0x{:08x} TXDMA_OFFSET_CHK=0x{:04x} "
+                "RQPN_CTRL_2=0x{:08x}",
+                _device.rtw_read16(0x0424), _device.rtw_read16(0x0206),
+                _device.rtw_read16(0x0456),
+                _device.rtw_read<uint32_t>(0x0208),
+                _device.rtw_read16(0x020C),
+                _device.rtw_read<uint32_t>(0x022C));
   _logger->info("j3 chipstate: pages configured/AVAILABLE - HQ {}/{} LQ {}/{} "
                 "NQ {}/{} PUB {}/{}",
                 hq, (hq_r >> 16) & 0x0fff,

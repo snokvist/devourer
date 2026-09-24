@@ -237,6 +237,38 @@ static bool profiled_ccmp(bool encrypt, const uint8_t* key, const uint8_t* nonce
   return ok;
 }
 
+/* THE BEACON PAGE AND THE LLT, read out of the chip (DEVOURER_AP_PKTBUF=1).
+ *
+ * The fault latches at a TBTT after data has been through the ring, which
+ * says the beacon engine read a page data had written. Two ways that could
+ * happen - the free list spans the reserved region from the start, or the
+ * hardware returns the beacon's page after each transmission - and they need
+ * different fixes. This reads the answer rather than inferring it: the first
+ * bytes of the beacon page (the injected frames are filled with 0x5a, so an
+ * overwrite is recognisable), and the LLT entries around the ACQ boundary
+ * (1938) and the end of the FIFO (2047), to see where the list actually
+ * links. */
+static void probe_pktbuf(const char* when) {
+  auto* rtl = dynamic_cast<IRtlRadio*>(g_dev);
+  if (!rtl) return;
+  uint8_t pg[32];
+  if (rtl->ReadPacketBuffer(0, 1938u << 7, pg, sizeof pg)) {
+    fprintf(stderr, "  PKTBUF %s: page 1938 =", when);
+    for (size_t i = 0; i < sizeof pg; i++) fprintf(stderr, " %02x", pg[i]);
+    fprintf(stderr, "\n");
+  }
+  /* LLT: one 32-bit entry per page is the most likely layout; print raw
+   * words so the layout can be read off rather than assumed. */
+  static const uint32_t pages[] = {0, 1, 1936, 1937, 1938, 1939, 2046, 2047};
+  fprintf(stderr, "  LLT %s:", when);
+  for (uint32_t p : pages) {
+    uint8_t e[4];
+    if (rtl->ReadPacketBuffer(1, p * 4, e, 4))
+      fprintf(stderr, " [%u]=%02x%02x%02x%02x", p, e[3], e[2], e[1], e[0]);
+  }
+  fprintf(stderr, "\n");
+}
+
 static void enqueue(std::vector<uint8_t> mpdu) {
   std::vector<uint8_t> f; f.reserve(g_rt.size() + mpdu.size());
   f.insert(f.end(), g_rt.begin(), g_rt.end());
@@ -1272,7 +1304,79 @@ int main(int argc, char** argv) {
   g_dev->InitWrite(SelectedChannel{g_chan, 0, CHANNEL_WIDTH_20});
   int tu = 25; if (const char* i = std::getenv("DEVOURER_BCN_TU")) tu = atoi(i);
   std::vector<uint8_t> bcn = build_beacon(tu);
-  bool bok = g_dev->StartBeacon(bcn.data(), bcn.size(), tu);
+  /* TWO DIAGNOSTIC KNOBS, both off by default, for one question: does the
+   * TX-DMA fault need the BEACON to be armed?
+   *
+   * The fault fires after ~2048 pages of transmission - one full traversal
+   * of the TX page ring - predicted and confirmed at two frame sizes. But
+   * txdemo, driving the same RTL8812CU through the same send path with the
+   * RX thread running, aired 5050 frames across several traversals with
+   * TXDMA_STATUS at zero throughout, and the FPV downlink has always pushed
+   * far more than 256 KB through this path. So it is not Jaguar3 TX in
+   * general. The obvious difference is that this AP arms a beacon in the
+   * reserved region, enables the beacon function and sets net_type=AP.
+   *
+   * DEVOURER_AP_NO_BEACON=1 skips StartBeacon. DEVOURER_AP_INJECT=N queues N
+   * 1476-byte data frames at a dummy unicast address straight after
+   * bring-up, so the A/B needs no station and no association: same binary,
+   * same descriptor, same queue, beacon on or off. */
+  /* DEVOURER_AP_PRE_INJECT=N: send N 1476-byte data frames synchronously,
+   * with NO beacon armed, before StartBeacon. Absolute or relative? If the
+   * fault is the TX ring pointer reaching a page the beacon engine reads,
+   * pre-loading the ring moves the fault EARLIER after the beacon starts; if
+   * it is something that counts from beacon start, it does not move. These
+   * frames bypass enqueue(), so `queued` at the fault counts only frames
+   * sent after the beacon was armed. */
+  if (const char* pre = std::getenv("DEVOURER_AP_PRE_INJECT")) {
+    const uint64_t n = std::strtoull(pre, nullptr, 10);
+    static const uint8_t kDummy[6] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01};
+    uint64_t ok = 0;
+    for (uint64_t i = 0; i < n; i++) {
+      std::vector<uint8_t> m = devourer::sta::data_hdr_from_ds(
+          kDummy, kBssid, kBssid, /*protect=*/false, g_seq.next());
+      m.resize(m.size() + 1452, 0x5a);
+      std::vector<uint8_t> f(g_rt);
+      f.insert(f.end(), m.begin(), m.end());
+      if (g_dev->send_packet(f.data(), f.size())) ok++;
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    fprintf(stderr, "  DIAGNOSTIC: pre-injected %llu/%llu frames with no beacon\n",
+            (unsigned long long)ok, (unsigned long long)n);
+  }
+  if (auto* rtl = dynamic_cast<IRtlRadio*>(g_dev)) {
+    fprintf(stderr, "  --- chip state BEFORE THE BEACON ---\n");
+    rtl->DumpChipState();
+    if (std::getenv("DEVOURER_AP_PKTBUF")) probe_pktbuf("before beacon");
+    /* The whole LLT, in the vendor driver's fifo_dump byte layout, so the two
+     * can be diffed entry for entry (DEVOURER_AP_LLT_FULL=1). */
+    if (std::getenv("DEVOURER_AP_LLT_FULL")) {
+      std::vector<uint8_t> llt(8192);
+      if (rtl->ReadPacketBuffer(1, 0, llt.data(), llt.size())) {
+        fprintf(stderr, "LLT FIFO DUMP [start_addr:0x0000 , size:8192]\n");
+        for (size_t i = 0; i < llt.size(); i += 16) {
+          for (size_t k = 0; k < 16; k++)
+            fprintf(stderr, "%02X%s", llt[i + k], (k % 4 == 3) ? "  " : " ");
+          fprintf(stderr, "\n");
+        }
+      }
+    }
+  }
+  const bool no_beacon = std::getenv("DEVOURER_AP_NO_BEACON") &&
+                         std::strcmp(std::getenv("DEVOURER_AP_NO_BEACON"), "0") != 0;
+  bool bok = no_beacon ? true
+                       : g_dev->StartBeacon(bcn.data(), bcn.size(), tu);
+  if (no_beacon) fprintf(stderr, "  DIAGNOSTIC: beacon NOT started\n");
+  /* A BISECTION OF StartBeacon, with no library change. StopBeacon undoes
+   * exactly three of StartBeacon's steps - EN_BCN_FUNCTION, EN_BCNQ_DL and
+   * net_type - and leaves the rest: the reserved-page download, the port
+   * identity, the interval and the H2C. Start then immediately stop, then
+   * inject: if the fault survives, the culprit is in the half StopBeacon
+   * leaves behind; if it disappears, it is in the half it undoes. */
+  if (!no_beacon && std::getenv("DEVOURER_AP_STOP_BEACON_FIRST")) {
+    const bool stopped = g_dev->StopBeacon();
+    fprintf(stderr, "  DIAGNOSTIC: beacon started then stopped (%s)\n",
+            stopped ? "ok" : "FAILED");
+  }
   std::thread rx([&]{ g_dev->StartRxLoop(on_rx); });
 
   /* DOWN: the host's frames become 802.11, addressed and keyed per station.
@@ -1297,10 +1401,16 @@ int main(int argc, char** argv) {
   if (auto* rtl = dynamic_cast<IRtlRadio*>(g_dev)) {
     fprintf(stderr, "  --- chip state WHILE HEALTHY ---\n");
     rtl->DumpChipState();
+    if (std::getenv("DEVOURER_AP_PKTBUF")) probe_pktbuf("healthy");
+    /* The full-window diff source - see IRtlRadio::DumpMacRegisters. */
+    if (std::getenv("DEVOURER_AP_MAC_DUMP")) rtl->DumpMacRegisters();
   }
   std::signal(SIGINT, ap_on_signal);
   std::signal(SIGTERM, ap_on_signal);
   int tx_backoff_ms = 0;
+  uint64_t inject_left = 0;
+  if (const char* n = std::getenv("DEVOURER_AP_INJECT"))
+    inject_left = std::strtoull(n, nullptr, 10);
   uint64_t consecutive_fail = 0;
   /* THE TX-DMA WATCHDOG. Polled, not per-frame: a register read costs USB
    * round trips and CLAUDE.md's standing rule is that nothing reads a
@@ -1316,6 +1426,21 @@ int main(int argc, char** argv) {
   auto end = std::chrono::steady_clock::now() + std::chrono::seconds(sec);
   while (!g_stop && std::chrono::steady_clock::now() < end) {
     hs_tick();                                   // 4-way retransmissions
+    if (inject_left) {
+      /* One per iteration, and only while the queue is short, so the
+       * injection is paced by the chip rather than overflowing the cap. */
+      size_t qn;
+      { std::lock_guard<std::mutex> l(g_q_mu); qn = g_q.size(); }
+      if (qn < 8) {
+        static const uint8_t kDummy[6] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01};
+        std::vector<uint8_t> f = devourer::sta::data_hdr_from_ds(
+            kDummy, kBssid, kBssid, /*protect=*/false, g_seq.next());
+        f.resize(f.size() + 1452, 0x5a);          /* 24 + 1452 = 1476 bytes */
+        enqueue(std::move(f));
+        if (--inject_left == 0)
+          fprintf(stderr, "  DIAGNOSTIC: injection finished\n");
+      }
+    }
     std::vector<std::vector<uint8_t>> batch;
     { std::lock_guard<std::mutex> l(g_q_mu); batch.swap(g_q); }
     /* THE BACKOFF THE LIBRARY ASKS FOR, AND THIS HARNESS NEVER DID.
@@ -1427,6 +1552,8 @@ int main(int argc, char** argv) {
               r2->DumpChipState();
             }
           }
+          if (st != txdma_seen && std::getenv("DEVOURER_AP_PKTBUF"))
+            probe_pktbuf("at fault");
           if (st != txdma_seen) {
             fprintf(stderr,
                     "  TXDMA_STATUS 0x%08x -> 0x%08x  after queued=%llu "

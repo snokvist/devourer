@@ -2277,11 +2277,19 @@ int main(int argc, char **argv) {
        * climbing failed with was_timeout=1 is a full TX FIFO (recoverable
        * back-pressure); a hard rc is a broken path. */
       auto ts = rtlDevice->GetTxStats();
+      /* The MAC's TX-DMA fault latch (IRtlRadio::GetTxDmaStatus), on the
+       * same 1-in-500 cadence as the rest of this event - never per frame.
+       * A nonzero value means the part has stopped transmitting whatever
+       * `submitted` says; the vendor answers it with a MAC reset. */
+      uint32_t txdma = 0;
+      if (auto *rr = dynamic_cast<IRtlRadio *>(rtlDevice))
+        txdma = rr->GetTxDmaStatus();
       devourer::Ev(*g_ev, "tx.stats")
           .f("submitted", (unsigned long long)ts.submitted)
           .f("failed", (unsigned long long)ts.failed)
           .f("was_timeout", ts.last_was_timeout ? 1 : 0)
-          .f("last_rc", ts.last_error_rc);
+          .f("last_rc", ts.last_error_rc)
+          .f("txdma_status", (unsigned long long)txdma);
     }
     /* Thermal telemetry via the generation-agnostic GetThermalStatus
      * (previously Jaguar1-only): every family reads its RF 0x42 meter —

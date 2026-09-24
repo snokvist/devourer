@@ -591,8 +591,81 @@ bool HalmacJaguar3MacInit::priority_queue_cfg() {
     }
   }
 
+  if (!terminate_acq_ring(rsvd_boundary))
+    return false;
+
   /* transfer mode NORMAL = 0 */
   _device.rtw_write8(REG_CR + 3, 0);
+  return true;
+}
+
+/* TERMINATE THE DATA PAGE RING AT THE RESERVED BOUNDARY.
+ *
+ * The LLT (link list table) chains the TX FIFO's 128-byte pages; the MAC
+ * allocates data pages by walking it. The auto-init above leaves every page
+ * linked to the next, 0 -> 1 -> ... -> 2047, so the chain runs straight
+ * through the reserved region - page rsvd_boundary and up, where the BEACON
+ * lives. Nothing then stops a sustained data flow from being allocated page
+ * rsvd_boundary and overwriting the beacon. It is harmless until something
+ * reads that page: the TBTT beacon engine does, every beacon interval, and
+ * when it reads a data frame where it expects a beacon descriptor the MAC
+ * latches TXDMA_STATUS BIT_TXPKTBUF_REQ_ERR and never transmits again for the
+ * life of the process (sometimes not until the adapter is re-plugged).
+ *
+ * MEASURED, not inferred, on an RTL8812CU:
+ *   - page rsvd_boundary read `59 00 30 85 ...` (the beacon descriptor) with
+ *     the link healthy and `5a 5a 5a ...` (the injected data's fill byte)
+ *     at the fault;
+ *   - the fault fires after one traversal of the ring (~2048 pages) at two
+ *     frame sizes, moves earlier when the ring is pre-loaded before the
+ *     beacon starts, and latches at the next TBTT - with a 1000 TU beacon all
+ *     600 frames of a test went out before it fired;
+ *   - it needs the beacon engine running (net_type=AP and EN_BCN_FUNCTION);
+ *     plain injection with no beacon crossed the ring several times clean;
+ *   - the rtl88x2cu VENDOR driver's LLT on the same chip, read live through
+ *     its fifo_dump while carrying 8 Mbit/s: every one of its 2048 entries
+ *     matches this backend's except LLT[rsvd_boundary - 1], which is 0 there
+ *     and rsvd_boundary here (the only other difference is the free list's
+ *     live tail marker). Its data ring wraps back to page 0; ours ran on.
+ *
+ * With this one entry written, the same AP carries 19.8 Mbit/s downlink at
+ * MCS7 with 0.9% loss (it collapsed above 0.45 Mbit/s before), and its beacon
+ * holds 100% of its idle rate under that load instead of falling to 8%.
+ *
+ * HOW the vendor's chip gets that terminator is NOT established. Its source
+ * never writes the LLT, only the same auto-init; one candidate is the
+ * firmware acting on the GENERAL_INFO H2C (FW_TX_BOUNDARY), a packet-type H2C
+ * this backend does not send. So this writes the entry directly, through the
+ * packet-buffer debug window (halmac read_buf_88xx's addressing: LLT at
+ * window 0x650, 4 KiB per window, selected in REG_PKTBUF_DBG_CTRL), and
+ * reads it back rather than trusting the write. */
+bool HalmacJaguar3MacInit::terminate_acq_ring(uint16_t rsvd_boundary) {
+  if (rsvd_boundary == 0)
+    return true; /* no reserved region, nothing to protect */
+  constexpr uint16_t kPktbufDbgCtrl = 0x0140; /* REG_PKTBUF_DBG_CTRL */
+  constexpr uint32_t LLT_WINDOW_BASE = 0x650;
+  const uint32_t off = static_cast<uint32_t>(rsvd_boundary - 1) * 4u;
+  const uint16_t win = static_cast<uint16_t>((off >> 12) + LLT_WINDOW_BASE);
+  const uint16_t addr = static_cast<uint16_t>(0x8000u + (off & 0xFFFu));
+
+  const uint16_t saved = _device.rtw_read16(kPktbufDbgCtrl);
+  _device.rtw_write16(kPktbufDbgCtrl,
+                      static_cast<uint16_t>((saved & 0xF000u) | win));
+  const uint32_t before = _device.rtw_read<uint32_t>(addr);
+  _device.rtw_write<uint32_t>(addr, 0u);
+  const uint32_t after = _device.rtw_read<uint32_t>(addr);
+  _device.rtw_write16(kPktbufDbgCtrl, saved);
+
+  if (after != 0u) {
+    _logger->error("Jaguar3: could not terminate the TX page ring at page {} "
+                   "(LLT entry reads 0x{:x} after writing 0) - a sustained "
+                   "load will overwrite the beacon",
+                   rsvd_boundary - 1, after);
+    return false;
+  }
+  _logger->info("Jaguar3: TX page ring terminated at page {} (LLT entry "
+                "0x{:x} -> 0), reserved region protected",
+                rsvd_boundary - 1, before);
   return true;
 }
 

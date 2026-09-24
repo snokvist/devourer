@@ -472,9 +472,11 @@ struct DeviceConfig {
      * against the vendor driver's end state. */
     std::string replay_wseq;
     /* env: DEVOURER_TX_QSEL — EXPERIMENTAL (A-MPDU spike, tests/ampdu_spike):
-     * override the data TX-descriptor QSEL (default 0x12 = MGMT queue, the
-     * monitor-inject convention). Data-queue values are the TID (0..7);
-     * hardware A-MPDU formation is expected only on data queues. */
+     * override the TX-descriptor QSEL. The default is 0x12 (MGMT) for
+     * management/control frames and, on Jaguar3, 0 (TID0/BE, LOW queue) for
+     * 802.11 data frames - see src/jaguar3/CLAUDE.md. Data-queue values are
+     * the TID (0..7); hardware A-MPDU formation is expected only on data
+     * queues. On Jaguar3 the bulk-OUT endpoint follows the final QSEL. */
     std::optional<uint8_t> tx_qsel;
     /* env: DEVOURER_TX_RATEID — EXPERIMENTAL (retry-ladder probe,
      * tests/retry_ladder_probe.sh): override the TX-descriptor RATE_ID (the

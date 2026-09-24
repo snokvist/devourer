@@ -1069,14 +1069,14 @@ cell_beacons() {
   down_ours=$(awk -v a="${o0:-0}" -v b="${o1:-0}" -v s="$phase" 'BEGIN{printf "%.1f", (b-a)/s}')
   down_rc=$(( ${r1:-0} - ${r0:-0} ))
 
-  # -- phase 4: IDLE AGAIN. Starved or clobbered? The beacon lives in the
-  # chip's reserved page and the hardware airs it at every TBTT from that one
-  # download (see RtlJaguar3Device::StartBeacon). If it comes straight back
-  # when the load stops, the page is intact and the beacon was losing an
-  # arbitration - the fix is to stop saturating the transmit path. If it
-  # stays dead, the page or the beacon queue state did not survive the load -
-  # the fix is to re-download it, which nothing does today because a single
-  # download was measured to be enough on an idle link.
+  # -- phase 4: IDLE AGAIN. Did the beacon survive the load? It lives in the
+  # chip's reserved page and the hardware airs it at every TBTT from one
+  # download. It used NOT to survive: the TX data page ring ran on into the
+  # reserved region, a sustained load overwrote the beacon page, and the next
+  # TBTT read a data frame as a beacon descriptor and latched a TX-DMA fault
+  # (measured - the page read 5a 5a 5a..., the injected fill byte). Fixed in
+  # HalmacJaguar3MacInit::terminate_acq_ring. This phase is the regression
+  # check for it: a beacon that does not come back means the page was lost.
   sleep 2
   b0=$(tick_field beacons); o0=$(tick_field beacons_ours)
   sleep "$phase"
@@ -1110,9 +1110,9 @@ cell_beacons() {
 
   # STARVED OR CLOBBERED. This is the one that says which fix to write.
   if awk -v a="$after_ours" -v i="$idle_ours" 'BEGIN{exit !(i>0 && a >= i*0.8)}'; then
-    ok "beacons: the beacon comes straight back when the load stops (${after_ours}/s vs ${idle_ours}/s idle) - the reserved page survives, so it is being STARVED, not clobbered"
+    ok "beacons: the beacon comes straight back when the load stops (${after_ours}/s vs ${idle_ours}/s idle) - the beacon page survived the load"
   else
-    bad "beacons: the beacon does NOT recover when the load stops (${after_ours}/s vs ${idle_ours}/s idle) - the reserved page or the beacon queue did not survive the load, and a single download is no longer enough"
+    bad "beacons: the beacon does NOT recover when the load stops (${after_ours}/s vs ${idle_ours}/s idle) - the beacon page was lost; check that bring-up logged 'TX page ring terminated' (HalmacJaguar3MacInit::terminate_acq_ring)"
   fi
 
   # THE DIRECTION DISCRIMINATOR, and it is the ratio of two ratios rather than either
@@ -1132,7 +1132,9 @@ cell_beacons() {
         }
         theirs = 100*theirs_n/theirs_d
         printf "ours %.0f%% of idle, neighbours %.0f%% of idle", ours, theirs
-        if (ours < theirs*0.6)
+        if (ours >= 80)
+          printf "  -> the beacon SURVIVES downlink load"
+        else if (ours < theirs*0.6)
           printf "  -> THE AP STOPPED SENDING (ours fell much further)"
         else
           printf "  -> both fell alike: the STATION RECEIVER is the bottleneck, not the AP" }')"

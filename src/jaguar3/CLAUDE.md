@@ -35,6 +35,24 @@ narrowband dividers, RF18 encoding), strategy interfaces `Jaguar3Calibration`
 - The rtl8822e's hardware-bisected constraints (DPDT/pin-mux front end,
   single-path 1SS TX, spur channels, LCK, the 2.4 GHz TX kernel-parity
   limitation) live in `docs/8822e-quirks.md`.
+- **The TX data page ring must end at `rsvd_boundary - 1`.** The auto-LLT
+  init links every TX FIFO page to the next, 0 -> ... -> 2047, so the data
+  ring runs on into the reserved region where the beacon lives. With a
+  beacon armed, a sustained load overwrites the beacon page and the next
+  TBTT latches `TXDMA_STATUS` `BIT_TXPKTBUF_REQ_ERR` - the part stops
+  transmitting for the life of the process. `terminate_acq_ring` writes
+  `LLT[rsvd_boundary - 1] = 0` after the LLT init, matching the vendor
+  driver's chip entry for entry (its 2048-entry LLT differs from ours only
+  there). Measured: AP downlink 0.445 -> 24.3 Mbit/s at MCS7. Plain injection
+  never showed it - no beacon engine reads the page - so the FPV path was
+  unaffected, and loses 110 pages of ring (2048 -> 1938) it never needed.
+- **Data frames go to the LOW queue.** `fill_data_tx_desc_8822c` stamps
+  QSEL 0x12 (MGNT) on everything; `build_tx_block` moves 802.11 data frames
+  to QSEL 0 (BE) and `send_packet` derives the bulk-OUT endpoint from the
+  final QSEL (halmac `get_usb_bulkout_id_88xx`: HIGH 0x05, NORMAL 0x06,
+  LOW 0x08). QSEL and endpoint must agree - changing either alone was
+  measured to do nothing, and `TXDMA_STATUS` has an `EP_QSEL_DIFF` bit for
+  the mismatch. Management and beacons stay on HIGH.
 
 ## Bring-up cost and the pipelined register writes
 
