@@ -1879,6 +1879,10 @@ devourer::ThermalStatus RtlJaguar3Device::GetThermalStatus() {
  * that has already failed. The bit meanings are the ones StartBeacon sets:
  * EN_BCNQ_DL (FWHW_TXQ_CTRL BIT22), EN_BCN_FUNCTION | DIS_TSF_UDT
  * (BCN_CTRL bits 3 and 4) and port-0 net_type = AP (REG_CR [17:16]). */
+uint32_t RtlJaguar3Device::GetTxDmaStatus() {
+  return _device.rtw_read<uint32_t>(REG_TXDMA_STATUS);
+}
+
 void RtlJaguar3Device::DumpChipState() {
   const uint32_t cr = _device.rtw_read<uint32_t>(REG_CR);
   const uint32_t txq = _device.rtw_read<uint32_t>(REG_FWHW_TXQ_CTRL);

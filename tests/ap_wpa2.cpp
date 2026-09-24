@@ -1302,6 +1302,13 @@ int main(int argc, char** argv) {
   std::signal(SIGTERM, ap_on_signal);
   int tx_backoff_ms = 0;
   uint64_t consecutive_fail = 0;
+  /* THE TX-DMA WATCHDOG. Polled, not per-frame: a register read costs USB
+   * round trips and CLAUDE.md's standing rule is that nothing reads a
+   * register on the send path. Ten times a second is enough to catch WHEN
+   * the fault latches, which is the question - a fault that appears with the
+   * very first frames is a different bug from one that appears after N. */
+  auto last_txdma = std::chrono::steady_clock::now();
+  uint32_t txdma_seen = 0;
   uint32_t bcn_refresh_ms = 0;
   if (const char* r = std::getenv("DEVOURER_AP_BCN_REFRESH_MS"))
     bcn_refresh_ms = (uint32_t)std::strtoul(r, nullptr, 10);
@@ -1399,6 +1406,39 @@ int main(int argc, char** argv) {
       }
       tx_backoff_ms = tx_backoff_ms ? std::min(tx_backoff_ms * 2, 16) : 1;
       g_backoffs.fetch_add(1);
+    }
+    {
+      const auto now_d = std::chrono::steady_clock::now();
+      if (std::chrono::duration_cast<std::chrono::milliseconds>(now_d - last_txdma)
+              .count() >= 100) {
+        last_txdma = now_d;
+        if (auto* rtl = dynamic_cast<IRtlRadio*>(g_dev)) {
+          const uint32_t st = rtl->GetTxDmaStatus();
+          /* THE PAGE COUNTS ALONGSIDE IT, every poll while healthy. Two
+           * stories fit "the fault fires at 2048 pages": the pages leak and
+           * the allocator runs out, or they are freed normally and the write
+           * pointer walks past the ACQ boundary into the reserved region on
+           * the first wrap. Availability declining monotonically to zero
+           * says the first; staying healthy right up to the fault says the
+           * second - and the reserved region is where the beacon lives. */
+          if (st != txdma_seen && g_dev) {
+            if (auto* r2 = dynamic_cast<IRtlRadio*>(g_dev)) {
+              fprintf(stderr, "  pages at the transition:\n");
+              r2->DumpChipState();
+            }
+          }
+          if (st != txdma_seen) {
+            fprintf(stderr,
+                    "  TXDMA_STATUS 0x%08x -> 0x%08x  after queued=%llu "
+                    "sent=%llu send_failed=%llu qdrop=%llu\n",
+                    txdma_seen, st, (unsigned long long)g_q_in.load(),
+                    (unsigned long long)g_sent.load(),
+                    (unsigned long long)g_send_fail.load(),
+                    (unsigned long long)g_q_drop.load());
+            txdma_seen = st;
+          }
+        }
+      }
     }
     if (bcn_refresh_ms) {
       const auto now_b = std::chrono::steady_clock::now();

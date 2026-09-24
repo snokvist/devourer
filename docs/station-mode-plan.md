@@ -1812,6 +1812,88 @@ that sustains load on this silicon. `first_bulk_out_ep()` is used the same
 way in Jaguar1 and Jaguar2; the QSEL hardcode is Jaguar3's, and the comment
 says it mirrors Jaguar1's. Neither was checked on hardware here.
 
+#### The fault fires at the first wrap of the TX page ring — measured, and predicted first
+
+`IRtlRadio::GetTxDmaStatus()` (new, Jaguar3 implements it) plus a supervisory
+watchdog in `ap_wpa2` that polls it ten times a second — **not** per frame,
+because reading a register on the send path is forbidden here for good
+reason. It logs the transition with the transmit counters attached.
+
+**The fault comes FIRST, and everything else follows from it:**
+
+```
+TXDMA_STATUS 0x00000000 -> 0x00040000  after queued=172 sent=172 send_failed=0 qdrop=0
+```
+
+172 frames sent, **zero failures, zero queue drops**, and then the fault. The
+send failures and the queue overflow that this investigation started from are
+downstream of it, not the cause.
+
+**It is a page count, not a frame count.** The TX FIFO is 262144 bytes in
+128-byte pages = 2048 pages. Predicting before measuring: a smaller frame
+occupies fewer pages, so it should take proportionally MORE frames to reach
+the same page total.
+
+| payload | frame + desc | pages/frame | latched after | pages |
+|---|---|---|---|---|
+| 1400 B | 1524 B | 12 | 172, 174 | 2064, 2088 |
+| 200 B | 324 B | 3 | **678** | 2034 |
+
+Both land on ~2048 — the whole FIFO — from frame counts that differ by a
+factor of four. One run latched at 348 frames (4176 pages), i.e. the second
+traversal rather than the first, so the wrap is the trigger but not every
+wrap trips it.
+
+**It is NOT a page leak**, and this is the measurement that says so. At the
+instant of the transition:
+
+```
+HQ 64/64   LQ 64/16   NQ 64/64   PUB 1745/1745
+```
+
+The public pool is entirely free and HQ untouched; LQ shows ordinary
+in-flight usage. Pages are being allocated and released correctly right up to
+the moment the MAC faults.
+
+**Four candidates ruled out by reading the vendor and the port side by side:**
+
+- The queue mapping — fixed above, and the registers confirm the frames moved.
+  The fault survived it.
+- The page allocation table: devourer's `PG_HQ/NQ/LQ/EXQ/GAP = 64/64/64/0/1`
+  and 110 reserved pages are byte-identical to the vendor's
+  `HALMAC_PG_NUM_3BULKOUT_8822C` NORMAL row.
+- The LLT. The Link List Table is what chains the FIFO's pages into a ring,
+  and an uninitialised one would fault at exactly the end of the buffer —
+  a perfect fit that turned out to be wrong: `priority_queue_cfg()` performs
+  `BIT_AUTO_INIT_LLT_V1` and polls it to completion, faithfully.
+- The boundary registers: `FIFOPAGE_CTRL_2` reads back 0x0792 = 1938 on the
+  live part, which is the computed `rsvd_boundary`.
+
+**What is left**, in the order I would test it:
+
+1. **The write pointer entering the reserved region.** The ACQ region ends at
+   page 1938 and the fault lands nearer 2048, which is past it — and the
+   reserved region is where the beacon page lives. That would explain the
+   beacon dying and the fault together, and nothing measured so far
+   contradicts it.
+2. **Per-frame page accounting drift.** If the MAC advances its pointer by a
+   different amount than the host assumes, the error is invisible until the
+   first wrap. `TXPKTSIZE` + `OFFSET` add up to the delivered length on every
+   frame checked (1476 + 48 = 1524, and the bulk write logs 1524), so this
+   needs a different probe than reading the descriptor.
+3. **`URB_ZERO_PACKET`.** The vendor sets it on every TX URB
+   (`usb_ops_linux.c:651`); devourer's synchronous `libusb_bulk_transfer`
+   has no equivalent and pads nothing. It does not fire for the fixed
+   1524-byte frames measured here, so it cannot be the trigger for THIS
+   result — but it remains a real divergence on frames that do land on a
+   512-byte multiple.
+
+The vendor's own answer to any nonzero `TXDMA_STATUS` is a MAC silent reset
+(`core/rtw_sreset.c`, `hal/rtl8822c/rtl8822c_ops.c`). devourer has no
+equivalent, which is why the part stays dead for the life of the process.
+A reset path is a fix for the SYMPTOM and worth having regardless of which
+candidate above turns out to be the cause.
+
 #### A RETRACTION OF A RETRACTION, which is worth more than either
 
 Earlier this session an ad-hoc script concluded the AP adapter was mute.

@@ -113,6 +113,24 @@ public:
    * tests/canary_diff.py. Reading a powered-down chip yields garbage or throws;
    * interpreting that is the caller's job. No-op where unsupported (default). */
   virtual void DumpChipState() {}
+  /* The MAC's TX-DMA fault latch, for a caller that needs to know its
+   * transmitter has stopped.
+   *
+   * This is not a statistic. The vendor driver treats ANY nonzero value as a
+   * fatal TXDMA error and answers it with a MAC silent reset
+   * (core/rtw_sreset.c, hal/rtl8822c/rtl8822c_ops.c in the rtl88x2cu tree);
+   * once a bit here is set the part has stopped transmitting and will not
+   * resume on its own. Measured on an RTL8812CU under a sustained downlink
+   * load: 0x00040000, BIT_TXPKTBUF_REQ_ERR, latched while the receiver went
+   * on working perfectly.
+   *
+   * NOT FOR THE SEND PATH. This is a register read over USB - see the
+   * standing rule in CLAUDE.md that nothing reads a register per frame - so
+   * poll it on a supervisory cadence, not per transmission.
+   *
+   * Returns 0 where unsupported, which is indistinguishable from healthy;
+   * a caller that needs to tell those apart should ask the backend. */
+  virtual uint32_t GetTxDmaStatus() { return 0; }
   /* The MAC carrier-sense gate, one bit at a time.
    *
    * SetCcaMode is all-or-nothing, and on Jaguar1 and Jaguar3 it is two

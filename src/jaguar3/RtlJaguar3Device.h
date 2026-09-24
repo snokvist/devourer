@@ -77,6 +77,7 @@ public:
   /* The TX/beacon register witness — see the definition. Read-only; safe to
    * call on a chip whose transmitter has stopped, which is the whole point. */
   void DumpChipState() override;
+  uint32_t GetTxDmaStatus() override;
   void ClearAckResponder() override;
   /* A-MPDU TX mode (IRadio contract; src/AmpduMode.h). Programs the 8822C
    * aggregate-fill timer (0x455) under _reg_mu (serialized against the coex
