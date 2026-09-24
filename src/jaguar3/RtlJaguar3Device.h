@@ -74,6 +74,9 @@ public:
   size_t send_packets(const TxPacketView *pkts, size_t count) override;
   /* Hardware ACK responder (IRadio contract; src/AckResponder.h). */
   bool SetAckResponder(const devourer::MacAddr &mac) override;
+  /* The TX/beacon register witness — see the definition. Read-only; safe to
+   * call on a chip whose transmitter has stopped, which is the whole point. */
+  void DumpChipState() override;
   void ClearAckResponder() override;
   /* A-MPDU TX mode (IRadio contract; src/AmpduMode.h). Programs the 8822C
    * aggregate-fill timer (0x455) under _reg_mu (serialized against the coex

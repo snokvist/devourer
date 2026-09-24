@@ -1867,6 +1867,59 @@ devourer::ThermalStatus RtlJaguar3Device::GetThermalStatus() {
   return t;
 }
 
+/* WHY THIS EXISTS. A sustained downlink load stops this part transmitting:
+ * the beacon disappears from the air, management replies go unanswered, and
+ * the receiver carries on decoding perfectly (measured — the AP logged
+ * seventeen received authentication requests and answered none). Whether the
+ * MAC's beacon gates got cleared or the failure is below the register
+ * interface decides which fix to write, and until now nothing could read
+ * them back.
+ *
+ * Read-only and allocation-free, so it is safe to call from a transmit path
+ * that has already failed. The bit meanings are the ones StartBeacon sets:
+ * EN_BCNQ_DL (FWHW_TXQ_CTRL BIT22), EN_BCN_FUNCTION | DIS_TSF_UDT
+ * (BCN_CTRL bits 3 and 4) and port-0 net_type = AP (REG_CR [17:16]). */
+void RtlJaguar3Device::DumpChipState() {
+  const uint32_t cr = _device.rtw_read<uint32_t>(REG_CR);
+  const uint32_t txq = _device.rtw_read<uint32_t>(REG_FWHW_TXQ_CTRL);
+  const uint8_t bcn_ctrl = _device.rtw_read8(REG_BCN_CTRL);
+  const uint16_t bcn_int = _device.rtw_read16(0x0554);
+  const uint16_t pg_ctrl2 = _device.rtw_read16(0x0204);
+  const uint8_t bcn_valid = _device.rtw_read8(0x0205);
+  const uint32_t txdma = _device.rtw_read<uint32_t>(REG_TXDMA_STATUS);
+  /* THE FLOW-CONTROL SIGNAL devourer never consults. The vendor driver reads
+   * the AVAILABLE page count out of the high half of each FIFOPAGE_INFO
+   * register - proc_get_pubq_free_page in the rtl88x2cu tree is exactly
+   * `(rtw_read32(0x0240) >> 16) & 0x0FFF` - while this backend submits until
+   * the USB endpoint NAKs and then eats a 20 ms timeout per refusal. If the
+   * public queue reads zero here on a wedged part, that is the mechanism. */
+  const uint32_t hq_r  = _device.rtw_read<uint32_t>(0x0230 /* INFO_1, HQ  */);
+  const uint32_t lq_r  = _device.rtw_read<uint32_t>(0x0234 /* INFO_2, LQ  */);
+  const uint32_t nq_r  = _device.rtw_read<uint32_t>(0x0238 /* INFO_3, NQ  */);
+  const uint32_t pub_r = _device.rtw_read<uint32_t>(0x0240 /* INFO_5, PUB */);
+  const uint16_t hq = (uint16_t)(hq_r & 0x0fff);
+  const uint16_t pub = (uint16_t)(pub_r & 0x0fff);
+
+  _logger->info("j3 chipstate: CR=0x{:08x} (net_type={}) TXQ_CTRL=0x{:08x} "
+                "(EN_BCNQ_DL={}) BCN_CTRL=0x{:02x} (EN_BCN={} DIS_TSF_UDT={}) "
+                "bcn_interval={} TU",
+                cr, (cr >> 16) & 0x3, txq, (txq >> 22) & 1, bcn_ctrl,
+                (bcn_ctrl >> 3) & 1, (bcn_ctrl >> 4) & 1, bcn_int);
+  _logger->info("j3 chipstate: FIFOPAGE_CTRL_2=0x{:04x} bcn_valid={} "
+                "TXDMA_STATUS=0x{:08x}",
+                pg_ctrl2, (bcn_valid >> 7) & 1, txdma);
+  _logger->info("j3 chipstate: pages configured/AVAILABLE - HQ {}/{} LQ {}/{} "
+                "NQ {}/{} PUB {}/{}",
+                hq, (hq_r >> 16) & 0x0fff,
+                lq_r & 0x0fff, (lq_r >> 16) & 0x0fff,
+                nq_r & 0x0fff, (nq_r >> 16) & 0x0fff,
+                pub, (pub_r >> 16) & 0x0fff);
+  /* EVERY ONE OF THESE IS A GUESS UNTIL IT IS READ BACK ON A WEDGED PART.
+   * If they all read the same as they do on a healthy one, the beacon gates
+   * are not the mechanism and this dump has done its job by excluding them —
+   * which is worth as much as finding the bit. */
+}
+
 bool RtlJaguar3Device::send_packet(const uint8_t *packet, size_t length) {
   /* The coex runtime thread (coex_runtime_loop) drives the periodic coex
    * decision + FW heartbeats + C2H draining, so the TX hot path stays lean. */

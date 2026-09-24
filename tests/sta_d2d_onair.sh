@@ -37,6 +37,7 @@
 #             and the ping MUST be lost. The falsifier for every cell above.
 #   thru      one-way UDP goodput, both directions - the first real throughput
 #   beacons   which end starves the beacon, with no third radio needed
+#   soak      a long run: does the link hold, do the books still close
 #   bench     software CCMP cost at BOTH ends, under a load the link sustains
 #   flood     the ceiling, and whether both ledgers account for what exceeds it
 #
@@ -51,7 +52,7 @@
 # STATAP, AIRGAP_SECS, BEACONS_MIN, PING_N, PING_MIN, BENCH_SECS,
 # BENCH_PAYLOAD, BENCH_PPS, THRU_SECS, THRU_PAYLOAD, TX_RATE, ARQ,
 # THRU_LADDER, THRU_LOSS_PCT, THRU_DIR, BCN_TU, BEACON_PHASE_SECS,
-# BEACON_KBIT, BEACON_FLOOR_PCT.
+# BEACON_KBIT, BEACON_FLOOR_PCT, BCN_REFRESH_MS.
 
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -130,6 +131,11 @@ ARQ="${ARQ:-0}"
 # beacon starve the data path" is a question with a one-word answer only if
 # you can change it.
 BCN_TU="${BCN_TU:-25}"
+# The beacon keepalive: how often the AP re-downloads its beacon page, in
+# milliseconds. 0 is off and is the default, because every figure already
+# recorded in this branch was taken without it. See the note in
+# tests/ap_wpa2.cpp for why the vendor driver does this on USB.
+BCN_REFRESH_MS="${BCN_REFRESH_MS:-0}"
 # Which direction the throughput ladder walks. `both` is the measurement;
 # `up` and `down` exist so a diagnostic arm does not have to pay for the half
 # it is not asking about - which on a shared bench is most of the cost.
@@ -140,6 +146,14 @@ THRU_DIR="${THRU_DIR:-both}"
 BEACON_PHASE_SECS="${BEACON_PHASE_SECS:-12}"
 BEACON_KBIT="${BEACON_KBIT:-4000}"
 BEACON_FLOOR_PCT="${BEACON_FLOOR_PCT:-50}"
+# The soak. Uplink-dominant because the AP's transmit path wedges under
+# sustained downlink load and a soak that triggers a known defect in its
+# first minute measures the defect. SOAK_DOWN_KBIT is reserved for when
+# that is fixed.
+SOAK_MINUTES="${SOAK_MINUTES:-30}"
+SOAK_KBIT="${SOAK_KBIT:-4000}"
+SOAK_CHUNK_S="${SOAK_CHUNK_S:-60}"
+SOAK_DEGRADE_PCT="${SOAK_DEGRADE_PCT:-20}"
 BENCH_SECS="${BENCH_SECS:-15}"
 # The bench PACES its traffic, and that is a finding rather than a
 # convenience: this link's measured ceiling is about twenty round trips a
@@ -231,7 +245,7 @@ rfkill unblock wlan 2>/dev/null || true
 say "AP  $AP_SYSFS ($ap_vid:$ap_pid, devourer/ap_wpa2, in netns '$NS')"
 say "STA $STA_SYSFS ($sta_vid:$sta_pid, devourer/sta_client, root namespace)"
 say "ssid '$SSID' bssid $BSSID  psk '$PSK'  taps '$APTAP'/'$STATAP'"
-say "tx rate '$TX_RATE'  arq $ARQ  beacon ${BCN_TU}TU"
+say "tx rate '$TX_RATE'  arq $ARQ  beacon ${BCN_TU}TU  refresh ${BCN_REFRESH_MS}ms"
 
 # --- build -----------------------------------------------------------------
 
@@ -280,6 +294,7 @@ ap_up() {   # $1 = channel, $2 = seconds, $3.. = extra env
   [ "$ARQ" = 1 ] && arq_env="DEVOURER_ACK_RESPONDER=$BSSID"
   ip netns exec "$NS" env \
       ${arq_env:+"$arq_env"} DEVOURER_TX_RATE="$TX_RATE" \
+      DEVOURER_AP_BCN_REFRESH_MS="$BCN_REFRESH_MS" \
       DEVOURER_VID="$AP_VID" DEVOURER_PID="$AP_PID" \
       DEVOURER_USB_BUS="${AP_SYSFS%%-*}" DEVOURER_USB_PORT="${AP_SYSFS#*-}" \
       DEVOURER_CHANNEL="$chan" DEVOURER_WPA2_PSK="$PSK" DEVOURER_BCN_TU="$BCN_TU" \
@@ -1118,6 +1133,139 @@ cell_beacons() {
           printf "  -> both fell alike: the STATION RECEIVER is the bottleneck, not the AP" }')"
 }
 
+# --- cell: the soak --------------------------------------------------------
+#
+# EVERY FIGURE IN THIS BRANCH CAME FROM A RUN OF 45 TO 160 SECONDS. That is
+# long enough to prove a link comes up and short enough to miss everything
+# that only happens on the hundredth rekey, the ten-thousandth frame, or the
+# first time a counter wraps. This is the cell that runs long.
+#
+# UPLINK-DOMINANT ON PURPOSE. The AP's transmit path wedges under sustained
+# downlink load (see the plan's Phase 5 section) and a soak that spends its
+# first minute triggering a known defect measures that defect, not stability.
+# The downlink is still exercised - a ping every SOAK_PING_S proves it is
+# alive in both directions - but it is not loaded. When the Jaguar3 transmit
+# path is fixed, raise SOAK_DOWN_KBIT and this becomes the bidirectional
+# soak it should eventually be.
+#
+# WHAT IT GRADES, and none of it is "it did not crash":
+#   - ONE association for the whole run. A soak that silently re-associates
+#     every ten minutes is a soak that proves nothing about the link.
+#   - The books close at both ends AFTER the long run, not just after a
+#     short one - a counter that drifts by one frame per thousand is
+#     invisible at 40 seconds and obvious at 30 minutes.
+#   - Throughput in the LAST quarter against the FIRST. Degradation over
+#     time is the thing a soak exists to find and a single end-of-run
+#     average hides it completely.
+#   - Resident memory at both ends, first sample against last.
+cell_soak() {
+  local freq
+  freq=$(chan_freq "$CH") || { bad "soak: channel '$CH' is not one this harness can map"; return; }
+  case "$SOAK_MINUTES$SOAK_KBIT$SOAK_CHUNK_S" in
+    ''|*[!0-9]*) bad "soak: SOAK_MINUTES, SOAK_KBIT and SOAK_CHUNK_S must be integers"; return ;;
+  esac
+  [ "$SOAK_MINUTES" -gt 0 ] || { bad "soak: SOAK_MINUTES must be positive"; return; }
+  local total=$(( SOAK_MINUTES * 60 ))
+  local chunks=$(( total / SOAK_CHUNK_S ))
+  [ "$chunks" -ge 4 ] || { bad "soak: need at least 4 chunks (SOAK_MINUTES*60 / SOAK_CHUNK_S = $chunks)"; return; }
+  say "== soak: ${SOAK_MINUTES} min, ${SOAK_KBIT} kbit/s uplink in ${chunks} x ${SOAK_CHUNK_S}s chunks, ch$CH ($freq MHz), rate $TX_RATE =="
+
+  build_both || { bad "soak: build"; return; }
+  ns_up      || { bad "soak: could not create netns $NS"; return; }
+  local run_secs=$(( SECS + total + 120 ))
+  ap_up "$CH" $((run_secs + 60)) || { bad "soak: the AP did not come up"; stop_both; return; }
+  sta_up "$CH" "$run_secs" DEVOURER_STA_TICK_MS=1000 || {
+    bad "soak: sta_client did not start"; stop_both; return; }
+  sta_tap_up || { stop_both; return; }
+  wait_for "4-WAY HANDSHAKE COMPLETE" "$OUT/ap.log" 40 || {
+    bad "soak: the four-way did not complete"; stop_both; return; }
+  ping -c 1 -W 3 -I "$STATAP" "$APIP" >/dev/null 2>&1
+  ip netns exec "$NS" ping -c 1 -W 3 -I "$APTAP" "$STAIP" >/dev/null 2>&1
+
+  local sta_pid ap_pid rss0_s rss0_a
+  sta_pid=$(pgrep -P "$STA_PID_RUN" -x sta_client | head -1)
+  ap_pid=$(ip netns exec "$NS" pgrep -x ap_wpa2 2>/dev/null | head -1)
+  [ -z "$ap_pid" ] && ap_pid=$(pgrep -x ap_wpa2 | head -1)
+  rss0_s=$(awk '/VmRSS/{print $2}' "/proc/${sta_pid:-0}/status" 2>/dev/null)
+  rss0_a=$(awk '/VmRSS/{print $2}' "/proc/${ap_pid:-0}/status" 2>/dev/null)
+
+  rm -f "$OUT/soak.chunks"
+  local c down_ok=0 down_try=0
+  for c in $(seq 1 "$chunks"); do
+    ip netns exec "$NS" "$OUT/udp_blast" recv "$APIP" 5201 "$SOAK_CHUNK_S" \
+        >"$OUT/soak.c$c.recv" 2>&1 &
+    local rp=$!
+    sleep 1
+    "$OUT/udp_blast" send "$APIP" 5201 "$THRU_PAYLOAD" "$SOAK_KBIT" \
+        "$SOAK_CHUNK_S" >"$OUT/soak.c$c.send" 2>&1
+    wait $rp 2>/dev/null
+    local mbps loss
+    mbps=$(sed -n 's/.*"goodput_mbps":\([0-9.]*\).*/\1/p' "$OUT/soak.c$c.recv" | tail -1)
+    loss=$(sed -n 's/.*"loss_pct":\(-\?[0-9.]*\).*/\1/p' "$OUT/soak.c$c.recv" | tail -1)
+    printf '%s %s %s\n' "$c" "${mbps:-0}" "${loss:--1}" >>"$OUT/soak.chunks"
+    # THE DOWNLINK IS PROVEN ALIVE, not loaded. One ping per chunk: if the
+    # AP's transmit path has died the soak should say so, and a loaded
+    # downlink would kill it itself.
+    down_try=$((down_try+1))
+    ip netns exec "$NS" ping -c 2 -W 2 -I "$APTAP" "$STAIP" >/dev/null 2>&1 &&
+      down_ok=$((down_ok+1))
+    sta_alive && ap_alive || break
+    say "    chunk $c/$chunks: ${mbps:-0} Mbit/s, loss ${loss:--}%  (downlink alive $down_ok/$down_try)"
+  done
+
+  if ! sta_alive || ! ap_alive; then
+    bad "soak: an endpoint exited during the run - it did not survive ${SOAK_MINUTES} minutes"
+    stop_both; return
+  fi
+  ok "soak: both endpoints ran for ${SOAK_MINUTES} minutes"
+
+  local rss1_s rss1_a
+  rss1_s=$(awk '/VmRSS/{print $2}' "/proc/${sta_pid:-0}/status" 2>/dev/null)
+  rss1_a=$(awk '/VmRSS/{print $2}' "/proc/${ap_pid:-0}/status" 2>/dev/null)
+  stop_both
+
+  # -- one association throughout
+  local assoc rc mic
+  assoc=$(led 'associations'); rc=$(led 'reconnects'); mic=$(led 'MIC failures')
+  if [ "${assoc:-0}" = 1 ] && [ "${rc:-1}" = 0 ]; then
+    ok "soak: ONE association for the whole run (reconnects=0)"
+  else
+    bad "soak: the link did not hold - associations=$assoc reconnects=$rc over ${SOAK_MINUTES} min"
+  fi
+
+  # -- the books still close after a long run
+  local s_from s_down s_enc s_plain s_q s_aired s_qdrop s_sfail
+  s_from=$(led 'from host'); s_down=$(led 'dropped down')
+  s_enc=$(sed -n 's/.*tx: encrypted=\([0-9]*\).*/\1/p' "$OUT/sta.log" | tail -1)
+  s_plain=$(sed -n 's/.*, plaintext=\([0-9]*\).*/\1/p' "$OUT/sta.log" | tail -1)
+  s_q=$(led 'queued'); s_aired=$(led 'aired')
+  s_qdrop=$(led 'queue dropped'); s_sfail=$(led 'send failed')
+  if [ $(( ${s_enc:-0} + ${s_plain:-0} + ${s_down:-0} )) = "${s_from:-0}" ] &&
+     [ $(( ${s_aired:-0} + ${s_qdrop:-0} + ${s_sfail:-0} )) = "${s_q:-0}" ]; then
+    ok "soak: the station's books still close after ${SOAK_MINUTES} min ($s_from host frames, $s_q queued)"
+  else
+    bad "soak: the station's books DRIFTED over the run - host: $s_from vs $s_enc+$s_plain+$s_down; queue: $s_q vs $s_aired+$s_qdrop+$s_sfail"
+  fi
+
+  # -- degradation: last quarter against first
+  local q first last
+  q=$(( chunks / 4 )); [ "$q" -lt 1 ] && q=1
+  first=$(head -n "$q" "$OUT/soak.chunks" | awk '{s+=$2} END{printf "%.3f", s/NR}')
+  last=$(tail -n "$q" "$OUT/soak.chunks" | awk '{s+=$2} END{printf "%.3f", s/NR}')
+  if awk -v f="$first" -v l="$last" -v p="$SOAK_DEGRADE_PCT" \
+        'BEGIN{exit !(f>0 && 100*l/f >= 100-p)}'; then
+    ok "soak: no throughput degradation - first quarter ${first} Mbit/s, last quarter ${last} Mbit/s"
+  else
+    bad "soak: throughput DEGRADED over the run - first quarter ${first} Mbit/s, last quarter ${last} Mbit/s (allowed ${SOAK_DEGRADE_PCT}%)"
+  fi
+
+  # -- the downlink stayed alive, and memory did not run away
+  say "  downlink reachable in $down_ok of $down_try chunks"
+  say "  RSS station ${rss0_s:-?} -> ${rss1_s:-?} kB, AP ${rss0_a:-?} -> ${rss1_a:-?} kB"
+  say "  MIC failures over the whole run: ${mic:-?}"
+  awk '{printf "    chunk %s: %s Mbit/s loss %s%%\n", $1, $2, $3}' "$OUT/soak.chunks"
+}
+
 # Expected check counts, so the advertised score is machine-enforced rather
 # than counted by eye - a future edit that drops an ok()/bad() pair would
 # otherwise run one check fewer, exit 0, and still be read as "N/N".
@@ -1129,10 +1277,11 @@ case "$CELLS" in
   flood)   cell_flood;                     want=3 ;;
   thru)    cell_throughput;                want=2 ;;
   beacons) cell_beacons;                   want=3 ;;
+  soak)    cell_soak;                      want=4 ;;
   all)     cell_link wpa2 "$CH"; cleanup
            cell_link fiveghz "$CH5"; cleanup
            cell_airgap;                    want=21 ;;
-  *)       echo "usage: $0 [wpa2|fiveghz|airgap|bench|flood|thru|beacons|all]"; exit 2 ;;
+  *)       echo "usage: $0 [wpa2|fiveghz|airgap|bench|flood|thru|beacons|soak|all]"; exit 2 ;;
 esac
 
 say ""

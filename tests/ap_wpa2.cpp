@@ -61,6 +61,7 @@
 #include "SelectedChannel.h"
 #include "TxMode.h"
 #include "UsbOpen.h"
+#include "IRtlRadio.h"
 #include "WiFiDriver.h"
 #include "env_config.h"
 #include "logger.h"
@@ -126,6 +127,27 @@ static constexpr size_t kTxBurst = 16;
  * counted from then on. There is no automatic re-arm: if the chip needs a
  * power cycle, pretending otherwise would wedge it again a second later. */
 static constexpr uint64_t kTxGiveUp = 250;
+/* THE BEACON KEEPALIVE, and it is the vendor driver's design rather than a
+ * guess. RtlJaguar3Device::StartBeacon says "A SINGLE download is enough -
+ * the hardware auto-transmits the beacon at every TBTT", bench-verified at
+ * ~8 beacons/s indefinitely. That verification was on an IDLE link. Under a
+ * downlink load this AP's beacons fall to 8% of their idle rate, measured
+ * three ways.
+ *
+ * The rtl88x2cu vendor driver does not rely on the hardware on USB at all.
+ * Its send_beacon() re-issues the beacon and POLLS BCN_VALID until the MAC
+ * confirms it took, retrying up to a hundred times, with an issue_bcn_fail
+ * counter and a CONFIG_BCN_RECOVERY path behind it - losing a beacon to
+ * contention is treated as normal and expected on this bus.
+ *
+ * UpdateBeaconPayload re-downloads the reserved page and polls that same
+ * valid bit, so the keepalive needs no library change to test. Off by
+ * default: every figure already recorded was taken without it. */
+static std::atomic<uint64_t> g_bcn_refresh{0}, g_bcn_refresh_fail{0},
+    g_bcn_retry{0};
+/* The vendor driver allows a hundred; this is a test harness on a shared
+ * bench, so it allows ten and reports how many it used. */
+static constexpr int kBcnRetries = 10;
 static std::atomic<uint64_t> g_tx_broken{0};   /* frames refused after tripping */
 static bool g_tx_circuit_open = false;
 /* Host frames this AP actually turned into an 802.11 frame. Without it the
@@ -1270,10 +1292,20 @@ int main(int argc, char** argv) {
   }
   fprintf(stderr, "ap_wpa2 up: SSID %s WPA2-PSK '%s' ch%d beacon=%s\n",
           kSsid, g_psk, g_chan, bok ? "OK" : "FAIL");
+  /* THE HEALTHY BASELINE. A dump from a wedged chip is uninterpretable on its
+   * own - every value needs a known-good counterpart to be read against. */
+  if (auto* rtl = dynamic_cast<IRtlRadio*>(g_dev)) {
+    fprintf(stderr, "  --- chip state WHILE HEALTHY ---\n");
+    rtl->DumpChipState();
+  }
   std::signal(SIGINT, ap_on_signal);
   std::signal(SIGTERM, ap_on_signal);
   int tx_backoff_ms = 0;
   uint64_t consecutive_fail = 0;
+  uint32_t bcn_refresh_ms = 0;
+  if (const char* r = std::getenv("DEVOURER_AP_BCN_REFRESH_MS"))
+    bcn_refresh_ms = (uint32_t)std::strtoul(r, nullptr, 10);
+  auto last_bcn = std::chrono::steady_clock::now();
   auto end = std::chrono::steady_clock::now() + std::chrono::seconds(sec);
   while (!g_stop && std::chrono::steady_clock::now() < end) {
     hs_tick();                                   // 4-way retransmissions
@@ -1331,6 +1363,17 @@ int main(int argc, char** argv) {
         g_send_fail.fetch_add(1);
         if (++consecutive_fail >= kTxGiveUp && !g_tx_circuit_open) {
           g_tx_circuit_open = true;
+          /* THE REGISTERS, AT THE MOMENT IT STOPS. Compare against the
+           * healthy dump taken at startup: if the beacon gates have been
+           * cleared the fix is to notice and re-assert them, and if they are
+           * untouched the failure is below the register interface and the
+           * fix is elsewhere. Either answer is progress; neither was
+           * askable before IRtlRadio::DumpChipState existed on this
+           * backend. */
+          if (auto* rtl = dynamic_cast<IRtlRadio*>(g_dev)) {
+            fprintf(stderr, "  --- chip state WHEN TX STOPPED ---\n");
+            rtl->DumpChipState();
+          }
           fprintf(stderr,
                   "\n  *** TX PATH NOT DRAINING: %llu consecutive refusals.\n"
                   "  *** This AP is no longer submitting data frames. Hammering a\n"
@@ -1356,6 +1399,43 @@ int main(int argc, char** argv) {
       }
       tx_backoff_ms = tx_backoff_ms ? std::min(tx_backoff_ms * 2, 16) : 1;
       g_backoffs.fetch_add(1);
+    }
+    if (bcn_refresh_ms) {
+      const auto now_b = std::chrono::steady_clock::now();
+      if (std::chrono::duration_cast<std::chrono::milliseconds>(now_b - last_bcn)
+              .count() >= (long)bcn_refresh_ms) {
+        last_bcn = now_b;
+        /* RETRIED, the way the vendor driver retries. rtl88x2cu's
+         * send_beacon() re-issues and polls BCN_VALID up to a HUNDRED times
+         * before giving up; a single attempt per interval failed 37 times
+         * out of 56 under load, which is the same "bxmitok == _FALSE" it
+         * treats as routine on USB. */
+        bool ok = false;
+        for (int try_i = 0; try_i < kBcnRetries && !ok; try_i++) {
+          ok = g_dev->UpdateBeaconPayload(bcn.data(), bcn.size());
+          if (!ok) {
+            g_bcn_retry.fetch_add(1);
+            std::this_thread::yield();
+          }
+        }
+        if (ok) {
+          g_bcn_refresh.fetch_add(1);
+        } else {
+          g_bcn_refresh_fail.fetch_add(1);
+          /* THE REGISTERS AT THE MOMENT THE BEACON CANNOT BE LOADED, once.
+           * This is the event of interest - the circuit breaker never trips
+           * in these runs, so the wedge dump was never taken. Compare
+           * against the healthy dump printed at startup. */
+          static bool dumped = false;
+          if (!dumped) {
+            dumped = true;
+            if (auto* rtl = dynamic_cast<IRtlRadio*>(g_dev)) {
+              fprintf(stderr, "  --- chip state WHEN THE BEACON WOULD NOT LOAD ---\n");
+              rtl->DumpChipState();
+            }
+          }
+        }
+      }
     }
     std::this_thread::sleep_for(
         std::chrono::milliseconds(tx_backoff_ms ? tx_backoff_ms : 1));
@@ -1451,7 +1531,8 @@ int main(int argc, char** argv) {
           "  data plane: encrypted frames received=%llu, MIC failures=%llu, "
           "replays rejected=%llu, queued=%llu, frames sent=%llu, "
           "queue dropped=%llu, send failed=%llu, backoffs=%llu,"
-          " refused after the TX circuit opened=%llu\n",
+          " refused after the TX circuit opened=%llu,"
+          " beacon refreshes=%llu (failed %llu, retries %llu)\n",
           (unsigned long long)g_enc_rx.load(),
           (unsigned long long)g_mic_fail.load(),
           (unsigned long long)g_replayed.load(),
@@ -1460,7 +1541,10 @@ int main(int argc, char** argv) {
           (unsigned long long)g_q_drop.load(),
           (unsigned long long)g_send_fail.load(),
           (unsigned long long)g_backoffs.load(),
-          (unsigned long long)g_tx_broken.load());
+          (unsigned long long)g_tx_broken.load(),
+          (unsigned long long)g_bcn_refresh.load(),
+          (unsigned long long)g_bcn_refresh_fail.load(),
+          (unsigned long long)g_bcn_retry.load());
 
   /* Retried, and the failure reported. StopBeacon can now genuinely fail (an
    * EP0 stall during teardown), IRadio.h says such a failure "must be retried

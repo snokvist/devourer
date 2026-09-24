@@ -1658,6 +1658,82 @@ diagnosis — it just stops feeding an endpoint that is not draining. **This is
 a harness guard, not a fix.** The fix belongs in the Jaguar3 TX path, which
 is shared with the FPV downlink, and is not attempted here.
 
+#### The soak — 30 minutes, 2026-09-24
+
+`tests/sta_d2d_onair.sh soak`, uplink-dominant at 4 Mbit/s (MCS7, ch6),
+thirty 60-second chunks. Every figure in this branch before it came from a
+run of 45 to 160 seconds.
+
+| | |
+|---|---|
+| associations / reconnects | **1 / 0** |
+| host frames, books closing | **643 039**, both identities exact |
+| throughput, first → last quarter | 3.924 → **3.971 Mbit/s** |
+| MIC failures | **0** |
+| RSS, station / AP | 11120 → 11144 kB / 11880 → 11884 kB |
+| downlink reachable | **30 of 30 chunks** |
+
+Per-chunk loss tracked ambient 2.4 GHz conditions (0.57%–3.14%) with no trend.
+
+**I damaged the end of my own run and it is recorded here rather than
+quietly re-run.** The script was edited *while it was executing* — bash reads
+a script incrementally from disk, so shifting byte offsets corrupted the tail
+of the running instance and it died with a syntax error at the summary
+block. All four checks had already printed (4 PASS, 0 FAIL, matching
+`want=4`), so the measurements above stand, but the harness's own
+machine-enforced score line never ran. Never edit a shell script that is
+running.
+
+#### Why the AP's transmitter stops: the HIGH QUEUE runs out of pages
+
+`RtlJaguar3Device::DumpChipState()` now exists (it was Jaguar1-only) and
+reads what actually gates transmission. `ap_wpa2` dumps it twice — healthy at
+startup and at the moment the beacon cannot be loaded — because a dump from a
+wedged chip is uninterpretable without its known-good counterpart.
+
+```
+healthy:  TXDMA_STATUS=0x00000000   HQ 64/64   LQ 64/64  NQ 64/64  PUB 1745/1745
+wedged:   TXDMA_STATUS=0x00040000   HQ 64/0    LQ 64/64  NQ 64/64  PUB 1745/1449
+```
+
+(configured/AVAILABLE, read the way the vendor reads them —
+`proc_get_pubq_free_page` in rtl88x2cu is `(rtw_read32(0x0240) >> 16) & 0xFFF`.)
+
+**The High Queue is exhausted while the public pool is 83% free.** Every gate
+that could have stopped the beacon is still set — `EN_BCNQ_DL=1`,
+`EN_BCN_FUNCTION=1`, net_type=AP, interval 25 TU — so the beacon is not
+disabled, it has nowhere to go. `init_trx_cfg` maps **MG and HI to HQ** and
+BE/BK to LQ, VO/VI to NQ, which is the vendor's own mapping; so when HQ
+empties, management frames and the beacon starve while bulk data still has
+room. That is every symptom at once: no beacons, seventeen received
+authentication requests answered zero times, and a receiver that never
+faltered.
+
+**What is NOT yet established** is what consumes those 64 HQ pages and why
+they are not returned. Bulk data is demonstrably not the consumer — it flows
+through PUB. The remaining candidate is the beacon / reserved-page path
+itself (`QSEL_BEACON`), whose pages may not be reclaimed when a download does
+not complete. Reading halmac's page accounting is the next step and is not
+attempted here.
+
+**Two fixes were tried against this and neither worked**, both recorded:
+
+- A **beacon keepalive** via `UpdateBeaconPayload`
+  (`DEVOURER_AP_BCN_REFRESH_MS`, default 0). At 500 ms it moved beacon
+  reception from 8% of idle to 14%; at 100 ms with vendor-style retries it
+  was back to 8%. The ledger shows why it cannot work: under load the
+  refresh itself fails — **37 of 56 attempts at 500 ms** — which is the same
+  `bxmitok == _FALSE` the vendor driver treats as routine on USB. Re-issuing
+  a beacon into a queue with no free pages does not get a beacon out.
+- **Vendor-style retry.** rtl88x2cu's `send_beacon()` re-issues and polls
+  `BCN_VALID` up to a hundred times with an `issue_bcn_fail` counter and a
+  `CONFIG_BCN_RECOVERY` path behind it. Ten retries per refresh changed
+  nothing, for the same reason.
+
+Both are kept, off by default, because they are the right shape even though
+they are not sufficient — and because the counters they added are what
+located the page exhaustion.
+
 #### A RETRACTION OF A RETRACTION, which is worth more than either
 
 Earlier this session an ad-hoc script concluded the AP adapter was mute.
