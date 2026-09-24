@@ -115,6 +115,9 @@ favourable measurement without its adversarial counterpart in the same breath.
 | Phase 4 | `02a0f62` | Flash (continuity + integration) | **a false doc claim, and a replay bypass** | 7 | yes — this commit |
 | Phase 5 | `a6678ba` | Flash (hostile input + correctness) | **the new ledger identity was arithmetically wrong** | 9 | yes — this commit |
 | Phase 5 | `a6678ba` | Flash (can any assertion fail?) | **the falsifier itself could pass vacuously** | 8 + a clean bill on `want=` | yes — this commit |
+| Phase 5 TX wedge | `5e7df6d` | Flash (vendor page accounting) | endpoint→queue rule found | 5 | yes — this commit |
+| Phase 5 TX wedge | `5e7df6d` | Flash (devourer TX path audit) | **QSEL 0x12 on every frame** | 4 | yes — this commit |
+| Phase 5 TX wedge | `5e7df6d` | Flash (adversarial) | **my endpoint-only fix would have made it worse** | 7 | yes — this commit |
 
 ### Round 5 — the Phase 1 gate, 2026-09-20
 
@@ -1733,6 +1736,81 @@ attempted here.
 Both are kept, off by default, because they are the right shape even though
 they are not sufficient — and because the counters they added are what
 located the page exhaustion.
+
+#### 2026-09-24: every frame was queued as MANAGEMENT — found, fixed, and it was not the whole story
+
+Three reviewers on the TX wedge. **The adversarial one stopped me shipping a
+fix that would have made things worse**, which is the entire argument for
+running it.
+
+**What I had wrong.** I traced halmac's `get_usb_bulkout_id_88xx()` — which
+derives the bulk-OUT endpoint from the descriptor's QSEL, `HIGH→0,
+NORMAL→1, LOW→2` — saw that this backend sends every frame to
+`first_bulk_out_ep()` (endpoint 0, HIGH), and concluded the endpoint was the
+bug. The reviewer pointed at `TXDMA_STATUS` bit 10, `BIT_EP_QSEL_DIFF`, which
+the hardware sets when the endpoint and the QSEL disagree. **It was clear in
+every dump.** Endpoint and QSEL agreed; my fix would have made them disagree.
+
+**What was actually wrong**, `src/jaguar3/FrameParserJaguar3.h:162`:
+
+```c
+SET_TX_DESC_QSEL_8822C(d, 0x12); /* MGMT queue (mirrors Jaguar1 inject) */
+```
+
+**Every frame this backend has ever transmitted was marked MANAGEMENT.** The
+priority-queue map sends MG to the HIGH queue, and HIGH has sixty-four pages.
+So a whole video downlink was being queued into the 64-page queue that
+management frames and the beacon must share, while LOW and NORMAL went
+entirely unused — which is exactly why `LQ 64/64` and `NQ 64/64` never budged
+under a flood. It was harmless for the monitor injector it was written for,
+which airs a beacon every few milliseconds.
+
+**Neither half of the fix works alone, and that was measured, not assumed.**
+Setting `DEVOURER_TX_QSEL=0` with no code change moved nothing — the queue
+still drained 64→0, because the frame still went to the HIGH endpoint. The
+fix has to move QSEL *and* the endpoint together, which is what the vendor
+does by construction.
+
+**The fix, and exactly what it bought.** Data frames (FC type 2) now carry
+QSEL 0 (TID0/BE) and the endpoint is derived from the final descriptor QSEL
+so the two always agree. The registers confirm the frames moved:
+
+```
+before:  HQ 64/0    LQ 64/64  NQ 64/64  PUB 1745/1449
+after:   HQ 64/63   LQ 64/0   NQ 64/64  PUB 1745/1449
+```
+
+and the downlink's sustainable rung went from **22.8% loss to 0.00%** at
+500 kbit/s. On-air 21/21, ctest 80/80, 78/78 under sanitizers.
+
+**IT DOES NOT LIFT THE CEILING, and saying so is the point.** The downlink
+still collapses above ~0.4 Mbit/s and the beacon still falls to 8% of idle
+under load. HQ exhaustion was a *consequence* of the mis-queuing, not the
+cause of the wedge. The cause is still latched in the same register it always
+was:
+
+    TXDMA_STATUS = 0x00040000  =  BIT_TXPKTBUF_REQ_ERR
+
+a TX-DMA fault. The vendor treats **any** nonzero `TXDMA_STATUS` as fatal and
+responds with a MAC silent reset (`core/rtw_sreset.c`,
+`hal/rtl8822c/rtl8822c_ops.c`). devourer has no equivalent and no caller ever
+reads the register.
+
+**The strongest remaining lead**, and it is a verified divergence rather than
+a theory: the vendor sets `URB_ZERO_PACKET` on every TX URB
+(`os_dep/linux/usb_ops_linux.c:651`), so a bulk transfer whose length is an
+exact multiple of the endpoint's 512-byte maximum is terminated properly.
+devourer transmits through a synchronous `libusb_bulk_transfer`, which has no
+such flag, and pads nothing. A transfer the device believes is unterminated
+is a plausible way to latch a packet-buffer request error. It does not
+obviously fire for the fixed 1524-byte frames used in these measurements, so
+it is a lead and not a conclusion.
+
+**This defect is not station-specific.** It is in the Jaguar3 transmit path,
+so it reaches `ap_wpa2`, the multi-AP cellular work, and any FPV downlink
+that sustains load on this silicon. `first_bulk_out_ep()` is used the same
+way in Jaguar1 and Jaguar2; the QSEL hardcode is Jaguar3's, and the comment
+says it mirrors Jaguar1's. Neither was checked on hardware here.
 
 #### A RETRACTION OF A RETRACTION, which is worth more than either
 

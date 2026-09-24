@@ -136,6 +136,10 @@ BCN_TU="${BCN_TU:-25}"
 # recorded in this branch was taken without it. See the note in
 # tests/ap_wpa2.cpp for why the vendor driver does this on USB.
 BCN_REFRESH_MS="${BCN_REFRESH_MS:-0}"
+# Override the AP's TX descriptor QSEL. Unset leaves the backend default,
+# which on Jaguar3 is 0x12 (MGNT) for EVERY frame - the thing under
+# investigation. 0 is TID0/BE. A diagnostic knob, not a setting.
+AP_TX_QSEL="${AP_TX_QSEL:-}"
 # Which direction the throughput ladder walks. `both` is the measurement;
 # `up` and `down` exist so a diagnostic arm does not have to pay for the half
 # it is not asking about - which on a shared bench is most of the cost.
@@ -294,6 +298,7 @@ ap_up() {   # $1 = channel, $2 = seconds, $3.. = extra env
   [ "$ARQ" = 1 ] && arq_env="DEVOURER_ACK_RESPONDER=$BSSID"
   ip netns exec "$NS" env \
       ${arq_env:+"$arq_env"} DEVOURER_TX_RATE="$TX_RATE" \
+      ${AP_TX_QSEL:+DEVOURER_TX_QSEL="$AP_TX_QSEL"} \
       DEVOURER_AP_BCN_REFRESH_MS="$BCN_REFRESH_MS" \
       DEVOURER_VID="$AP_VID" DEVOURER_PID="$AP_PID" \
       DEVOURER_USB_BUS="${AP_SYSFS%%-*}" DEVOURER_USB_PORT="${AP_SYSFS#*-}" \

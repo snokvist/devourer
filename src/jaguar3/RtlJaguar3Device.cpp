@@ -1920,6 +1920,62 @@ void RtlJaguar3Device::DumpChipState() {
    * which is worth as much as finding the bit. */
 }
 
+/* WHICH BULK-OUT ENDPOINT A FRAME BELONGS ON — and getting this wrong is why
+ * this backend's AP stopped transmitting under load.
+ *
+ * On a Realtek USB part the ENDPOINT selects the hardware TX queue. halmac's
+ * get_usb_bulkout_id_88xx() reads QSEL out of the descriptor, looks the
+ * access category up in the same priority-queue map the driver programmed
+ * into REG_TXDMA_PQ_MAP, and turns the resulting DMA mapping into a bulk-out
+ * index: HIGH->0, NORMAL->1, LOW->2, EXTRA->3. With the enum values
+ * (EXTRA=0, LOW=1, NORMAL=2, HIGH=3) that is simply `3 - mapping`.
+ *
+ * This backend sent EVERY frame to the first bulk-OUT endpoint — index 0,
+ * the HIGH queue — while init_trx_cfg maps BE/BK to LOW and VO/VI to NORMAL
+ * exactly as the vendor does. So all data went into a 64-page queue that
+ * management frames and the beacon must share, and LOW and NORMAL were never
+ * used at all.
+ *
+ * Measured on an RTL8812CU running this project's AP under a downlink load,
+ * configured/AVAILABLE pages:
+ *
+ *     healthy:  HQ 64/64  LQ 64/64  NQ 64/64  PUB 1745/1745
+ *     wedged:   HQ 64/0   LQ 64/64  NQ 64/64  PUB 1745/1449
+ *
+ * HQ drained to nothing; LOW and NORMAL sat untouched at their full 64,
+ * which is the signature of a queue nothing is ever sent to. With HQ empty
+ * the beacon could not be loaded and management frames could not be sent,
+ * so the AP went silent while its receiver carried on perfectly — it logged
+ * seventeen received authentication requests and answered none. */
+static uint8_t bulkout_id_for_descriptor(const uint8_t *desc, size_t n_eps) {
+  if (n_eps <= 1)
+    return 0;
+  /* QSEL: dword at 0x04, bits 8..12 (SET_TX_DESC_QSEL_8822C). */
+  const uint32_t d1 = (uint32_t)desc[4] | ((uint32_t)desc[5] << 8) |
+                      ((uint32_t)desc[6] << 16) | ((uint32_t)desc[7] << 24);
+  const uint8_t qsel = (uint8_t)((d1 >> 8) & 0x1f);
+  /* The same map init_trx_cfg writes: VO/VI->NQ(2), BE/BK->LQ(1),
+   * MG/HI/BCN/CMD->HQ(3). TID to access category is 802.11-2016 Table 9-1:
+   * 0,3 = BE; 1,2 = BK; 4,5 = VI; 6,7 = VO. */
+  uint32_t mapping;
+  switch (qsel) {
+  case 0: case 3: case 1: case 2:
+    mapping = 1; /* LOW  */
+    break;
+  case 4: case 5: case 6: case 7:
+    mapping = 2; /* NORMAL */
+    break;
+  default:
+    /* 0x10 BEACON, 0x11 HIGH, 0x12 MGT, 0x13 CMD, and anything unexpected:
+     * HIGH is the safe home, because it is where this backend has always
+     * sent everything and where the beacon must go. */
+    mapping = 3; /* HIGH */
+    break;
+  }
+  const uint8_t id = (uint8_t)(3u - mapping);
+  return id < n_eps ? id : 0;
+}
+
 bool RtlJaguar3Device::send_packet(const uint8_t *packet, size_t length) {
   /* The coex runtime thread (coex_runtime_loop) drives the periodic coex
    * decision + FW heartbeats + C2H draining, so the TX hot path stays lean. */
@@ -1944,7 +2000,10 @@ bool RtlJaguar3Device::send_packet(const uint8_t *packet, size_t length) {
                                  0);
   if (build_tx_block(packet, length, usb_frame.data(), 0) == 0)
     return false;
-  int rc = _device.bulk_send_sync_ep(_device.first_bulk_out_ep(),
+  /* The endpoint IS the queue on this bus — see bulkout_id_for_descriptor. */
+  const uint8_t ep = _device.nth_bulk_out_ep(
+      bulkout_id_for_descriptor(usb_frame.data(), _device.bulk_out_ep_count()));
+  int rc = _device.bulk_send_sync_ep(ep ? ep : _device.first_bulk_out_ep(),
                                      usb_frame.data(), usb_frame.size(),
                                      /*timeout_ms=*/20);
   /* bulk_send_sync_ep returns BYTES SUBMITTED, so `rc >= 0` would also cover
@@ -2263,6 +2322,37 @@ size_t RtlJaguar3Device::build_tx_block(const uint8_t *packet, size_t length,
       out, static_cast<uint16_t>(frame_len), MRateToHwRate(fixed_rate), rate_id,
       bw_desc, sgi != 0, ldpc != 0, stbc, bmc, ndpa, data_sc, pwr_type,
       pkt_offset);
+  /* A DATA FRAME BELONGS IN A DATA QUEUE, and until now none of them were.
+   *
+   * fill_data_tx_desc_8822c hardcodes QSEL = 0x12 (MGNT) on every descriptor
+   * it builds - "mirrors Jaguar1 inject", which was true and harmless for a
+   * monitor injector that airs a beacon every few milliseconds. init_trx_cfg
+   * maps MG to the HIGH queue, and HIGH has SIXTY-FOUR pages. So every frame
+   * this backend has ever sent - a whole video downlink included - was
+   * queued into the 64-page queue that management frames and the beacon must
+   * share, while LOW (BE/BK) and NORMAL (VO/VI) went entirely unused.
+   *
+   * Measured on an RTL8812CU running this project's AP under load, pages
+   * configured/AVAILABLE (0x0230 bits 16..27 are HPQ_AVAL_PG - see
+   * BIT_SHIFT_HPQ_AVAL_PG_V1_8822C in the vendor's halmac bit header):
+   *
+   *     healthy:  HQ 64/64  LQ 64/64  NQ 64/64  PUB 1745/1745
+   *     wedged:   HQ 64/0   LQ 64/64  NQ 64/64  PUB 1745/1449
+   *
+   * LOW and NORMAL sitting at exactly their configured 64 under a flood is
+   * the signature of a queue nothing is ever sent to. With HIGH at zero the
+   * beacon could not be loaded and management frames could not be sent: the
+   * AP went silent - seventeen received authentication requests, none
+   * answered - while its receiver carried on perfectly.
+   *
+   * Management and control keep 0x12; only DATA moves, to TID 0 (BE), which
+   * the priority-queue map already routes to LOW. The endpoint moves with it
+   * - see bulkout_id_for_descriptor - because on this bus the two must
+   * agree; TXDMA_STATUS has an EP_QSEL_DIFF bit for exactly that mismatch.
+   * Changing QSEL alone was measured to do nothing at all: the queue still
+   * drained 64 -> 0, because the frame still went to the HIGH endpoint. */
+  if (frame_len >= 1 && ((dot11[0] >> 2) & 0x3) == 0x2 /* type = data */)
+    SET_TX_DESC_QSEL_8822C(out, 0x00 /* TID0 = BE -> LOW queue */);
   if (_cfg.tx.report) {
     /* DEVOURER_TX_REPORT: SPE_RPT asks the fw for a CCX TX report; the
      * report echoes SW_DEFINE's low byte, so stamp a rotating tag for
