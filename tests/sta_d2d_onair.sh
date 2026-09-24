@@ -998,7 +998,7 @@ cell_beacons() {
   build_both || { bad "beacons: build"; return; }
   ns_up      || { bad "beacons: could not create netns $NS"; return; }
   local phase=${BEACON_PHASE_SECS:-12}
-  local run_secs=$(( SECS + phase * 3 + 30 ))
+  local run_secs=$(( SECS + phase * 4 + 40 ))
   ap_up "$CH" $((run_secs + 30)) || { bad "beacons: the AP did not come up"; stop_both; return; }
   sta_up "$CH" "$run_secs" DEVOURER_STA_TICK_MS=1000 || {
     bad "beacons: sta_client did not start"; stop_both; return; }
@@ -1049,6 +1049,21 @@ cell_beacons() {
   down_ours=$(awk -v a="${o0:-0}" -v b="${o1:-0}" -v s="$phase" 'BEGIN{printf "%.1f", (b-a)/s}')
   down_rc=$(( ${r1:-0} - ${r0:-0} ))
 
+  # -- phase 4: IDLE AGAIN. Starved or clobbered? The beacon lives in the
+  # chip's reserved page and the hardware airs it at every TBTT from that one
+  # download (see RtlJaguar3Device::StartBeacon). If it comes straight back
+  # when the load stops, the page is intact and the beacon was losing an
+  # arbitration - the fix is to stop saturating the transmit path. If it
+  # stays dead, the page or the beacon queue state did not survive the load -
+  # the fix is to re-download it, which nothing does today because a single
+  # download was measured to be enough on an idle link.
+  sleep 2
+  b0=$(tick_field beacons); o0=$(tick_field beacons_ours)
+  sleep "$phase"
+  b1=$(tick_field beacons); o1=$(tick_field beacons_ours)
+  local after_ours
+  after_ours=$(awk -v a="${o0:-0}" -v b="${o1:-0}" -v s="$phase" 'BEGIN{printf "%.1f", (b-a)/s}')
+
   if ! sta_alive || ! ap_alive; then
     bad "beacons: an endpoint exited during the phases (raise SECS, currently $SECS)"
     stop_both; return
@@ -1059,6 +1074,7 @@ cell_beacons() {
   say "  idle       ${idle_rate}/s        ${idle_ours}/s"
   say "  uplink     ${up_rate}/s        ${up_ours}/s         ${up_rc}"
   say "  downlink   ${down_rate}/s        ${down_ours}/s         ${down_rc}"
+  say "  idle again ${after_ours}/s (ours)"
 
   # THE RULE, and it is the half that should hold: the station's receiver is
   # every bit as busy transmitting as it is receiving, so if beacon reception
@@ -1072,7 +1088,14 @@ cell_beacons() {
     bad "beacons: uplink load alone costs the station its beacons (${up_rate}/s vs ${idle_rate}/s idle) - the receiver IS the bottleneck and the downlink figure proves nothing about the AP"
   fi
 
-  # THE DISCRIMINATOR, and it is the ratio of two ratios rather than either
+  # STARVED OR CLOBBERED. This is the one that says which fix to write.
+  if awk -v a="$after_ours" -v i="$idle_ours" 'BEGIN{exit !(i>0 && a >= i*0.8)}'; then
+    ok "beacons: the beacon comes straight back when the load stops (${after_ours}/s vs ${idle_ours}/s idle) - the reserved page survives, so it is being STARVED, not clobbered"
+  else
+    bad "beacons: the beacon does NOT recover when the load stops (${after_ours}/s vs ${idle_ours}/s idle) - the reserved page or the beacon queue did not survive the load, and a single download is no longer enough"
+  fi
+
+  # THE DIRECTION DISCRIMINATOR, and it is the ratio of two ratios rather than either
   # one. Under downlink load the station's receiver is busy, so SOME beacon
   # loss is expected from every BSS on the channel. What separates "the AP
   # stopped sending" from "the receiver stopped hearing" is whether OUR
@@ -1105,7 +1128,7 @@ case "$CELLS" in
   bench)   cell_bench;                     want=3 ;;
   flood)   cell_flood;                     want=3 ;;
   thru)    cell_throughput;                want=2 ;;
-  beacons) cell_beacons;                   want=2 ;;
+  beacons) cell_beacons;                   want=3 ;;
   all)     cell_link wpa2 "$CH"; cleanup
            cell_link fiveghz "$CH5"; cleanup
            cell_airgap;                    want=21 ;;

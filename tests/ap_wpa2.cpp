@@ -105,6 +105,29 @@ static std::atomic<uint64_t> g_backoffs{0};
  * the send site: the beacon shares this path and a full-batch burst starves
  * it. */
 static constexpr size_t kTxBurst = 16;
+/* THE CIRCUIT BREAKER, and it exists because this harness wedged an adapter.
+ *
+ * A sustained downlink load does not merely throttle the Jaguar3 transmit
+ * path - it WEDGES it. Measured: the AP kept receiving perfectly (17 of 17
+ * authentication requests logged) while nothing it sent reached the air; its
+ * beacon stopped, its management replies stopped, and it did not recover for
+ * the life of the process. An earlier occurrence survived process restarts
+ * AND a USB `authorized` toggle, and was only cleared by physically
+ * unplugging the adapter.
+ *
+ * send_packet's own definition warns about precisely this: "The caller backs
+ * off when these fail repeatedly ... hammering a non-draining endpoint is
+ * exactly what wedged its USB core." Backing off is not enough - this loop
+ * backed off 1021 times in the run that wedged it. So it also STOPS.
+ *
+ * Once tripped the AP keeps running and keeps receiving, so the run still
+ * produces a ledger and the operator still gets a diagnosis; it just stops
+ * feeding an endpoint that is not draining. Data frames are refused and
+ * counted from then on. There is no automatic re-arm: if the chip needs a
+ * power cycle, pretending otherwise would wedge it again a second later. */
+static constexpr uint64_t kTxGiveUp = 250;
+static std::atomic<uint64_t> g_tx_broken{0};   /* frames refused after tripping */
+static bool g_tx_circuit_open = false;
 /* Host frames this AP actually turned into an 802.11 frame. Without it the
  * host-side identity has the losses but not the successes. */
 static std::atomic<uint64_t> g_tap_framed{0};
@@ -1250,6 +1273,7 @@ int main(int argc, char** argv) {
   std::signal(SIGINT, ap_on_signal);
   std::signal(SIGTERM, ap_on_signal);
   int tx_backoff_ms = 0;
+  uint64_t consecutive_fail = 0;
   auto end = std::chrono::steady_clock::now() + std::chrono::seconds(sec);
   while (!g_stop && std::chrono::steady_clock::now() < end) {
     hs_tick();                                   // 4-way retransmissions
@@ -1293,12 +1317,29 @@ int main(int argc, char** argv) {
      * sustains - and it leaves the chip room to breathe between bursts. */
     const size_t burst = batch.size() < kTxBurst ? batch.size() : kTxBurst;
     size_t i = 0;
+    if (g_tx_circuit_open) {
+      /* Tripped: drop the batch, counted, and do not touch the device. */
+      g_tx_broken.fetch_add(batch.size());
+      batch.clear();
+    }
     for (; i < burst; i++) {
       if (g_dev->send_packet(batch[i].data(), batch[i].size())) {
         g_sent.fetch_add(1);
         tx_backoff_ms = 0;
+        consecutive_fail = 0;
       } else {
         g_send_fail.fetch_add(1);
+        if (++consecutive_fail >= kTxGiveUp && !g_tx_circuit_open) {
+          g_tx_circuit_open = true;
+          fprintf(stderr,
+                  "\n  *** TX PATH NOT DRAINING: %llu consecutive refusals.\n"
+                  "  *** This AP is no longer submitting data frames. Hammering a\n"
+                  "  *** non-draining endpoint WEDGES the chip - measured: beacons\n"
+                  "  *** and management replies stop, the receiver keeps working,\n"
+                  "  *** and only a physical replug clears it.\n"
+                  "  *** The ledger below is still valid; the link is not.\n\n",
+                  (unsigned long long)consecutive_fail);
+        }
         break;
       }
     }
@@ -1409,7 +1450,8 @@ int main(int argc, char** argv) {
   fprintf(stderr,
           "  data plane: encrypted frames received=%llu, MIC failures=%llu, "
           "replays rejected=%llu, queued=%llu, frames sent=%llu, "
-          "queue dropped=%llu, send failed=%llu, backoffs=%llu\n",
+          "queue dropped=%llu, send failed=%llu, backoffs=%llu,"
+          " refused after the TX circuit opened=%llu\n",
           (unsigned long long)g_enc_rx.load(),
           (unsigned long long)g_mic_fail.load(),
           (unsigned long long)g_replayed.load(),
@@ -1417,7 +1459,8 @@ int main(int argc, char** argv) {
           (unsigned long long)g_sent.load(),
           (unsigned long long)g_q_drop.load(),
           (unsigned long long)g_send_fail.load(),
-          (unsigned long long)g_backoffs.load());
+          (unsigned long long)g_backoffs.load(),
+          (unsigned long long)g_tx_broken.load());
 
   /* Retried, and the failure reported. StopBeacon can now genuinely fail (an
    * EP0 stall during teardown), IRadio.h says such a failure "must be retried

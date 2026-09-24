@@ -1569,8 +1569,8 @@ missing forty consecutive beacons at 25 TU.
   before at exactly 36.0/s, read the AP's beacons at **1.7/s** under a
   downlink flood.
 
-**NOT established: where the beacons are lost.** Every apparatus tried so far
-shares one confound — under a downlink flood *every* receiver on the channel
+**NOT established at the time this was written — RESOLVED the next day, see
+below.** Every apparatus tried at this point shared one confound — under a downlink flood *every* receiver on the channel
 is busy, so "few beacons seen" is satisfied both by an AP that stopped
 sending them and by a receiver too busy to decode them.
 
@@ -1601,6 +1601,79 @@ because a fix that did not work is worth as much as one that did:
   reserved page needs room in the same TX path.
 
 Both are defensible and both are kept. Neither moved the 8% figure.
+
+#### RESOLVED 2026-09-24: the AP's transmit path WEDGES under sustained load
+
+The question above — whether the beacons stop being sent or stop being heard
+— is settled, and the answer is worse than a throughput limit.
+
+**The measurement that closed it.** A third radio in monitor mode, counting
+the AP's DATA frames and its BEACONS in the same window. That is the control
+every earlier attempt lacked: a witness decoding the AP's data is not a
+witness too busy to decode its beacon.
+
+| 10 s window | the AP's beacons | the AP's data frames |
+|---|---|---|
+| idle | 329 | 29 |
+| downlink flood | **17** | **314** |
+
+The witness decoded **357 frames in total** during the flood — 36 a second,
+nowhere near saturation — and within that it saw essentially *all* of the
+AP's data frames (31/s, matching the AP's own ledger ceiling) and 5% of its
+beacons. The AP transmits data and stops transmitting beacons.
+
+**And it is a wedge, not a throttle.** The station's tick stream across the
+twenty seconds *after* the load stopped:
+
+```
+t=31..51s  state=Failed/Authenticating   all+19..23/s   ours+0   assoc=1
+```
+
+The station receives 19–23 neighbour beacons a second throughout — its
+receiver is healthy — and zero from our AP, which also never answers its
+authentication. The AP's own log for the same window shows **`AUTH from ...`
+seventeen times**: it RECEIVED every attempt. Its receiver works and its
+transmitter is dead.
+
+  queued=4408  frames sent=379  send failed=1149  backoffs=1021
+
+**The backoff did not prevent it.** It fired 1021 times in the run that
+wedged. Neither did the 16-frame burst cap. By the time `send_packet` returns
+false the damage is done, which is exactly what its own definition warns
+about: *"hammering a non-draining endpoint is exactly what wedged its USB
+core."*
+
+**How persistent.** Always for the life of the process (20+ s observed, never
+recovering). On one occasion it survived process restarts AND a USB
+`authorized` toggle and was cleared only by physically unplugging the
+adapter. On another it cleared with a fresh process. So: at minimum
+process-lifetime, sometimes requiring a power cycle.
+
+**A CIRCUIT BREAKER is now in `ap_wpa2`.** After `kTxGiveUp` (250)
+consecutive refusals it stops submitting data frames entirely, says so
+loudly, and counts what it then refuses. It does not re-arm: if the chip
+needs a power cycle, pretending otherwise wedges it again a second later. The
+AP keeps running and keeps receiving, so the run still yields a ledger and a
+diagnosis — it just stops feeding an endpoint that is not draining. **This is
+a harness guard, not a fix.** The fix belongs in the Jaguar3 TX path, which
+is shared with the FPV downlink, and is not attempted here.
+
+#### A RETRACTION OF A RETRACTION, which is worth more than either
+
+Earlier this session an ad-hoc script concluded the AP adapter was mute.
+I retracted that, on the grounds that the reviewed acceptance cell passed 8/8
+on the same adapter minutes later, and wrote that the script had been wrong.
+
+**The script was right.** The adapter really was mute — wedged by the
+preceding throughput runs. The acceptance cell passed afterwards because the
+operator had physically replugged the adapter in between, which is precisely
+what clears this wedge. I had the correct evidence, disbelieved it for a
+plausible-sounding reason, and recorded the wrong conclusion in a commit
+message.
+
+The lesson is not "trust ad-hoc scripts". It is that **"a later test passed"
+does not retract an earlier failure unless nothing changed in between**, and
+something very much had.
 
 #### Three instruments misled this investigation, and that is the lesson
 
