@@ -35,17 +35,23 @@ narrowband dividers, RF18 encoding), strategy interfaces `Jaguar3Calibration`
 - The rtl8822e's hardware-bisected constraints (DPDT/pin-mux front end,
   single-path 1SS TX, spur channels, LCK, the 2.4 GHz TX kernel-parity
   limitation) live in `docs/8822e-quirks.md`.
-- **The TX data page ring must end at `rsvd_boundary - 1`.** The auto-LLT
-  init links every TX FIFO page to the next, 0 -> ... -> 2047, so the data
-  ring runs on into the reserved region where the beacon lives. With a
-  beacon armed, a sustained load overwrites the beacon page and the next
-  TBTT latches `TXDMA_STATUS` `BIT_TXPKTBUF_REQ_ERR` - the part stops
-  transmitting for the life of the process. `terminate_acq_ring` writes
-  `LLT[rsvd_boundary - 1] = 0` after the LLT init, matching the vendor
-  driver's chip entry for entry (its 2048-entry LLT differs from ours only
-  there). Measured: AP downlink 0.445 -> 24.3 Mbit/s at MCS7. Plain injection
-  never showed it - no beacon engine reads the page - so the FPV path was
-  unaffected, and loses 110 pages of ring (2048 -> 1938) it never needed.
+- **The whole MAC must be enabled before the LLT init** (`REG_CR` low byte
+  = halmac `MAC_TRX_ENABLE` = `0xFF`, not the DMA-only `0x0F` this port used
+  to write). With PROTOCOL/SCHEDULE off at the auto-LLT init, the TX page
+  allocator never learns where the data region ends: it runs past
+  `rsvd_boundary` into the reserved region and a sustained load overwrites
+  the beacon page; the next TBTT latches `TXDMA_STATUS` `BIT_TXPKTBUF_REQ_ERR`
+  and the part stops transmitting for the life of the process. With them on,
+  the hardware wraps the ring itself - it writes `LLT[rsvd_boundary - 1] = 0`
+  at the first wrap. The LLT reads identically at init either way
+  (`[1937] = 0x792` on the 8822C, on the vendor driver too); only the
+  allocator's behaviour differs, so an init-time LLT read cannot check this -
+  inject past a wrap and read it after (`ap_wpa2` with `DEVOURER_AP_INJECT` +
+  `DEVOURER_AP_PKTBUF`). Found by diffing a usbmon capture of the vendor
+  driver's bring-up against ours: `REG_CR` was the only difference up to the
+  LLT init. Plain injection never showed it - no beacon engine reads the
+  page. `GENERAL_INFO`/`PHYDM_INFO` H2C packets were ruled out as the
+  mechanism (sent byte-exact, consumed by the firmware, no effect on the LLT).
 - **Data frames go to the LOW queue.** `fill_data_tx_desc_8822c` stamps
   QSEL 0x12 (MGNT) on everything; `build_tx_block` moves 802.11 data frames
   to QSEL 0 (BE) and `send_packet` derives the bulk-OUT endpoint from the

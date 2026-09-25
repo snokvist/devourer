@@ -1074,9 +1074,11 @@ cell_beacons() {
   # download. It used NOT to survive: the TX data page ring ran on into the
   # reserved region, a sustained load overwrote the beacon page, and the next
   # TBTT read a data frame as a beacon descriptor and latched a TX-DMA fault
-  # (measured - the page read 5a 5a 5a..., the injected fill byte). Fixed in
-  # HalmacJaguar3MacInit::terminate_acq_ring. This phase is the regression
-  # check for it: a beacon that does not come back means the page was lost.
+  # (measured - the page read 5a 5a 5a..., the injected fill byte). Fixed by
+  # enabling the whole MAC (halmac MAC_TRX_ENABLE = 0xFF) before the LLT init
+  # in HalmacJaguar3MacInit, so the hardware wraps the ring at the reserved
+  # boundary. This phase is the regression check for it: a beacon that does
+  # not come back means the page was lost.
   sleep 2
   b0=$(tick_field beacons); o0=$(tick_field beacons_ours)
   sleep "$phase"
@@ -1112,7 +1114,7 @@ cell_beacons() {
   if awk -v a="$after_ours" -v i="$idle_ours" 'BEGIN{exit !(i>0 && a >= i*0.8)}'; then
     ok "beacons: the beacon comes straight back when the load stops (${after_ours}/s vs ${idle_ours}/s idle) - the beacon page survived the load"
   else
-    bad "beacons: the beacon does NOT recover when the load stops (${after_ours}/s vs ${idle_ours}/s idle) - the beacon page was lost; check that bring-up logged 'TX page ring terminated' (HalmacJaguar3MacInit::terminate_acq_ring)"
+    bad "beacons: the beacon does NOT recover when the load stops (${after_ours}/s vs ${idle_ours}/s idle) - the beacon page was lost; check MAC_TRX_ENABLE in HalmacJaguar3MacInit (0xFF before the LLT init), and run ap_wpa2 with DEVOURER_AP_INJECT=4000 DEVOURER_AP_PKTBUF=1: LLT[1937] must read 0 at the end of run"
   fi
 
   # THE DIRECTION DISCRIMINATOR, and it is the ratio of two ratios rather than either

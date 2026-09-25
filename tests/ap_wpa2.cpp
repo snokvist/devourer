@@ -1622,6 +1622,9 @@ int main(int argc, char** argv) {
       else g_send_fail.fetch_add(1);
     }
   }
+  /* The same probe once the traffic is over: whether the ring terminator
+   * appeared on its own, and whether the beacon page is still a beacon. */
+  if (std::getenv("DEVOURER_AP_PKTBUF")) probe_pktbuf("end of run");
   {
     std::lock_guard<std::mutex> l(g_hs_mu);
     fprintf(stderr, "sent=%llu stations=%d", (unsigned long long)g_sent.load(),

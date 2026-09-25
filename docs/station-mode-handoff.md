@@ -59,7 +59,7 @@ that tree up; nothing here depends on it any more.
 | 2 — the `IRadio` seam | **Implemented.** Seam + caps flag + MT7612U implementation + five bring-up gates + a headless selftest. R5 and R6 both measured; `station_mode_ok` is **true** for MT7612U. `docs/mt7612u-station-identity.md` — read its retraction section before quoting any number. The R6 table was re-taken 2026-09-20 under the corrected single-variable harness and holds. |
 | 3 — pure station logic | **DONE 2026-09-21.** BSS table, association state machine, EAPOL/4-way supplicant, all headless. Both acceptance negatives present and load-bearing. Pinned against a captured hostapd/wpa_supplicant four-way. |
 | 4 — the harness | **DONE 2026-09-21.** `tests/sta_client.cpp` (+ its `.inc`, ctest `sta_client_headless`) and `tests/mt7612u_sta_onair.sh`. **16/16 on ch6** against hostapd on an RTL8812AU; `bench` 2/2 separately. No backend branch anywhere in it, which is the phase's acceptance property. |
-| 5 — validation | **Nearly closed.** Independent witness (Phase 4); devourer-to-devourer + 5 GHz, `tests/sta_d2d_onair.sh`. **Throughput** measured (`udp_blast`, `thru` cell): ~20 Mbit/s both ways at MCS7 after the Jaguar3 TX fix (`222bcf9`; the AP downlink was 0.445). **30-minute soak** passed (uplink-dominant). Still owed: a **bidirectional** soak now that the downlink works, and the Phase 5 close-out review round. Jaguar3 open items: `docs/jaguar3-tx-ring.md`. |
+| 5 — validation | **Nearly closed.** Independent witness (Phase 4); devourer-to-devourer + 5 GHz, `tests/sta_d2d_onair.sh`. **Throughput** measured (`udp_blast`, `thru` cell): ~20 Mbit/s up, ~30 down at MCS7 after the Jaguar3 TX fix (the AP downlink was 0.445; root cause `REG_CR` = DMA-only at the LLT init, fixed 2026-09-25, superseding `222bcf9`'s direct LLT write). **30-minute soak** passed (uplink-dominant, on the old fix). Acceptance `all` 21/21 on the new one. Jaguar1 as AP checked on air (clean). Still owed: a **bidirectional** soak now that the downlink works, and the Phase 5 close-out review round. Jaguar3 open items: `docs/jaguar3-tx-ring.md`. |
 | 6 — the Realtek arm | Not started. |
 
 ## What exists now
@@ -375,7 +375,7 @@ because it was measured, not because it is understood.
    data ring ran into the reserved region and overwrote its own beacon page;
    the next TBTT latched a TX-DMA fault and the AP stopped transmitting
    (beacons and management replies both), so the station's supervision
-   correctly declared the link dead. Fixed in `222bcf9`; record and the
+   correctly declared the link dead. Fixed 2026-09-25 (`REG_CR`, superseding `222bcf9`); record and the
    remaining Jaguar3 items in `docs/jaguar3-tx-ring.md`.
 9. **No link-layer retransmission anywhere on the devourer-to-devourer link.**
    Neither `ap_wpa2` nor `sta_client` arms `SetAckResponder`, so a lost frame

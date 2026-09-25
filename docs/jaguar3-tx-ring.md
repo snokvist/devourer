@@ -1,145 +1,160 @@
 # Jaguar3 TX page ring — the beacon overwrite, the fix, and what is still open
 
-**Status 2026-09-25.** Root cause found and fixed in `222bcf9`
-(`HalmacJaguar3MacInit::terminate_acq_ring`). This file is the record of the
-open items the fix leaves, and the ready-to-run plan for the one that would
-turn the fix from "matches the vendor's end state" into "matches the vendor's
-mechanism": the `GENERAL_INFO` H2C.
+**Status 2026-09-25, updated the same day: the mechanism is found and the fix
+replaced.** `222bcf9` wrote the ring terminator directly
+(`terminate_acq_ring`); that matched the vendor chip's end state but not how it
+gets there. The GENERAL_INFO lead below was tested and ruled out, and the real
+mechanism turned out to be a one-constant porting defect: devourer enabled only
+the DMA bits of `REG_CR` before the LLT init, where halmac enables all eight.
+The direct write is gone; the constant is fixed. Item 1 below is the record.
 
-The investigation narrative, the ruled-out hypotheses and the three corrected
-claims live in `docs/station-mode-plan.md` (Phase 5). The durable per-chip
-facts live in `src/jaguar3/CLAUDE.md`. This file does not repeat them.
+The investigation narrative, the ruled-out hypotheses and the corrected claims
+live in `docs/station-mode-plan.md` (Phase 5). The durable per-chip facts live
+in `src/jaguar3/CLAUDE.md`. This file does not repeat them.
 
 ## The defect in one paragraph
 
 The TX FIFO is 2048 pages of 128 bytes, chained by the LLT. The auto-LLT init
-links every page to the next, `0 -> 1 -> ... -> 2047`, so the data ring runs
-on into the reserved region, and page `rsvd_boundary` (1938) is where the
-beacon lives. Under sustained TX with a beacon armed, the data allocator is
+links every page to the next, `0 -> 1 -> ... -> 2047`, and page
+`rsvd_boundary` (1938) is where the beacon lives. On a correctly configured
+chip the allocator wraps at the boundary and writes `LLT[1937] = 0` itself;
+with `REG_CR` holding only the DMA bits at the LLT init, it did not - the data
+ring ran on into the reserved region. Under sustained TX with a beacon armed, the data allocator is
 eventually handed page 1938 and overwrites the beacon; the next TBTT reads a
 data frame as a beacon descriptor and `TXDMA_STATUS` latches
 `BIT_TXPKTBUF_REQ_ERR`. The chip transmits nothing more for the life of the
 process. The rtl88x2cu vendor driver's chip, read live on the same adapter,
-differs from ours in exactly one LLT entry: `LLT[1937] = 0`. The fix writes
-that entry.
+differs from ours in exactly one LLT entry: `LLT[1937] = 0`. The chip writes that
+entry itself - when the MAC is configured the way the vendor configures it.
 
-| RTL8812CU AP, MCS7, ch6 | before | after |
-|---|---|---|
-| downlink goodput (~1% loss) | 0.445 Mbit/s | 24.3 Mbit/s |
-| our beacon under downlink load | 8% of idle | 100% |
-| flood ping | ~21 rt/s, 78–89% loss | 357 rt/s, 1.1% loss |
+| RTL8812CU AP, MCS7, ch6 | before | direct LLT write (`222bcf9`) | `REG_CR` fix (current) |
+|---|---|---|---|
+| downlink goodput | 0.445 Mbit/s | 24.3 Mbit/s, ~1% loss | 29.6 Mbit/s, 1.2% loss (top rung offered) |
+| our beacon under downlink load | 8% of idle | 100% | 100% |
+| flood ping | ~21 rt/s, 78–89% loss | 357 rt/s, 1.1% loss | 305 rt/s, 5.2% loss; re-run 351 rt/s, 1.4% |
+| injection with the beacon armed | fault at ~172–208 frames | 2001/2001 | 4000/4000 |
+| `txdemo` 8000 frames, max duty | clean | clean | 8050/8050, `txdma_status` 0 |
+| acceptance `all` | - | 20/21 (wpa2 at 6M) | 21/21, one run |
+
+Single runs each; the flood pair shows the run-to-run spread is several
+points, so the new fix's downlink figure is "at least as good", not a
+measured gain. The 30-minute soak ran on the direct-write fix only.
 
 ## Open items
 
-### 1. How the vendor's chip gets `LLT[1937] = 0` — the GENERAL_INFO H2C
+### 1. RESOLVED - how the vendor's chip gets `LLT[1937] = 0`
 
-**Why it matters.** `terminate_acq_ring` reproduces the vendor's END STATE by
-writing the LLT through the packet-buffer debug window. It does not reproduce
-the vendor's MECHANISM, and the vendor source never writes the LLT: it runs
-the same auto-init we do. Something else produces the terminator. If it is
-the firmware, then (a) our direct write may race or conflict with firmware
-LLT management we are not modelling, and (b) other firmware behaviour keyed
-on the same information is also missing.
+**Answer: its hardware writes it, dynamically, because the vendor enables the
+whole MAC before the LLT init. devourer enabled only the DMA bits.**
 
-**The lead, and why it is the right one.** `hal/hal_halmac.c` in the vendor
-tree, `rtw_halmac_init_hal`, in order:
+halmac's `MAC_TRX_ENABLE` for the 8822C (and 8822E, and 8822B) is `0xFF`:
+HCI TX/RX DMA, TX/RX DMA, PROTOCOL, SCHEDULE, MACTX, MACRX. `init_trx_cfg`
+writes it to `REG_CR` just before `priority_queue_cfg` runs the auto-LLT init.
+devourer's port had `MAC_TRX_ENABLE = 0x0F` - the four DMA bits only - and set
+the rest later, after the LLT init had already run.
 
-1. `init_mac_flow` — which contains `priority_queue_cfg_8822c` and the
-   auto-LLT init devourer ports faithfully;
-2. `_drv_enable_trx`;
-3. **`_send_general_info`** → `send_general_info_88xx`
-   (`halmac_88xx/halmac_fw_88xx.c:1047`), which sends two H2C *packets* —
-   `GENERAL_INFO` then `PHYDM_INFO` — and then **polls the H2C queue element
-   in the reserved region** (`rsvd_h2cq_addr << 7`, via `dump_fifo_88xx`)
-   until it reads `(b0 & 0x7F) == 0x01 && b1 == 0xFF`, i.e. until the
-   firmware has consumed them;
-4. `rtw_hal_init_mac_register`.
+How it was established, each step with the control that makes it mean
+something:
 
-`GENERAL_INFO`'s only field is `FW_TX_BOUNDARY` — the firmware's TX buffer
-offset *within the reserved region*. It is sent immediately after the LLT
-init. That is precisely the information, at precisely the moment, a firmware
-would need to carve the reserved pages out of the data ring. devourer sends
-neither packet: it has no H2C-packet path at all, only the HMEBOX register
-mailbox.
+| step | result |
+|---|---|
+| **A/B, GENERAL_INFO** (both arms with the direct write disabled) | control (no H2C): fault at 208 frames, `LLT[1937]` stays `0x792`. With GENERAL_INFO + PHYDM_INFO: fault at 206 frames, `LLT[1937]` stays `0x792`. |
+| were the H2C packets really delivered? | both built byte-identical to the vendor's 80-byte transfers (headless test against the usbmon bytes); the H2C queue's hardware write pointer AND the firmware's read pointer both advanced by 64 bytes - received and consumed. **GENERAL_INFO is not the mechanism.** |
+| does the vendor host write the LLT? | no - its whole captured bring-up touches the packet-buffer window once, for the GENERAL_INFO poll of the H2C queue |
+| the vendor chip, freshly bound, idle | `LLT[1936..1939] = 791 792 793 794` - **identical to ours**. The terminator is not there at init. |
+| the vendor chip after 500 injected frames, monitor mode, **no AP, no beacon** | `LLT[1937] = 0`. The allocator wraps at the boundary on its own. |
+| diff of the vendor's register writes vs ours, TRX enable through LLT init (usbmon, both captures) | exactly one difference: `REG_CR` `0xFF` vs `0x0F` |
+| devourer with `REG_CR = 0xFF`, no direct write | 2001/2001 then 4000/4000 frames, zero faults; after the run `LLT[1937] = 0` - written by the hardware - and page 1938 still holds the beacon descriptor |
 
-**What is already known — the exact bytes.** From a usbmon capture of the
-vendor driver on this adapter (bus 5, EP `0x05`, 80-byte bulk-OUT = 48-byte
-descriptor + 32-byte H2C packet; frames 2331/2332 of that capture):
+The GENERAL_INFO port (a header-only byte-exact builder, its selftest, the
+H2C-packet send path with its own sequence counter, and the A/B switches) is
+kept on the local branch `xp/j3-general-info`, not in the tree: it is not
+needed for this, and sending it in bring-up would change firmware state under
+every existing Jaguar3 validation for no measured benefit. The captured bytes
+are below in case a future feature needs the packet path.
+
+<details><summary>The captured GENERAL_INFO / PHYDM_INFO bytes</summary>
+
+usbmon, vendor rtl88x2cu on an RTL8812CU, bulk-OUT endpoint `0x05`, 80 bytes
+each (48-byte descriptor `TXPKTSIZE=32 QSEL=0x13`, checksum `0x1320`, then the
+32-byte packet):
 
 ```
-descriptor  DW0 0x00000020  TXPKTSIZE=32  OFFSET=0   (all else 0)
-            DW1 0x00001300  QSEL=0x13 (HALMAC_TXDESC_QSEL_H2C_CMD)
-            DW7 checksum
-            -> bulk-OUT on endpoint 0x05 (HIGH)
-
-GENERAL_INFO  01 ff 0d 00 0c 00 00 00  00 00 38 00 00 00 00 00  00 ... (32 B)
-              cat=0x01 cmd=0xFF sub=0x0D  total_len=12  seq=0
-              content dword @0x08: FW_TX_BOUNDARY (bits 16..23) = 0x38 = 56
-
-PHYDM_INFO    01 ff 11 00 10 00 01 00  03 02 05 33 00 07 00 00  00 ... (32 B)
-              sub=0x11  total_len=16  seq=1
-              content: rfe_type 3, rf_type 2, cut 5, ... (matches devourer's
-              own bring-up log: rfe_type=0x03, cut=5)
+GENERAL_INFO  01 ff 0d 00 0c 00 00 00  00 00 38 00 ...   FW_TX_BOUNDARY 56, seq 0
+PHYDM_INFO    01 ff 11 00 10 00 01 00  03 02 05 33 00 07 00 00 ...
+              rfe 3, HALMAC_RF_2T2R, cut 5, rx|tx ant 3|3, ext_pa 0,
+              package_type 7 (from its MAC-hidden report), seq 1
 ```
 
-`FW_TX_BOUNDARY = rsvd_fw_txbuf_addr - rsvd_boundary`. devourer's layout
-(`HalmacJaguar3MacInit::priority_queue_cfg`): `2048 - 50 (CSI) - 4
-(FW_TXBUF) = 1994`, and `1994 - 1938 = 56 = 0x38` — the identical value. The
-packet can be sent byte-for-byte.
-
-The capture also shows a steady stream of `sub=0x08` packets (`CFG_PARAM`,
-the firmware's register-write offload, ACK bit set, seq incrementing). They
-are not part of this question.
-
-**The plan, in order, each step with its own pass/fail:**
-
-1. **An H2C-packet transmit path.** 48-byte descriptor (`TXPKTSIZE=32`,
-   `QSEL=0x13`, `OFFSET` as captured), 32-byte payload, bulk-OUT on the HIGH
-   endpoint, a sequence counter. A headless cell that builds the two packets
-   and compares them byte-for-byte to the capture above. *Pass: identical
-   bytes.*
-2. **Send them where the vendor does** — after `init_mac_cfg` and the TRX
-   enable, before the MAC register tables — and poll the H2C-queue element at
-   `rsvd_h2cq_addr` (1986) through `ReadPacketBuffer` for the consumed
-   marker. *Pass: the firmware consumes them (marker seen within the
-   vendor's 100-poll budget).*
-3. **The A/B that answers the question.** With `terminate_acq_ring` disabled
-   (a temporary build flag, not a shipped knob), read `LLT[1937]` after
-   bring-up, with and without the two packets. *If it reads 0 only with them,
-   the firmware is the mechanism.* If it reads `0x792` either way, it is not,
-   and item 1 closes as "not GENERAL_INFO".
-4. **Then decide.** If the firmware does it: send `GENERAL_INFO` in bring-up
-   and keep `terminate_acq_ring` as a verified assertion (read the entry, log
-   if the firmware did not terminate it) rather than a write. If not: keep the
-   direct write and record the negative.
-5. Whatever the outcome, re-run the on-air regression set (below).
-
-**What to watch for.** The vendor checks `fw_ver.h2c_version >= 4` before
-sending (and warns below 14). devourer's firmware blob's H2C version should
-be read before relying on the packet path. And the HMEBOX path and the
-H2C-packet path are different firmware queues: the existing rule in
-`src/jaguar3/CLAUDE.md` about the HMEBOX box counter does not cover the new
-one — it needs its own sequence counter, owned in one place.
+Both firmware blobs (8822C 9.0.17, 8822E) report H2C format version 15.
+</details>
 
 ### 2. The 8822E is untested
 
-`HalmacJaguar3MacInit` serves both Jaguar3 dies. The fix is written in terms
-of the die's own `rsvd_boundary`, so it is structurally correct for the
-8822E, but no 8812EU/8822EU was on the bench. *To close:* the `beacons` and
-`thru` cells of `tests/sta_d2d_onair.sh` with an 8822E as the AP (the harness
-takes `AP_VID`/`AP_PID`/`AP_SYSFS`), and the bring-up log line
-`TX page ring terminated at page N` checked for the 8822E's N.
+`HalmacJaguar3MacInit` serves both Jaguar3 dies, and the 8822E's halmac
+defines the same `MAC_TRX_ENABLE = 0xFF`, so the fix is the vendor's own value
+there too - but no 8812EU/8822EU was on the bench. *To close:* the `beacons`
+and `thru` cells of `tests/sta_d2d_onair.sh` with an 8822E as the AP (the
+harness takes `AP_VID`/`AP_PID`/`AP_SYSFS`), plus `ap_wpa2` with
+`DEVOURER_AP_INJECT=4000 DEVOURER_AP_PKTBUF=1`: zero faults and the LLT
+entry before the 8822E's `rsvd_boundary` reading 0 at the end of run. (The
+probe prints entries 1936..1939, the 8822C's neighbourhood; check the 8822E's
+boundary first.)
 
-### 3. Jaguar1 and Jaguar2 are unchecked
+### 3. Jaguar1 - checked, clear. Jaguar2 - carries the same defect, unverified
 
-Both use `first_bulk_out_ep()` for every frame and the Jaguar3 QSEL comment
-says it "mirrors Jaguar1 inject". Neither has been checked for the queue
-mapping or for a data ring that reaches its beacon page. *To close:* the
-`DEVOURER_AP_INJECT` + `DEVOURER_AP_PKTBUF` probe from `tests/ap_wpa2.cpp`
-needs a `ReadPacketBuffer` implementation on those backends (the halmac
-window addressing is the same family); then inject past one ring traversal
-with a beacon armed and watch for a TX-DMA fault. Jaguar2 is a HalMAC part
-and the likelier of the two to share the defect.
+**Jaguar1 (RTL8812AU, on air 2026-09-25): no instance of either Jaguar3
+defect.**
+
+- *The page ring* cannot run into the beacon by construction: the 8812A/8821A
+  LLT init is the old manual one (`HalModule::InitLLTTable8812A`), and it ends
+  the data free list explicitly - `LLT[txpktbuf_bndy - 1] = 0xFF` - with the
+  beacon pages above the boundary on a separate ring. (The 8814A uses the
+  auto-LLT and is not covered by this; no 8814AU was on the bench.)
+- *The queue mapping* is consistent: every frame carries QSEL `0x12` (MGT) on
+  the first bulk-OUT endpoint, and Jaguar1's own priority init maps MGT to
+  the HIGH queue that endpoint feeds. Data therefore competes with
+  management for HIGH-queue pages - a throughput question, not a fault.
+- *On air*, the 8812AU as the `ap_wpa2` AP (`AP_SYSFS=7-1 AP_PID=0x8812`),
+  the MT7612U as station, ch6, MCS7: `beacons` **3/3**, our beacon 101% of
+  idle under downlink load and straight back after it; the AP aired 4320
+  frames with 0 send failures. `thru` downlink clean to **13.8 Mbit/s at
+  0.28% loss**, saturating at ~12.5-12.8 Mbit/s above that - about half the
+  Jaguar3 AP's ceiling, degrading smoothly, never collapsing.
+
+**One finding that is NOT Jaguar1's: the uplink into this 8812AU loses a flat
+~18-21% at every rate**, 1 to 30 Mbit/s offered, and MCS1 no better than
+MCS7, so the `thru` cell fails its 5%-loss gate in that direction. It is this
+adapter or its placement, established by elimination on one 1 Mbit/s rung
+(1373 station frames aired, `ARQ=0`, so each airs exactly once):
+
+| receiver of the station's frames | captured |
+|---|---|
+| the 8812AU as devourer AP | 81.5% |
+| the 8812AU as a plain devourer `rxdemo` monitor, no TX | 84.0% |
+| the same, with the Jaguar1 DIG watchdog on (IGI walked 0x1c -> 0x2a) | 77.3% |
+| **the same 8812AU on the kernel's rtw88 driver, monitor** | **80.5%** |
+| the 8812CU (vendor driver monitor / devourer AP), same moments | 94.8% / 99.0% |
+
+Ruled out on the way: AP-mode TX/RX concurrency (plain monitor loses the same),
+modulation margin (MCS1 no better; every frame that does arrive is strong -
+RSSI ~83/72, EVM -54 dB), CRC-corrupted arrivals (only 2 of ~220 missing
+frames show up as CRC failures with the address intact), and false-alarm
+blinding by a low IGI (a hypothesis I tested and **retract**: DIG raised the IGI
+and neither the garbage decode rate nor the capture moved). The same
+8812AU is the bench witness that "goes deaf after a run"; together these say
+the unit or its antenna position is marginal on this bench. Not pursued
+further - it is not a devourer defect.
+
+**Jaguar2 has the identical `REG_CR` defect, and it is not fixed.**
+`src/jaguar2/HalmacJaguar2MacInit.cpp` defines the same DMA-only
+`MAC_TRX_ENABLE = 0x0F` and writes it before its auto-LLT init, where the
+vendor's 8822B halmac defines `0xFF`. No Jaguar2 adapter (8812BU/8822BU/
+8811CU/8821CU) was on the bench, so it is flagged rather than changed. *To
+close:* the one-constant fix, then `ap_wpa2` on a Jaguar2 AP with
+`DEVOURER_AP_INJECT=4000` - zero faults, beacon page intact after - and the
+`beacons` cell. Plain injection (the FPV path) is not expected to be
+affected, as it was not on Jaguar3.
 
 ### 4. The `wpa2` acceptance cell is flaky at 6M on ch6
 
@@ -150,6 +165,8 @@ it is not a regression: the threshold was calibrated on ch36 (4–5% loss) and
 the cell runs on ch6. Options, not chosen — they change what the gate means:
 run the acceptance cells at MCS7; raise the sample to 50 pings with a
 correspondingly derived threshold; or move `wpa2` to a cleaner channel.
+With the `REG_CR` fix, one full `all` run passed 21/21 with this cell at
+19/20 both ways - one run, so not evidence the flakiness is gone.
 
 ### 5. Why 6M legacy is less reliable than MCS7 on this bench
 
@@ -177,8 +194,10 @@ sudo tests/sta_d2d_onair.sh all                    # 21 checks (see item 4)
 ```
 
 Plus a station-free stress that needs no association:
-`DEVOURER_AP_INJECT=2000 DEVOURER_AP_PKTBUF=1` on `tests/ap_wpa2.cpp` — zero
-send failures, no `TXDMA_STATUS` transition, `LLT[1937]=0` in the probe. And
+`DEVOURER_AP_INJECT=4000 DEVOURER_AP_PKTBUF=1` on `tests/ap_wpa2.cpp` — zero
+send failures, no `TXDMA_STATUS` transition, and in the `end of run` probe
+`LLT[1937]=0` (written by the hardware at the first wrap - it reads `0x792`
+at init, correctly) with page 1938 still `59 00 30 85 ...`. And
 `txdemo` with `DEVOURER_TX_FRAMES=8000 DEVOURER_TX_GAP_US=0`: `tx.stats`
 carries `txdma_status`, which must stay 0.
 

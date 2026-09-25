@@ -1979,6 +1979,41 @@ measured earlier the same day), so it is not a regression - it is a
 threshold I calibrated on ch36 applied to ch6. Why 6M legacy is less
 reliable than MCS7 on this bench is itself unexplained.
 
+#### SUPERSEDED 2026-09-25: the mechanism, and the real fix
+
+The section above says HOW the vendor's chip gets `LLT[1937] = 0` "is NOT
+established", and fixes it by writing the entry directly. Both are now
+superseded. **The vendor's chip writes it in hardware, at the first wrap of
+the page ring, because the vendor enables the whole MAC before the LLT init;
+devourer enabled only the DMA bits.** halmac `MAC_TRX_ENABLE` is `0xFF`;
+`HalmacJaguar3MacInit` had `0x0F`. The constant is fixed and
+`terminate_acq_ring` is removed.
+
+The chain, each link measured: GENERAL_INFO (the lead this section named)
+sent byte-exact and consumed by the firmware changed nothing; the vendor
+chip's LLT at idle reads `0x792`, identical to ours, so the terminator is not
+set at init; it appears after 500 injected frames with no AP and no beacon;
+a usbmon register-write diff of both bring-ups, TRX enable through LLT init,
+has exactly one difference - `REG_CR`; with it fixed and no direct write,
+4000/4000 frames, no fault, the hardware writes `LLT[1937] = 0` and the beacon
+page survives. On air with the fix: `beacons` 3/3, `thru` 2/2 (downlink
+29.6 Mbit/s at 1.2% loss), `flood` 3/3, `all` 21/21, `txdemo` 8050/8050
+clean. Full record: `docs/jaguar3-tx-ring.md`.
+
+**What I got wrong in the section above, stated plainly:** it called the
+direct write "what the evidence supports". The evidence supported the end
+state; it said nothing about the mechanism, and the mechanism was a porting
+defect sitting in plain sight in a constant whose comment listed only four of
+halmac's eight bits. Two general lessons: (1) an end-state match against the
+answer key is not a mechanism - read the answer key's state at more than one
+moment (here: idle vs under load); (2) diff the vendor's register WRITES,
+not just its register STATE - the state diff last session could not see a
+bit that is set later anyway.
+
+Jaguar1 was checked on air the same day and has neither Jaguar3 defect;
+Jaguar2 has the identical `0x0F` constant and is flagged, unverified (no
+adapter). Both in `docs/jaguar3-tx-ring.md` item 3.
+
 #### A RETRACTION OF A RETRACTION, which is worth more than either
 
 Earlier this session an ad-hoc script concluded the AP adapter was mute.

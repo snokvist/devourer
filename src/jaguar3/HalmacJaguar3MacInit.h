@@ -48,8 +48,6 @@ public:
 private:
   bool init_trx_cfg();
   bool priority_queue_cfg();
-  /* LLT[rsvd_boundary - 1] := 0 - see the definition. */
-  bool terminate_acq_ring(uint16_t rsvd_boundary);
   void init_h2c();
   void init_protocol_cfg();
   void init_edca_cfg(ChannelWidth_t bw);
