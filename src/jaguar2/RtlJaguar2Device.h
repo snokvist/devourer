@@ -92,6 +92,13 @@ public:
    * ride the steer re-download; interval/TBTT/port identity untouched. */
   bool UpdateBeaconPayload(const uint8_t *beacon, size_t len) override;
   bool StopBeacon() override;
+  /* Read-only TX-path diagnostics, the same halmac read_buf_88xx port as
+   * Jaguar3 (the 88xx common code: TX FIFO window 0x780, LLT 0x650, selected
+   * through REG_PKTBUF_DBG_CTRL; TXDMA_STATUS at 0x0210). Safe on a chip whose
+   * transmitter has stopped. */
+  uint32_t GetTxDmaStatus() override;
+  bool ReadPacketBuffer(int sel, uint32_t offset, uint8_t *out,
+                        size_t n) override;
   /* Disable/restore the MAC EDCCA gate (BIT_DIS_EDCCA 0x520[15] + EDCCA-mask
    * 0x524[11] — HalMAC-common with J3) so a TBTT beacon airs on schedule. */
   void SetCcaMode(bool disabled) override;

@@ -89,19 +89,24 @@ PHYDM_INFO    01 ff 11 00 10 00 01 00  03 02 05 33 00 07 00 00 ...
 Both firmware blobs (8822C 9.0.17, 8822E) report H2C format version 15.
 </details>
 
-### 2. The 8822E is untested
+### 2. RESOLVED - the 8822E had the defect, and the fix removes it
 
-`HalmacJaguar3MacInit` serves both Jaguar3 dies, and the 8822E's halmac
-defines the same `MAC_TRX_ENABLE = 0xFF`, so the fix is the vendor's own value
-there too - but no 8812EU/8822EU was on the bench. *To close:* the `beacons`
-and `thru` cells of `tests/sta_d2d_onair.sh` with an 8822E as the AP (the
-harness takes `AP_VID`/`AP_PID`/`AP_SYSFS`), plus `ap_wpa2` with
-`DEVOURER_AP_INJECT=4000 DEVOURER_AP_PKTBUF=1`: zero faults and the LLT
-entry before the 8822E's `rsvd_boundary` reading 0 at the end of run. (The
-probe prints entries 1936..1939, the 8822C's neighbourhood; check the 8822E's
-boundary first.)
+Measured 2026-09-25 on an 8812EU (1-1, `0bda:a81a`). Same `rsvd_boundary`
+(1938) as the 8822C.
 
-### 3. Jaguar1 - checked, clear. Jaguar2 - carries the same defect, unverified
+| 8812EU | result |
+|---|---|
+| control, `MAC_TRX_ENABLE` temporarily back to `0x0F`, 4000 frames with the beacon armed | fault at 172 frames, page 1938 = `5a 5a ...`, `LLT[1937]` never terminated |
+| `0xFF` | 4000/4000, no fault, end-of-run `LLT[1937] = 0`, beacon page intact |
+| `txdemo` 8000 frames, max duty | 8050/8050, `txdma_status` 0 |
+| as AP, MT7612U station, **ch36** | `beacons` 3/3 (ours 103% of idle under downlink); `thru` 2/2 - up 19.9 Mbit/s at 0.27%, down 29.8 Mbit/s at 0.81% |
+| as AP, **ch6** | the station never completes the four-way - the documented 2.4 GHz TX limitation of this module (`docs/8822e-quirks.md`, "2.4 GHz TX: undecodable", kernel parity), not this fix |
+
+One observation against that quirk entry, not pursued: on ch6 the MT7612U
+decoded about half of the 8812EU's beacons (~20/s of 39/s aired), where the
+quirk records no receiver decoding any 2.4 GHz TX from this module.
+
+### 3. Jaguar1 - checked, clear. Jaguar2 - had the same defect, fixed
 
 **Jaguar1 (RTL8812AU, on air 2026-09-25): no instance of either Jaguar3
 defect.**
@@ -146,15 +151,43 @@ and neither the garbage decode rate nor the capture moved). The same
 the unit or its antenna position is marginal on this bench. Not pursued
 further - it is not a devourer defect.
 
-**Jaguar2 has the identical `REG_CR` defect, and it is not fixed.**
-`src/jaguar2/HalmacJaguar2MacInit.cpp` defines the same DMA-only
-`MAC_TRX_ENABLE = 0x0F` and writes it before its auto-LLT init, where the
-vendor's 8822B halmac defines `0xFF`. No Jaguar2 adapter (8812BU/8822BU/
-8811CU/8821CU) was on the bench, so it is flagged rather than changed. *To
-close:* the one-constant fix, then `ap_wpa2` on a Jaguar2 AP with
-`DEVOURER_AP_INJECT=4000` - zero faults, beacon page intact after - and the
-`beacons` cell. Plain injection (the FPV path) is not expected to be
-affected, as it was not on Jaguar3.
+**Jaguar2 had the identical `REG_CR` defect - fixed and measured 2026-09-25**
+on an 8812BU (6-1, `0bda:b812`). `src/jaguar2/HalmacJaguar2MacInit.cpp`
+had the same DMA-only `MAC_TRX_ENABLE = 0x0F`; halmac's is `0xFF` for both
+the 8822B and the 8821C. Same `rsvd_boundary`, 1938.
+
+| 8812BU | result |
+|---|---|
+| unchanged code (`0x0F`), 4000 frames with the beacon armed | fault at 358 frames: page 1938 overwritten with `5a 5a ...`, `TXDMA_STATUS` 0 -> `0x10` -> `0x15`, then every bulk-OUT times out |
+| `0xFF` | 4000/4000, no fault, end-of-run `LLT[1937] = 0`, beacon page intact |
+| `txdemo` 8000 frames, max duty | 8042/8042, `txdma_status` 0 |
+| as AP, MT7612U station, ch6 | `beacons` 3/3 (ours 100% of idle under downlink, 4317 aired, 0 failed) |
+| as AP, **ch36** | `thru` 2/2 - up 19.9 Mbit/s at 0.16%, down 29.6 Mbit/s at 1.34% |
+| as AP, **ch6** | `thru` FAILS its gate: downlink carries up to 28.4 Mbit/s but at a flat ~5.5-6% loss; uplink loses 40-47% at every rate (an earlier run: 31% falling to 2.5%) |
+
+The ch6 losses are OPEN and unattributed. ch36 is clean both ways, so it is
+not Jaguar2's RX or TX path in general. The split that would attribute it -
+the station's ch6 frames received by rtw88 on the same 8812BU - needs a
+second AP the station can join on ch6, and this bench had none that session
+(no 8812CU; the 8812EU cannot transmit decodably at 2.4 GHz). The 8812AU
+showed a similar adapter-level ch6 uplink loss that rtw88 reproduced, which
+makes placement/2.4 GHz environment the leading guess - a guess, not a
+finding.
+
+**A second Jaguar2 defect found on the way, fixed:** the first `thru` run
+killed the AP. Its DIG thread (`RtlJaguar2Device::StartRxLoop`) called
+`dig_step()` every 100 ms with no exception handling, and a USB control read
+(`rtw_read(0c50)`, the IGI) threw `iostream error` under a 14-20 Mbit/s
+uplink - `std::terminate`, core dump. The file already documented that such
+reads "race the async bulk-IN and throw under load" and guarded the CFO
+tracker for it; DIG and the thermal-track thread were not guarded. Both now
+skip and count the tick. It fired about once per ladder afterwards - a
+recurring event, not a one-off. Jaguar2's `ReadPacketBuffer` and
+`GetTxDmaStatus` were ported from Jaguar3 (read-only; the 88xx common
+`read_buf` addressing) to make the station-free probe work on this die.
+
+Not covered: the 8821C (USB) and the PCIe 8821CE share the constant and
+were not on the bench.
 
 ### 4. The `wpa2` acceptance cell is flaky at 6M on ch6
 
@@ -197,7 +230,10 @@ Plus a station-free stress that needs no association:
 `DEVOURER_AP_INJECT=4000 DEVOURER_AP_PKTBUF=1` on `tests/ap_wpa2.cpp` — zero
 send failures, no `TXDMA_STATUS` transition, and in the `end of run` probe
 `LLT[1937]=0` (written by the hardware at the first wrap - it reads `0x792`
-at init, correctly) with page 1938 still `59 00 30 85 ...`. And
+at init, correctly) with page 1938 still `59 00 30 85 ...`. The probe reads
+around page 1938; `DEVOURER_AP_PKTBUF_BNDY=N` points it at another die's
+boundary (all three measured dies - 8822C, 8822E, 8822B - use 1938). It
+works on Jaguar2 and Jaguar3, the backends with `ReadPacketBuffer`. And
 `txdemo` with `DEVOURER_TX_FRAMES=8000 DEVOURER_TX_GAP_US=0`: `tx.stats`
 carries `txdma_status`, which must stay 0.
 

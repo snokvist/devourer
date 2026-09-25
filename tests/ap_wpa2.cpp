@@ -251,15 +251,20 @@ static bool profiled_ccmp(bool encrypt, const uint8_t* key, const uint8_t* nonce
 static void probe_pktbuf(const char* when) {
   auto* rtl = dynamic_cast<IRtlRadio*>(g_dev);
   if (!rtl) return;
+  /* The reserved boundary is per die (1938 on the 8822C); the bring-up log
+   * prints it. DEVOURER_AP_PKTBUF_BNDY=N points the probe at another die's. */
+  uint32_t b = 1938;
+  if (const char* e = std::getenv("DEVOURER_AP_PKTBUF_BNDY"))
+    b = (uint32_t)std::strtoul(e, nullptr, 0);
   uint8_t pg[32];
-  if (rtl->ReadPacketBuffer(0, 1938u << 7, pg, sizeof pg)) {
-    fprintf(stderr, "  PKTBUF %s: page 1938 =", when);
+  if (rtl->ReadPacketBuffer(0, b << 7, pg, sizeof pg)) {
+    fprintf(stderr, "  PKTBUF %s: page %u =", when, b);
     for (size_t i = 0; i < sizeof pg; i++) fprintf(stderr, " %02x", pg[i]);
     fprintf(stderr, "\n");
   }
   /* LLT: one 32-bit entry per page is the most likely layout; print raw
    * words so the layout can be read off rather than assumed. */
-  static const uint32_t pages[] = {0, 1, 1936, 1937, 1938, 1939, 2046, 2047};
+  const uint32_t pages[] = {0, 1, b - 2, b - 1, b, b + 1, 2046, 2047};
   fprintf(stderr, "  LLT %s:", when);
   for (uint32_t p : pages) {
     uint8_t e[4];

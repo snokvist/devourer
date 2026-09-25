@@ -298,7 +298,13 @@ void RtlJaguar2Device::start_pwrtrack() {
         continue;
       int cck = -1, ofdm = -1, mcs7 = -1;
       _hal.txagc_shadow(cck, ofdm, mcs7);
-      _cal->pwr_track(ofdm);
+      /* Same hazard as the DIG thread: a register read that throws under RX
+       * load must skip this tick, not terminate the process. */
+      try {
+        _cal->pwr_track(ofdm);
+      } catch (const std::exception &e) {
+        _logger->warn("Jaguar2 thermal track: tick skipped ({})", e.what());
+      }
     }
   });
   _logger->info("RtlJaguar2Device: thermal-track thread started");
@@ -516,9 +522,21 @@ void RtlJaguar2Device::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
   _dig_stop = false;
   if (!_cfg.tuning.skip_dig) {
     _dig_thread = std::thread([this] {
+      uint64_t skipped = 0;
       while (!_dig_stop && !g_devourer_should_stop) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        _hal.dig_step();
+        /* A control-transfer read can race the async bulk-IN and throw under
+         * RX load (the same hazard the CFO tracker guards below). Uncaught on
+         * this thread it is std::terminate - it killed an 8812BU AP mid-way
+         * through a 14-20 Mbit/s uplink. DIG is a tracking loop: a failed
+         * tick is skipped, counted, and the next one re-reads everything. */
+        try {
+          _hal.dig_step();
+        } catch (const std::exception &e) {
+          if (skipped++ % 100 == 0)
+            _logger->warn("Jaguar2 DIG: tick skipped after a failed register "
+                          "access ({}), {} so far", e.what(), skipped);
+        }
       }
     });
     _logger->info("RtlJaguar2Device: DIG thread started");
@@ -1759,6 +1777,43 @@ bool RtlJaguar2Device::UpdateBeaconPayload(const uint8_t *beacon, size_t len) {
    * replaces the TBTT engine's buffer and re-arms the valid latch (its poll is
    * the success signal). Interval/TBTT/port identity untouched. */
   return redownload_beacon_locked();
+}
+
+uint32_t RtlJaguar2Device::GetTxDmaStatus() {
+  return _device.rtw_read<uint32_t>(0x0210); /* REG_TXDMA_STATUS */
+}
+
+bool RtlJaguar2Device::ReadPacketBuffer(int sel, uint32_t offset,
+                                        uint8_t *out, size_t n) {
+  uint32_t base;
+  if (sel == 0)
+    base = 0x780; /* TX FIFO */
+  else if (sel == 1)
+    base = 0x650; /* LLT */
+  else
+    return false;
+  if (n % 4)
+    return false;
+  uint32_t win = (offset >> 12) + base;
+  uint32_t residue = offset & 0xFFF;
+  const uint16_t saved = _device.rtw_read16(0x0140); /* REG_PKTBUF_DBG_CTRL */
+  const uint16_t hi = static_cast<uint16_t>(saved & 0xF000);
+  size_t got = 0;
+  while (got < n) {
+    _device.rtw_write16(0x0140, static_cast<uint16_t>(win | hi));
+    for (uint32_t a = 0x8000 + residue; a <= 0x8FFF && got < n; a += 4) {
+      const uint32_t v = _device.rtw_read<uint32_t>(static_cast<uint16_t>(a));
+      out[got + 0] = static_cast<uint8_t>(v);
+      out[got + 1] = static_cast<uint8_t>(v >> 8);
+      out[got + 2] = static_cast<uint8_t>(v >> 16);
+      out[got + 3] = static_cast<uint8_t>(v >> 24);
+      got += 4;
+    }
+    residue = 0;
+    win++;
+  }
+  _device.rtw_write16(0x0140, saved);
+  return true;
 }
 
 bool RtlJaguar2Device::StopBeacon() {

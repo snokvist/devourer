@@ -44,6 +44,21 @@ Jaguar1 (shared `PhyTableLoader`).
   instead (`fw_switch_confirm`). Classic 8-byte H2Cs ride the HMEBOX
   mailboxes (0x1d0/0x1f0 + 0x1cc busy bits), distinct from MacInit's 32-byte
   h2c-pkt queue.
+- **The whole MAC must be enabled before the LLT init** (`MAC_TRX_ENABLE =
+  0xFF`, halmac's value for both 8822B and 8821C; this port had the DMA-only
+  `0x0F`). The same defect and fix as Jaguar3 (`src/jaguar3/CLAUDE.md`):
+  without PROTOCOL/SCHEDULE at the auto-LLT init the TX page allocator runs
+  past `rsvd_boundary` (1938 on the 8822B too), a sustained load overwrites
+  the beacon page, and the next TBTT latches `TXDMA_STATUS` (`0x10`, then
+  `0x15` on this die) and TX dies. Measured on an 8812BU: fault at 358 frames
+  before, 4000/4000 clean after with the hardware writing `LLT[1937] = 0`.
+  The 8821C and the PCIe 8821CE ride the same constant and are unverified.
+- **Runtime threads must survive a failed register read.** A control-transfer
+  read can race the async bulk-IN and throw under RX load; the DIG and
+  thermal-track threads now skip the tick and count it. Before that guard, an
+  uncaught `rtw_read: iostream error` in the DIG thread terminated an 8812BU AP
+  mid-way through a 14-20 Mbit/s uplink, and the guard has fired about once
+  per throughput ladder since - it is a recurring event, not a one-off.
 
 ## TX power
 

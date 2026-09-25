@@ -44,7 +44,7 @@ narrowband dividers, RF18 encoding), strategy interfaces `Jaguar3Calibration`
   and the part stops transmitting for the life of the process. With them on,
   the hardware wraps the ring itself - it writes `LLT[rsvd_boundary - 1] = 0`
   at the first wrap. The LLT reads identically at init either way
-  (`[1937] = 0x792` on the 8822C, on the vendor driver too); only the
+  (`[1937] = 0x792` on the 8822C and 8822E, on the vendor driver too); only the
   allocator's behaviour differs, so an init-time LLT read cannot check this -
   inject past a wrap and read it after (`ap_wpa2` with `DEVOURER_AP_INJECT` +
   `DEVOURER_AP_PKTBUF`). Found by diffing a usbmon capture of the vendor
@@ -52,6 +52,8 @@ narrowband dividers, RF18 encoding), strategy interfaces `Jaguar3Calibration`
   LLT init. Plain injection never showed it - no beacon engine reads the
   page. `GENERAL_INFO`/`PHYDM_INFO` H2C packets were ruled out as the
   mechanism (sent byte-exact, consumed by the firmware, no effect on the LLT).
+  Verified on both dies: an 8812EU faults at 172 frames on `0x0F` and runs
+  4000/4000 clean on `0xFF`. Jaguar2 had the identical defect.
 - **Data frames go to the LOW queue.** `fill_data_tx_desc_8822c` stamps
   QSEL 0x12 (MGNT) on everything; `build_tx_block` moves 802.11 data frames
   to QSEL 0 (BE) and `send_packet` derives the bulk-OUT endpoint from the

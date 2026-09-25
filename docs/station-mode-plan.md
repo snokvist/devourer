@@ -2010,9 +2010,13 @@ moment (here: idle vs under load); (2) diff the vendor's register WRITES,
 not just its register STATE - the state diff last session could not see a
 bit that is set later anyway.
 
-Jaguar1 was checked on air the same day and has neither Jaguar3 defect;
-Jaguar2 has the identical `0x0F` constant and is flagged, unverified (no
-adapter). Both in `docs/jaguar3-tx-ring.md` item 3.
+Jaguar1 was checked on air the same day and has neither Jaguar3 defect.
+Jaguar2 had the identical `0x0F` constant: reproduced on an 8812BU (fault at
+358 frames), fixed the same way, and a second Jaguar2 defect found on the way
+(an unguarded DIG thread that a throwing USB read under uplink load turned
+into `std::terminate`). The 8822E was confirmed the same way (control fault
+at 172 frames, clean with the fix). All in `docs/jaguar3-tx-ring.md` items
+2 and 3, including what is still open (Jaguar2 ch6 losses, unattributed).
 
 #### A RETRACTION OF A RETRACTION, which is worth more than either
 
