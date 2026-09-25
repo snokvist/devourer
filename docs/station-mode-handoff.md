@@ -377,11 +377,15 @@ because it was measured, not because it is understood.
    (beacons and management replies both), so the station's supervision
    correctly declared the link dead. Fixed 2026-09-25 (`REG_CR`, superseding `222bcf9`); record and the
    remaining Jaguar3 items in `docs/jaguar3-tx-ring.md`.
-9. **No link-layer retransmission anywhere on the devourer-to-devourer link.**
-   Neither `ap_wpa2` nor `sta_client` arms `SetAckResponder`, so a lost frame
-   stays lost. This is why 10 pps of 1400 B loses 27% on a busy ch6 and 4% on
-   ch36, and it is why the hostapd comparison is not like-for-like: the kernel
-   AP retries. Arming it is the obvious next experiment and has not been run.
+9. ~~**No link-layer retransmission anywhere on the devourer-to-devourer link.**~~
+   **RESOLVED 2026-09-25, and the premise was half wrong.** The UPLINK already
+   has it: the station's MT7612U requests an ACK with a 15-deep retry and the
+   Realtek AP already ACKs it (zero replays over 321k soak frames), so
+   `SetAckResponder` (`ARQ=1`) measured as no change. The DOWNLINK had none:
+   the AP airs data with the library default retry limit 0. `AP_RETRY=7`
+   (`DEVOURER_TX_RETRY_LIMIT`) took downlink loss from 1.3-2.3% to 0.00% on
+   every rung up to 30 Mbit/s at ch36. Table: `docs/jaguar3-tx-ring.md`
+   item 6.
 
 ## The rule this work runs under
 

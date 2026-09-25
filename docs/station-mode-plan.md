@@ -2037,6 +2037,37 @@ just switched on for Jaguar2 (details and numbers in
 throughout with no ARQ, and the 8812BU AP's memory growing 532 kB in 15
 minutes (not separated from warm-up).
 
+#### Retransmission, measured 2026-09-25 - and one prediction retracted
+
+| arm (8812CU AP, MT7612U station, ch36, MCS7) | uplink loss, 1-20 Mbit/s | downlink loss, 1-30 Mbit/s | station replays rejected |
+|---|---|---|---|
+| A0 no responder, no AP retries (every earlier figure) | 0.14-0.30% | 1.26-2.27% | 0 |
+| A1 `ARQ=1` (AP ACK responder) only | 0.19-0.41% | 0.75-2.16% | 0 |
+| A2 `AP_RETRY=7` only | 0.15-0.45% | **0.00% on every rung** | 115 |
+| A3 both | 0.09-0.45% | **0.00% on every rung** | 114 |
+
+One ladder per arm. What it establishes:
+
+- **The downlink loss was single-shot frames.** The AP transmits with the
+  library's default retry limit, 0 (`DEVOURER_TX_RETRY_LIMIT` - right for the
+  FPV link, where FEC carries reliability), so every downlink frame aired
+  once and a frame the station missed stayed lost. With a retry limit of 7
+  the loss is zero up to 30 Mbit/s (29.998 delivered). The ~115 replays the
+  station rejects are the fingerprint of it working: frames whose ACK was
+  lost, retried, and correctly dropped as copies - nothing delivered twice.
+- **The ACK responder (`ARQ=1`) changes nothing here**, because the AP
+  already ACKs the station: over 321k soak frames the AP rejected zero
+  replays, and the station's MT7612U requests an ACK on every frame with a
+  15-deep retry (`MT_TX_RETRY_CFG` 0x47f01f0f) - unACKed frames would have
+  aired repeatedly and shown up as replays. The harness comment that
+  predicted `ARQ=1` would improve the uplink was wrong and is corrected.
+- The uplink's residual 0.1-0.4% is not the air's retry budget; it is not
+  explained yet. The 30 Mbit/s uplink rung loses 21-25% in every arm - the
+  station dropping 8-10k frames from its own queue, a send-path ceiling.
+
+`AP_RETRY` is a harness knob, unset by default so every recorded figure stays
+reproducible.
+
 #### A RETRACTION OF A RETRACTION, which is worth more than either
 
 Earlier this session an ad-hoc script concluded the AP adapter was mute.

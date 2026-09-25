@@ -235,11 +235,38 @@ longer frames on a busy band, or the MT7612U's legacy RX path. A `thru` ladder
 at `TX_RATE=6M` against one at `MCS7`, one direction at a time, splits which
 end.
 
-### 6. No link-layer retransmission
+### 6. RESOLVED - retransmission: the AP's retry limit, not the responder
 
-Neither `ap_wpa2` nor `sta_client` arms `SetAckResponder`, so every lost frame
-stays lost. `ARQ=1` in `tests/sta_d2d_onair.sh` arms the AP's responder and
-has not yet been measured. With the downlink now working, it is measurable.
+Measured 2026-09-25 with the new `AP_RETRY` harness knob:
+
+| arm (8812CU AP, MT7612U station, ch36, MCS7) | uplink loss, 1-20 Mbit/s | downlink loss, 1-30 Mbit/s | station replays rejected |
+|---|---|---|---|
+| A0 no responder, no AP retries (every earlier figure) | 0.14-0.30% | 1.26-2.27% | 0 |
+| A1 `ARQ=1` (AP ACK responder) only | 0.19-0.41% | 0.75-2.16% | 0 |
+| A2 `AP_RETRY=7` only | 0.15-0.45% | **0.00% on every rung** | 115 |
+| A3 both | 0.09-0.45% | **0.00% on every rung** | 114 |
+
+One ladder per arm. What it establishes:
+
+- **The downlink loss was single-shot frames.** The AP transmits with the
+  library's default retry limit, 0 (`DEVOURER_TX_RETRY_LIMIT` - right for the
+  FPV link, where FEC carries reliability), so every downlink frame aired
+  once and a frame the station missed stayed lost. With a retry limit of 7
+  the loss is zero up to 30 Mbit/s (29.998 delivered). The ~115 replays the
+  station rejects are the fingerprint of it working: frames whose ACK was
+  lost, retried, and correctly dropped as copies - nothing delivered twice.
+- **The ACK responder (`ARQ=1`) changes nothing here**, because the AP
+  already ACKs the station: over 321k soak frames the AP rejected zero
+  replays, and the station's MT7612U requests an ACK on every frame with a
+  15-deep retry (`MT_TX_RETRY_CFG` 0x47f01f0f) - unACKed frames would have
+  aired repeatedly and shown up as replays. The harness comment that
+  predicted `ARQ=1` would improve the uplink was wrong and is corrected.
+- The uplink's residual 0.1-0.4% is not the air's retry budget; it is not
+  explained yet. The 30 Mbit/s uplink rung loses 21-25% in every arm - the
+  station dropping 8-10k frames from its own queue, a send-path ceiling.
+
+`AP_RETRY` is a harness knob, unset by default so every recorded figure stays
+reproducible.
 
 ## The on-air regression set for any change here
 

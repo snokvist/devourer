@@ -56,7 +56,7 @@
 # ap_wpa2 claims), AP_VID/AP_PID, CH, CH5, PSK, FW_DIR, SECS, NS, APTAP,
 # STATAP, AIRGAP_SECS, BEACONS_MIN, PING_N, PING_MIN, BENCH_SECS,
 # BENCH_PAYLOAD, BENCH_PPS, THRU_SECS, THRU_PAYLOAD, TX_RATE, ARQ,
-# THRU_LADDER, THRU_LOSS_PCT, THRU_DIR, BCN_TU, BEACON_PHASE_SECS,
+# AP_RETRY, THRU_LADDER, THRU_LOSS_PCT, THRU_DIR, BCN_TU, BEACON_PHASE_SECS,
 # BEACON_KBIT, BEACON_FLOOR_PCT, BCN_REFRESH_MS, SOAK_MINUTES, SOAK_KBIT,
 # SOAK_DOWN_KBIT, SOAK_CHUNK_S, SOAK_DEGRADE_PCT.
 
@@ -120,17 +120,22 @@ THRU_LOSS_PCT="${THRU_LOSS_PCT:-5}"
 # What the harness owes is the ability to ask. Grammar is DEVOURER_TX_RATE's
 # (see CLAUDE.md): 6M, MCS7/40/SGI, VHT2SS_MCS3/80/LDPC, ...
 TX_RATE="${TX_RATE:-6M}"
-# ARQ=1 arms the AP's hardware ACK responder on the BSSID, which closes a
-# MAC-level retransmission loop for the STATION'S UPLINK: the station's MAC
-# retries until the AP acknowledges. The station side needs nothing - an
-# MT7612U auto-ACKs its own address from SetStationIdentity, measured at
-# 99.9% in Phase 0 (docs/mt7612u-station-identity.md, R6).
-#
-# NOT symmetric, and the asymmetry is the point: this arms the AP's RECEIVER
-# to answer, and whether the AP's TRANSMITTER asks for an ACK is a descriptor
-# property this harness does not set. So expect the uplink to improve and
-# make no prediction about the downlink - measure it.
+# ARQ=1 arms the AP's hardware ACK responder on the BSSID (SetAckResponder).
+# MEASURED TO CHANGE NOTHING on the 8812CU AP (ch36, 2026-09-25): the AP
+# already ACKs the station without it - zero replays over 321k soak frames,
+# against a station whose MT7612U requests an ACK with a 15-deep retry - so
+# the uplink's retransmission loop is closed either way. Kept as a knob for
+# an AP that does not. (The comment here used to predict ARQ=1 would improve
+# the uplink; it did not.) Table: docs/jaguar3-tx-ring.md item 6.
 ARQ="${ARQ:-0}"
+# AP_RETRY=N is the half that matters: the AP's per-frame hardware retry limit
+# (DEVOURER_TX_RETRY_LIMIT, 0..63). The library default is 0 - right for the
+# FPV link, where FEC carries reliability - so without this every downlink
+# frame airs exactly once and a frame the station misses stays lost. The
+# station needs nothing for it: the MT7612U ACKs its own address. Unset keeps
+# the library default. Measured: AP_RETRY=7 took downlink loss from 1.3-2.3%
+# to 0.00% on every rung to 30 Mbit/s at ch36.
+AP_RETRY="${AP_RETRY:-}"
 # The AP's beacon interval, in TU. 25 is what every figure in this branch was
 # measured under and stays the default; 100 is what a normal AP uses. It is a
 # knob because the beacon rides the same chip as the data queue and "does the
@@ -307,7 +312,7 @@ rfkill unblock wlan 2>/dev/null || true
 say "AP  $AP_SYSFS ($ap_vid:$ap_pid, devourer/ap_wpa2, in netns '$NS')"
 say "STA $STA_SYSFS ($sta_vid:$sta_pid, devourer/sta_client, root namespace)"
 say "ssid '$SSID' bssid $BSSID  psk '$PSK'  taps '$APTAP'/'$STATAP'"
-say "tx rate '$TX_RATE'  arq $ARQ  beacon ${BCN_TU}TU  refresh ${BCN_REFRESH_MS}ms"
+say "tx rate '$TX_RATE'  arq $ARQ  ap-retry ${AP_RETRY:-default}  beacon ${BCN_TU}TU  refresh ${BCN_REFRESH_MS}ms"
 
 # --- build -----------------------------------------------------------------
 
@@ -356,6 +361,7 @@ ap_up() {   # $1 = channel, $2 = seconds, $3.. = extra env
   [ "$ARQ" = 1 ] && arq_env="DEVOURER_ACK_RESPONDER=$BSSID"
   ip netns exec "$NS" env \
       ${arq_env:+"$arq_env"} DEVOURER_TX_RATE="$TX_RATE" \
+      ${AP_RETRY:+DEVOURER_TX_RETRY_LIMIT="$AP_RETRY"} \
       ${AP_TX_QSEL:+DEVOURER_TX_QSEL="$AP_TX_QSEL"} \
       DEVOURER_AP_BCN_REFRESH_MS="$BCN_REFRESH_MS" \
       DEVOURER_VID="$AP_VID" DEVOURER_PID="$AP_PID" \
@@ -980,7 +986,7 @@ cell_throughput() {
     ''|*[!0-9]*) bad "throughput: THRU_SECS and THRU_PAYLOAD must be integers"; return ;;
   esac
   local steps; steps=$(printf '%s' "$THRU_LADDER" | tr ',' ' ' | wc -w)
-  say "== throughput: UDP goodput, ${THRU_PAYLOAD}B, ${steps}-rung ladder x ${THRU_SECS}s each way, ch$CH ($freq MHz), rate $TX_RATE, arq=$ARQ =="
+  say "== throughput: UDP goodput, ${THRU_PAYLOAD}B, ${steps}-rung ladder x ${THRU_SECS}s each way, ch$CH ($freq MHz), rate $TX_RATE, arq=$ARQ, ap-retry=${AP_RETRY:-default} =="
 
   build_both || { bad "throughput: build"; return; }
   ns_up      || { bad "throughput: could not create netns $NS"; return; }
@@ -1026,7 +1032,7 @@ cell_throughput() {
     return
   fi
   if awk -v u="${up_best:-0}" -v d="${dn_best:-0}" 'BEGIN{exit !(u>0 && d>0)}'; then
-    ok "throughput: ch$CH $TX_RATE arq=$ARQ - UP ${up_best} Mbit/s (offered ${up_at} kbit/s), DOWN ${dn_best} Mbit/s (offered ${dn_at} kbit/s), both at <= ${THRU_LOSS_PCT}% loss"
+    ok "throughput: ch$CH $TX_RATE arq=$ARQ ap-retry=${AP_RETRY:-default} - UP ${up_best} Mbit/s (offered ${up_at} kbit/s), DOWN ${dn_best} Mbit/s (offered ${dn_at} kbit/s), both at <= ${THRU_LOSS_PCT}% loss"
   else
     bad "throughput: a direction never carried a rung under ${THRU_LOSS_PCT}% loss (up=${up_best} down=${dn_best}) - see the rungs above"
   fi
