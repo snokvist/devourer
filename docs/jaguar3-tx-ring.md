@@ -165,14 +165,19 @@ the 8822B and the 8821C. Same `rsvd_boundary`, 1938.
 | as AP, **ch36** | `thru` 2/2 - up 19.9 Mbit/s at 0.16%, down 29.6 Mbit/s at 1.34% |
 | as AP, **ch6** | `thru` FAILS its gate: downlink carries up to 28.4 Mbit/s but at a flat ~5.5-6% loss; uplink loses 40-47% at every rate (an earlier run: 31% falling to 2.5%) |
 
-The ch6 losses are OPEN and unattributed. ch36 is clean both ways, so it is
-not Jaguar2's RX or TX path in general. The split that would attribute it -
-the station's ch6 frames received by rtw88 on the same 8812BU - needs a
-second AP the station can join on ch6, and this bench had none that session
-(no 8812CU; the 8812EU cannot transmit decodably at 2.4 GHz). The 8812AU
-showed a similar adapter-level ch6 uplink loss that rtw88 reproduced, which
-makes placement/2.4 GHz environment the leading guess - a guess, not a
-finding.
+**The ch6 losses are the adapter or its placement, not Jaguar2** - split the
+same day with the 8812CU back on the bench as a known-good ch6 AP and
+witness. Uplink, the station's frames at the same moments: the 8812CU AP got
+99.2%; the 8812BU on the kernel's **rtw88** got 74.9%; the 8812BU on
+**devourer** got 89.0% (deduplicated by CCMP PN - Jaguar2's parser leaves
+`rx.frame` `seq` at 0). devourer's receive path does no worse than the kernel
+on this unit. Downlink, from the 8812BU AP: 5365 data frames submitted, 5197
+(96.9%) seen on air by the 8812CU witness, 4986 (92.9%) decrypted by the
+station - the loss is mostly on the receiving side of that path; Jaguar2 TX
+accounts for at most ~3%, indistinguishable from the witness's own misses.
+The 8812BU-as-AP uplink losses (31-47%) exceed its monitor-mode 11%; those
+were separate runs on a busy 2.4 GHz channel and AP mode is clean on ch36,
+so the excess is recorded, not explained.
 
 **A second Jaguar2 defect found on the way, fixed:** the first `thru` run
 killed the AP. Its DIG thread (`RtlJaguar2Device::StartRxLoop`) called
