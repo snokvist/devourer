@@ -2284,9 +2284,13 @@ int main(int argc, char **argv) {
       /* A register read can throw under load (a control transfer racing the
        * bulk-IN); that sample then omits the field and says so, rather than
        * reporting a 0 that reads as healthy - or killing the demo. */
+      /* Only where the backend reads the real latch (HasTxDmaStatus): its 0
+       * default elsewhere would read as "healthy" for a chip never asked. */
       uint32_t txdma = 0;
-      bool txdma_ok = true;
-      if (auto *rr = dynamic_cast<IRtlRadio *>(rtlDevice)) {
+      bool txdma_have = false, txdma_ok = true;
+      if (auto *rr = dynamic_cast<IRtlRadio *>(rtlDevice);
+          rr && rr->HasTxDmaStatus()) {
+        txdma_have = true;
         try {
           txdma = rr->GetTxDmaStatus();
         } catch (const std::exception &) {
@@ -2298,9 +2302,9 @@ int main(int argc, char **argv) {
           .f("failed", (unsigned long long)ts.failed)
           .f("was_timeout", ts.last_was_timeout ? 1 : 0)
           .f("last_rc", ts.last_error_rc);
-      if (txdma_ok)
+      if (txdma_have && txdma_ok)
         ev.f("txdma_status", (unsigned long long)txdma);
-      else
+      else if (txdma_have)
         ev.f("txdma_read_failed", 1);
     }
     /* Thermal telemetry via the generation-agnostic GetThermalStatus

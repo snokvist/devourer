@@ -35,32 +35,36 @@ narrowband dividers, RF18 encoding), strategy interfaces `Jaguar3Calibration`
 - The rtl8822e's hardware-bisected constraints (DPDT/pin-mux front end,
   single-path 1SS TX, spur channels, LCK, the 2.4 GHz TX kernel-parity
   limitation) live in `docs/8822e-quirks.md`.
-- **The whole MAC must be enabled before the LLT init** (`REG_CR` low byte
-  = halmac `MAC_TRX_ENABLE` = `0xFF`, not the DMA-only `0x0F` this port used
-  to write). With PROTOCOL/SCHEDULE off at the auto-LLT init, the TX page
-  allocator never learns where the data region ends: it runs past
-  `rsvd_boundary` into the reserved region and a sustained load overwrites
-  the beacon page; the next TBTT latches `TXDMA_STATUS` `BIT_TXPKTBUF_REQ_ERR`
-  and the part stops transmitting for the life of the process. With them on,
-  the hardware wraps the ring itself - it writes `LLT[rsvd_boundary - 1] = 0`
-  at the first wrap. The LLT reads identically at init either way
-  (`[1937] = 0x792` on the 8822C and 8822E, on the vendor driver too); only the
-  allocator's behaviour differs, so an init-time LLT read cannot check this -
+- **PROTOCOL_EN must be set before the LLT init.** halmac writes
+  `MAC_TRX_ENABLE = 0xFF` to `REG_CR` just before the auto-LLT init; this port
+  wrote the DMA-only `0x0F`. Without PROTOCOL_EN (bit 4) at that moment the
+  TX page allocator never terminates the data ring at `rsvd_boundary`: a
+  sustained load runs into the reserved region and overwrites the beacon
+  page, and the next TBTT latches `TXDMA_STATUS` `BIT_TXPKTBUF_REQ_ERR` - TX
+  dead for the life of the process. Bisected on an 8812CU: `0x1F` (DMA +
+  PROTOCOL) clean; `0x2F` (+SCHEDULE) and `0xCF` (+MACTX/MACRX) fault. The
+  later full-CR write (`0x06FF`) is too late. The code uses the vendor's full
+  `0xFF`; the 8822E was fixed with it (its `0x0F` control faulted at 172
+  frames, `0xFF` ran 4000/4000) and not bisected. With it the hardware
+  writes `LLT[rsvd_boundary - 1] = 0` itself by the end of a run past one
+  traversal; the LLT reads `0x792` at init either way (8822C and 8822E, and
+  the vendor driver's chip too), so an init-time LLT read proves nothing -
   inject past a wrap and read it after (`ap_wpa2` with `DEVOURER_AP_INJECT` +
-  `DEVOURER_AP_PKTBUF`). Found by diffing a usbmon capture of the vendor
-  driver's bring-up against ours: `REG_CR` was the only difference up to the
-  LLT init. Plain injection never showed it - no beacon engine reads the
+  `DEVOURER_AP_PKTBUF`). Found by diffing the vendor's usbmon register writes
+  against ours from the TRX enable to the LLT init: `REG_CR` was the one
+  difference. Plain injection never showed it - no beacon engine reads the
   page. `GENERAL_INFO`/`PHYDM_INFO` H2C packets were ruled out as the
   mechanism (sent byte-exact, consumed by the firmware, no effect on the LLT).
-  Verified on both dies: an 8812EU faults at 172 frames on `0x0F` and runs
-  4000/4000 clean on `0xFF`. Jaguar2 had the identical defect.
+  Record: `docs/jaguar3-tx-ring.md`.
 - **Data frames go to the LOW queue.** `fill_data_tx_desc_8822c` stamps
   QSEL 0x12 (MGNT) on everything; `build_tx_block` moves 802.11 data frames
   to QSEL 0 (BE) and `send_packet` derives the bulk-OUT endpoint from the
   final QSEL (halmac `get_usb_bulkout_id_88xx`: HIGH 0x05, NORMAL 0x06,
-  LOW 0x08). QSEL and endpoint must agree - changing either alone was
-  measured to do nothing, and `TXDMA_STATUS` has an `EP_QSEL_DIFF` bit for
-  the mismatch. Management and beacons stay on HIGH.
+  LOW 0x08). QSEL and endpoint must agree: QSEL alone was measured to change
+  nothing; the endpoint alone was not run (a reviewer predicted it would set
+  `TXDMA_STATUS`'s `EP_QSEL_DIFF` bit). The aggregated-URB path
+  (`send_packets`) follows the same rule, falling back to per-frame sends
+  when packed frames disagree on queue. Management and beacons stay on HIGH.
 
 ## Bring-up cost and the pipelined register writes
 

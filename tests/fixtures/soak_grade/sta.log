@@ -1,0 +1,3 @@
+  TAP: dvsta0 open with 40:a5:ef:5a:32:f8 - the host stack owns ARP/ICMP/DHCP
+  TAP: to host=83490, from host=85792, dropped up=0, dropped down=1
+  tx: encrypted=85791 (cipher refused 0), plaintext=0, queued=85797, aired=85797, send failed=0, queue dropped=0

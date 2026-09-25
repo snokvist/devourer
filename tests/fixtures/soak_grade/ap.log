@@ -1,0 +1,3 @@
+  TAP: dvap0 open - the host stack owns ARP/ICMP/DHCP now, the userspace responders are OFF
+  TAP: to host=85557, from host=85757, framed=85749, dropped up=0, dropped down=8
+  data plane: encrypted frames received=85557, MIC failures=0, replays rejected=0, queued=85804, frames sent=85804, queue dropped=0, send failed=0, backoffs=0, refused after the TX circuit opened=0, beacon refreshes=0 (failed 0, retries 0)

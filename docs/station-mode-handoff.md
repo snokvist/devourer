@@ -59,7 +59,7 @@ that tree up; nothing here depends on it any more.
 | 2 — the `IRadio` seam | **Implemented.** Seam + caps flag + MT7612U implementation + five bring-up gates + a headless selftest. R5 and R6 both measured; `station_mode_ok` is **true** for MT7612U. `docs/mt7612u-station-identity.md` — read its retraction section before quoting any number. The R6 table was re-taken 2026-09-20 under the corrected single-variable harness and holds. |
 | 3 — pure station logic | **DONE 2026-09-21.** BSS table, association state machine, EAPOL/4-way supplicant, all headless. Both acceptance negatives present and load-bearing. Pinned against a captured hostapd/wpa_supplicant four-way. |
 | 4 — the harness | **DONE 2026-09-21.** `tests/sta_client.cpp` (+ its `.inc`, ctest `sta_client_headless`) and `tests/mt7612u_sta_onair.sh`. **16/16 on ch6** against hostapd on an RTL8812AU; `bench` 2/2 separately. No backend branch anywhere in it, which is the phase's acceptance property. |
-| 5 — validation | **Validation done; the close-out review round is still owed.** Independent witness (Phase 4); devourer-to-devourer + 5 GHz, `tests/sta_d2d_onair.sh`. Throughput (`thru`): ~20 Mbit/s up, ~30 down at MCS7 on 8812CU, 8812EU and 8812BU APs at ch36. **Bidirectional soak** (4+4 Mbit/s, ch36): 8812CU AP 30 min and 8812BU AP 15 min, both 5/5 - one association, both ledgers close, no degradation; downlink loss ~3% throughout (no ARQ). The TX wedge behind the old uplink-only soak is fixed on Jaguar3 and Jaguar2 (`REG_CR` at the LLT init). Open items: `docs/jaguar3-tx-ring.md`. |
+| 5 — validation | **Validated; close-out review done (Round 6, three reviewers, all findings resolved); open items remain.** Independent witness (Phase 4); devourer-to-devourer + 5 GHz, `tests/sta_d2d_onair.sh`. Throughput at ch36, MCS7, one ladder per AP: ~20 Mbit/s up at 0.2-0.4% loss and ~30 down at 0.8-1.3% (8812CU, 8812EU, 8812BU). Bidirectional soak, ch36, 4+4 Mbit/s: 8812CU 30 min and 8812BU 15 min, both 5/5 - but the FIRST 8812BU soak died at minute 9 (an unguarded register read, fixed), downlink loss ran ~3% throughout without retries, and the 8812BU AP's RSS grew 532 kB in 15 min (not separated from warm-up). Still failing their gates, both at 2.4 GHz: the 8812BU as AP on ch6 and the 8812AU uplink. **Open and next:** ACKed-but-undelivered loss on the AP receive path (Jaguar1 ~18% at ch6; Jaguar3 legacy frames ~0.5-4% at ch36) - `docs/jaguar3-tx-ring.md` items 3 and 5. |
 | 6 — the Realtek arm | Not started. |
 
 ## What exists now
@@ -384,7 +384,11 @@ because it was measured, not because it is understood.
    `SetAckResponder` (`ARQ=1`) measured as no change. The DOWNLINK had none:
    the AP airs data with the library default retry limit 0. `AP_RETRY=7`
    (`DEVOURER_TX_RETRY_LIMIT`) took downlink loss from 1.3-2.3% to 0.00% on
-   every rung up to 30 Mbit/s at ch36. Table: `docs/jaguar3-tx-ring.md`
+   every rung up to 30 Mbit/s at ch36 - ONE ladder per arm, ch36 only; the
+   ch6 conditions behind the old 27% are untested with it, and the library
+   and harness default is still 0, so a default d2d downlink still has no
+   retransmission. The uplink's residual loss turned out to be
+   ACKed-but-undelivered at the AP (open). Table: `docs/jaguar3-tx-ring.md`
    item 6.
 
 ## The rule this work runs under

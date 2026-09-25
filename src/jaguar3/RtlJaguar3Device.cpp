@@ -1895,6 +1895,20 @@ bool RtlJaguar3Device::ReadPacketBuffer(int sel, uint32_t offset,
   uint32_t win = (offset >> 12) + base;
   uint32_t residue = offset & 0xFFF;
   const uint16_t saved = _device.rtw_read16(0x0140);
+  /* Restore the borrowed window on every exit, a throwing read included: a
+   * read that fails mid-walk must not leave 0x0140 pointing into the TX FIFO
+   * for the next user of the window (LaCapture snapshots and restores it). A
+   * destructor must not throw, so a failed restore is swallowed. */
+  struct WindowRestore {
+    RtlAdapter &dev;
+    uint16_t value;
+    ~WindowRestore() {
+      try {
+        dev.rtw_write16(0x0140, value);
+      } catch (...) {
+      }
+    }
+  } restore{_device, saved};
   const uint16_t hi = static_cast<uint16_t>(saved & 0xF000);
   size_t got = 0;
   while (got < n) {
@@ -1910,7 +1924,6 @@ bool RtlJaguar3Device::ReadPacketBuffer(int sel, uint32_t offset,
     residue = 0;
     win++;
   }
-  _device.rtw_write16(0x0140, saved);
   return true;
 }
 
@@ -1984,8 +1997,14 @@ void RtlJaguar3Device::DumpChipState() {
    * which is worth as much as finding the bit. */
 }
 
-/* WHICH BULK-OUT ENDPOINT A FRAME BELONGS ON — and getting this wrong is why
- * this backend's AP stopped transmitting under load.
+/* WHICH BULK-OUT ENDPOINT A FRAME BELONGS ON.
+ *
+ * CORRECTED 2026-09-24: this comment used to say getting this wrong was WHY
+ * the AP stopped transmitting under load. It was not. The mis-queuing below
+ * is real and is fixed here, but the wedge was the TX page ring running into
+ * the beacon page (REG_CR at the LLT init - docs/jaguar3-tx-ring.md); HQ
+ * running dry was a consequence, and fixing the queues moved the exhaustion
+ * to LOW without touching the wedge. The measurement is kept as recorded.
  *
  * On a Realtek USB part the ENDPOINT selects the hardware TX queue. halmac's
  * get_usb_bulkout_id_88xx() reads QSEL out of the descriptor, looks the
@@ -2010,7 +2029,13 @@ void RtlJaguar3Device::DumpChipState() {
  * which is the signature of a queue nothing is ever sent to. With HQ empty
  * the beacon could not be loaded and management frames could not be sent,
  * so the AP went silent while its receiver carried on perfectly — it logged
- * seventeen received authentication requests and answered none. */
+ * seventeen received authentication requests and answered none.
+ *
+ * Limits, both deliberate: every 802.11 data frame is queued as TID 0 (BE),
+ * whatever its own QoS TID - only SetAmpduMode picks another; and the map is
+ * the vendor's 3-bulk-OUT table. A 2- or 4-bulk-OUT part keys a different
+ * table (halmac HALMAC_RQPN_{2,4}BULKOUT_8822C); none is on the bench, and
+ * an out-of-range index falls back to endpoint 0 here. */
 static uint8_t bulkout_id_for_descriptor(const uint8_t *desc, size_t n_eps) {
   if (n_eps <= 1)
     return 0;
@@ -2170,12 +2195,29 @@ size_t RtlJaguar3Device::send_packets(const TxPacketView *pkts, size_t count) {
      * re-zeroed first, and the 8822C span extension reads the PKT_OFFSET
      * field that is already in place). */
     uint8_t *first = urb.data() + plan.blocks[0].offset;
+    /* The endpoint IS the queue, as in send_packet: the URB goes where its
+     * descriptors' QSEL says. One URB reaches one endpoint, so frames that
+     * disagree - data on LOW packed with management on HIGH - cannot share
+     * it; that run goes out frame by frame, each on its own queue. */
+    const size_t n_eps = _device.bulk_out_ep_count();
+    const uint8_t agg_id = bulkout_id_for_descriptor(first, n_eps);
+    bool one_queue = true;
+    for (size_t k = 1; k < plan.frames() && one_queue; ++k)
+      one_queue = bulkout_id_for_descriptor(urb.data() + plan.blocks[k].offset,
+                                            n_eps) == agg_id;
+    if (!one_queue) {
+      for (size_t k = 0; k < plan.frames(); ++k, ++done)
+        if (send_packet(pkts[done].data, pkts[done].len))
+          ++ok;
+      continue;
+    }
     SET_TX_DESC_DMA_TXAGG_NUM_8822C(first, plan.frames());
     jaguar3::cal_txdesc_chksum_8822c(first);
 
-    const int rc = _device.bulk_send_sync_ep(_device.first_bulk_out_ep(),
-                                             urb.data(), urb.size(),
-                                             /*timeout_ms=*/50);
+    const uint8_t agg_ep = _device.nth_bulk_out_ep(agg_id);
+    const int rc = _device.bulk_send_sync_ep(
+        agg_ep ? agg_ep : _device.first_bulk_out_ep(), urb.data(), urb.size(),
+        /*timeout_ms=*/50);
     /* Full write or nothing submitted: a truncated URB means the chip got a
      * prefix — some trailing block partial or absent — and there is no way to
      * say which frames aired, so none may be counted. A genuine short write
@@ -2185,8 +2227,8 @@ size_t RtlJaguar3Device::send_packets(const TxPacketView *pkts, size_t count) {
     if (rc >= 0 && !sent_all)
       _logger->error("8822C aggregated TX short on EP 0x{:02x}: {}/{} "
                      "({} frames dropped)",
-                     _device.first_bulk_out_ep(), rc, urb.size(),
-                     plan.frames());
+                     agg_ep ? agg_ep : _device.first_bulk_out_ep(), rc,
+                     urb.size(), plan.frames());
     devourer::Ev(_logger->events(), "tx.agg")
         .f("frames", (unsigned long long)plan.frames())
         .f("bytes", (unsigned long long)urb.size())

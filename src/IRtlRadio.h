@@ -129,28 +129,32 @@ public:
    * poll it on a supervisory cadence, not per transmission.
    *
    * THROWS on a failed USB transfer, like every register read. A poller must
-   * catch and skip that sample: on a Jaguar2 under a 4+4 Mbit/s load about
-   * one control read a minute fails while the chip goes on working, and an
-   * uncaught one killed an AP nine minutes into a soak.
+   * catch and skip that sample - on a busy bus these fail while the chip
+   * works on (the measured rate is in src/jaguar2/CLAUDE.md).
    *
-   * Returns 0 where unsupported, which is indistinguishable from healthy;
-   * a caller that needs to tell those apart should ask the backend. */
+   * Returns 0 where unsupported, which is indistinguishable from healthy:
+   * check HasTxDmaStatus() before reading a 0 as "no fault". */
   virtual uint32_t GetTxDmaStatus() { return 0; }
+  /* True where GetTxDmaStatus reads the real latch (Jaguar2, Jaguar3). */
+  virtual bool HasTxDmaStatus() const { return false; }
   /* The whole MAC register window, 0x0000..0x0FFF, printed in the SAME
    * format as the rtl88x2cu vendor driver's /proc/.../mac_reg_dump - one
    * line per 16 bytes, "0x%04x 0x%08x  0x%08x  0x%08x  0x%08x" - so a dump
-   * from each can be diffed line by line. That is its whole purpose: the
-   * vendor driver's AP on an RTL8812CU carried an 8 Mbit/s downlink for 20 s
-   * with zero loss and zero TX faults, and this project's AP on the SAME
-   * adapter faults after one traversal of its TX page ring. Somewhere in this
-   * window is the difference. 1024 register reads over USB: diagnostic use
+   * from each can be diffed line by line. A STATE diff: it cannot see a bit
+   * that bring-up sets late but needed early (the TX page-ring defect was
+   * found by diffing register WRITES from usbmon instead -
+   * docs/jaguar3-tx-ring.md). 1024 register reads over USB: diagnostic use
    * only. No-op where unsupported. */
   virtual void DumpMacRegisters() {}
   /* Read the chip's internal packet memory through the debug window
    * (REG_PKTBUF_DBG_CTRL + 0x8000..0x8FFF), a port of halmac read_buf_88xx.
    * `sel` 0 = TX FIFO, 1 = the LLT (the linked list that chains TX pages).
    * `offset` is in bytes from the start of that memory. Diagnostic: it
-   * borrows a shared debug window, so never call it on the send path.
+   * borrows a shared debug window, so never call it on the send path; the
+   * window is restored on every exit, a throw included. Not serialised
+   * against another user of the window in the same process. The vendor's
+   * dump_fifo gates the RX clock around the same read; this does not, so a
+   * FIFO read with RX running is a snapshot of moving memory.
    * Throws on a failed USB transfer, like GetTxDmaStatus - catch it.
    * Returns false where unsupported. */
   virtual bool ReadPacketBuffer(int sel, uint32_t offset, uint8_t *out,

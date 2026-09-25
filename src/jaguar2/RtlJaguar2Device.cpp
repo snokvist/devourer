@@ -1797,6 +1797,20 @@ bool RtlJaguar2Device::ReadPacketBuffer(int sel, uint32_t offset,
   uint32_t win = (offset >> 12) + base;
   uint32_t residue = offset & 0xFFF;
   const uint16_t saved = _device.rtw_read16(0x0140); /* REG_PKTBUF_DBG_CTRL */
+  /* Restore the borrowed window on every exit, a throwing read included: a
+   * read that fails mid-walk must not leave 0x0140 pointing into the TX FIFO
+   * for the next user of the window (LaCapture snapshots and restores it). A
+   * destructor must not throw, so a failed restore is swallowed. */
+  struct WindowRestore {
+    RtlAdapter &dev;
+    uint16_t value;
+    ~WindowRestore() {
+      try {
+        dev.rtw_write16(0x0140, value);
+      } catch (...) {
+      }
+    }
+  } restore{_device, saved};
   const uint16_t hi = static_cast<uint16_t>(saved & 0xF000);
   size_t got = 0;
   while (got < n) {
@@ -1812,7 +1826,6 @@ bool RtlJaguar2Device::ReadPacketBuffer(int sel, uint32_t offset,
     residue = 0;
     win++;
   }
-  _device.rtw_write16(0x0140, saved);
   return true;
 }
 

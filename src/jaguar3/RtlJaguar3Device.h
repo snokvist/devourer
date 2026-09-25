@@ -78,6 +78,7 @@ public:
    * call on a chip whose transmitter has stopped, which is the whole point. */
   void DumpChipState() override;
   uint32_t GetTxDmaStatus() override;
+  bool HasTxDmaStatus() const override { return true; }
   void DumpMacRegisters() override;
   bool ReadPacketBuffer(int sel, uint32_t offset, uint8_t *out,
                         size_t n) override;

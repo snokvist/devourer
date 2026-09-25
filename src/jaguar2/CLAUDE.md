@@ -46,13 +46,14 @@ Jaguar1 (shared `PhyTableLoader`).
   h2c-pkt queue.
 - **The whole MAC must be enabled before the LLT init** (`MAC_TRX_ENABLE =
   0xFF`, halmac's value for both 8822B and 8821C; this port had the DMA-only
-  `0x0F`). The same defect and fix as Jaguar3 (`src/jaguar3/CLAUDE.md`):
-  without PROTOCOL/SCHEDULE at the auto-LLT init the TX page allocator runs
-  past `rsvd_boundary` (1938 on the 8822B too), a sustained load overwrites
-  the beacon page, and the next TBTT latches `TXDMA_STATUS` (`0x10`, then
-  `0x15` on this die) and TX dies. Measured on an 8812BU: fault at 358 frames
-  before, 4000/4000 clean after with the hardware writing `LLT[1937] = 0`.
-  The 8821C and the PCIe 8821CE ride the same constant and are unverified.
+  `0x0F`). The same defect and fix as Jaguar3 (`src/jaguar3/CLAUDE.md`, where
+  the bit - PROTOCOL_EN - was bisected on the 8822C; not bisected here). On
+  an 8812BU (`rsvd_boundary` 1938 too): with `0x0F`, 4000 frames injected
+  with a beacon armed overwrote page 1938 and latched `TXDMA_STATUS` `0x10`
+  then `0x15` (bits not decoded; the TBTT trigger was bisected on the 8822C
+  only) at 358 frames, then every bulk-OUT timed out; with `0xFF`, 4000/4000
+  clean and `LLT[1937] = 0` by the end of the run. The 8821C and the PCIe
+  8821CE ride the same constant and are unverified.
 - **Runtime threads must survive a failed register read.** A control-transfer
   read can race the async bulk-IN and throw under RX load; the DIG and
   thermal-track threads now skip the tick and count it. Before that guard, an

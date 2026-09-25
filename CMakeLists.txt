@@ -1113,6 +1113,10 @@ endif()
 if(UNIX)
     add_executable(UdpBlast tests/udp_blast.cpp)
     add_test(NAME udp_blast_selftest COMMAND UdpBlast --self-test)
+    # The station soak's graders, mutation-swept over a real run's ledger
+    # lines (tests/fixtures/soak_grade). No radio, no root.
+    add_test(NAME soak_grade_selftest
+             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/soak_grade_selftest.sh)
 endif()
 
 # src/sta/Dot11.h - the management-frame module the AP harnesses and a station

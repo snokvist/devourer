@@ -121,12 +121,12 @@ THRU_LOSS_PCT="${THRU_LOSS_PCT:-5}"
 # (see CLAUDE.md): 6M, MCS7/40/SGI, VHT2SS_MCS3/80/LDPC, ...
 TX_RATE="${TX_RATE:-6M}"
 # ARQ=1 arms the AP's hardware ACK responder on the BSSID (SetAckResponder).
-# MEASURED TO CHANGE NOTHING on the 8812CU AP (ch36, 2026-09-25): the AP
-# already ACKs the station without it - zero replays over 321k soak frames,
-# against a station whose MT7612U requests an ACK with a 15-deep retry - so
-# the uplink's retransmission loop is closed either way. Kept as a knob for
-# an AP that does not. (The comment here used to predict ARQ=1 would improve
-# the uplink; it did not.) Table: docs/jaguar3-tx-ring.md item 6.
+# MEASURED TO CHANGE NOTHING on the 8812CU AP (ch36, 2026-09-25, one ladder
+# per arm): StartBeacon already programs the same registers (MACID +
+# net_type=AP), so the AP ACKs the station without it - a witness saw zero
+# station retries on air. Kept as a knob for an AP that does not. (The
+# comment here used to predict ARQ=1 would improve the uplink; it did not.)
+# Table: docs/jaguar3-tx-ring.md item 6.
 ARQ="${ARQ:-0}"
 # AP_RETRY=N is the half that matters: the AP's per-frame hardware retry limit
 # (DEVOURER_TX_RETRY_LIMIT, 0..63). The library default is 0 - right for the
@@ -189,31 +189,90 @@ say() { printf '%s\n' "$*"; }
 ok()  { pass=$((pass+1)); printf '  PASS  %s\n' "$*"; }
 bad() { fail=$((fail+1)); printf '  FAIL  %s\n' "$*"; }
 
-# The soak's two ledger-and-trend graders, over the files a soak leaves in
-# $OUT (ap.log, soak.chunks). A function, and defined up here, so that
-# `soak-grade DIR` can run them offline over a saved or doctored run - which
-# is how they are mutation-tested without spending thirty minutes of air.
+# The soak's three graders - the station's books, the AP's books, and the
+# per-direction trend - over the files a soak leaves in $OUT (sta.log, ap.log,
+# soak.chunks). A function, and defined up here, so that `soak-grade DIR` can
+# run them offline over a saved or doctored run - which is how they are
+# mutation-tested without spending thirty minutes of air.
+#
+# Every field is read from its OWN ledger line (the "TAP:", "tx:" and "data
+# plane:" lines), never "the last match anywhere": a watchdog line that also
+# says queued= must not be able to stand in for the ledger. A missing line
+# reads empty and FAILS - a ledger that is not there cannot close.
+soak_field() {  # $1 file, $2 line marker, $3 field -> value, or empty
+  grep -F -- "$2" "$1" 2>/dev/null | tail -1 |
+    sed -n "s/.*$3=\([0-9][0-9]*\).*/\1/p"
+}
+soak_all_set() { local v; for v in "$@"; do [ -n "$v" ] || return 1; done; }
+soak_knobs_ok() {  # the knobs the graders do arithmetic with
+  case "$SOAK_DOWN_KBIT" in ''|*[!0-9]*) return 1 ;; esac
+  case "$SOAK_DEGRADE_PCT" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$SOAK_DEGRADE_PCT" -le 100 ]
+}
 soak_grade_tail() {
-  local chunks; chunks=$(wc -l <"$OUT/soak.chunks" 2>/dev/null)
-  apl() { sed -n "s/.*$1=\\([0-9][0-9]*\\).*/\\1/p" "$OUT/ap.log" | tail -1; }
-  # -- the AP's books, the flood cell's identity: every host frame framed or
-  # refused, every queued frame aired, queue-dropped or send-failed
-  local a_from a_framed a_down a_q a_sent a_qdrop a_sfail
-  a_from=$(apl 'from host'); a_framed=$(apl 'framed')
-  a_down=$(apl 'dropped down'); a_q=$(apl 'queued')
-  a_sent=$(apl 'frames sent'); a_qdrop=$(apl 'queue dropped')
-  a_sfail=$(apl 'send failed')
-  if [ "${a_from:-0}" -gt 0 ] 2>/dev/null &&
-     [ $(( ${a_framed:-0} + ${a_down:-0} )) = "${a_from:-0}" ] &&
-     [ $(( ${a_sent:-0} + ${a_qdrop:-0} + ${a_sfail:-0} )) = "${a_q:-0}" ]; then
-    ok "soak: the AP's books still close after ${SOAK_MINUTES} min ($a_from host frames, $a_q queued, $a_sent aired, $a_sfail send-failed)"
+  soak_knobs_ok || {
+    bad "soak: SOAK_DOWN_KBIT and SOAK_DEGRADE_PCT must be integers, SOAK_DEGRADE_PCT 0..100"
+    bad "soak: (not graded)"; bad "soak: (not graded)"; return; }
+
+  # -- the station's books: every host frame encrypted, sent plain or
+  # refused; every queued frame aired, queue-dropped or send-failed
+  local st="$OUT/sta.log"
+  local s_from s_down s_enc s_plain s_q s_aired s_qdrop s_sfail
+  s_from=$(soak_field "$st" "TAP:" 'from host')
+  s_down=$(soak_field "$st" "TAP:" 'dropped down')
+  s_enc=$(soak_field "$st" "tx: encrypted=" 'tx: encrypted')
+  s_plain=$(soak_field "$st" "tx: encrypted=" 'plaintext')
+  s_q=$(soak_field "$st" "tx: encrypted=" 'queued')
+  s_aired=$(soak_field "$st" "tx: encrypted=" 'aired')
+  s_qdrop=$(soak_field "$st" "tx: encrypted=" 'queue dropped')
+  s_sfail=$(soak_field "$st" "tx: encrypted=" 'send failed')
+  if soak_all_set "$s_from" "$s_down" "$s_enc" "$s_plain" "$s_q" "$s_aired" \
+                  "$s_qdrop" "$s_sfail" &&
+     [ "$s_from" -gt 0 ] && [ "$s_q" -gt 0 ] &&
+     [ $(( s_enc + s_plain + s_down )) = "$s_from" ] &&
+     [ $(( s_aired + s_qdrop + s_sfail )) = "$s_q" ]; then
+    ok "soak: the station's books still close after ${SOAK_MINUTES} min ($s_from host frames, $s_q queued)"
   else
-    bad "soak: the AP's books DRIFTED over the run - host: $a_from vs $a_framed+$a_down; queue: $a_q vs $a_sent+$a_qdrop+$a_sfail"
+    bad "soak: the station's books do NOT close (or are missing) - host: '$s_from' vs '$s_enc'+'$s_plain'+'$s_down'; queue: '$s_q' vs '$s_aired'+'$s_qdrop'+'$s_sfail'"
   fi
 
-  # -- degradation: last quarter against first, per loaded direction
-  local q first last dfirst dlast
-  q=$(( ${chunks:-0} / 4 )); [ "$q" -lt 1 ] && q=1
+  # -- the AP's books: every host frame framed or refused; every queued
+  # frame aired, queue-dropped, send-failed or refused by the TX circuit
+  # breaker (ap_wpa2 counts those in `queued` and drops them after)
+  local ap="$OUT/ap.log"
+  local a_from a_framed a_down a_q a_sent a_qdrop a_sfail a_brk
+  a_from=$(soak_field "$ap" "TAP:" 'from host')
+  a_framed=$(soak_field "$ap" "TAP:" 'framed')
+  a_down=$(soak_field "$ap" "TAP:" 'dropped down')
+  a_q=$(soak_field "$ap" "data plane:" 'queued')
+  a_sent=$(soak_field "$ap" "data plane:" 'frames sent')
+  a_qdrop=$(soak_field "$ap" "data plane:" 'queue dropped')
+  a_sfail=$(soak_field "$ap" "data plane:" 'send failed')
+  a_brk=$(soak_field "$ap" "data plane:" 'refused after the TX circuit opened')
+  if soak_all_set "$a_from" "$a_framed" "$a_down" "$a_q" "$a_sent" "$a_qdrop" \
+                  "$a_sfail" "$a_brk" &&
+     [ "$a_from" -gt 0 ] && [ "$a_q" -gt 0 ] &&
+     [ $(( a_framed + a_down )) = "$a_from" ] &&
+     [ $(( a_sent + a_qdrop + a_sfail + a_brk )) = "$a_q" ]; then
+    if [ "$a_brk" -gt 0 ]; then
+      bad "soak: the AP's books close but its TX circuit breaker OPENED - $a_brk frames refused after it tripped"
+    else
+      ok "soak: the AP's books still close after ${SOAK_MINUTES} min ($a_from host frames, $a_q queued, $a_sent aired, $a_sfail send-failed)"
+    fi
+  else
+    bad "soak: the AP's books do NOT close (or are missing) - host: '$a_from' vs '$a_framed'+'$a_down'; queue: '$a_q' vs '$a_sent'+'$a_qdrop'+'$a_sfail'+'$a_brk' (breaker)"
+  fi
+
+  # -- degradation: last quarter against first, per loaded direction. Needs
+  # the cell's own minimum of four chunks: with fewer, "first quarter" and
+  # "last quarter" are the same line and the ratio is 100% by construction.
+  local chunks q first last dfirst dlast
+  chunks=$(grep -c . "$OUT/soak.chunks" 2>/dev/null)
+  if [ "${chunks:-0}" -lt 4 ]; then
+    bad "soak: only ${chunks:-0} chunk(s) recorded - a trend needs at least 4"
+    return
+  fi
+  q=$(( chunks / 4 ))
   first=$(head -n "$q" "$OUT/soak.chunks" | awk '{s+=$2} END{printf "%.3f", s/NR}')
   last=$(tail -n "$q" "$OUT/soak.chunks" | awk '{s+=$2} END{printf "%.3f", s/NR}')
   dfirst=$(head -n "$q" "$OUT/soak.chunks" | awk '{s+=$4} END{printf "%.3f", s/NR}')
@@ -226,7 +285,7 @@ soak_grade_tail() {
         'BEGIN{exit !(f>0 && 100*l/f >= 100-p)}' || dn_ok=0
   fi
   if [ "$up_ok$dn_ok" = 11 ]; then
-    ok "soak: no throughput degradation - up ${first} -> ${last} Mbit/s, down ${dfirst} -> ${dlast} Mbit/s (first quarter -> last)"
+    ok "soak: no throughput degradation beyond ${SOAK_DEGRADE_PCT}% - up ${first} -> ${last} Mbit/s, down ${dfirst} -> ${dlast} Mbit/s (first quarter -> last)"
   else
     bad "soak: throughput DEGRADED over the run - up ${first} -> ${last}, down ${dfirst} -> ${dlast} Mbit/s (allowed ${SOAK_DEGRADE_PCT}%)"
   fi
@@ -237,7 +296,7 @@ if [ "$CELLS" = soak-grade ]; then
   OUT="${2:?usage: $0 soak-grade DIR}"
   soak_grade_tail
   say "=== $pass passed, $fail failed (offline grade of $OUT) ==="
-  [ $((pass + fail)) = 2 ] || { say "=== HARNESS ERROR: expected 2 checks ==="; exit 2; }
+  [ $((pass + fail)) = 3 ] || { say "=== HARNESS ERROR: expected 3 checks ==="; exit 2; }
   exit $(( fail > 0 ))
 fi
 mkdir -p "$OUT"
@@ -1233,9 +1292,15 @@ cell_beacons() {
 cell_soak() {
   local freq
   freq=$(chan_freq "$CH") || { bad "soak: channel '$CH' is not one this harness can map"; return; }
-  case "$SOAK_MINUTES$SOAK_KBIT$SOAK_DOWN_KBIT$SOAK_CHUNK_S" in
-    ''|*[!0-9]*) bad "soak: SOAK_MINUTES, SOAK_KBIT, SOAK_DOWN_KBIT and SOAK_CHUNK_S must be integers"; return ;;
-  esac
+  local knob
+  for knob in "$SOAK_MINUTES" "$SOAK_KBIT" "$SOAK_DOWN_KBIT" "$SOAK_CHUNK_S" \
+              "$SOAK_DEGRADE_PCT"; do
+    case "$knob" in
+      ''|*[!0-9]*) bad "soak: SOAK_MINUTES, SOAK_KBIT, SOAK_DOWN_KBIT, SOAK_CHUNK_S and SOAK_DEGRADE_PCT must each be an integer"; return ;;
+    esac
+  done
+  [ "$SOAK_CHUNK_S" -gt 0 ] || { bad "soak: SOAK_CHUNK_S must be positive"; return; }
+  [ "$SOAK_DEGRADE_PCT" -le 100 ] || { bad "soak: SOAK_DEGRADE_PCT must be 0..100"; return; }
   [ "$SOAK_MINUTES" -gt 0 ] || { bad "soak: SOAK_MINUTES must be positive"; return; }
   local total=$(( SOAK_MINUTES * 60 ))
   local chunks=$(( total / SOAK_CHUNK_S ))
@@ -1319,21 +1384,8 @@ cell_soak() {
     bad "soak: the link did not hold - associations=$assoc reconnects=$rc over ${SOAK_MINUTES} min"
   fi
 
-  # -- the books still close after a long run
-  local s_from s_down s_enc s_plain s_q s_aired s_qdrop s_sfail
-  s_from=$(led 'from host'); s_down=$(led 'dropped down')
-  s_enc=$(sed -n 's/.*tx: encrypted=\([0-9]*\).*/\1/p' "$OUT/sta.log" | tail -1)
-  s_plain=$(sed -n 's/.*, plaintext=\([0-9]*\).*/\1/p' "$OUT/sta.log" | tail -1)
-  s_q=$(led 'queued'); s_aired=$(led 'aired')
-  s_qdrop=$(led 'queue dropped'); s_sfail=$(led 'send failed')
-  if [ $(( ${s_enc:-0} + ${s_plain:-0} + ${s_down:-0} )) = "${s_from:-0}" ] &&
-     [ $(( ${s_aired:-0} + ${s_qdrop:-0} + ${s_sfail:-0} )) = "${s_q:-0}" ]; then
-    ok "soak: the station's books still close after ${SOAK_MINUTES} min ($s_from host frames, $s_q queued)"
-  else
-    bad "soak: the station's books DRIFTED over the run - host: $s_from vs $s_enc+$s_plain+$s_down; queue: $s_q vs $s_aired+$s_qdrop+$s_sfail"
-  fi
-
-  # -- the AP's books and the per-direction trend (shared with soak-grade)
+  # -- the station's books, the AP's books and the per-direction trend
+  # (shared with soak-grade, which is how they are mutation-tested)
   soak_grade_tail
 
   # -- the downlink stayed alive, and memory did not run away

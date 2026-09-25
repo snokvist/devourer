@@ -248,6 +248,13 @@ static bool profiled_ccmp(bool encrypt, const uint8_t* key, const uint8_t* nonce
  * overwrite is recognisable), and the LLT entries around the ACQ boundary
  * (1938) and the end of the FIFO (2047), to see where the list actually
  * links. */
+/* A diagnostic knob is ON when set to anything but "" or "0" - so
+ * DEVOURER_AP_PKTBUF=0 means off, as DEVOURER_AP_NO_BEACON=0 always has. */
+static bool env_on(const char* name) {
+  const char* v = std::getenv(name);
+  return v && *v && std::strcmp(v, "0") != 0;
+}
+
 static void probe_pktbuf_body(const char* when);
 static void probe_pktbuf(const char* when) {
   /* A diagnostic must not take the AP down: its reads can throw under load
@@ -265,8 +272,15 @@ static void probe_pktbuf_body(const char* when) {
   /* The reserved boundary is per die (1938 on the 8822C); the bring-up log
    * prints it. DEVOURER_AP_PKTBUF_BNDY=N points the probe at another die's. */
   uint32_t b = 1938;
-  if (const char* e = std::getenv("DEVOURER_AP_PKTBUF_BNDY"))
-    b = (uint32_t)std::strtoul(e, nullptr, 0);
+  if (const char* e = std::getenv("DEVOURER_AP_PKTBUF_BNDY")) {
+    const unsigned long v = std::strtoul(e, nullptr, 0);
+    /* The probe reads pages b-2..b+1 of a 2048-page FIFO. */
+    if (v >= 2 && v <= 2046)
+      b = (uint32_t)v;
+    else
+      fprintf(stderr, "  PKTBUF: DEVOURER_AP_PKTBUF_BNDY=%s is outside 2..2046, "
+              "using 1938\n", e);
+  }
   uint8_t pg[32];
   if (rtl->ReadPacketBuffer(0, b << 7, pg, sizeof pg)) {
     fprintf(stderr, "  PKTBUF %s: page %u =", when, b);
@@ -1362,10 +1376,10 @@ int main(int argc, char** argv) {
   if (auto* rtl = dynamic_cast<IRtlRadio*>(g_dev)) {
     fprintf(stderr, "  --- chip state BEFORE THE BEACON ---\n");
     rtl->DumpChipState();
-    if (std::getenv("DEVOURER_AP_PKTBUF")) probe_pktbuf("before beacon");
+    if (env_on("DEVOURER_AP_PKTBUF")) probe_pktbuf("before beacon");
     /* The whole LLT, in the vendor driver's fifo_dump byte layout, so the two
      * can be diffed entry for entry (DEVOURER_AP_LLT_FULL=1). */
-    if (std::getenv("DEVOURER_AP_LLT_FULL")) {
+    if (env_on("DEVOURER_AP_LLT_FULL")) {
       std::vector<uint8_t> llt(8192);
       if (rtl->ReadPacketBuffer(1, 0, llt.data(), llt.size())) {
         fprintf(stderr, "LLT FIFO DUMP [start_addr:0x0000 , size:8192]\n");
@@ -1388,7 +1402,7 @@ int main(int argc, char** argv) {
    * identity, the interval and the H2C. Start then immediately stop, then
    * inject: if the fault survives, the culprit is in the half StopBeacon
    * leaves behind; if it disappears, it is in the half it undoes. */
-  if (!no_beacon && std::getenv("DEVOURER_AP_STOP_BEACON_FIRST")) {
+  if (!no_beacon && env_on("DEVOURER_AP_STOP_BEACON_FIRST")) {
     const bool stopped = g_dev->StopBeacon();
     fprintf(stderr, "  DIAGNOSTIC: beacon started then stopped (%s)\n",
             stopped ? "ok" : "FAILED");
@@ -1417,9 +1431,9 @@ int main(int argc, char** argv) {
   if (auto* rtl = dynamic_cast<IRtlRadio*>(g_dev)) {
     fprintf(stderr, "  --- chip state WHILE HEALTHY ---\n");
     rtl->DumpChipState();
-    if (std::getenv("DEVOURER_AP_PKTBUF")) probe_pktbuf("healthy");
+    if (env_on("DEVOURER_AP_PKTBUF")) probe_pktbuf("healthy");
     /* The full-window diff source - see IRtlRadio::DumpMacRegisters. */
-    if (std::getenv("DEVOURER_AP_MAC_DUMP")) rtl->DumpMacRegisters();
+    if (env_on("DEVOURER_AP_MAC_DUMP")) rtl->DumpMacRegisters();
   }
   std::signal(SIGINT, ap_on_signal);
   std::signal(SIGTERM, ap_on_signal);
@@ -1568,20 +1582,21 @@ int main(int argc, char** argv) {
                     "(%llu so far)\n", e.what(),
                     (unsigned long long)++txdma_read_fail);
           }
-          /* THE PAGE COUNTS ALONGSIDE IT, every poll while healthy. Two
-           * stories fit "the fault fires at 2048 pages": the pages leak and
-           * the allocator runs out, or they are freed normally and the write
-           * pointer walks past the ACQ boundary into the reserved region on
-           * the first wrap. Availability declining monotonically to zero
-           * says the first; staying healthy right up to the fault says the
-           * second - and the reserved region is where the beacon lives. */
+          /* THE PAGE COUNTS AT THE TRANSITION, beside the dump taken while
+           * healthy - two snapshots, not a trace, so a gradual decline
+           * between them is not visible. Two stories fit "the fault fires at
+           * 2048 pages": the pages leak and the allocator runs out, or they
+           * are freed normally and the write pointer walks past the ACQ
+           * boundary into the reserved region. Healthy counts at the fault
+           * favour the second - and the reserved region is where the beacon
+           * lives. */
           if (st != txdma_seen && g_dev) {
             if (auto* r2 = dynamic_cast<IRtlRadio*>(g_dev)) {
               fprintf(stderr, "  pages at the transition:\n");
               r2->DumpChipState();
             }
           }
-          if (st != txdma_seen && std::getenv("DEVOURER_AP_PKTBUF"))
+          if (st != txdma_seen && env_on("DEVOURER_AP_PKTBUF"))
             probe_pktbuf("at fault");
           if (st != txdma_seen) {
             fprintf(stderr,
@@ -1653,7 +1668,7 @@ int main(int argc, char** argv) {
   }
   /* The same probe once the traffic is over: whether the ring terminator
    * appeared on its own, and whether the beacon page is still a beacon. */
-  if (std::getenv("DEVOURER_AP_PKTBUF")) probe_pktbuf("end of run");
+  if (env_on("DEVOURER_AP_PKTBUF")) probe_pktbuf("end of run");
   {
     std::lock_guard<std::mutex> l(g_hs_mu);
     fprintf(stderr, "sent=%llu stations=%d", (unsigned long long)g_sent.load(),

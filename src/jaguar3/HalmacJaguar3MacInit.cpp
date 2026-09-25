@@ -247,14 +247,14 @@ constexpr uint8_t CHIP_VER_B_CUT = 1;
 
 /* ---- bit / value constants ---- */
 /* halmac MAC_TRX_ENABLE: HCI_TXDMA | HCI_RXDMA | TXDMA | RXDMA | PROTOCOL |
- * SCHEDULE | MACTX | MACRX - ALL EIGHT, and it matters when. init_trx_cfg writes
- * it before priority_queue_cfg runs the LLT auto-init, and with PROTOCOL and
- * SCHEDULE off at that moment (this was 0x0F, the DMA bits only) the TX page
- * allocator never learns where the data region ends: it runs on past
- * rsvd_boundary into the reserved region and overwrites the beacon page. With
- * them on, the hardware wraps the ring itself - it writes LLT[rsvd_boundary-1]
- * = 0 at the first wrap, exactly as the vendor driver's chip does. See
- * src/jaguar3/CLAUDE.md for the measurement. */
+ * SCHEDULE | MACTX | MACRX - all eight, and it matters when. init_trx_cfg
+ * writes it before priority_queue_cfg runs the LLT auto-init. This was 0x0F,
+ * the DMA bits only, and without PROTOCOL_EN at that moment (bisected: bit 4
+ * alone suffices, SCHEDULE or MACTX/MACRX alone do not) the TX page allocator
+ * never terminates the data ring at rsvd_boundary - it runs on into the
+ * reserved region and overwrites the beacon page. With it, the hardware
+ * writes LLT[rsvd_boundary-1] = 0 itself during a run, as the vendor
+ * driver's chip does. Measurements: src/jaguar3/CLAUDE.md. */
 constexpr uint8_t MAC_TRX_ENABLE = 0xFF;
 constexpr uint8_t BIT_FWEN = 0x80;       /* BIT(7) of REG_WMAC_FWPKT_CR */
 constexpr uint8_t BIT_AUTO_INIT_LLT_V1 = 0x01;

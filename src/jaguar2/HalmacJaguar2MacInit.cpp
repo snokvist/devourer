@@ -200,11 +200,11 @@ constexpr uint16_t WLAN_RA_TRY_RATE_AGG_LIMIT = 0x08;
 
 /* halmac MAC_TRX_ENABLE (8822B and 8821C alike): HCI_TXDMA | HCI_RXDMA | TXDMA
  * | RXDMA | PROTOCOL | SCHEDULE | MACTX | MACRX - all eight, before the LLT
- * init. This was 0x0F (the DMA bits only), and with PROTOCOL/SCHEDULE off at
- * the auto-LLT init the TX page allocator never wraps at rsvd_boundary: a
- * sustained load runs into the reserved region, overwrites the beacon page and
- * latches a TX-DMA fault. Measured on an 8812BU; the same defect and fix as
- * Jaguar3 - see src/jaguar3/CLAUDE.md. */
+ * init. This was 0x0F (the DMA bits only), and the TX page allocator then
+ * never terminates the data ring at rsvd_boundary: a sustained load runs into
+ * the reserved region, overwrites the beacon page and latches a TX-DMA fault.
+ * Measured on an 8812BU. The same defect and fix as Jaguar3, where the bit
+ * that matters (PROTOCOL_EN) was bisected - see src/jaguar3/CLAUDE.md. */
 constexpr uint8_t MAC_TRX_ENABLE = 0xFF;
 constexpr uint8_t BIT_FWEN = 0x80;
 constexpr uint8_t BIT_AUTO_INIT_LLT_V1 = 0x01;

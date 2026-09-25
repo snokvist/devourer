@@ -5,8 +5,11 @@ replaced.** `222bcf9` wrote the ring terminator directly
 (`terminate_acq_ring`); that matched the vendor chip's end state but not how it
 gets there. The GENERAL_INFO lead below was tested and ruled out, and the real
 mechanism turned out to be a one-constant porting defect: devourer enabled only
-the DMA bits of `REG_CR` before the LLT init, where halmac enables all eight.
-The direct write is gone; the constant is fixed. Item 1 below is the record.
+the DMA bits of `REG_CR` before the LLT init, where halmac enables all eight -
+and a bit bisection names the one that matters, PROTOCOL_EN (bit 4). The
+direct write is gone; the constant is fixed. Item 1 below is the record. The
+Phase 5 close-out review corrected several claims in this file; each
+correction is marked where it was made.
 
 The investigation narrative, the ruled-out hypotheses and the corrected claims
 live in `docs/station-mode-plan.md` (Phase 5). The durable per-chip facts live
@@ -17,9 +20,11 @@ in `src/jaguar3/CLAUDE.md`. This file does not repeat them.
 The TX FIFO is 2048 pages of 128 bytes, chained by the LLT. The auto-LLT init
 links every page to the next, `0 -> 1 -> ... -> 2047`, and page
 `rsvd_boundary` (1938) is where the beacon lives. On a correctly configured
-chip the allocator wraps at the boundary and writes `LLT[1937] = 0` itself;
-with `REG_CR` holding only the DMA bits at the LLT init, it did not - the data
-ring ran on into the reserved region. Under sustained TX with a beacon armed, the data allocator is
+chip the hardware terminates the data ring at the boundary itself -
+`LLT[1937]` reads `0x792` at init and `0` by the end of any run that has gone
+past one traversal (the moment it changes was not observed); with `REG_CR`
+lacking PROTOCOL_EN at the LLT init, it did not - the data ring ran on into
+the reserved region. Under sustained TX with a beacon armed, the data allocator is
 eventually handed page 1938 and overwrites the beacon; the next TBTT reads a
 data frame as a beacon descriptor and `TXDMA_STATUS` latches
 `BIT_TXPKTBUF_REQ_ERR`. The chip transmits nothing more for the life of the
@@ -38,12 +43,17 @@ entry itself - when the MAC is configured the way the vendor configures it.
 
 Single runs each; the flood pair shows the run-to-run spread is several
 points, so the new fix's downlink figure is "at least as good", not a
-measured gain.
+measured gain. (`txdemo`'s `submitted` is the transport's count of every
+bulk-OUT, bring-up's included; the demo's own frames stop at exactly 8000,
+and the extra 50 (8822C/E) / 42 (8822B) fit each die's firmware-download
+chunk count - fits, not verified.)
 
 **Bidirectional soak on the fix, 5 GHz (ch36, MCS7, 4 Mbit/s each way at
 once):** 8812CU AP 30 min and 8812BU AP 15 min, both **5/5** - one
 association, zero MIC failures, both ledgers close (~643k and ~322k frames
-each way), no quarter-on-quarter degradation. Counterparts: downlink loss
+each way), no quarter-on-quarter degradation beyond the grader's 20%
+allowance (8812CU up 3.984 -> 3.985, down 3.862 -> 3.860 Mbit/s; 8812BU up
+3.996 -> 3.996, down 3.919 -> 3.856). Counterparts: downlink loss
 averaged 3.3% (8812CU, worst chunk 5.0%) and 3.1% (8812BU, worst 3.9%) with
 no ARQ; AP resident memory grew 16 kB in 30 min on the 8812CU but **532 kB
 in 15 min on the 8812BU** - one run, so leak vs warm-up is not separated.
@@ -53,8 +63,9 @@ The first 8812BU soak did NOT survive: see Jaguar2 below.
 
 ### 1. RESOLVED - how the vendor's chip gets `LLT[1937] = 0`
 
-**Answer: its hardware writes it, dynamically, because the vendor enables the
-whole MAC before the LLT init. devourer enabled only the DMA bits.**
+**Answer: its hardware writes it, because the vendor enables the whole MAC -
+PROTOCOL_EN in particular - before the LLT init. devourer enabled only the
+DMA bits.**
 
 halmac's `MAC_TRX_ENABLE` for the 8822C (and 8822E, and 8822B) is `0xFF`:
 HCI TX/RX DMA, TX/RX DMA, PROTOCOL, SCHEDULE, MACTX, MACRX. `init_trx_cfg`
@@ -74,6 +85,12 @@ something:
 | the vendor chip after 500 injected frames, monitor mode, **no AP, no beacon** | `LLT[1937] = 0`. The allocator wraps at the boundary on its own. |
 | diff of the vendor's register writes vs ours, TRX enable through LLT init (usbmon, both captures) | exactly one difference: `REG_CR` `0xFF` vs `0x0F` |
 | devourer with `REG_CR = 0xFF`, no direct write | 2001/2001 then 4000/4000 frames, zero faults; after the run `LLT[1937] = 0` - written by the hardware - and page 1938 still holds the beacon descriptor |
+| **which bit** (asked by the close-out review; 8812CU, ch36, 4000 frames each) | `0x1F` (DMA + PROTOCOL): **4002/4002, clean, terminator written**. `0x2F` (DMA + SCHEDULE): fault at 212. `0xCF` (DMA + MACTX + MACRX): fault at 175. PROTOCOL_EN is the bit, on the 8822C; the 8822E and 8822B were fixed with the vendor's full `0xFF` and not bisected. |
+
+The usbmon diff covered the window from the TRX enable to the LLT init. The
+bisection is what places the requirement AT the LLT init: the later full
+`REG_CR` write (`0x06FF`, which includes PROTOCOL_EN) comes after the PHY
+tables, and the `0x0F` arms still faulted.
 
 The GENERAL_INFO port (a header-only byte-exact builder, its selftest, the
 H2C-packet send path with its own sequence counter, and the A/B switches) is
@@ -105,15 +122,17 @@ Measured 2026-09-25 on an 8812EU (1-1, `0bda:a81a`). Same `rsvd_boundary`
 
 | 8812EU | result |
 |---|---|
+| at init, before the beacon (both arms) | `LLT[1936..1939] = 791 792 793 794`, the same as the 8822C |
 | control, `MAC_TRX_ENABLE` temporarily back to `0x0F`, 4000 frames with the beacon armed | fault at 172 frames, page 1938 = `5a 5a ...`, `LLT[1937]` never terminated |
 | `0xFF` | 4000/4000, no fault, end-of-run `LLT[1937] = 0`, beacon page intact |
 | `txdemo` 8000 frames, max duty | 8050/8050, `txdma_status` 0 |
 | as AP, MT7612U station, **ch36** | `beacons` 3/3 (ours 103% of idle under downlink); `thru` 2/2 - up 19.9 Mbit/s at 0.27%, down 29.8 Mbit/s at 0.81% |
-| as AP, **ch6** | the station never completes the four-way - the documented 2.4 GHz TX limitation of this module (`docs/8822e-quirks.md`, "2.4 GHz TX: undecodable", kernel parity), not this fix |
+| as AP, **ch6** | the station never completes the four-way. UNATTRIBUTED: consistent with the documented 2.4 GHz TX limitation of this module (`docs/8822e-quirks.md`), but ch6 was never tried before the fix, so "not this fix" is untested |
 
-One observation against that quirk entry, not pursued: on ch6 the MT7612U
-decoded about half of the 8812EU's beacons (~20/s of 39/s aired), where the
-quirk records no receiver decoding any 2.4 GHz TX from this module.
+And an observation that contradicts that quirk entry (which records no
+receiver decoding any 2.4 GHz TX from this module): on ch6 the MT7612U
+decoded about half of the 8812EU's beacons (~20/s of 39/s aired). One run;
+the quirk entry is annotated.
 
 ### 3. Jaguar1 - checked, clear. Jaguar2 - had the same defect, fixed
 
@@ -136,11 +155,27 @@ defect.**
   0.28% loss**, saturating at ~12.5-12.8 Mbit/s above that - about half the
   Jaguar3 AP's ceiling, degrading smoothly, never collapsing.
 
-**One finding that is NOT Jaguar1's: the uplink into this 8812AU loses a flat
-~18-21% at every rate**, 1 to 30 Mbit/s offered, and MCS1 no better than
-MCS7, so the `thru` cell fails its 5%-loss gate in that direction. It is this
-adapter or its placement, established by elimination on one 1 Mbit/s rung
-(1373 station frames aired, `ARQ=0`, so each airs exactly once):
+**The uplink into this 8812AU loses a flat ~18-21% at every rate**, 1 to 30
+Mbit/s offered, and MCS1 no better than MCS7, so the `thru` cell fails its
+5%-loss gate in that direction.
+
+**CORRECTED by the close-out review - this section first said "it is not a
+devourer defect" and "each frame airs exactly once". Both were wrong for AP
+mode.** The station does not send once: its MT7612U retries unacknowledged
+unicast 15 deep (`docs/mt7612u-tx-retry.md`: ~45.5 ms per frame at
+exhaustion). And the witness capture of the 1373-frame AP-mode rung shows
+**zero station retries on the air** - no retry bit, no repeated sequence
+number, across 1301 captured frames. A frame the 8812AU AP had not ACKed
+would have been retried; none was. So the Jaguar1 MAC acknowledged
+essentially every frame, and ~18% of them never reached `ap_wpa2`: an
+**ACKed-but-undelivered loss on the Jaguar1 receive path**, after the MAC -
+the failure mode the root CLAUDE.md warns defeats ARQ. OPEN; where between
+the MAC and the host it happens is not established.
+
+What the table below does still show, for PASSIVE reception only (where the
+station's frames are ACKed by another AP and single-shot to this receiver):
+devourer's monitor RX on this unit is no worse than the kernel's. Evidence
+from one 1 Mbit/s rung per receiver, separate runs:
 
 | receiver of the station's frames | captured |
 |---|---|
@@ -155,10 +190,10 @@ modulation margin (MCS1 no better; every frame that does arrive is strong -
 RSSI ~83/72, EVM -54 dB), CRC-corrupted arrivals (only 2 of ~220 missing
 frames show up as CRC failures with the address intact), and false-alarm
 blinding by a low IGI (a hypothesis I tested and **retract**: DIG raised the IGI
-and neither the garbage decode rate nor the capture moved). The same
-8812AU is the bench witness that "goes deaf after a run"; together these say
-the unit or its antenna position is marginal on this bench. Not pursued
-further - it is not a devourer defect.
+and neither the garbage decode rate nor the capture moved). For passive RX
+the unit (the bench witness that "goes deaf after a run") or its position
+remains the leading explanation; for AP mode it is not, per the correction
+above.
 
 **Jaguar2 had the identical `REG_CR` defect - fixed and measured 2026-09-25**
 on an 8812BU (6-1, `0bda:b812`). `src/jaguar2/HalmacJaguar2MacInit.cpp`
@@ -172,21 +207,26 @@ the 8822B and the 8821C. Same `rsvd_boundary`, 1938.
 | `txdemo` 8000 frames, max duty | 8042/8042, `txdma_status` 0 |
 | as AP, MT7612U station, ch6 | `beacons` 3/3 (ours 100% of idle under downlink, 4317 aired, 0 failed) |
 | as AP, **ch36** | `thru` 2/2 - up 19.9 Mbit/s at 0.16%, down 29.6 Mbit/s at 1.34% |
-| as AP, **ch6** | `thru` FAILS its gate: downlink carries up to 28.4 Mbit/s but at a flat ~5.5-6% loss; uplink loses 40-47% at every rate (an earlier run: 31% falling to 2.5%) |
+| as AP, **ch6** | `thru` FAILS its gate: downlink carries up to 28.4 Mbit/s but at a flat ~5.5-6% loss; uplink 40-47% at every rate in one run, 31% falling to 2.5% with rate in another |
 
-**The ch6 losses are the adapter or its placement, not Jaguar2** - split the
-same day with the 8812CU back on the bench as a known-good ch6 AP and
-witness. Uplink, the station's frames at the same moments: the 8812CU AP got
-99.2%; the 8812BU on the kernel's **rtw88** got 74.9%; the 8812BU on
-**devourer** got 89.0% (deduplicated by CCMP PN - Jaguar2's parser leaves
-`rx.frame` `seq` at 0). devourer's receive path does no worse than the kernel
-on this unit. Downlink, from the 8812BU AP: 5365 data frames submitted, 5197
-(96.9%) seen on air by the 8812CU witness, 4986 (92.9%) decrypted by the
-station - the loss is mostly on the receiving side of that path; Jaguar2 TX
-accounts for at most ~3%, indistinguishable from the witness's own misses.
-The 8812BU-as-AP uplink losses (31-47%) exceed its monitor-mode 11%; those
-were separate runs on a busy 2.4 GHz channel and AP mode is clean on ch36,
-so the excess is recorded, not explained.
+**The ch6 losses are UNATTRIBUTED** (corrected by the close-out review: this
+paragraph first said "the adapter or its placement, not Jaguar2"). What the
+split with the 8812CU back on the bench actually shows:
+
+- *Passive RX only*, one 1 Mbit/s rung per receiver, **separate runs**: the
+  8812BU on the kernel's rtw88 captured 74.9% (deduplicated by unique
+  802.11 sequence number), on devourer 89.0% (by CCMP PN - Jaguar2's parser
+  leaves `rx.frame` `seq` at 0), while the 8812CU AP of those runs got
+  99.2%. devourer's passive RX is no worse than the kernel's on this unit.
+- *AP-mode uplink* (2.5-47% across two runs) is WORSE than that passive
+  figure, where the station's 15-deep retry should make it better - the same
+  ACKed-but-undelivered shape as the Jaguar1 AP. Not established for this
+  die (no witness retry count was taken on these runs). Open.
+- *Downlink*: 5365 data frames submitted, 5197 (96.9%) seen on air by the
+  8812CU witness, 4986 (92.9%) decrypted by the station. The witness's own
+  passive miss rate was not measured, and the same station decoded the
+  8812CU AP's ch6 downlink at ~98.8%, so a transmitter-side share (RF/EVM
+  of this 8812BU, or its programmed TX power) is not excluded.
 
 **A second Jaguar2 defect found on the way, fixed:** the first `thru` run
 killed the AP. Its DIG thread (`RtlJaguar2Device::StartRxLoop`) called
@@ -225,15 +265,33 @@ correspondingly derived threshold; or move `wpa2` to a cleaner channel.
 With the `REG_CR` fix, one full `all` run passed 21/21 with this cell at
 19/20 both ways - one run, so not evidence the flakiness is gone.
 
-### 5. Why 6M legacy is less reliable than MCS7 on this bench
+### 5. Why 6M is less reliable than MCS7 - split on 5 GHz, and it found a defect class
 
-Unexplained, and backwards from physics — 6M is the more robust rate. Same
-pair, same channel, same minutes: MCS7 one-way loss ~1%, 6M round-trip loss
-10–30%. Candidates not yet separated: the legacy-rate TX descriptor fields on
-either end (retry limit, `DISDATAFB`), a CCA/EDCA interaction specific to
-longer frames on a busy band, or the MT7612U's legacy RX path. A `thru` ladder
-at `TX_RATE=6M` against one at `MCS7`, one direction at a time, splits which
-end.
+Measured 2026-09-25, ch36, 8812CU AP, single-shot (`AP_RETRY` unset), one
+ladder per arm (500-4000 kbit/s; each arm's saturated top rung excluded):
+
+| arm | airtime / frame | uplink loss | downlink loss |
+|---|---|---|---|
+| MCS7, 1400 B (from item 6's A0) | ~0.2 ms | 0.14-0.30% | 1.26-2.27% |
+| MCS0, 1400 B | ~1.8 ms | 0.07-0.15% | 2.99-4.52% |
+| 6M, 1400 B | ~1.9 ms | 0.78-4.22% | 3.66-5.75% |
+| 6M, 350 B | ~0.5 ms | 0.69-1.37% | 2.00-3.21% |
+
+- **Downlink** (single-shot, no AP retries): loss rises with frame airtime
+  but does not scale with it - a floor of roughly 1.5-2% plus an
+  airtime-dependent part. Exposure plus a fixed per-frame miss; AP retries
+  (item 6) remove both.
+- **Uplink** is retry-backed, and 6M is worse than MCS0 at the same airtime:
+  a LEGACY-format loss. A witness settled what it is. On a 6M 2 Mbit/s rung
+  (30 s) the station aired 5393 encrypted data frames, the 8812BU (rtw88,
+  monitor) saw 5337 of them with **zero retry bits and 5337 unique CCMP
+  PNs** - no retransmission at all - and the AP decrypted 5364 (99.46%). So
+  the 8812CU AP's MAC ACKed every frame on the first attempt and ~29 never
+  reached `ap_wpa2`: **ACKed-but-undelivered on the Jaguar3 receive path
+  too**, as on the Jaguar1 AP (item 3), here worse for legacy frames than
+  for HT. No retry setting can recover it - the sender believes it arrived.
+  OPEN, and the next thing worth chasing: where between the MAC's ACK and
+  `ap_wpa2` those frames go.
 
 ### 6. RESOLVED - retransmission: the AP's retry limit, not the responder
 
@@ -246,7 +304,10 @@ Measured 2026-09-25 with the new `AP_RETRY` harness knob:
 | A2 `AP_RETRY=7` only | 0.15-0.45% | **0.00% on every rung** | 115 |
 | A3 both | 0.09-0.45% | **0.00% on every rung** | 114 |
 
-One ladder per arm. What it establishes:
+One ladder per arm, ch36 only - the ch6 conditions the old "27%" came from
+are untested with `AP_RETRY`, and the library default (and the harness
+default) is still retry limit 0, so a default d2d downlink still has no
+retransmission. What it establishes:
 
 - **The downlink loss was single-shot frames.** The AP transmits with the
   library's default retry limit, 0 (`DEVOURER_TX_RETRY_LIMIT` - right for the
@@ -256,14 +317,21 @@ One ladder per arm. What it establishes:
   station rejects are the fingerprint of it working: frames whose ACK was
   lost, retried, and correctly dropped as copies - nothing delivered twice.
 - **The ACK responder (`ARQ=1`) changes nothing here**, because the AP
-  already ACKs the station: over 321k soak frames the AP rejected zero
-  replays, and the station's MT7612U requests an ACK on every frame with a
-  15-deep retry (`MT_TX_RETRY_CFG` 0x47f01f0f) - unACKed frames would have
-  aired repeatedly and shown up as replays. The harness comment that
+  already ACKs the station without it - by construction: `StartBeacon`
+  programs the MACID and net_type=AP, the same registers `SetAckResponder`
+  arms (`RtlJaguar3Device.cpp`, "same registers the proven StartBeacon/AP
+  path programs"). The measurement agrees three ways: A1 = A0; the uplink
+  runs at ~20 Mbit/s, where a non-ACKing AP would cap it near 22 frames/s
+  (the MT7612U's ~45.5 ms retry-ladder exhaustion per unACKed frame,
+  `docs/mt7612u-tx-retry.md`); and a witness on a ch36 uplink rung saw zero
+  station retries (item 5). The earlier-cited "zero replays over 321k soak
+  frames" came from the 8812BU soak, not this 8812CU A/B, and on its own
+  cannot separate "ACKed" from "never retried". The harness comment that
   predicted `ARQ=1` would improve the uplink was wrong and is corrected.
-- The uplink's residual 0.1-0.4% is not the air's retry budget; it is not
-  explained yet. The 30 Mbit/s uplink rung loses 21-25% in every arm - the
-  station dropping 8-10k frames from its own queue, a send-path ceiling.
+- The uplink's residual 0.1-0.4% is NOT explained by the air: item 5 shows
+  it is ACKed-but-undelivered. The 30 Mbit/s uplink rung loses 21-25% in
+  every arm - the station dropping 8-10k frames from its own queue, a
+  send-path ceiling.
 
 `AP_RETRY` is a harness knob, unset by default so every recorded figure stays
 reproducible.
@@ -280,7 +348,7 @@ sudo tests/sta_d2d_onair.sh all                    # 21 checks (see item 4)
 Plus a station-free stress that needs no association:
 `DEVOURER_AP_INJECT=4000 DEVOURER_AP_PKTBUF=1` on `tests/ap_wpa2.cpp` — zero
 send failures, no `TXDMA_STATUS` transition, and in the `end of run` probe
-`LLT[1937]=0` (written by the hardware at the first wrap - it reads `0x792`
+`LLT[1937]=0` (written by the hardware during the run - it reads `0x792`
 at init, correctly) with page 1938 still `59 00 30 85 ...`. The probe reads
 around page 1938; `DEVOURER_AP_PKTBUF_BNDY=N` points it at another die's
 boundary (all three measured dies - 8822C, 8822E, 8822B - use 1938). It

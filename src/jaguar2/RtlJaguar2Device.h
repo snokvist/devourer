@@ -97,6 +97,7 @@ public:
    * through REG_PKTBUF_DBG_CTRL; TXDMA_STATUS at 0x0210). Safe on a chip whose
    * transmitter has stopped. */
   uint32_t GetTxDmaStatus() override;
+  bool HasTxDmaStatus() const override { return true; }
   bool ReadPacketBuffer(int sel, uint32_t offset, uint8_t *out,
                         size_t n) override;
   /* Disable/restore the MAC EDCCA gate (BIT_DIS_EDCCA 0x520[15] + EDCCA-mask

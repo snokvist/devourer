@@ -118,6 +118,73 @@ favourable measurement without its adversarial counterpart in the same breath.
 | Phase 5 TX wedge | `5e7df6d` | Flash (vendor page accounting) | endpoint→queue rule found | 5 | yes — this commit |
 | Phase 5 TX wedge | `5e7df6d` | Flash (devourer TX path audit) | **QSEL 0x12 on every frame** | 4 | yes — this commit |
 | Phase 5 TX wedge | `5e7df6d` | Flash (adversarial) | **my endpoint-only fix would have made it worse** | 7 | yes — this commit |
+| Phase 5 close-out | `5e7df6d..2c4ee47` src/ | Flash (library correctness vs vendor halmac) | **the aggregated TX path reverted the queue fix** | 8 | yes — this commit (see Round 6) |
+| Phase 5 close-out | `5e7df6d..2c4ee47` tests/ | Flash (can any assertion fail?) | **three soak graders could pass vacuously** | 10 | yes — this commit |
+| Phase 5 close-out | `5e7df6d..2c4ee47` docs + commits | Opus subagent (evidence vs claims) | **"not a devourer defect" was wrong for AP mode** | 20 | yes — this commit |
+
+### Round 6 — the Phase 5 close-out, 2026-09-25
+
+Three reviewers over everything after the TX-wedge reviews (`5e7df6d..2c4ee47`:
+the queue fix, the LLT write and its replacement by the `REG_CR` fix, the
+Jaguar2 fix and thread guards, the Jaguar2 diagnostics, the bidirectional
+soak, the ARQ knob). Every finding was verified against the tree before
+acting; the dispositions:
+
+**Library (Flash, 8).** (1) DEFECT, fixed: `send_packets` submitted every
+aggregated URB on the HIGH endpoint while its data descriptors said LOW - the
+queue fix silently reverted under `DEVOURER_TX_USB_AGG`. It now picks the
+endpoint from the packed descriptors and falls back to per-frame sends when
+they disagree; on air, 1000 aggregated URBs of management frames clean (the
+LOW-queue data aggregation it protects is not driven by any current tool).
+(2) 2/4-bulk-OUT parts key a different vendor table: documented at the
+helper, not fixed - no such part on the bench. (3) `ReadPacketBuffer` left
+`0x0140` pointing into the FIFO after a throw: fixed with a scope guard on
+both generations. (4) The vendor gates the RX clock around the same read:
+documented as a precondition, not ported. (5) `0xFF` enables MACRX before
+bulk-IN is armed, on bring-up failure paths and on the 8821C/8821CE:
+vendor-identical order, judged benign, untested - recorded as open. (6) Two
+comments misstated what `0x06FF` sets (ENSWBCN is bit 8 and stays clear;
+bits 9-10 are added): fixed. (7) `GetTxDmaStatus`'s 0 read as healthy on
+backends that never read it: `IRtlRadio::HasTxDmaStatus` added, `txdemo`
+emits the field only where it is real, `docs/logging.md` updated. (8) Data is
+pinned to TID 0: documented.
+
+**Tests (Flash, 10), all verified on the real interpreter before fixing.**
+(1-3) The AP-books identity passed on a ledger with no data-plane line; the
+station books passed on an all-zero ledger; the trend passed on a one-line
+chunks file: all three graders now read anchored ledger lines, require
+non-zero traffic, and need four chunks. (4) The AP identity ignored frames the
+TX circuit breaker drops after counting them `queued`: included, and a trip
+now FAILs by name. (5) See library (7). (6) `DEVOURER_AP_PKTBUF_BNDY` could
+underflow: range-checked. (7) Knobs validated only as a concatenation, and
+`SOAK_DEGRADE_PCT>100` made the trend unfailable: validated one by one.
+(8) A watchdog comment promised a per-poll trace it never took: corrected.
+(9) Diagnostic knobs treated `=0` as on: `env_on`. (10) Fields were "the last
+match anywhere": anchored. The sweep grew from 9 to 18 cases, moved into the
+tree as `tests/soak_grade_selftest.sh` over a real run's ledger lines
+(ctest `soak_grade_selftest`), 0 survivors - and it goes red when the
+four-chunk minimum is weakened.
+
+**Evidence vs claims (Opus, 20).** The heaviest: (1) the Jaguar1 AP-mode
+uplink was written off as "the adapter, not a devourer defect" on the premise
+that each frame airs once. The station retries 15 deep, and the witness
+capture of that very run shows zero retries: the Jaguar1 MAC ACKed frames
+that never reached the host - ACKed-but-undelivered, reopened, and the same
+signature then found on the Jaguar3 AP for legacy frames (tx-ring item 5).
+(2-4) The 8812BU ch6 attribution overreached (passive-only evidence, separate
+runs, an unmeasured witness miss rate, a misquoted range): now unattributed.
+(5) The ARQ inference rested on a replay count that could not separate the
+alternatives: now rests on the code, the airtime bound and a witness count.
+(6) "PROTOCOL/SCHEDULE" was never bisected: bisected - PROTOCOL_EN.
+(7-9, 17, 18) Mechanism details and "measured" wording stated more than was
+observed: corrected in the CLAUDE.md facts. (10-12) Retracted claims still
+read as live (a code comment, two plan headings): marked. (13-15) Numbers
+without their counterparts or single-run labels: added. (16) The 8822E ch6
+failure's "not this fix" was untested, and a contrary observation was not
+annotated on the quirk entry: both fixed. (19) Duplicated text: the plan's
+retransmission section is now a pointer, the interface header keeps the
+contract only. (20) `txdemo`'s 8050 against an 8000 bound: the transport
+counts every bulk-OUT, bring-up's included.
 
 ### Round 5 — the Phase 1 gate, 2026-09-20
 
@@ -1687,7 +1754,7 @@ block. All four checks had already printed (4 PASS, 0 FAIL, matching
 machine-enforced score line never ran. Never edit a shell script that is
 running.
 
-#### Why the AP's transmitter stops: the HIGH QUEUE runs out of pages
+#### Why the AP's transmitter stops: the HIGH QUEUE runs out of pages (RETRACTED 2026-09-24 - a consequence, not the cause; see "FIXED 2026-09-24" below)
 
 `RtlJaguar3Device::DumpChipState()` now exists (it was Jaguar1-only) and
 reads what actually gates transmission. `ap_wpa2` dumps it twice — healthy at
@@ -1894,7 +1961,7 @@ equivalent, which is why the part stays dead for the life of the process.
 A reset path is a fix for the SYMPTOM and worth having regardless of which
 candidate above turns out to be the cause.
 
-#### FIXED 2026-09-24: the beacon's page was being overwritten by data
+#### FIXED 2026-09-24: the beacon's page was being overwritten by data (the fix described here is SUPERSEDED - see "SUPERSEDED 2026-09-25" below)
 
 **Root cause, read directly out of the chip.** The TX FIFO's 128-byte pages
 are chained by the LLT (link list table). The auto-LLT init links every page
@@ -1996,9 +2063,12 @@ set at init; it appears after 500 injected frames with no AP and no beacon;
 a usbmon register-write diff of both bring-ups, TRX enable through LLT init,
 has exactly one difference - `REG_CR`; with it fixed and no direct write,
 4000/4000 frames, no fault, the hardware writes `LLT[1937] = 0` and the beacon
-page survives. On air with the fix: `beacons` 3/3, `thru` 2/2 (downlink
-29.6 Mbit/s at 1.2% loss), `flood` 3/3, `all` 21/21, `txdemo` 8050/8050
-clean. Full record: `docs/jaguar3-tx-ring.md`.
+page survives; a later bit bisection named PROTOCOL_EN (bit 4) as the one
+that matters. On air with the fix, ONE RUN EACH: `beacons` 3/3, `thru` 2/2
+(downlink 29.6 Mbit/s at 1.2% loss), `flood` 3/3 (but 305 rt/s at 5.2% loss
+on its first run - worse than the old fix's 357 at 1.1% - and 351 at 1.4% on
+the re-run), `all` 21/21 (with the `wpa2` cell known flaky), `txdemo`
+8050/8050 clean. Full record: `docs/jaguar3-tx-ring.md`.
 
 **What I got wrong in the section above, stated plainly:** it called the
 direct write "what the evidence supports". The evidence supported the end
@@ -2039,34 +2109,15 @@ minutes (not separated from warm-up).
 
 #### Retransmission, measured 2026-09-25 - and one prediction retracted
 
-| arm (8812CU AP, MT7612U station, ch36, MCS7) | uplink loss, 1-20 Mbit/s | downlink loss, 1-30 Mbit/s | station replays rejected |
-|---|---|---|---|
-| A0 no responder, no AP retries (every earlier figure) | 0.14-0.30% | 1.26-2.27% | 0 |
-| A1 `ARQ=1` (AP ACK responder) only | 0.19-0.41% | 0.75-2.16% | 0 |
-| A2 `AP_RETRY=7` only | 0.15-0.45% | **0.00% on every rung** | 115 |
-| A3 both | 0.09-0.45% | **0.00% on every rung** | 114 |
-
-One ladder per arm. What it establishes:
-
-- **The downlink loss was single-shot frames.** The AP transmits with the
-  library's default retry limit, 0 (`DEVOURER_TX_RETRY_LIMIT` - right for the
-  FPV link, where FEC carries reliability), so every downlink frame aired
-  once and a frame the station missed stayed lost. With a retry limit of 7
-  the loss is zero up to 30 Mbit/s (29.998 delivered). The ~115 replays the
-  station rejects are the fingerprint of it working: frames whose ACK was
-  lost, retried, and correctly dropped as copies - nothing delivered twice.
-- **The ACK responder (`ARQ=1`) changes nothing here**, because the AP
-  already ACKs the station: over 321k soak frames the AP rejected zero
-  replays, and the station's MT7612U requests an ACK on every frame with a
-  15-deep retry (`MT_TX_RETRY_CFG` 0x47f01f0f) - unACKed frames would have
-  aired repeatedly and shown up as replays. The harness comment that
-  predicted `ARQ=1` would improve the uplink was wrong and is corrected.
-- The uplink's residual 0.1-0.4% is not the air's retry budget; it is not
-  explained yet. The 30 Mbit/s uplink rung loses 21-25% in every arm - the
-  station dropping 8-10k frames from its own queue, a send-path ceiling.
-
-`AP_RETRY` is a harness knob, unset by default so every recorded figure stays
-reproducible.
+The downlink's steady ~2-3% was single-shot frames: the AP airs data with the
+library default retry limit 0. `AP_RETRY=7` took it to 0.00% on every rung
+to 30 Mbit/s at ch36 (one ladder per arm). `ARQ=1`, the AP's ACK responder,
+changed nothing, and the harness comment that predicted it would improve the
+uplink was wrong - `StartBeacon` already programs the same registers. The
+table, the provenance of each inference and the limits (ch36 only, the
+default still 0) are in `docs/jaguar3-tx-ring.md` item 6, not repeated here.
+Item 5 there is the 6M-vs-MCS7 split, which found ACKed-but-undelivered loss
+on the Jaguar3 AP's receive path.
 
 #### A RETRACTION OF A RETRACTION, which is worth more than either
 
