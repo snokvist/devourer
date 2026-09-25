@@ -63,6 +63,19 @@ public:
    * page AND the head is restored there (where the TBTT engine reads). */
   void set_rsvd_boundary(uint16_t b) { _rsvd_boundary = b; }
 
+  /* The firmware image's H2C format version (header offset 28, halmac
+   * chk_h2c_ver_88xx), recorded by download_firmware; 0 before it. halmac
+   * refuses the H2C-packet commands below version 4. */
+  uint16_t h2c_version() const { return _h2c_ver; }
+
+  /* Send one 32-byte H2C packet (halmac send_h2c_pkt_88xx over the USB
+   * not-xmitframe path): stamps the next H2C-packet sequence number into
+   * bytes 6..7, wraps it in the QSEL 0x13 descriptor and bulk-OUTs it on the
+   * HIGH endpoint. First checks the H2C queue has room, from the hardware
+   * write pointer and the firmware read pointer (get_h2c_buf_free_space_88xx).
+   * h2cq_bytes is the queue's size. */
+  bool send_h2c_pkt(uint8_t *pkt, uint32_t h2cq_bytes);
+
 private:
   /* --- ported halmac DLFW steps --- */
   bool start_dlfw(const uint8_t *fw_bin, size_t size);
@@ -100,6 +113,10 @@ private:
    * rsvd-page bracket restores FIFOPAGE_CTRL_2 to. Computed by the queue/page
    * allocation during power-on. */
   uint16_t _rsvd_boundary = 0;
+  uint16_t _h2c_ver = 0;
+  /* halmac h2c_info.seq_num: ONE counter for every H2C packet. It is not the
+   * HMEBOX box index - that is a different firmware queue with its own. */
+  uint16_t _h2c_pkt_seq = 0;
 };
 
 } /* namespace jaguar3 */

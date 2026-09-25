@@ -99,6 +99,8 @@ public:
 private:
   void power_off();           /* card-disable PWR_SEQ — reset from active state */
   void power_on();            /* card-enable PWR_SEQ */
+  /* halmac send_general_info_88xx: GENERAL_INFO + PHYDM_INFO H2C packets. */
+  bool send_general_info();
   void init_rfk();            /* RF-calibration init (0x1B00 cal_init block) */
   void apply_bb_rf_agc_tables(::InitTimer *timer = nullptr); /* phydm BB/AGC/RF tables via PhyTableLoader; stage checkpoints when given */
   void bf_init();                /* rtl8822c_phy_bf_init: BF/MU + NDPA sounding */

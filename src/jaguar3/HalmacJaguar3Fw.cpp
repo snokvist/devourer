@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "FrameParserJaguar3.h"
+#include "H2cPktJaguar3.h"
 #include "HalmacJaguar3Regs.h"
 #if defined(DEVOURER_HAVE_JAGUAR3_8822C)
 #include "hal8822c_fw.h" /* array_mp_8822c_fw_nic[] + _len */
@@ -242,6 +243,29 @@ bool HalmacJaguar3Fw::send_fw_page(uint16_t pg_addr, const uint8_t *chunk,
   return status;
 }
 
+bool HalmacJaguar3Fw::send_h2c_pkt(uint8_t *pkt, uint32_t h2cq_bytes) {
+  constexpr uint16_t REG_H2C_PKT_READADDR = 0x10D0;
+  constexpr uint16_t REG_H2C_PKT_WRITEADDR = 0x10D4;
+  const uint32_t hw_wptr = r32(REG_H2C_PKT_WRITEADDR) & 0x3FFFF;
+  const uint32_t fw_rptr = r32(REG_H2C_PKT_READADDR) & 0x3FFFF;
+  const uint32_t free_bytes = hw_wptr >= fw_rptr
+                                  ? h2cq_bytes - (hw_wptr - fw_rptr)
+                                  : fw_rptr - hw_wptr;
+  if (free_bytes <= H2C_PKT_SIZE) {
+    _logger->error("Jaguar3: H2C queue full ({} bytes free), packet not sent",
+                   free_bytes);
+    return false;
+  }
+  pkt[6] = static_cast<uint8_t>(_h2c_pkt_seq);
+  pkt[7] = static_cast<uint8_t>(_h2c_pkt_seq >> 8);
+  _h2c_pkt_seq++;
+  uint8_t frame[H2C_USB_FRAME_SIZE];
+  build_h2c_usb_frame(frame, pkt);
+  const int rc = _device.bulk_send_sync_ep(_device.first_bulk_out_ep(), frame,
+                                           static_cast<int>(sizeof frame), 1000);
+  return rc == static_cast<int>(sizeof frame);
+}
+
 /* Port of dlfw_to_mem_88xx — chunked rsvd-page TX + IDDMA copy + checksum. */
 bool HalmacJaguar3Fw::dlfw_to_mem(const uint8_t *fw_bin, uint32_t src,
                                 uint32_t dest, uint32_t size) {
@@ -343,6 +367,7 @@ bool HalmacJaguar3Fw::download_firmware(const uint8_t *fw_bin, size_t size) {
 
   if (!chk_fw_size(fw_bin, size))
     return false;
+  _h2c_ver = static_cast<uint16_t>(fw_bin[28] | (fw_bin[29] << 8));
 
   wlan_cpu_en(false);
 

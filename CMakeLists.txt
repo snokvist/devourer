@@ -1539,6 +1539,15 @@ if(DEVOURER_JAGUAR3 OR DEVOURER_JAGUAR2_8822B OR DEVOURER_JAGUAR2_8821C)
     add_test(NAME rx_physt_bit COMMAND RxPhystSelftest)
 endif()
 
+# Headless guard for the Jaguar3 H2C-packet builders (GENERAL_INFO,
+# PHYDM_INFO): held byte-for-byte to the vendor driver's usbmon capture.
+if(DEVOURER_JAGUAR3)
+    add_executable(J3H2cPktSelftest tests/j3_h2c_pkt_selftest.cpp)
+    target_link_libraries(J3H2cPktSelftest PRIVATE devourer)
+    target_include_directories(J3H2cPktSelftest PRIVATE src)
+    add_test(NAME j3_h2c_pkt COMMAND J3H2cPktSelftest)
+endif()
+
 # Headless guard for the USB TX-aggregation URB packing (src/TxAggPlan.h) —
 # block alignment, the never-a-bulk-multiple boundary shim, the OQT
 # descs-per-bulk guard, the frame/byte caps — plus the HalMAC descriptor agg

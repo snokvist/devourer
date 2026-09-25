@@ -44,6 +44,20 @@ public:
    * rsvd_pg_num) — the head page of the beacon/rsvd region, where the beacon is
    * downloaded and BCN_HEAD points. Valid after init_mac_cfg. */
   uint16_t rsvd_boundary() const { return _rsvd_boundary; }
+  /* The reserved region's layout, from the same allocation (valid after
+   * init_mac_cfg): the firmware's TX buffer page, the H2C-packet queue's head
+   * page and its size in pages. GENERAL_INFO carries the first as an offset
+   * from rsvd_boundary; the H2C-packet path polls the second. */
+  uint16_t rsvd_fw_txbuf_addr() const { return _rsvd_fw_txbuf_addr; }
+  uint16_t rsvd_h2cq_addr() const { return _rsvd_h2cq_addr; }
+  uint16_t rsvd_h2cq_pages() const;
+
+  /* One dword of on-chip packet memory through the debug window (halmac
+   * read_buf_88xx addressing). window_base 0x780 = TX FIFO, 0x650 = LLT;
+   * byte_off is 4-aligned. Saves and restores REG_PKTBUF_DBG_CTRL. */
+  uint32_t read_pktbuf32(uint16_t window_base, uint32_t byte_off);
+  /* LLT entry `page` - the page that follows it in its chain. */
+  uint32_t llt_entry(uint16_t page) { return read_pktbuf32(0x650, page * 4u); }
 
 private:
   bool init_trx_cfg();
@@ -60,6 +74,8 @@ private:
   void cfg_mac_clk();
 
   uint16_t _rsvd_boundary = 0;
+  uint16_t _rsvd_fw_txbuf_addr = 0;
+  uint16_t _rsvd_h2cq_addr = 0;
   RtlAdapter _device;
   Logger_t _logger;
 };

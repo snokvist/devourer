@@ -1,5 +1,6 @@
 #include "HalJaguar3.h"
 #include "InitTimer.h"
+#include "H2cPktJaguar3.h"
 #include <cstdlib>
 #include <cstring>
 
@@ -146,6 +147,15 @@ void HalJaguar3::rtw_hal_init(SelectedChannel channel) {
    * was 0 during the pre-queue-init FW stage, so a beacon rsvd-page download
    * would otherwise target page 0 instead of the real boundary. */
   _fw.set_rsvd_boundary(_macinit.rsvd_boundary());
+#ifndef DEVOURER_J3_XP_NO_GENINFO
+  send_general_info();
+#endif
+  {
+    const uint16_t last = static_cast<uint16_t>(_macinit.rsvd_boundary() - 1);
+    _logger->info("Jaguar3 XP: after general info, LLT[{}] = 0x{:x}", last,
+                  _macinit.llt_entry(last));
+  }
+  timer.stage("general_info");
   _macinit.init_usb_cfg();         /* USB RX-DMA mode — RX delivery to bulk-IN */
   _macinit.enable_bb_rf(true);     /* set_hw_value(EN_BB_RF) */
   timer.stage("usb_cfg_bbrf");
@@ -166,7 +176,69 @@ void HalJaguar3::rtw_hal_init(SelectedChannel channel) {
   enable_tx_path();                /* enable OFDM/CCK TX block (gates on-air TX) */
   timer.stage("bf_rx_tx_cfg");
   timer.total();
+  {
+    const uint16_t last = static_cast<uint16_t>(_macinit.rsvd_boundary() - 1);
+    _logger->info("Jaguar3 XP: bring-up end, LLT[{}] = 0x{:x}", last,
+                  _macinit.llt_entry(last));
+  }
   _logger->info("Jaguar3: bring-up complete");
+}
+
+/* halmac send_general_info_88xx, called where rtw_halmac_init_hal calls it:
+ * after the MAC init and TRX enable, before the rest of bring-up. Two H2C
+ * packets, then a poll of the H2C queue's head element in the reserved region
+ * until the first packet's header is there - which proves the MAC filed it,
+ * not that the firmware has acted on it. */
+bool HalJaguar3::send_general_info() {
+  if (_fw.h2c_version() < 4) {
+    _logger->warn("Jaguar3: firmware H2C version {} < 4 - GENERAL_INFO not "
+                  "supported, not sent", _fw.h2c_version());
+    return false;
+  }
+  const uint32_t h2cq_bytes = static_cast<uint32_t>(_macinit.rsvd_h2cq_pages())
+                              << 7;
+  auto ptrs = [this](const char *when) {
+    _logger->info("Jaguar3 XP: H2C pkt ptrs {}: hw_wptr=0x{:05x} fw_rptr=0x{:05x}",
+                  when, _device.rtw_read32(0x10D4) & 0x3FFFF,
+                  _device.rtw_read32(0x10D0) & 0x3FFFF);
+  };
+  ptrs("before");
+  const uint16_t boundary = static_cast<uint16_t>(
+      _macinit.rsvd_fw_txbuf_addr() - _macinit.rsvd_boundary());
+  uint8_t pkt[H2C_PKT_SIZE];
+  build_general_info(pkt, static_cast<uint8_t>(boundary), 0);
+  if (!_fw.send_h2c_pkt(pkt, h2cq_bytes)) {
+    _logger->error("Jaguar3: GENERAL_INFO send failed");
+    return false;
+  }
+  PhydmInfo pi;
+  pi.rfe_type = _phy_ctx.rfe_type;
+  pi.rf_type = _ver.rf_2t2r ? 2 /* HALMAC_RF_2T2R */ : 4 /* HALMAC_RF_1T1R */;
+  pi.cut = _ver.cut;
+  pi.rx_ant = _ver.rf_2t2r ? 3 : 1;
+  pi.tx_ant = _ver.rf_2t2r ? 3 : 1;
+  pi.package_type = 7;
+  build_phydm_info(pkt, pi, 0);
+  if (!_fw.send_h2c_pkt(pkt, h2cq_bytes)) {
+    _logger->error("Jaguar3: PHYDM_INFO send failed");
+    return false;
+  }
+  const uint32_t h2cq = static_cast<uint32_t>(_macinit.rsvd_h2cq_addr()) << 7;
+  for (int i = 0; i < 100; i++) {
+    const uint32_t e = _macinit.read_pktbuf32(0x780, h2cq);
+    if ((e & 0x7F) == 0x01 && ((e >> 8) & 0xFF) == 0xFF) {
+      _logger->info("Jaguar3: GENERAL_INFO sent (FW_TX_BOUNDARY {}, fw H2C "
+                    "ver {}, cut {}, rfe {}), in the H2C queue after {} polls",
+                    boundary, _fw.h2c_version(), pi.cut, pi.rfe_type, i + 1);
+      ptrs("after poll");
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      ptrs("after 20 ms");
+      return true;
+    }
+    std::this_thread::sleep_for(std::chrono::microseconds(5));
+  }
+  _logger->error("Jaguar3: GENERAL_INFO never reached the H2C queue");
+  return false;
 }
 
 /* Port of config_phydm_parameter_init_8822c(ODM_POST_SETTING): turn on the

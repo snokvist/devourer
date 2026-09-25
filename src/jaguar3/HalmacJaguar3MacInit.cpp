@@ -246,7 +246,11 @@ constexpr uint8_t WLAN_PHY_REQ_DELAY_10M = 0xA;
 constexpr uint8_t CHIP_VER_B_CUT = 1;
 
 /* ---- bit / value constants ---- */
+#ifdef DEVOURER_J3_XP_CR_FF
+constexpr uint8_t MAC_TRX_ENABLE = 0xFF;
+#else
 constexpr uint8_t MAC_TRX_ENABLE = 0x0F; /* HCI_TXDMA|HCI_RXDMA|TXDMA|RXDMA */
+#endif
 constexpr uint8_t BIT_FWEN = 0x80;       /* BIT(7) of REG_WMAC_FWPKT_CR */
 constexpr uint8_t BIT_AUTO_INIT_LLT_V1 = 0x01;
 constexpr uint8_t BLK_DESC_NUM = 0x3;
@@ -545,9 +549,11 @@ bool HalmacJaguar3MacInit::priority_queue_cfg() {
   cur -= RSVD_PG_CSIBUF_NUM;
   const uint16_t rsvd_csibuf_addr = cur; /* 1998 */
   cur -= RSVD_PG_FW_TXBUF_NUM;
+  _rsvd_fw_txbuf_addr = cur; /* 1994 */
   cur -= RSVD_PG_CPU_INSTRUCTION_NUM;
   cur -= RSVD_PG_H2CQ_NUM;
   const uint16_t rsvd_h2cq_addr = cur; /* 1986 */
+  _rsvd_h2cq_addr = rsvd_h2cq_addr;
 
   const uint16_t pub_pg =
       acq_pg_num - PG_HQ - PG_NQ - PG_LQ - PG_EXQ - PG_GAP; /* 1745 */
@@ -591,8 +597,13 @@ bool HalmacJaguar3MacInit::priority_queue_cfg() {
     }
   }
 
+#ifndef DEVOURER_J3_XP_NO_TERMINATE
   if (!terminate_acq_ring(rsvd_boundary))
     return false;
+#else
+  _logger->warn("Jaguar3 XP: terminate_acq_ring DISABLED; LLT[{}] = 0x{:x}",
+                rsvd_boundary - 1, llt_entry(rsvd_boundary - 1));
+#endif
 
   /* transfer mode NORMAL = 0 */
   _device.rtw_write8(REG_CR + 3, 0);
@@ -667,6 +678,23 @@ bool HalmacJaguar3MacInit::terminate_acq_ring(uint16_t rsvd_boundary) {
                 "0x{:x} -> 0), reserved region protected",
                 rsvd_boundary - 1, before);
   return true;
+}
+
+uint16_t HalmacJaguar3MacInit::rsvd_h2cq_pages() const {
+  return RSVD_PG_H2CQ_NUM;
+}
+
+uint32_t HalmacJaguar3MacInit::read_pktbuf32(uint16_t window_base,
+                                             uint32_t byte_off) {
+  constexpr uint16_t kPktbufDbgCtrl = 0x0140; /* REG_PKTBUF_DBG_CTRL */
+  const uint16_t win = static_cast<uint16_t>((byte_off >> 12) + window_base);
+  const uint16_t addr = static_cast<uint16_t>(0x8000u + (byte_off & 0xFFCu));
+  const uint16_t saved = _device.rtw_read16(kPktbufDbgCtrl);
+  _device.rtw_write16(kPktbufDbgCtrl,
+                      static_cast<uint16_t>((saved & 0xF000u) | win));
+  const uint32_t v = _device.rtw_read<uint32_t>(addr);
+  _device.rtw_write16(kPktbufDbgCtrl, saved);
+  return v;
 }
 
 /* init_h2c_8822c */
