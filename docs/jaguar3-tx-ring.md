@@ -38,7 +38,16 @@ entry itself - when the MAC is configured the way the vendor configures it.
 
 Single runs each; the flood pair shows the run-to-run spread is several
 points, so the new fix's downlink figure is "at least as good", not a
-measured gain. The 30-minute soak ran on the direct-write fix only.
+measured gain.
+
+**Bidirectional soak on the fix, 5 GHz (ch36, MCS7, 4 Mbit/s each way at
+once):** 8812CU AP 30 min and 8812BU AP 15 min, both **5/5** - one
+association, zero MIC failures, both ledgers close (~643k and ~322k frames
+each way), no quarter-on-quarter degradation. Counterparts: downlink loss
+averaged 3.3% (8812CU, worst chunk 5.0%) and 3.1% (8812BU, worst 3.9%) with
+no ARQ; AP resident memory grew 16 kB in 30 min on the 8812CU but **532 kB
+in 15 min on the 8812BU** - one run, so leak vs warm-up is not separated.
+The first 8812BU soak did NOT survive: see Jaguar2 below.
 
 ## Open items
 
@@ -187,7 +196,17 @@ uplink - `std::terminate`, core dump. The file already documented that such
 reads "race the async bulk-IN and throw under load" and guarded the CFO
 tracker for it; DIG and the thermal-track thread were not guarded. Both now
 skip and count the tick. It fired about once per ladder afterwards - a
-recurring event, not a one-off. Jaguar2's `ReadPacketBuffer` and
+recurring event, not a one-off. **And it is not only DIG's problem:** the
+first 15-minute 8812BU soak died at minute 9 the same way, through the
+`GetTxDmaStatus` read this session added to Jaguar2 - `ap_wpa2`'s TX-DMA
+watchdog polls it every 100 ms and did not catch. The ap log shows 12
+isolated read failures over those 9 minutes with bulk traffic succeeding
+between every one: the chip was healthy, the reads just fail about once a
+minute under a 4+4 Mbit/s load. The watchdog, the PKTBUF probe and
+`txdemo`'s `tx.stats` now catch and skip the sample (`tx.stats` reports
+`txdma_read_failed` instead of a 0 that would read as healthy), and the
+`IRtlRadio` contract says so. The rerun passed 5/5 with 17 failed reads
+absorbed. Jaguar2's `ReadPacketBuffer` and
 `GetTxDmaStatus` were ported from Jaguar3 (read-only; the 88xx common
 `read_buf` addressing) to make the station-free probe work on this die.
 

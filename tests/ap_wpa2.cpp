@@ -248,7 +248,18 @@ static bool profiled_ccmp(bool encrypt, const uint8_t* key, const uint8_t* nonce
  * overwrite is recognisable), and the LLT entries around the ACQ boundary
  * (1938) and the end of the FIFO (2047), to see where the list actually
  * links. */
+static void probe_pktbuf_body(const char* when);
 static void probe_pktbuf(const char* when) {
+  /* A diagnostic must not take the AP down: its reads can throw under load
+   * like any register read (see the TX-DMA watchdog). */
+  try {
+    probe_pktbuf_body(when);
+  } catch (const std::exception& e) {
+    fprintf(stderr, "  PKTBUF %s: read failed (%s), probe skipped\n", when,
+            e.what());
+  }
+}
+static void probe_pktbuf_body(const char* when) {
   auto* rtl = dynamic_cast<IRtlRadio*>(g_dev);
   if (!rtl) return;
   /* The reserved boundary is per die (1938 on the 8822C); the bring-up log
@@ -1543,7 +1554,20 @@ int main(int argc, char** argv) {
               .count() >= 100) {
         last_txdma = now_d;
         if (auto* rtl = dynamic_cast<IRtlRadio*>(g_dev)) {
-          const uint32_t st = rtl->GetTxDmaStatus();
+          /* A register read, and on a busy Jaguar2 one in a few thousand
+           * throws (a control transfer racing the bulk-IN - measured ~1 a
+           * minute under a 4+4 Mbit/s soak). Uncaught here it killed the AP
+           * nine minutes in. A failed sample keeps the last value, so it can
+           * never read as a fault transition, and is counted. */
+          static uint64_t txdma_read_fail = 0;
+          uint32_t st = txdma_seen;
+          try {
+            st = rtl->GetTxDmaStatus();
+          } catch (const std::exception& e) {
+            fprintf(stderr, "  TX-DMA watchdog: read failed (%s), sample skipped "
+                    "(%llu so far)\n", e.what(),
+                    (unsigned long long)++txdma_read_fail);
+          }
           /* THE PAGE COUNTS ALONGSIDE IT, every poll while healthy. Two
            * stories fit "the fault fires at 2048 pages": the pages leak and
            * the allocator runs out, or they are freed normally and the write

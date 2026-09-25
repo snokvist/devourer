@@ -59,6 +59,9 @@ Jaguar1 (shared `PhyTableLoader`).
   uncaught `rtw_read: iostream error` in the DIG thread terminated an 8812BU AP
   mid-way through a 14-20 Mbit/s uplink, and the guard has fired about once
   per throughput ladder since - it is a recurring event, not a one-off.
+  It applies to EVERY periodic reader, caller-side too: under a 4+4 Mbit/s
+  soak about one control read a minute fails while the chip works on, and an
+  unguarded `GetTxDmaStatus` poll in `ap_wpa2` killed the AP at minute 9.
 
 ## TX power
 

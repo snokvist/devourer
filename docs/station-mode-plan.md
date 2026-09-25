@@ -2018,6 +2018,25 @@ into `std::terminate`). The 8822E was confirmed the same way (control fault
 at 172 frames, clean with the fix). All in `docs/jaguar3-tx-ring.md` items
 2 and 3, including what is still open (Jaguar2 ch6 losses, unattributed).
 
+#### The bidirectional soak, 2026-09-25
+
+The soak cell was uplink-only because the AP wedged under downlink load. With
+that fixed it now loads both directions at once (`SOAK_DOWN_KBIT`, default
+4000) and grades the AP's ledger as well as the station's - five checks.
+The two graders that read saved files moved into `soak_grade_tail` and gained
+an offline mode, `soak-grade DIR`, so they could be mutation-tested without
+air time: nine cases (the known-good run, six doctored failures, two that
+must still pass), zero survivors, plus a code mutant (the downlink trend read
+from the uplink column) that the sweep kills.
+
+On 5 GHz, ch36, MCS7, 4+4 Mbit/s: 8812CU AP 30 min **5/5**, 8812BU AP 15 min
+**5/5** on the second attempt. The first 8812BU attempt died at minute 9 - an
+unguarded register read in the TX-DMA watchdog, a read path this session had
+just switched on for Jaguar2 (details and numbers in
+`docs/jaguar3-tx-ring.md`). The adversarial counterparts: ~3% downlink loss
+throughout with no ARQ, and the 8812BU AP's memory growing 532 kB in 15
+minutes (not separated from warm-up).
+
 #### A RETRACTION OF A RETRACTION, which is worth more than either
 
 Earlier this session an ad-hoc script concluded the AP adapter was mute.

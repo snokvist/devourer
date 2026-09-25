@@ -128,6 +128,11 @@ public:
    * standing rule in CLAUDE.md that nothing reads a register per frame - so
    * poll it on a supervisory cadence, not per transmission.
    *
+   * THROWS on a failed USB transfer, like every register read. A poller must
+   * catch and skip that sample: on a Jaguar2 under a 4+4 Mbit/s load about
+   * one control read a minute fails while the chip goes on working, and an
+   * uncaught one killed an AP nine minutes into a soak.
+   *
    * Returns 0 where unsupported, which is indistinguishable from healthy;
    * a caller that needs to tell those apart should ask the backend. */
   virtual uint32_t GetTxDmaStatus() { return 0; }
@@ -146,6 +151,7 @@ public:
    * `sel` 0 = TX FIFO, 1 = the LLT (the linked list that chains TX pages).
    * `offset` is in bytes from the start of that memory. Diagnostic: it
    * borrows a shared debug window, so never call it on the send path.
+   * Throws on a failed USB transfer, like GetTxDmaStatus - catch it.
    * Returns false where unsupported. */
   virtual bool ReadPacketBuffer(int sel, uint32_t offset, uint8_t *out,
                                 size_t n) {

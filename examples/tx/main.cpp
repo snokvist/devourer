@@ -2281,15 +2281,27 @@ int main(int argc, char **argv) {
        * same 1-in-500 cadence as the rest of this event - never per frame.
        * A nonzero value means the part has stopped transmitting whatever
        * `submitted` says; the vendor answers it with a MAC reset. */
+      /* A register read can throw under load (a control transfer racing the
+       * bulk-IN); that sample then omits the field and says so, rather than
+       * reporting a 0 that reads as healthy - or killing the demo. */
       uint32_t txdma = 0;
-      if (auto *rr = dynamic_cast<IRtlRadio *>(rtlDevice))
-        txdma = rr->GetTxDmaStatus();
-      devourer::Ev(*g_ev, "tx.stats")
-          .f("submitted", (unsigned long long)ts.submitted)
+      bool txdma_ok = true;
+      if (auto *rr = dynamic_cast<IRtlRadio *>(rtlDevice)) {
+        try {
+          txdma = rr->GetTxDmaStatus();
+        } catch (const std::exception &) {
+          txdma_ok = false;
+        }
+      }
+      auto ev = devourer::Ev(*g_ev, "tx.stats");
+      ev.f("submitted", (unsigned long long)ts.submitted)
           .f("failed", (unsigned long long)ts.failed)
           .f("was_timeout", ts.last_was_timeout ? 1 : 0)
-          .f("last_rc", ts.last_error_rc)
-          .f("txdma_status", (unsigned long long)txdma);
+          .f("last_rc", ts.last_error_rc);
+      if (txdma_ok)
+        ev.f("txdma_status", (unsigned long long)txdma);
+      else
+        ev.f("txdma_read_failed", 1);
     }
     /* Thermal telemetry via the generation-agnostic GetThermalStatus
      * (previously Jaguar1-only): every family reads its RF 0x42 meter —
