@@ -434,8 +434,20 @@ because it was measured, not because it is understood.
 16. **12 station MIC failures = 12 AP send failures** in the unarmed Phase 6
     control (8812BU station, 8812CU AP, 4x retry load): possibly frames aired
     truncated when a Jaguar3 send timed out, possibly coincidence. One run.
-17. **Phase 6 remainder:** the 8822E and 8821C cells; a soak with a
-    Realtek station. (Jaguar1 done: 8812AU, non-discriminating control.)
+17. **Phase 6 remainder:** the 8822E and 8821C cells. (Jaguar1 done:
+    8812AU, non-discriminating control. Realtek-station soak done
+    2026-09-26: 8812CU station, 8812AU AP, ch36, 30 min, 5/5 - up 0.00%
+    every chunk, down 0.02-0.36%, 643k frames each way, replays 0, arm and
+    verified clear; one run.)
+19. ~~**Exit hang: the TAP reader.**~~ **FIXED 2026-09-26.** That soak's AP
+    passed every chunk and then hung ~30 min in exit, SIGTERM ignored: gdb
+    showed main in `join()` on the TAP reader, blocked in `read()` - closing
+    the fd from another thread does not wake it, so with the peer gone and
+    the TAP idle it never returned (earlier runs escaped on a stray host
+    packet). Both `ap_wpa2` and `sta_client` had it. Now poll(200 ms) + a stop
+    flag, join, then close. Deterministic repro (sta_client alone, TAP never
+    brought up, 25 s run): old binary killed by the outer timeout at 80 s,
+    fixed binary rc 0 at 27 s.
 18. **Jaguar1 EDCCA at 2.4 GHz.** The 8812AU AP deferred ~13x on ch6 at its
     current placement with EDCCA on (the family's default). What trips it -
     a bench emitter, or a threshold the IGI-coupled adaptivity sets too low

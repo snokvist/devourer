@@ -34,6 +34,8 @@
 #include <chrono>
 #include <csignal>
 #include <cstdint>
+#include <poll.h>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -682,6 +684,7 @@ static uint16_t csum16(const uint8_t* d, int len) {
  * an address conflict, not redundancy. Without a TAP they own it, as before.
  */
 static int g_tap_fd = -1;
+static std::atomic<bool> g_tap_stop{false}; /* the TAP reader's exit */
 /* ONE COUNTER PER DIRECTION. `g_tap_drop` served both the radio->host path
  * and the host->radio path, so "did everything the host handed us go
  * somewhere named?" was not a question this ledger could answer - the sum it
@@ -1456,16 +1459,23 @@ int main(int argc, char** argv) {
   std::thread rx([&]{ g_dev->StartRxLoop(on_rx); });
 
   /* DOWN: the host's frames become 802.11, addressed and keyed per station.
-   * Its own thread because read() blocks; it exits when the fd is closed. */
+   * Its own thread because read() blocks; it exits on g_tap_stop (see the
+   * shutdown: closing the fd does not wake a blocked read). */
   std::thread tap_rd;
   if (g_tap_fd >= 0) {
     /* The loop is the thread's; the decision is tap_down_one()'s, so
      * `ap_wpa2 --self-test` can drive it without a TAP device or a thread. */
     tap_rd = std::thread([&]{
       uint8_t eth[2048];
+      const int fd = g_tap_fd;
       for (;;) {
-        const ssize_t got = ::read(g_tap_fd, eth, sizeof eth);
-        if (got <= 0) return;                 /* closed, or a fatal error */
+        pollfd pf{fd, POLLIN, 0};
+        const int r = ::poll(&pf, 1, 200);
+        if (g_tap_stop.load()) return;
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) { if (r < 0) return; continue; }
+        const ssize_t got = ::read(fd, eth, sizeof eth);
+        if (got <= 0) return;                 /* a fatal error */
         tap_down_one(eth, (size_t)got);
       }
     });
@@ -1719,9 +1729,17 @@ int main(int argc, char** argv) {
    * after that. Otherwise the reader thread can frame and enqueue between the
    * loop's last drain and the print, and the two identities the ledger states
    * are off by whatever was in flight at that instant. */
+  /* A STOP FLAG AND A POLL, not "it exits when the fd is closed": on Linux a
+   * close() from another thread does NOT wake a read() already blocked on the
+   * fd. With the peer gone and nothing more arriving on the TAP, the reader
+   * sat in read() forever and the join below hung the process - measured,
+   * 2026-09-26: a Jaguar1 AP soak whose chunks all passed, then ~30 min
+   * stuck in exit, SIGTERM ignored (gdb: main in join, the reader in read).
+   * Earlier runs got out only because a stray host packet woke the reader. */
   const bool had_tap = g_tap_fd >= 0;      /* the ledger below asks AFTER the close */
-  if (g_tap_fd >= 0) { ::close(g_tap_fd); g_tap_fd = -1; }
+  g_tap_stop.store(true);
   if (tap_rd.joinable()) tap_rd.join();
+  if (g_tap_fd >= 0) { ::close(g_tap_fd); g_tap_fd = -1; }
   {
     std::vector<std::vector<uint8_t>> batch;
     { std::lock_guard<std::mutex> l(g_q_mu); batch.swap(g_q); }

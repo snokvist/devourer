@@ -64,6 +64,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <poll.h>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -212,6 +214,7 @@ uint32_t g_tick_ms = 0;
  * it is how the harness shows what the arm itself buys (STA_ARM in
  * tests/sta_d2d_onair.sh): everything else about the run is unchanged. */
 bool g_arm = true;
+std::atomic<bool> g_tap_stop{false}; /* the TAP reader's exit */
 uint32_t g_last_tick = 0;
 std::atomic<uint64_t> g_tx_enc{0}, g_tx_enc_fail{0}, g_tx_plain{0};
 std::atomic<uint64_t> g_crc_err{0}, g_amsdu_drop{0}, g_frag_drop{0};
@@ -1116,9 +1119,15 @@ int main(int argc, char** argv) {
   if (g_tap_fd >= 0) {
     tap_rd = std::thread([&] {
       uint8_t eth[2048];
+      const int fd = g_tap_fd;
       for (;;) {
-        const ssize_t got = ::read(g_tap_fd, eth, sizeof eth);
-        if (got <= 0) return;
+        pollfd pf{fd, POLLIN, 0};
+        const int r = ::poll(&pf, 1, 200);
+        if (g_tap_stop.load()) return;
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) { if (r < 0) return; continue; }
+        const ssize_t got = ::read(fd, eth, sizeof eth);
+        if (got <= 0) return;                 /* a fatal error */
         tap_down_one(eth, (size_t)got);
       }
     });
@@ -1278,8 +1287,16 @@ int main(int argc, char** argv) {
    * frame between the last drain and report(), which lands in `encrypted` and
    * in nothing else - and the two identities the ledger now states would be
    * off by however many frames were in flight at the instant it printed. */
-  if (g_tap_fd >= 0) { ::close(g_tap_fd); g_tap_fd = -1; }
+  /* A STOP FLAG AND A POLL, not "it exits when the fd is closed": on Linux a
+   * close() from another thread does NOT wake a read() already blocked on the
+   * fd. With the peer gone and nothing more arriving on the TAP, the reader
+   * sat in read() forever and the join below hung the process - measured,
+   * 2026-09-26: a Jaguar1 AP soak whose chunks all passed, then ~30 min
+   * stuck in exit, SIGTERM ignored (gdb: main in join, the reader in read).
+   * Earlier runs got out only because a stray host packet woke the reader. */
+  g_tap_stop.store(true);
   if (tap_rd.joinable()) tap_rd.join();
+  if (g_tap_fd >= 0) { ::close(g_tap_fd); g_tap_fd = -1; }
   {
     std::vector<std::vector<uint8_t>> batch;
     { std::lock_guard<std::mutex> l(g_q_mu); batch.swap(g_q); }
