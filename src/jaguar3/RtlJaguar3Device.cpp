@@ -1973,6 +1973,16 @@ void RtlJaguar3Device::DumpChipState() {
   _logger->info("j3 chipstate: FIFOPAGE_CTRL_2=0x{:04x} bcn_valid={} "
                 "TXDMA_STATUS=0x{:08x}",
                 pg_ctrl2, (bcn_valid >> 7) & 1, txdma);
+  /* The RX side's own fault flags. REG_RXDMA_STATUS 0x0288: bit0 RXPKT_OVF
+   * (the RX packet FIFO overflowed - frames the MAC may already have ACKed
+   * were dropped), bit2 RX_SFF_OVF, bit7 C2H_PKT_OVF. REG_RXPKT_NUM 0x0284
+   * [31:24] = frames waiting in the RX FIFO. */
+  const uint32_t rxdma_st = _device.rtw_read<uint32_t>(0x0288);
+  const uint32_t rxpkt = _device.rtw_read<uint32_t>(0x0284);
+  _logger->info("j3 chipstate: RXDMA_STATUS=0x{:08x} (RXPKT_OVF={} "
+                "RX_SFF_OVF={} C2H_PKT_OVF={}) RXPKT_NUM=0x{:08x}",
+                rxdma_st, rxdma_st & 1, (rxdma_st >> 2) & 1,
+                (rxdma_st >> 7) & 1, rxpkt);
   /* THE RING BOUNDARIES, read back live. The TX page ring faults when data
    * walks through the reserved region while the TBTT beacon engine is
    * running; the registers that are supposed to keep it out are written once

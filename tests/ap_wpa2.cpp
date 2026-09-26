@@ -622,6 +622,14 @@ static HarnessCrypto g_crypto;
 // Data-plane visibility. The one thing the on-air runs could not answer was
 // whether encrypted frames were arriving at all, because nothing counted them.
 static std::atomic<uint64_t> g_enc_rx{0}, g_mic_fail{0}, g_replayed{0};
+/* THE RECEIVE PATH, counted at the door. Every frame the device hands us, and
+ * every 802.11 data frame addressed to this BSS BEFORE any filter, with each
+ * exit that used to be silent named. The encrypted counter above only sees
+ * frames that reached the decrypt; a frame the MAC ACKed and something
+ * between here and there dropped was invisible, and that is exactly the
+ * ACKed-but-undelivered loss this exists to locate. */
+static std::atomic<uint64_t> g_rx_cb{0}, g_rx_data_us{0}, g_rx_data_crc{0},
+    g_rx_data_short{0}, g_rx_malformed{0};
 /* Frames whose DESTINATION is not this AP. Until Phase 2b.3 nothing read
  * addr3, so every decrypted frame was handed to the local IP responders no
  * matter who it was addressed to - harmless while the AP is the only thing on
@@ -990,6 +998,13 @@ static void on_rx(const Packet& p) {
    * authenticate - which this harness's ledger would then report as MIC
    * failures, i.e. as an attack. See tests/rx_mpdu.h. */
   const size_t mlen = devourer::test::mpdu_len(p);
+  g_rx_cb.fetch_add(1);
+  if (p.Data.size() >= 10 && (p.Data[0] & 0x0c) == 0x08 && (p.Data[1] & 0x01) &&
+      std::memcmp(p.Data.data() + 4, kBssid, 6) == 0) {
+    g_rx_data_us.fetch_add(1);
+    if (p.RxAtrib.crc_err) g_rx_data_crc.fetch_add(1);
+    else if (mlen < 24) g_rx_data_short.fetch_add(1);
+  }
   if (mlen < 24 || p.RxAtrib.crc_err) return;
   const uint8_t fc0 = p.Data[0], fc1 = p.Data[1];
   const uint8_t* a1 = p.Data.data() + 4;
@@ -1075,7 +1090,7 @@ static void on_rx(const Packet& p) {
     if (fc1 & 0x40) { dl.lock(); sender = g_stas.find(sta); }
     if ((fc1 & 0x40) && sender && sender->keyed()) {    // PROTECTED (CCMP) data
       int len = (int)mlen;
-      if (len < hlen + 8 + 8) return;                   // hdr + CCMP hdr + MIC
+      if (len < hlen + 8 + 8) { g_rx_data_short.fetch_add(1); return; }
       const uint8_t* d = p.Data.data();
       // The header length is passed explicitly, so a QoS frame's AAD includes
       // its TID as 802.11-2016 12.5.3.3.3 requires. This is a deliberate
@@ -1111,6 +1126,21 @@ static void on_rx(const Packet& p) {
         const int tid = devourer::sta::is_qos_data(fc0)
                             ? (d[qoff] & 0x0f)
                             : devourer::sta::CcmpReplay::kNonQosTid;
+        /* DEVOURER_AP_PN_LOG=<path>: every CCMP PN this AP decrypted, one per
+         * line. A station stamps consecutive PNs on everything it encrypts,
+         * so a PN missing here - checked against a witness capture of the
+         * air - is either a frame that aired and this AP lost, or one the
+         * station never put on the air. Diagnostic; off by default. */
+        static FILE* pn_log = [] {
+          const char* path = std::getenv("DEVOURER_AP_PN_LOG");
+          FILE* f = path && *path ? std::fopen(path, "w") : nullptr;
+          /* Line-buffered: the harness ends this process with a signal, and
+           * a fully-buffered log lost its last ~170 lines - which read as
+           * frames the AP never received. */
+          if (f) std::setvbuf(f, nullptr, _IOLBF, 0);
+          return f;
+        }();
+        if (pn_log) std::fprintf(pn_log, "%llu\n", (unsigned long long)pn);
         if (sender->rx_replay.accept(pn, tid)) {
           /* WHO IS THIS FOR? addr3 on a to-DS frame, which nothing in this
            * tree read before 2b.3. A group DA - a station's broadcast ARP, its
@@ -1137,6 +1167,7 @@ static void on_rx(const Packet& p) {
             g_amsdu_drop.fetch_add(1);
             return;
           case devourer::sta::Disposition::Malformed:
+            g_rx_malformed.fetch_add(1);
             return;
           case devourer::sta::Disposition::Group:
             g_to_group.fetch_add(1);
@@ -1669,6 +1700,18 @@ int main(int argc, char** argv) {
   /* The same probe once the traffic is over: whether the ring terminator
    * appeared on its own, and whether the beacon page is still a beacon. */
   if (env_on("DEVOURER_AP_PKTBUF")) probe_pktbuf("end of run");
+  /* DEVOURER_AP_CHIPSTATE_END=1: the chip-state dump once more after the
+   * traffic - the RX-side overflow flags are sticky, so this is where a
+   * receive FIFO that overflowed during the run shows. */
+  if (env_on("DEVOURER_AP_CHIPSTATE_END"))
+    if (auto* rtl = dynamic_cast<IRtlRadio*>(g_dev)) {
+      fprintf(stderr, "  --- chip state AT THE END OF THE RUN ---\n");
+      try {
+        rtl->DumpChipState();
+      } catch (const std::exception& e) {
+        fprintf(stderr, "  chip-state read failed (%s)\n", e.what());
+      }
+    }
   {
     std::lock_guard<std::mutex> l(g_hs_mu);
     fprintf(stderr, "sent=%llu stations=%d", (unsigned long long)g_sent.load(),
@@ -1741,6 +1784,14 @@ int main(int argc, char** argv) {
           (unsigned long long)g_frag_drop.load(),
           (unsigned long long)g_amsdu_drop.load(),
           (unsigned long long)g_group_drop.load());
+  fprintf(stderr,
+          "  rx path: frames from the device=%llu, data to this BSS=%llu "
+          "(crc-flagged %llu, short %llu), malformed=%llu\n",
+          (unsigned long long)g_rx_cb.load(),
+          (unsigned long long)g_rx_data_us.load(),
+          (unsigned long long)g_rx_data_crc.load(),
+          (unsigned long long)g_rx_data_short.load(),
+          (unsigned long long)g_rx_malformed.load());
   fprintf(stderr,
           "  data plane: encrypted frames received=%llu, MIC failures=%llu, "
           "replays rejected=%llu, queued=%llu, frames sent=%llu, "

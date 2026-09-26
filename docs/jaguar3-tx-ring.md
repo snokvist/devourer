@@ -159,18 +159,21 @@ defect.**
 Mbit/s offered, and MCS1 no better than MCS7, so the `thru` cell fails its
 5%-loss gate in that direction.
 
-**CORRECTED by the close-out review - this section first said "it is not a
-devourer defect" and "each frame airs exactly once". Both were wrong for AP
-mode.** The station does not send once: its MT7612U retries unacknowledged
-unicast 15 deep (`docs/mt7612u-tx-retry.md`: ~45.5 ms per frame at
-exhaustion). And the witness capture of the 1373-frame AP-mode rung shows
-**zero station retries on the air** - no retry bit, no repeated sequence
-number, across 1301 captured frames. A frame the 8812AU AP had not ACKed
-would have been retried; none was. So the Jaguar1 MAC acknowledged
-essentially every frame, and ~18% of them never reached `ap_wpa2`: an
-**ACKed-but-undelivered loss on the Jaguar1 receive path**, after the MAC -
-the failure mode the root CLAUDE.md warns defeats ARQ. OPEN; where between
-the MAC and the host it happens is not established.
+**CORRECTED TWICE.** First, by the close-out review: this section had said
+"it is not a devourer defect" because "each frame airs exactly once". The
+review answered that the MT7612U retries unacknowledged unicast 15 deep, and
+since the witness saw zero station retries, the AP must have ACKed frames it
+then dropped - "ACKed-but-undelivered". **That correction is itself
+RETRACTED (2026-09-26):** the station sent every frame with the radiotap
+NOACK flag (`build_stream_radiotap`'s default), which on the MT7612U clears
+the TXWI ACK request - the station never waited for an ACK and never
+retried. Zero retries was by request and proves nothing about ACKs
+(`src/mt7612u/CLAUDE.md`). So "each airs exactly once" was TRUE, for a reason
+nobody had written down. The Jaguar1 AP-mode ~18% is single-shot loss:
+frames the 8812AU did not decode. Whether that is the unit/placement (as the
+passive comparison below suggests) or devourer's Jaguar1 receive path is not
+separated; with the station now able to retry (`STA_ACK=1`) it would be
+largely masked either way. Not re-measured - no 8812AU on the bench.
 
 What the table below does still show, for PASSIVE reception only (where the
 station's frames are ACKed by another AP and single-shot to this receiver):
@@ -218,10 +221,11 @@ split with the 8812CU back on the bench actually shows:
   802.11 sequence number), on devourer 89.0% (by CCMP PN - Jaguar2's parser
   leaves `rx.frame` `seq` at 0), while the 8812CU AP of those runs got
   99.2%. devourer's passive RX is no worse than the kernel's on this unit.
-- *AP-mode uplink* (2.5-47% across two runs) is WORSE than that passive
-  figure, where the station's 15-deep retry should make it better - the same
-  ACKed-but-undelivered shape as the Jaguar1 AP. Not established for this
-  die (no witness retry count was taken on these runs). Open.
+- *AP-mode uplink* (2.5-47% across two runs) is worse than that passive
+  figure. (The close-out review read this as the Jaguar1 "ACKed-but-
+  undelivered" shape; that inference is retracted - see item 3: the station
+  sent NOACK, so there was no retry to make AP mode better.) Single-shot loss
+  on a busy 2.4 GHz channel; unattributed, not re-run with `STA_ACK=1`.
 - *Downlink*: 5365 data frames submitted, 5197 (96.9%) seen on air by the
   8812CU witness, 4986 (92.9%) decrypted by the station. The witness's own
   passive miss rate was not measured, and the same station decoded the
@@ -265,7 +269,7 @@ correspondingly derived threshold; or move `wpa2` to a cleaner channel.
 With the `REG_CR` fix, one full `all` run passed 21/21 with this cell at
 19/20 both ways - one run, so not evidence the flakiness is gone.
 
-### 5. Why 6M is less reliable than MCS7 - split on 5 GHz, and it found a defect class
+### 5. Why 6M is less reliable than MCS7 - split on 5 GHz; the "defect class" it seemed to find was the station's NOACK
 
 Measured 2026-09-25, ch36, 8812CU AP, single-shot (`AP_RETRY` unset), one
 ladder per arm (500-4000 kbit/s; each arm's saturated top rung excluded):
@@ -281,17 +285,31 @@ ladder per arm (500-4000 kbit/s; each arm's saturated top rung excluded):
   but does not scale with it - a floor of roughly 1.5-2% plus an
   airtime-dependent part. Exposure plus a fixed per-frame miss; AP retries
   (item 6) remove both.
-- **Uplink** is retry-backed, and 6M is worse than MCS0 at the same airtime:
-  a LEGACY-format loss. A witness settled what it is. On a 6M 2 Mbit/s rung
-  (30 s) the station aired 5393 encrypted data frames, the 8812BU (rtw88,
-  monitor) saw 5337 of them with **zero retry bits and 5337 unique CCMP
-  PNs** - no retransmission at all - and the AP decrypted 5364 (99.46%). So
-  the 8812CU AP's MAC ACKed every frame on the first attempt and ~29 never
-  reached `ap_wpa2`: **ACKed-but-undelivered on the Jaguar3 receive path
-  too**, as on the Jaguar1 AP (item 3), here worse for legacy frames than
-  for HT. No retry setting can recover it - the sender believes it arrived.
-  OPEN, and the next thing worth chasing: where between the MAC's ACK and
-  `ap_wpa2` those frames go.
+- **Uplink** was NOT retry-backed, though every account here said it was.
+  The first reading: 6M worse than MCS0 at the same airtime, and a witness
+  showing zero station retries while the AP delivered 99.46%, taken as the
+  8812CU AP ACKing frames and then dropping them. **RETRACTED 2026-09-26.**
+  The station sends every frame radiotap-NOACK, so it never retries; zero
+  retries meant nothing. What the follow-up measured (ch36, 6M, 2 Mbit/s,
+  30 s each, one run per arm):
+
+  | arm | station frames | lost at the AP | of those on the air | not on the air |
+  |---|---|---|---|---|
+  | vendor rtl88x2cu AP (open; per-datagram by UDP sequence) | 5358 | 20 | 1 | 19 |
+  | devourer AP (WPA2; per-frame by CCMP PN, AP PN log) | 5386 | 55 | 22 | 33 |
+  | **devourer AP, station requesting ACKs (`STA_ACK=1`)** | 5386 | **0** | 0 | 0 |
+
+  The instruments behind it: an AP-side PN log (`DEVOURER_AP_PN_LOG`),
+  `ap_wpa2`'s new `rx path:` ledger line (frames reaching the callback
+  before any filter), the Jaguar3 `RXDMA_STATUS` overflow flag in
+  `DumpChipState` (clear at the end of the run - no RX FIFO overflow), the
+  RX ring telemetry (never starved), and a witness checked against a known
+  beacon each run. With ACKs requested, 63 retry-bit frames and 33 repeated
+  PNs appear on the air, and every frame arrives. Frames "not on the air"
+  in the NOACK arms are not explained - the witness's own miss rate was
+  0.5-1.7% - but they vanish with retries on, so they are not a loss the link
+  has to carry. The vendor/devourer difference in "on the air, lost" (1 vs
+  22) is one run each and was not pursued once the NOACK cause was found.
 
 ### 6. RESOLVED - retransmission: the AP's retry limit, not the responder
 
@@ -316,22 +334,31 @@ retransmission. What it establishes:
   the loss is zero up to 30 Mbit/s (29.998 delivered). The ~115 replays the
   station rejects are the fingerprint of it working: frames whose ACK was
   lost, retried, and correctly dropped as copies - nothing delivered twice.
-- **The ACK responder (`ARQ=1`) changes nothing here**, because the AP
-  already ACKs the station without it - by construction: `StartBeacon`
-  programs the MACID and net_type=AP, the same registers `SetAckResponder`
-  arms (`RtlJaguar3Device.cpp`, "same registers the proven StartBeacon/AP
-  path programs"). The measurement agrees three ways: A1 = A0; the uplink
-  runs at ~20 Mbit/s, where a non-ACKing AP would cap it near 22 frames/s
-  (the MT7612U's ~45.5 ms retry-ladder exhaustion per unACKed frame,
-  `docs/mt7612u-tx-retry.md`); and a witness on a ch36 uplink rung saw zero
-  station retries (item 5). The earlier-cited "zero replays over 321k soak
-  frames" came from the 8812BU soak, not this 8812CU A/B, and on its own
-  cannot separate "ACKed" from "never retried". The harness comment that
-  predicted `ARQ=1` would improve the uplink was wrong and is corrected.
-- The uplink's residual 0.1-0.4% is NOT explained by the air: item 5 shows
-  it is ACKed-but-undelivered. The 30 Mbit/s uplink rung loses 21-25% in
-  every arm - the station dropping 8-10k frames from its own queue, a
-  send-path ceiling.
+- **The ACK responder (`ARQ=1`) changes nothing here - because the station
+  never asked for an ACK.** It sent every frame radiotap-NOACK, so whether
+  the AP ACKs could not matter. (Two earlier explanations recorded here were
+  wrong: "the AP already ACKs the station", argued from zero witness retries
+  and an airtime bound, both of which assume the station was waiting for
+  ACKs; it was not.) `StartBeacon` does program the same registers as
+  `SetAckResponder` (MACID + net_type=AP), and the `STA_ACK=1` run shows the
+  AP answering once asked. The harness comment that predicted `ARQ=1` would
+  improve the uplink was wrong and is corrected.
+- **The uplink's half is `STA_ACK=1`** (item 5): with it, a 6M uplink went
+  to 0.00% loss. The 30 Mbit/s uplink rung loses 21-25% in every arm - the
+  station dropping 8-10k frames from its own queue, a send-path ceiling.
+
+**Both halves on (`STA_ACK=1 AP_RETRY=7`), ch36, one ladder per rate,
+2026-09-26:**
+
+| rate | uplink loss | downlink loss |
+|---|---|---|
+| MCS7, 1-20 Mbit/s up / 1-30 down | **0.00% on every rung** | **0.00%** on every rung but the first (6.64% at 1 Mbit/s, not reproduced in two later runs of that rung) |
+| 6M, 0.5-4 Mbit/s | **0.00%** | **0.00%** |
+
+So the 6M-vs-MCS7 difference (item 5) was never a property of the rate: it
+was single-shot loss, larger for longer frames, and it disappears once
+either end can retry. The 30 Mbit/s uplink rung still loses ~24% - the
+station's own send-path ceiling (~22.7 Mbit/s), a separate question.
 
 `AP_RETRY` is a harness knob, unset by default so every recorded figure stays
 reproducible.

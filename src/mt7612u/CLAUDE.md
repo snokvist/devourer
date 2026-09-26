@@ -23,3 +23,16 @@ the latter, reuse the tick's own controlled benchmark — with and without the
 poller, against a steady peer — reading the full figures, control arm included,
 from the `mt7612u_phy_tick` doc comment rather than a copy of its headline
 number.
+
+## Radiotap NOACK disables the hardware retry
+
+`radiotap.cpp` maps TX_FLAGS NOACK to `rate->no_ack`, and `tx.cpp` then leaves
+the TXWI `ACK_CTL_REQ` clear: the MAC marks the frame done on the first
+attempt and its 15-deep retry (`MT_TX_RETRY_CFG`, `docs/mt7612u-tx-retry.md`)
+never runs. `build_stream_radiotap(mode)` always sets NOACK - right for a
+broadcast stream, wrong for unicast to a peer that ACKs. A station must use
+`build_stream_radiotap(mode, /*no_ack=*/false)` for unicast and keep NOACK
+for group-addressed frames (`tests/sta_client.cpp`, `DEVOURER_STA_ACK`).
+Measured at ch36, 6M: uplink loss ~1% -> 0.00% (5386/5386), retries visible
+on air. The trap it set: "a witness sees zero station retries" reads like
+proof the peer ACKed everything, and it proves nothing while NOACK is set.

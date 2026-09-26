@@ -279,10 +279,20 @@ struct ProfilingCrypto : devourer::test::OpenSslCryptoOps {
 /* THE ONE the whole harness uses. */
 ProfilingCrypto g_crypto;
 
+/* DEVOURER_STA_ACK=1: unicast frames request an ACK, so the MT7612U's
+ * hardware retries until the AP answers (15 deep). Unset/0 keeps every frame
+ * NOACK - what every recorded figure was measured with, and the reason this
+ * station's uplink never retransmitted anything. Group-addressed frames stay
+ * NOACK either way: nobody ACKs them. */
+std::vector<uint8_t> g_rt_ack;
+
 void enqueue(std::vector<uint8_t> mpdu) {
+  /* addr1's I/G bit: a group address is never ACKed. */
+  const bool unicast = mpdu.size() >= 10 && (mpdu[4] & 0x01) == 0;
+  const std::vector<uint8_t>& rt = (unicast && !g_rt_ack.empty()) ? g_rt_ack : g_rt;
   std::vector<uint8_t> f;
-  f.reserve(g_rt.size() + mpdu.size());
-  f.insert(f.end(), g_rt.begin(), g_rt.end());
+  f.reserve(rt.size() + mpdu.size());
+  f.insert(f.end(), rt.begin(), rt.end());
   f.insert(f.end(), mpdu.begin(), mpdu.end());
   std::lock_guard<std::mutex> lk(g_q_mu);
   g_q_in.fetch_add(1);
@@ -1022,7 +1032,11 @@ int main(int argc, char** argv) {
   const char* rate_s = std::getenv("DEVOURER_TX_RATE");
   if (!rate_s || !*rate_s) rate_s = "6M";
   g_rt = devourer::build_stream_radiotap(devourer::parse_tx_mode_str(rate_s));
-  std::fprintf(stderr, "  TX rate: %s\n", rate_s);
+  if (const char* a = std::getenv("DEVOURER_STA_ACK"); a && *a && std::strcmp(a, "0") != 0)
+    g_rt_ack = devourer::build_stream_radiotap(devourer::parse_tx_mode_str(rate_s),
+                                               /*no_ack=*/false);
+  std::fprintf(stderr, "  TX rate: %s, unicast %s\n", rate_s,
+               g_rt_ack.empty() ? "NOACK (no retries)" : "ACK-requested (hardware retries)");
   g_dev->InitWrite(SelectedChannel{g_chan, 0, CHANNEL_WIDTH_20});
 
   /* THE STATION'S ADDRESS IS THE ADAPTER'S, NOT A CHOICE. See the note at the

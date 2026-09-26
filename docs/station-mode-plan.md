@@ -186,6 +186,33 @@ retransmission section is now a pointer, the interface header keeps the
 contract only. (20) `txdemo`'s 8050 against an 8000 bound: the transport
 counts every bulk-OUT, bring-up's included.
 
+### Round 6 addendum — a finding of the round, retracted, 2026-09-26
+
+Round 6's evidence review corrected "the Jaguar1 uplink loss is not a
+devourer defect" by arguing that the MT7612U station retries 15 deep, so the
+witness's zero retries meant the AP had ACKed frames it then dropped - and
+the same shape was then "found" on the Jaguar3 AP. **Both are retracted.**
+Chasing the Jaguar3 case down, stage by stage, ended somewhere else: the
+station sends every frame with the radiotap NOACK flag - the default of
+`build_stream_radiotap`, built for the FPV broadcast stream - and on the
+MT7612U that clears the TXWI ACK request. The station never waited for an
+ACK and never retried. Zero witness retries was by request.
+
+How it was found, because the path is the transferable part: counters at
+`ap_wpa2`'s callback door showed the frames never reached it; the RX ring
+never starved; the chip's own RX-overflow flag stayed clear; the vendor
+driver as AP on the same chip lost frames too, and a per-datagram map of its
+run put 19 of its 20 losses NOT on the air at all. That made "the AP drops
+what it ACKed" untenable and sent the search to the transmitter, where the
+retry record (`docs/mt7612u-tx-retry.md`) already said NOACK frames are
+marked done on the first attempt. With ACKs requested (`STA_ACK=1`), the
+same 6M uplink lost nothing: 5386 of 5386 frames, retries visible on air.
+
+Two lessons. A reviewer's correction is evidence to verify like any other -
+this one was checked against the retry *engine* but not against whether the
+frames ever asked for it. And "zero retries on the air" is only evidence of
+ACKs when the transmitter was asked to wait for one.
+
 ### Round 5 — the Phase 1 gate, 2026-09-20
 
 The gate's own acceptance harness, reviewed after it first read 14/14. All
@@ -2116,8 +2143,10 @@ changed nothing, and the harness comment that predicted it would improve the
 uplink was wrong - `StartBeacon` already programs the same registers. The
 table, the provenance of each inference and the limits (ch36 only, the
 default still 0) are in `docs/jaguar3-tx-ring.md` item 6, not repeated here.
-Item 5 there is the 6M-vs-MCS7 split, which found ACKed-but-undelivered loss
-on the Jaguar3 AP's receive path.
+Item 5 there is the 6M-vs-MCS7 split. It first appeared to find
+ACKed-but-undelivered loss on the AP's receive path; that was the station's
+NOACK misread (see "Round 6 addendum"), and `STA_ACK=1` - the uplink's own
+retransmission - took the uplink to 0.00%.
 
 #### A RETRACTION OF A RETRACTION, which is worth more than either
 

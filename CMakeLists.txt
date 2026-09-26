@@ -1238,6 +1238,17 @@ target_include_directories(HeRadiotapSelftest PRIVATE
 
 add_test(NAME he_radiotap COMMAND HeRadiotapSelftest)
 
+# Headless guard for the radiotap TX_FLAGS NOACK choice - the flag that
+# decides whether a unicast frame is retried (MT7612U: NOACK disables the
+# hardware retry). Every builder layout, default and both explicit settings.
+add_executable(RadiotapNoackSelftest
+    tests/radiotap_noack_selftest.cpp
+)
+target_link_libraries(RadiotapNoackSelftest PRIVATE devourer)
+target_include_directories(RadiotapNoackSelftest PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src)
+add_test(NAME radiotap_noack COMMAND RadiotapNoackSelftest)
+
 # Headless round-trip guard for the 802.11ax Trigger frame path (src/TriggerTwt.h
 # build_basic_trigger + he_ru_alloc, src/TriggerParse.h parse_trigger): build ->
 # parse a Basic Trigger, RU-allocation golden vectors. Generation-neutral (the

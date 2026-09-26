@@ -56,7 +56,7 @@
 # ap_wpa2 claims), AP_VID/AP_PID, CH, CH5, PSK, FW_DIR, SECS, NS, APTAP,
 # STATAP, AIRGAP_SECS, BEACONS_MIN, PING_N, PING_MIN, BENCH_SECS,
 # BENCH_PAYLOAD, BENCH_PPS, THRU_SECS, THRU_PAYLOAD, TX_RATE, ARQ,
-# AP_RETRY, THRU_LADDER, THRU_LOSS_PCT, THRU_DIR, BCN_TU, BEACON_PHASE_SECS,
+# AP_RETRY, STA_ACK, THRU_LADDER, THRU_LOSS_PCT, THRU_DIR, BCN_TU, BEACON_PHASE_SECS,
 # BEACON_KBIT, BEACON_FLOOR_PCT, BCN_REFRESH_MS, SOAK_MINUTES, SOAK_KBIT,
 # SOAK_DOWN_KBIT, SOAK_CHUNK_S, SOAK_DEGRADE_PCT.
 
@@ -122,11 +122,11 @@ THRU_LOSS_PCT="${THRU_LOSS_PCT:-5}"
 TX_RATE="${TX_RATE:-6M}"
 # ARQ=1 arms the AP's hardware ACK responder on the BSSID (SetAckResponder).
 # MEASURED TO CHANGE NOTHING on the 8812CU AP (ch36, 2026-09-25, one ladder
-# per arm): StartBeacon already programs the same registers (MACID +
-# net_type=AP), so the AP ACKs the station without it - a witness saw zero
-# station retries on air. Kept as a knob for an AP that does not. (The
-# comment here used to predict ARQ=1 would improve the uplink; it did not.)
-# Table: docs/jaguar3-tx-ring.md item 6.
+# per arm) - and the reason is NOT the one first recorded here: the station
+# sent every frame NOACK (build_stream_radiotap's TX_FLAGS), so it never
+# waited for an ACK from anyone. StartBeacon does program the same registers
+# (MACID + net_type=AP), so the AP answers once asked - see STA_ACK below.
+# Kept as a knob for an AP that does not. Table: docs/jaguar3-tx-ring.md.
 ARQ="${ARQ:-0}"
 # AP_RETRY=N is the half that matters: the AP's per-frame hardware retry limit
 # (DEVOURER_TX_RETRY_LIMIT, 0..63). The library default is 0 - right for the
@@ -136,6 +136,13 @@ ARQ="${ARQ:-0}"
 # the library default. Measured: AP_RETRY=7 took downlink loss from 1.3-2.3%
 # to 0.00% on every rung to 30 Mbit/s at ch36.
 AP_RETRY="${AP_RETRY:-}"
+# STA_ACK=1 is the uplink's half: the station's unicast frames request an ACK
+# (DEVOURER_STA_ACK), so its MT7612U retries until the AP answers (15 deep).
+# Unset keeps every frame NOACK, the stream builder's default and what every
+# earlier figure was measured with - an uplink with no retransmission at all.
+# Measured: a 6M 2 Mbit/s uplink at ch36 went from ~1% loss to 0.00% (5386 of
+# 5386 frames decrypted), with the retries visible on air.
+STA_ACK="${STA_ACK:-}"
 # The AP's beacon interval, in TU. 25 is what every figure in this branch was
 # measured under and stays the default; 100 is what a normal AP uses. It is a
 # knob because the beacon rides the same chip as the data queue and "does the
@@ -371,7 +378,7 @@ rfkill unblock wlan 2>/dev/null || true
 say "AP  $AP_SYSFS ($ap_vid:$ap_pid, devourer/ap_wpa2, in netns '$NS')"
 say "STA $STA_SYSFS ($sta_vid:$sta_pid, devourer/sta_client, root namespace)"
 say "ssid '$SSID' bssid $BSSID  psk '$PSK'  taps '$APTAP'/'$STATAP'"
-say "tx rate '$TX_RATE'  arq $ARQ  ap-retry ${AP_RETRY:-default}  beacon ${BCN_TU}TU  refresh ${BCN_REFRESH_MS}ms"
+say "tx rate '$TX_RATE'  arq $ARQ  ap-retry ${AP_RETRY:-default}  sta-ack ${STA_ACK:-off}  beacon ${BCN_TU}TU  refresh ${BCN_REFRESH_MS}ms"
 
 # --- build -----------------------------------------------------------------
 
@@ -458,6 +465,7 @@ sta_up() {   # $1 = channel, $2 = seconds, $3.. = extra env
   local chan="$1" secs="$2"; shift 2
   rm -f "$OUT/sta.log"
   env DEVOURER_TX_RATE="$TX_RATE" \
+      ${STA_ACK:+DEVOURER_STA_ACK="$STA_ACK"} \
       DEVOURER_VID=0x0e8d DEVOURER_PID=0x7612 \
       DEVOURER_USB_BUS="${STA_SYSFS%%-*}" DEVOURER_USB_PORT="${STA_SYSFS#*-}" \
       DEVOURER_CHANNEL="$chan" DEVOURER_TX_WITH_RX=thread \
@@ -1045,7 +1053,7 @@ cell_throughput() {
     ''|*[!0-9]*) bad "throughput: THRU_SECS and THRU_PAYLOAD must be integers"; return ;;
   esac
   local steps; steps=$(printf '%s' "$THRU_LADDER" | tr ',' ' ' | wc -w)
-  say "== throughput: UDP goodput, ${THRU_PAYLOAD}B, ${steps}-rung ladder x ${THRU_SECS}s each way, ch$CH ($freq MHz), rate $TX_RATE, arq=$ARQ, ap-retry=${AP_RETRY:-default} =="
+  say "== throughput: UDP goodput, ${THRU_PAYLOAD}B, ${steps}-rung ladder x ${THRU_SECS}s each way, ch$CH ($freq MHz), rate $TX_RATE, arq=$ARQ, ap-retry=${AP_RETRY:-default}, sta-ack=${STA_ACK:-off} =="
 
   build_both || { bad "throughput: build"; return; }
   ns_up      || { bad "throughput: could not create netns $NS"; return; }
@@ -1091,7 +1099,7 @@ cell_throughput() {
     return
   fi
   if awk -v u="${up_best:-0}" -v d="${dn_best:-0}" 'BEGIN{exit !(u>0 && d>0)}'; then
-    ok "throughput: ch$CH $TX_RATE arq=$ARQ ap-retry=${AP_RETRY:-default} - UP ${up_best} Mbit/s (offered ${up_at} kbit/s), DOWN ${dn_best} Mbit/s (offered ${dn_at} kbit/s), both at <= ${THRU_LOSS_PCT}% loss"
+    ok "throughput: ch$CH $TX_RATE arq=$ARQ ap-retry=${AP_RETRY:-default} sta-ack=${STA_ACK:-off} - UP ${up_best} Mbit/s (offered ${up_at} kbit/s), DOWN ${dn_best} Mbit/s (offered ${dn_at} kbit/s), both at <= ${THRU_LOSS_PCT}% loss"
   else
     bad "throughput: a direction never carried a rung under ${THRU_LOSS_PCT}% loss (up=${up_best} down=${dn_best}) - see the rungs above"
   fi
