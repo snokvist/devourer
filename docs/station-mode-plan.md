@@ -2324,9 +2324,11 @@ there for the behaviour, with that stated at the declaration.
 discriminates - unarmed 35541 duplicates / 11899 delivered (2.99x), the 14
 Mbit/s rung collapsing to 64% loss - but the armed port ACKs only ~83%: ~17%
 duplicates in three runs (one at MCS3), and the same with an uncommitted build
-arming net_type AP. Neither rate nor net_type; open (handoff item 20). Flag TRUE
-with the caveat at the declaration.
+arming net_type AP. Neither rate nor net_type - and then root-caused: a monitor
+witness saw the station's ACKs on air for ~97% of the frames the AP re-aired,
+and lowering only the station's power 10 dB cut re-airs 11% -> 0.6%. The AP's
+receiver misses near-field ACKs on this bench (handoff item 20). Flag TRUE.
 
 *Realtek-station soak (2026-09-26):* 8812CU station, 8812AU AP, 30 min, 5/5.
 
-*Open:* the 8821C has the code and no cell; the 8822E's ACK shortfall.
+*Open:* the 8821C has the code and no cell.

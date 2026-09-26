@@ -285,10 +285,14 @@ struct AdapterCaps {
    * only ~83% of the AP's frames: 3994/24089, 4259/24083 (a repeat) and
    * 4267/23151 at MCS3 - so not the peer's rate - and 4129/24073 with the
    * arm writing net_type AP instead of Infra (an uncommitted experiment) -
-   * so not net_type either. The AP's retries hide it (downlink <= 0.22%
-   * loss). Not separated: placement, and this combo chip's coex firmware
-   * taking response slots. The ACK-responder matrix (docs/scheduled-mac.md)
-   * had the 8812EU at 98% single-shot, so the silicon can do better.
+   * so not net_type either. ROOT CAUSE, same day: NOT the 8822E - the AP.
+   * An mt76 monitor witness saw the 8812EU's ACK on air after 96.8% of the
+   * airings the 8812CU AP re-aired (same 6M rate, same -30 dBm as the ACKs
+   * it took), and with the station 10 dB down (DEVOURER_STA_TXPWR_QDB=-40)
+   * re-aired MSDUs fell 11% -> 0.6% and duplicates 669 -> 13: the AP's
+   * receiver missing an ACK too strong right after its own TX - near-field
+   * placement on this bench. Roles swapped (8812CU station, 8812EU AP):
+   * 0.2% re-aired. The arm is fine; the bench is too close.
    *
    * Unarmed, the MAC does not ACK the AP's unicast, so each downlink frame
    * airs AP_RETRY+1 = 4 times - the 3x duplicate ratio - and the wasted

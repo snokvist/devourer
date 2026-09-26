@@ -1062,6 +1062,18 @@ int main(int argc, char** argv) {
   std::fprintf(stderr, "  TX rate: %s, unicast %s\n", rate_s,
                g_rt_ack.empty() ? "NOACK (no retries)" : "ACK-requested (hardware retries)");
   g_dev->InitWrite(SelectedChannel{g_chan, 0, CHANNEL_WIDTH_20});
+  /* DEVOURER_STA_TXPWR_QDB=N - DIAGNOSTIC: a relative TX power offset in
+   * quarter-dB on THIS station only (IRadio::SetTxPowerOffsetQdb), applied
+   * after bring-up. The AP reads no such variable, so a harness run that
+   * sets it changes one endpoint. Added to test whether an AP misses this
+   * station's ACKs because they arrive too strong (8812EU station vs 8812CU
+   * AP, 2026-09-26). Printed with what the backend applied. */
+  if (const char* q = std::getenv("DEVOURER_STA_TXPWR_QDB"); q && *q) {
+    const int want = (int)std::strtol(q, nullptr, 10);
+    const int got = g_dev->SetTxPowerOffsetQdb(want);
+    std::fprintf(stderr, "  TX power offset: asked %d qdB, applied %d qdB\n",
+                 want, got);
+  }
 
   /* THE STATION'S ADDRESS IS THE ADAPTER'S, NOT A CHOICE. See the note at the
    * top of this file: on MT7612U a station that transmits from any other

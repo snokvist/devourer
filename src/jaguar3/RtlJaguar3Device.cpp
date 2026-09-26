@@ -1730,9 +1730,9 @@ devourer::AdapterCaps RtlJaguar3Device::GetAdapterCaps() {
   /* station_mode_ok: SetStationIdentity is ported on both dies (shared
    * StationArm), but the flag's bar is an on-air cell per die - see the
    * declaration. Both dies have run it (8822E: 2026-09-26, 8812EU). The
-   * 8822E's ARMED ACK rate is lower - ~83% of the AP's frames ACKed in
-   * three runs, vs ~100% on the 8822C - with rate and net_type both ruled
-   * out; see the table at the AdapterCaps declaration. */
+   * 8822E's armed run showed ~17% duplicates - traced to the AP's receiver
+   * saturating on this station's near-field ACKs, not to the 8822E (see
+   * the table at the AdapterCaps declaration). */
   c.station_mode_ok = true;
   /* Per-packet TX power: the TXPWR_OFSET_TYPE bank selector + programmable
    * 0x1e70 offset banks (SetTxPacketPowerOffsetQdb / radiotap DBM_TX_POWER;
