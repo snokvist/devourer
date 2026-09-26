@@ -167,11 +167,18 @@ struct FixtureAp {
         16, replay, anonce, nullptr, nullptr, 0, nullptr, nullptr);
   }
 
+  /* Non-empty: the RSN element message 3 carries instead of the advertised
+   * one - the downgrade-check cell. */
+  std::vector<uint8_t> rsn_override;
+
   std::vector<uint8_t> msg3() {
     std::vector<uint8_t> kd;
     const uint8_t hdr[8] = {0xdd, 0x16, 0x00, 0x0f, 0xac, 0x01, 1, 0x00};
 
-    devourer::sta::append_rsn_ccmp_psk(kd);
+    if (!rsn_override.empty())
+      kd = rsn_override;
+    else
+      devourer::sta::append_rsn_ccmp_psk(kd);
     kd.insert(kd.end(), hdr, hdr + 8);
     kd.insert(kd.end(), gtk, gtk + 16);
     if (kd.size() % 8) {
@@ -1133,6 +1140,57 @@ void test_reconfigure_forgets_the_keys() {
 
 }  // namespace
 
+/* THE ADVERTISEMENT REACHES THE SUPPLICANT. join() keeps the RSN element of
+ * the BSS it chose and the four-way holds message 3 to it (802.11-2016
+ * 12.7.6.4). Here the beacon advertises CCMP alone while the AP's
+ * MIC-protected message 3 offers TKIP as well: someone rewrote the beacon. The
+ * station must not come up keyed. Without this cell, a join() that stopped
+ * passing the element would leave the supplicant's check silently off. */
+void test_rsn_downgrade_is_refused() {
+  OpenSslCryptoOps crypto;
+  BssTable table;
+  StationSm sm;
+  FixtureAp ap;
+  uint8_t snonce[32];
+
+  std::memset(snonce, 0x7a, 32);
+  check(sm.configure(crypto, kSsid, kPsk, kOwn), "configure derives the PMK");
+  discovered(table);
+  const BssEntry* bss = table.select(kSsid);
+  if (!bss) { check(false, "the BSS is selectable"); return; }
+  ap.rsn_override = {0x30, 0x18, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04,
+                     0x02, 0x00, 0x00, 0x0f, 0xac, 0x02, 0x00, 0x0f,
+                     0xac, 0x04, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x02,
+                     0x00, 0x00};
+  check(sm.join(*bss, snonce, 0), "join starts");
+  pump(sm, ap, 0);
+  check(!sm.keyed() && !ap.saw_msg4,
+        "a message 3 RSN element that differs from the beacon's: not keyed, "
+        "no message 4");
+  check(sm.supplicant().rsn_mismatches == 1,
+        "...and the supplicant counted the mismatch");
+}
+
+/* A RECONFIGURE DROPS WHAT WAS QUEUED for the association it lets go: the
+ * authentication request join() queued must not air afterwards, built for a
+ * configuration the machine no longer has. */
+void test_reconfigure_drops_queued_frames() {
+  OpenSslCryptoOps crypto;
+  BssTable table;
+  StationSm sm;
+  uint8_t snonce[32];
+  std::memset(snonce, 0x7a, 32);
+  check(sm.configure(crypto, kSsid, kPsk, kOwn), "configure");
+  discovered(table);
+  const BssEntry* bss = table.select(kSsid);
+  if (!bss) { check(false, "beacon"); return; }
+  check(sm.join(*bss, snonce, 0) && sm.pending_tx() == 1,
+        "join queues an authentication request");
+  check(sm.configure(crypto, kSsid, kPsk, kOwn), "reconfigure");
+  check(sm.pending_tx() == 0,
+        "...and the reconfigure dropped it: nothing for the old association airs");
+}
+
 int main() {
   test_full_association();
   test_auth_timeout();
@@ -1161,6 +1219,8 @@ int main() {
   test_broadcast_eapol_is_not_fed_to_the_supplicant();
   test_beacon_loss_follows_the_interval();
   test_reconfigure_forgets_the_keys();
+  test_rsn_downgrade_is_refused();
+  test_reconfigure_drops_queued_frames();
 
   if (g_fail) {
     std::printf("station_sm_selftest: %d failure(s)\n", g_fail);

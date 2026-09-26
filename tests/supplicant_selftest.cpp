@@ -197,6 +197,11 @@ struct Authenticator {
   uint8_t gtk_keyid = 1;
   uint64_t replay = 0;
   bool have_ptk = false;
+  /* The RSN element message 3 carries: empty = the advertised one
+   * (append_rsn_ccmp_psk); `rsn_omit` leaves it out altogether. For the
+   * downgrade-check cells. */
+  std::vector<uint8_t> rsn_override;
+  bool rsn_omit = false;
 
   void init() {
     devourer::sta::pmk_from_psk(crypto, kPsk, kSsid, pmk);
@@ -228,7 +233,10 @@ struct Authenticator {
   /* Key data: the RSN element then a GTK KDE, 802.11i-padded, AES-wrapped. */
   std::vector<uint8_t> wrapped_gtk(const uint8_t* key, uint8_t keyid) {
     std::vector<uint8_t> kd;
-    devourer::sta::append_rsn_ccmp_psk(kd);
+    if (!rsn_override.empty())
+      kd = rsn_override;
+    else if (!rsn_omit)
+      devourer::sta::append_rsn_ccmp_psk(kd);
     const uint8_t hdr[8] = {0xdd, 0x16, 0x00, 0x0f, 0xac, 0x01, keyid, 0x00};
     kd.insert(kd.end(), hdr, hdr + 8);
     kd.insert(kd.end(), key, key + 16);
@@ -301,6 +309,88 @@ bool handshake(Authenticator& ap, Supplicant& sup, OpenSslCryptoOps& crypto) {
   if (sup.on_eapol(m3.data(), m3.size(), &out) != Supplicant::Verdict::Reply)
     return false;
   return ap.on_msg4(out);
+}
+
+/* ---- the downgrade check (802.11-2016 12.7.6.4) ---------------------------
+ *
+ * Message 3 carries the AP's RSN element under the MIC and the KEK; the one
+ * the station chose the BSS by came off the air unauthenticated. A station
+ * given the advertisement must refuse a message 3 whose element differs -
+ * and must refuse it BEFORE installing anything. */
+devourer::sta::RsnInfo advertised_rsn() {
+  std::vector<uint8_t> e;
+  devourer::sta::append_rsn_ccmp_psk(e);
+  devourer::sta::RsnInfo r;
+  devourer::sta::parse_rsn(e.data() + 2, e.size() - 2, &r);
+  return r;
+}
+
+/* One four-way against `ap` with the advertisement passed to start();
+ * returns the message 3 verdict. */
+Supplicant::Verdict four_way_with_advert(Authenticator& ap, Supplicant& sup,
+                                          OpenSslCryptoOps& crypto) {
+  uint8_t snonce[32];
+  std::vector<uint8_t> out;
+  std::memset(snonce, 0x7a, 32);
+  ap.init();
+  const devourer::sta::RsnInfo adv = advertised_rsn();
+  sup.start(crypto, ap.pmk, kSpa, kAa, snonce, &adv);
+  const std::vector<uint8_t> m1 = ap.msg1();
+  if (sup.on_eapol(m1.data(), m1.size(), &out) != Supplicant::Verdict::Reply ||
+      !ap.on_msg2(out))
+    return Supplicant::Verdict::CryptoError;
+  const std::vector<uint8_t> m3 = ap.msg3();
+  return sup.on_eapol(m3.data(), m3.size(), &out);
+}
+
+void test_rsne_downgrade_check() {
+  {
+    Authenticator ap;
+    Supplicant sup;
+    OpenSslCryptoOps crypto;
+    check(four_way_with_advert(ap, sup, crypto) == Supplicant::Verdict::Reply &&
+              sup.rsn_mismatches == 0 && sup.ptk_generation() == 1,
+          "a message 3 carrying the ADVERTISED RSN element completes the four-way");
+  }
+  {
+    Authenticator ap;
+    Supplicant sup;
+    OpenSslCryptoOps crypto;
+    /* The real AP offers TKIP as well as CCMP; the advertisement the station
+     * saw had been rewritten to CCMP alone. */
+    ap.rsn_override = {0x30, 0x18, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04,
+                       0x02, 0x00, 0x00, 0x0f, 0xac, 0x02, 0x00, 0x0f,
+                       0xac, 0x04, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x02,
+                       0x00, 0x00};
+    const uint32_t pg = sup.ptk_generation(), gg = sup.gtk_generation();
+    check(four_way_with_advert(ap, sup, crypto) == Supplicant::Verdict::Malformed &&
+              sup.rsn_mismatches == 1,
+          "a message 3 whose RSN element DIFFERS from the advertisement is refused");
+    check(sup.ptk_generation() == pg && sup.gtk_generation() == gg && !sup.ptk_valid(),
+          "...and nothing is installed");
+  }
+  {
+    Authenticator ap;
+    Supplicant sup;
+    OpenSslCryptoOps crypto;
+    ap.rsn_omit = true;
+    check(four_way_with_advert(ap, sup, crypto) == Supplicant::Verdict::Malformed &&
+              sup.rsn_mismatches == 1 && !sup.ptk_valid(),
+          "a message 3 with NO RSN element is refused when an advertisement is known");
+  }
+  {
+    Authenticator ap;
+    Supplicant sup;
+    OpenSslCryptoOps crypto;
+    /* Same suites, different capabilities (MFP capable): still a different
+     * element. */
+    ap.rsn_override = {0x30, 0x14, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04,
+                       0x01, 0x00, 0x00, 0x0f, 0xac, 0x04, 0x01, 0x00,
+                       0x00, 0x0f, 0xac, 0x02, 0x80, 0x00};
+    check(four_way_with_advert(ap, sup, crypto) == Supplicant::Verdict::Malformed &&
+              sup.rsn_mismatches == 1,
+          "a capabilities difference alone is a mismatch");
+  }
 }
 
 /* ---- the four-way ------------------------------------------------------ */
@@ -1276,6 +1366,7 @@ int main() {
   test_msg3_retransmit_does_not_reinstall();
   test_group1_same_gtk_does_not_reinstall();
   test_forged_msg1_does_not_orphan_msg3_retransmit();
+  test_rsne_downgrade_check();
 
   if (g_fail) {
     std::printf("supplicant_selftest: %d failure(s)\n", g_fail);

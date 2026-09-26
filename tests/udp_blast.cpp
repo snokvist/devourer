@@ -85,6 +85,9 @@ struct RecvResult {
   uint64_t reordered = 0;  /* arrived below the high-water mark */
   uint64_t duplicated = 0; /* the same sequence twice - a retransmit, or a
                             * duplicate the MAC delivered twice */
+  uint64_t first_seq = 0;  /* the lowest sequence that arrived: nonzero on a
+                            * run whose head was lost, or on a receiver
+                            * started after its sender */
   double first_s = 0, last_s = 0;
   /* THE WINDOW THE MEASUREMENT COVERS, which is not the span between the
    * first and last arrival. Dividing bytes by the span rewards a link that
@@ -173,11 +176,15 @@ RecvResult receive_for(int fd, double secs, double grace) {
     uint64_t arrived = r.datagrams - r.duplicated;
     uint64_t span = high - (r.datagrams ? 0 : 0);
     (void)span;
-    /* Loss is the span the sequence covered minus what actually arrived -
-     * from the LOWEST sequence seen, not from 0: the sequences before the
-     * first arrival are not evidence of loss (see the note at `started`),
-     * and counting them made a receiver started late report phantom loss. */
-    const uint64_t expected = high - low + 1;
+    /* Loss is the span the sequence covered minus what actually arrived,
+     * FROM SEQUENCE 0 - this tool's sender always starts there, and the
+     * harness starts the receiver first, so a missing head is a lost head.
+     * Counting from the lowest arrival instead (tried in review) hid exactly
+     * that: a link that dropped its first 300 datagrams reported lost=0.
+     * A receiver started AFTER its sender over-reports instead - the
+     * conservative direction - and `first_seq` in the event says so. */
+    r.first_seq = low;
+    const uint64_t expected = high + 1;
     r.lost = expected > arrived ? expected - arrived : 0;
   }
   return r;
@@ -213,11 +220,13 @@ int run_recv(const char* bind_ip, int port, double secs) {
   std::printf(
       "{\"ev\":\"udp_blast.recv\",\"datagrams\":%llu,\"bytes\":%llu,"
       "\"lost\":%llu,\"reordered\":%llu,\"duplicated\":%llu,"
+      "\"first_seq\":%llu,"
       "\"window_s\":%.3f,\"span_s\":%.3f,\"goodput_mbps\":%.3f,"
       "\"loss_pct\":%.2f}\n",
       (unsigned long long)r.datagrams, (unsigned long long)r.bytes,
       (unsigned long long)r.lost, (unsigned long long)r.reordered,
-      (unsigned long long)r.duplicated, r.window_s, span, mbps,
+      (unsigned long long)r.duplicated, (unsigned long long)r.first_seq,
+      r.window_s, span, mbps,
       /* -1, NOT ZERO. A rung that delivered nothing has no idea what was
        * offered, and printing 0.00% next to 0.000 Mbit/s reads as a perfect
        * link. It did exactly that in the first ladder run: three rungs in a
@@ -403,9 +412,9 @@ int self_test() {
     check(r.datagrams == 3, "three arrive across a window-wide jump");
     check(r.reordered == 1, "...the late one is reordering");
     check(r.duplicated == 0, "...and NOT a duplicate of a stale window slot");
-    check(r.lost == 1098,
-          "...and the gap between them is counted in full - from the first "
-          "arrival (100), not from sequence 0");
+    check(r.lost == 1198,
+          "...and the gap is counted in full, from sequence 0: the head the "
+          "sender aired first (0..99) is lost too");
   }
   {   /* A HUGE FORWARD JUMP must not spin the window-clearing loop once per
        * skipped sequence number: one stray datagram near 2^63 hung the
@@ -415,11 +424,13 @@ int self_test() {
     check(r.datagrams == 2, "a 2^40 jump arrives and the run ENDS");
     check(r.lost == (1ull << 40) - 1, "...with the gap counted as lost");
   }
-  {   /* A receiver started late: loss is counted from the first arrival, and
-       * an earlier sequence arriving after it extends the span down. */
+  {   /* A LOST HEAD IS LOSS. The sender starts at 0; a run whose first 48
+       * datagrams never arrived must not read as nearly perfect, and the
+       * event names where it started. */
     const uint64_t s[] = {50, 51, 48};
     RecvResult r = drive(s, 3);
-    check(r.lost == 1, "loss counts from the lowest sequence seen (49 only)");
+    check(r.lost == 49, "loss counts from sequence 0 (0..47 and 49)");
+    check(r.first_seq == 48, "...and first_seq reports the lowest arrival");
   }
   {   /* THE RATE IS OVER THE WINDOW, NOT THE BURST. Ten datagrams delivered
        * in a millisecond, then silence for the rest of a quarter second, is

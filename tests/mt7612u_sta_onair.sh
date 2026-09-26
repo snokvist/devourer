@@ -106,12 +106,13 @@ reap() {
 # merely STARTS with $NS.
 ns_exists() { ip netns list 2>/dev/null | awk '{print $1}' | grep -qx "$NS"; }
 NS_OURS=no
+TAP_OURS=no
 
 cleanup() {
   reap
   [ -f "$OUT/hostapd.pid" ] && { kill "$(cat "$OUT/hostapd.pid")" 2>/dev/null
                                  rm -f "$OUT/hostapd.pid"; }
-  ip addr flush dev "$TAP" 2>/dev/null
+  [ "$TAP_OURS" = yes ] && ip addr flush dev "$TAP" 2>/dev/null
   # THE PHY MUST COME BACK BEFORE THE NAMESPACE GOES. A script that dies with
   # the adapter still in its namespace leaves the operator an adapter that has
   # simply vanished - no netdev, nothing in `iw dev`, and no hint where it
@@ -138,8 +139,10 @@ cleanup() {
       NS_OURS=no
     fi
   fi
-  # The TAP is sta_client's and dies with it; this only catches a leak.
-  ip link del "$TAP" 2>/dev/null
+  # The TAP is sta_client's and dies with it; this only catches a leak - and
+  # only of a name this run was the one to claim (see the preflight).
+  [ "$TAP_OURS" = yes ] && ip link del "$TAP" 2>/dev/null
+  return 0
 }
 trap cleanup EXIT
 # AND IT MUST STOP: with INT/TERM on the EXIT trap, bash runs cleanup and then
@@ -243,6 +246,16 @@ if command -v nmcli >/dev/null 2>&1; then
                 NM_AP=yes ;;
   esac
 fi
+
+# THE STATION'S TAP NAME MUST BE FREE - the same rule, and the same reason,
+# as tests/sta_d2d_onair.sh: sta_client creates it per cell and cleanup
+# deletes it, so a pre-existing interface of that name would be addressed,
+# used and then destroyed. Only after this check is the name ours.
+if [ -e "/sys/class/net/$TAP" ]; then
+  echo "TAP=$TAP already exists - refusing to use or delete it (set TAP=<other name>)"
+  exit 2
+fi
+TAP_OURS=yes
 
 say "station $STA_SYSFS (MT7612U, devourer)   AP $AP_SYSFS ($AP_IF $AP_MAC, $AP_PHY)"
 say "ch$CH ($FREQ MHz)  ssid '$SSID'  ns '$NS'  tap '$TAP'"

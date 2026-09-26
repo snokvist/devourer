@@ -187,6 +187,10 @@ Emitters: L = library, RX/TX/... = demo. Optional fields in [brackets];
 | `stream.done` | streamtx (stderr) | sent |
 | `svc.stats` | svctx | frames, crit, t0, t1, t2, t3plus |
 | `doctor.verdict` | doctor | verdict, reasons "0x…", efuse_reads, efuse_mismatch, efuse_bad_id, efuse_id, fw_attempted, fw_ready, rx_ok, rx_crc, init |
+| `sta.tick` | sta_client (`DEVOURER_STA_TICK_MS`) | t_ms, state, beacons, beacons_ours, associations, reconnects, enc_rx, enc_tx, mic_fail, replays, tap_to_host, tap_from_host, aired, send_fail, q_drop |
+| `ccmp.profile` | sta_client, ap_wpa2 (`DEVOURER_CCMP_PROFILE`) | path "software", tx_frames, tx_ns, rx_frames, rx_ns |
+| `udp_blast.send` / `udp_blast.recv` | udp_blast (station-mode harness) | datagrams, bytes, refused, seconds, offered_mbps / datagrams, bytes, lost (from sequence 0), reordered, duplicated, first_seq, window_s, span_s, goodput_mbps, loss_pct (-1 when nothing arrived) |
+| `ccmp.sw_bench` | CcmpSwBench | bytes, operation, iterations, wall_seconds, cpu_seconds, wall_ns_per_frame, cpu_ns_per_frame, cpu_payload_mbps, radio_payload_mbps, projected_core_pct |
 
 ## Not JSON by design
 

@@ -937,9 +937,11 @@ void report() {
                (unsigned long long)g_gtk_installs.load());
   std::fprintf(stderr,
                "  four-way: mic_failures=%u replays=%u retransmits=%u"
-               " malformed=%u out_of_state=%u ignored=%u crypto_errors=%u\n",
+               " malformed=%u out_of_state=%u ignored=%u crypto_errors=%u"
+               " rsn_mismatches=%u\n",
                sup.mic_failures, sup.replays, sup.retransmits, sup.malformed,
-               sup.out_of_state, sup.ignored, sup.crypto_errors);
+               sup.out_of_state, sup.ignored, sup.crypto_errors,
+               sup.rsn_mismatches);
   std::fprintf(stderr,
                "  data plane: encrypted rx=%llu (group=%llu), plaintext rx="
                "%llu, MIC failures=%llu, replays rejected=%llu,"

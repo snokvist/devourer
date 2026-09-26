@@ -2139,11 +2139,14 @@ void RtlJaguar3Device::DumpChipState() {
       if (kWitness[i] == addr) return val[i];
     return 0;
   };
-  _logger->info("=== DEVOURER_DUMP_CANARY (post channel-set: j3 chipstate "
-                "witness) ===");
+  /* The raw witness values, labelled - deliberately OUTSIDE the canary
+   * envelope above: canary_diff.py pairs a canary block with a kernel or
+   * bring-up capture of the same register set, and these 17 are not in
+   * either, so wrapping them in canary markers made every such diff report
+   * them as devourer-only registers. */
   for (size_t i = 0; i < kN; i++)
-    _logger->info("MAC 0x{:03x} = 0x{:08X}", kWitness[i], val[i]);
-  _logger->info("=== END DEVOURER_DUMP_CANARY ===");
+    _logger->info("j3 chipstate raw: MAC 0x{:03x} = 0x{:08X}", kWitness[i],
+                  val[i]);
 
   const uint32_t cr = v(REG_CR);
   const uint32_t txq = v(REG_FWHW_TXQ_CTRL);

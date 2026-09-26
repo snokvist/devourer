@@ -18,6 +18,9 @@
  *   - a retransmission (equal counter): answered again, installs nothing
  *                                                       retransmits
  *   - a message arriving in a state that cannot use it  out_of_state
+ *   - a message 3 whose RSN element differs from the
+ *     one the AP advertised (a downgrade, 12.7.6.4)     rsn_mismatches
+ *     (counted under malformed too)
  *   - anything malformed, over-long, or a descriptor
  *     version whose MIC is a different algorithm        malformed
  *   - a well-formed EAPOL-Key this role does not handle ignored
@@ -111,9 +114,22 @@ class Supplicant {
    * counter or a timestamp makes the PTK derivable from the air by anyone who
    * knows the PSK - which on a PSK network is every other station.
    */
+  /* `ap_rsn` is the RSN element the AP advertised in the Beacon or Probe
+   * Response this association was chosen from. When given, message 3's RSN
+   * element must match it (802.11-2016 12.7.6.4, the downgrade check): an
+   * attacker who forged the advertisement to steer the choice is caught by
+   * the MIC-protected copy. Compared field by field, not byte by byte - an AP
+   * may encode the same element differently in the two places, which is what
+   * wpa_supplicant tolerates too. Null skips the check; StationSm always
+   * passes it. */
   void start(CryptoOps& crypto, const uint8_t pmk[32], const uint8_t own[6],
-             const uint8_t bssid[6], const uint8_t snonce[32]) {
+             const uint8_t bssid[6], const uint8_t snonce[32],
+             const RsnInfo* ap_rsn = nullptr) {
     forget();
+    if (ap_rsn && ap_rsn->valid) {
+      ap_rsn_ = *ap_rsn;
+      ap_rsn_set_ = true;
+    }
     crypto_ = &crypto;
     std::memcpy(pmk_, pmk, 32);
     std::memcpy(own_, own, 6);
@@ -140,6 +156,8 @@ class Supplicant {
     m1_replay_ = 0;
     m1_answered_ = false;
     gtk_rsc_ = 0;
+    ap_rsn_ = RsnInfo{};
+    ap_rsn_set_ = false;
     state_ = State::Idle;
     crypto_ = nullptr;
     rx_replay_ = 0;
@@ -257,6 +275,7 @@ class Supplicant {
   uint32_t out_of_state = 0;
   uint32_t ignored = 0;
   uint32_t crypto_errors = 0;
+  uint32_t rsn_mismatches = 0;
 
  private:
   /* An MSDU is 2304 bytes; key data larger than that never crossed a link. */
@@ -399,6 +418,19 @@ class Supplicant {
       secure_wipe(plain.data(), plain.size());
       return note(Verdict::Malformed);
     }
+    /* THE DOWNGRADE CHECK (12.7.6.4). The RSN element in this MIC-verified,
+     * KEK-wrapped key data is the AP's own; the one we chose the BSS by came
+     * off the air unauthenticated. They must agree, or someone rewrote the
+     * advertisement - refused before anything is installed. */
+    if (ap_rsn_set_) {
+      RsnInfo got;
+      if (!find_rsn_element(plain.data(), plain.size(), &got) ||
+          !rsn_equivalent(got, ap_rsn_)) {
+        secure_wipe(plain.data(), plain.size());
+        rsn_mismatches++;
+        return note(Verdict::Malformed);
+      }
+    }
 
     std::vector<uint8_t> e = build_eapol_key(
         (uint16_t)(kKeyDescVersionCcmp | kKiPairwise | kKiMic | kKiSecure), 0,
@@ -472,6 +504,31 @@ class Supplicant {
     return Verdict::Reply;
   }
 
+  /* The first RSN element (EID 48) in unwrapped key data. Elements before
+   * it are stepped over; the walk stops at the 0xdd padding marker's empty
+   * element or at anything that would run past the buffer. */
+  static bool find_rsn_element(const uint8_t* kd, size_t len, RsnInfo* out) {
+    size_t i = 0;
+    while (i + 2 <= len) {
+      const uint8_t id = kd[i], l = kd[i + 1];
+      if (i + 2 + l > len) return false;
+      if (id == 48) return parse_rsn(kd + i + 2, l, out) && out->valid;
+      if (id == 0xdd && l == 0) return false;
+      i += 2 + (size_t)l;
+    }
+    return false;
+  }
+
+  /* Every field the summary carries must agree. The suite COUNTS are part of
+   * it: an advertisement that dropped a pairwise suite or an AKM is a
+   * different element even where CCMP and PSK are in both. */
+  static bool rsn_equivalent(const RsnInfo& a, const RsnInfo& b) {
+    return a.version == b.version && a.group_ccmp == b.group_ccmp &&
+           a.pairwise_ccmp == b.pairwise_ccmp && a.akm_psk == b.akm_psk &&
+           a.pairwise_count == b.pairwise_count &&
+           a.akm_count == b.akm_count && a.capabilities == b.capabilities;
+  }
+
   /* The GTK already in use is NOT reinstalled - not copied, not counted, and
    * its RSC is not re-read. Every PTK rekey's message 3 re-delivers the
    * current GTK, and a caller that reopens its group replay window on a
@@ -530,6 +587,8 @@ class Supplicant {
   size_t gtk_len_ = 0;
   uint8_t gtk_key_id_ = 0;
   uint64_t gtk_rsc_ = 0;
+  RsnInfo ap_rsn_{};         /* the advertisement message 3 must match */
+  bool ap_rsn_set_ = false;
   uint32_t ptk_gen_ = 0;
   uint32_t gtk_gen_ = 0;
   bool ptk_valid_ = false;

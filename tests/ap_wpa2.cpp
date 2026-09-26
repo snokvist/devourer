@@ -98,6 +98,11 @@ static std::atomic<uint64_t> g_sent{0};
  * was counted, so the ledger's "frames sent" was the only transmit figure
  * and there was nothing to compare it against. */
 static std::atomic<uint64_t> g_q_drop{0}, g_send_fail{0};
+/* A refusal is a RETRY, not a loss: the frame goes back to the front of the
+ * queue and is booked once, wherever it finally ends up (sent, a queue drop,
+ * or refused after the breaker opened). This counts the refusals themselves,
+ * so a backing-off link is visible without breaking the ledger identity. */
+static std::atomic<uint64_t> g_send_refused{0};
 /* Every frame handed to enqueue(), so the transmit chain closes:
  * queued == aired + queue dropped + send failed. */
 static std::atomic<uint64_t> g_q_in{0};
@@ -444,9 +449,18 @@ static void compute_ptk_into(const uint8_t own[6], const uint8_t anonce[32],
   const uint8_t* nn = memcmp(anonce,snonce,32) < 0 ? anonce : snonce;
   const uint8_t* nx = memcmp(anonce,snonce,32) < 0 ? snonce : anonce;
   memcpy(b+p, nn, 32); p+=32; memcpy(b+p, nx, 32); p+=32;
+  /* THE SAME PMK RULE AS THE STATION (src/sta/Eapol.h pmk_from_psk): 64 hex
+   * digits are the raw PMK, anything else is an 8..63-character passphrase
+   * through PBKDF2. This used to PBKDF2 any string, so a hex PSK - or a
+   * passphrase the station refuses - derived a different PMK at each end and
+   * failed as a MIC mismatch instead of as what it was. main() refuses an
+   * invalid PSK up front, so the failure branch here is a backstop. */
   uint8_t pmk[32];
-  PKCS5_PBKDF2_HMAC(g_psk, strlen(g_psk), (const unsigned char*)kSsid,
-                    strlen(kSsid), 4096, EVP_sha1(), 32, pmk);
+  static devourer::test::OpenSslCryptoOps pmk_crypto;
+  if (!devourer::sta::pmk_from_psk(pmk_crypto, g_psk, kSsid, pmk)) {
+    memset(out_ptk, 0, 48);
+    return;
+  }
   prf(pmk, 32, "Pairwise key expansion", b, p, out_ptk, 48);
 }
 // MIC over the EAPOL frame with the MIC field (offset 81, 16 bytes) zeroed.
@@ -1374,6 +1388,15 @@ int main(int argc, char** argv) {
   if (const char* t = std::getenv("DEVOURER_AP_TAP")) g_tap_fd = tap_open(t);
   if (const char* c = std::getenv("DEVOURER_CHANNEL")) g_chan = (uint8_t)atoi(c);
   if (const char* k = std::getenv("DEVOURER_WPA2_PSK")) g_psk = k;
+  {
+    devourer::test::OpenSslCryptoOps co;
+    uint8_t probe[32];
+    if (!devourer::sta::pmk_from_psk(co, g_psk, kSsid, probe)) {
+      fprintf(stderr, "ap_wpa2: DEVOURER_WPA2_PSK is neither an 8..63-character "
+                      "passphrase nor 64 hex digits - refused\n");
+      return 2;
+    }
+  }
   if (const char* p = std::getenv("DEVOURER_CCMP_PROFILE"))
     g_ccmp_profile = std::strcmp(p, "0") != 0;
   auto logger = std::make_shared<Logger>(); apply_logging_env(*logger);
@@ -1623,7 +1646,7 @@ int main(int argc, char** argv) {
         tx_backoff_ms = 0;
         consecutive_fail = 0;
       } else {
-        g_send_fail.fetch_add(1);
+        g_send_refused.fetch_add(1);
         if (++consecutive_fail >= kTxGiveUp && !g_tx_circuit_open) {
           g_tx_circuit_open = true;
           /* THE REGISTERS, AT THE MOMENT IT STOPS. Compare against the
@@ -1657,11 +1680,14 @@ int main(int argc, char** argv) {
        * ledger identity the on-air cells check. The cap still applies -
        * anything beyond it is a queue drop like any other.
        *
-       * THE REFUSED FRAME ITSELF IS NOT REQUEUED: it is already booked in
-       * g_send_fail, and requeueing it let it be booked AGAIN in g_sent
-       * when it later aired, so `queued == sent + qdrop + sfail` stopped
-       * closing exactly when the backoff path ran. */
-      const size_t from = refused ? i + 1 : i;
+       * THE REFUSED FRAME IS REQUEUED TOO. One 20 ms NAK is back-pressure,
+       * not a verdict - dropping it cost a DHCP, EAPOL or TCP frame the
+       * next iteration would have delivered. It was booked in g_send_fail
+       * at the refusal once, and then AGAIN in g_sent when it aired, so the
+       * ledger identity broke; now a refusal is only g_send_refused and the
+       * frame is booked once, where it ends up. */
+      (void)refused;
+      const size_t from = i;
       std::lock_guard<std::mutex> l(g_q_mu);
       for (size_t k = batch.size(); k-- > from;) {
         if (g_q.size() < 128) g_q.insert(g_q.begin(), std::move(batch[k]));
@@ -1890,7 +1916,8 @@ int main(int argc, char** argv) {
           "replays rejected=%llu, duplicates dropped=%llu, queued=%llu, frames sent=%llu, "
           "queue dropped=%llu, send failed=%llu, backoffs=%llu,"
           " refused after the TX circuit opened=%llu,"
-          " beacon refreshes=%llu (failed %llu, retries %llu)\n",
+          " beacon refreshes=%llu (failed %llu, retries %llu),"
+          " send refusals retried=%llu\n",
           (unsigned long long)g_enc_rx.load(),
           (unsigned long long)g_mic_fail.load(),
           (unsigned long long)g_replayed.load(),
@@ -1903,7 +1930,8 @@ int main(int argc, char** argv) {
           (unsigned long long)g_tx_broken.load(),
           (unsigned long long)g_bcn_refresh.load(),
           (unsigned long long)g_bcn_refresh_fail.load(),
-          (unsigned long long)g_bcn_retry.load());
+          (unsigned long long)g_bcn_retry.load(),
+          (unsigned long long)g_send_refused.load());
 
   /* Retried, and the failure reported. StopBeacon can now genuinely fail (an
    * EP0 stall during teardown), IRadio.h says such a failure "must be retried

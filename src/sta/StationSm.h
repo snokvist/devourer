@@ -161,6 +161,11 @@ class StationSm {
    * A Failed state keeps its reason for the caller to read. */
   void drop_association_keys() {
     sup_.forget();
+    /* And whatever was queued for that association - an auth, assoc or
+     * EAPOL frame built under the old configuration must not air after the
+     * machine has let the association go (join() clears it for the same
+     * reason). */
+    tx_.clear();
     if (state_ != State::Failed) state_ = State::Idle;
   }
 
@@ -177,6 +182,9 @@ class StationSm {
     if (security_ == Security::Wpa2Psk) {
       if (!have_pmk_) { fail(Failure::NoPmk, 0); return false; }
       if (!bss.info.rsn_ccmp_psk) { fail(Failure::AssocRefused, 0); return false; }
+      /* Kept for the four-way: message 3 must carry the same RSN element
+       * (Supplicant::start, the downgrade check). */
+      ap_rsn_ = bss.info.rsn;
       /* The SNonce is only read on this path, so it is only required on this
        * path - but a WPA2 join without one would start the supplicant with a
        * nonce of whatever was in the buffer, which for a caller that
@@ -533,7 +541,7 @@ class StationSm {
       return;
     }
     state_ = State::FourWay;
-    sup_.start(*crypto_, pmk_, own_, bssid_, snonce_);
+    sup_.start(*crypto_, pmk_, own_, bssid_, snonce_, &ap_rsn_);
   }
 
   /* One EAPOL-Key frame in, the EAPOL-Key body to send back out (or empty).
@@ -597,6 +605,7 @@ class StationSm {
   std::string ssid_;
   uint8_t own_[6] = {0};
   uint8_t bssid_[6] = {0};
+  RsnInfo ap_rsn_{};  /* the joined BSS's advertised RSN element */
   uint8_t snonce_[32] = {0};
   uint8_t pmk_[32] = {0};
   bool have_pmk_ = false;
