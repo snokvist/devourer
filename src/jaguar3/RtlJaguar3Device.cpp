@@ -1729,8 +1729,11 @@ devourer::AdapterCaps RtlJaguar3Device::GetAdapterCaps() {
   c.tx_retry_limit_ok = true;
   /* station_mode_ok: SetStationIdentity is ported on both dies (shared
    * StationArm), but the flag's bar is an on-air cell per die - see the
-   * declaration. Set where one has run; the 8822E is unmeasured. */
-  c.station_mode_ok = _variant == jaguar3::ChipVariant::C8822C;
+   * declaration. Both dies have run it (8822E: 2026-09-26, 8812EU). The
+   * 8822E's ARMED ACK rate is lower - ~83% of the AP's frames ACKed in
+   * three runs, vs ~100% on the 8822C - with rate and net_type both ruled
+   * out; see the table at the AdapterCaps declaration. */
+  c.station_mode_ok = true;
   /* Per-packet TX power: the TXPWR_OFSET_TYPE bank selector + programmable
    * 0x1e70 offset banks (SetTxPacketPowerOffsetQdb / radiotap DBM_TX_POWER;
    * TxPktPwrBanks.h). Continuous in step_qdb units, ±63/-64 index travel, 2

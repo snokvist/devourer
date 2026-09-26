@@ -2320,5 +2320,13 @@ die, as the review predicted: bring-up programs the EFUSE MAC (`own`) into
 MACID, and the 8812's MACID answers with net_type NoLink. The flag is TRUE
 there for the behaviour, with that stated at the declaration.
 
-*Open:* the 8822E and 8821C have the code and no cell; no soak with a Realtek
-station yet.
+*8822E (2026-09-26, 8812EU station, 8812CU AP, ch36):* the control
+discriminates - unarmed 35541 duplicates / 11899 delivered (2.99x), the 14
+Mbit/s rung collapsing to 64% loss - but the armed port ACKs only ~83%: ~17%
+duplicates in three runs (one at MCS3), and the same with an uncommitted build
+arming net_type AP. Neither rate nor net_type; open (handoff item 20). Flag TRUE
+with the caveat at the declaration.
+
+*Realtek-station soak (2026-09-26):* 8812CU station, 8812AU AP, 30 min, 5/5.
+
+*Open:* the 8821C has the code and no cell; the 8822E's ACK shortfall.

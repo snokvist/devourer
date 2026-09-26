@@ -261,7 +261,8 @@ struct AdapterCaps {
    *     successful arm leaves behind - but the literal end-to-end path
    *     "arm the seam, then measure" has not been exercised.
    *
-   * TRUE ALSO on the Realtek 8822C (Jaguar3) and 8822B (Jaguar2), since
+   * TRUE ALSO on the Realtek 8822C and 8822E (Jaguar3), the 8822B (Jaguar2)
+   * and the Jaguar1 8812 die, since
    * 2026-09-26 (Phase 6: src/StationArm.h, MACID = own, BSSID = the AP,
    * net_type = Infra). Unlike the MT7612U cells above, these drove the seam
    * itself, associated, end to end: tests/sta_d2d_onair.sh `thru` against a
@@ -272,12 +273,22 @@ struct AdapterCaps {
    *   8812CU (8812BU)         2 / 24111                  42122 / 14126 (2.98x)
    *   8812BU (8812CU)        13 / 24115                  35117 / 11744 (2.99x)
    *   8812AU (8812CU)        38 / 24110                     27 / 24114  (!)
+   *   8812EU (8812CU)      3994 / 24089 (*)              35541 / 11899 (2.99x)
    *
    * (!) The Jaguar1 8812 row does NOT discriminate, and was predicted not
    * to: its bring-up programs `own` into MACID and that die's MACID answers
    * with net_type NoLink, so the port ACKs with or without the arm. TRUE
    * there because the station behaviour is measured, not because the arm
    * produces it (RtlJaguarDevice::GetAdapterCaps).
+   *
+   * (*) The 8822E discriminates (unarmed 2.99x) but its ARMED port ACKs
+   * only ~83% of the AP's frames: 3994/24089, 4259/24083 (a repeat) and
+   * 4267/23151 at MCS3 - so not the peer's rate - and 4129/24073 with the
+   * arm writing net_type AP instead of Infra (an uncommitted experiment) -
+   * so not net_type either. The AP's retries hide it (downlink <= 0.22%
+   * loss). Not separated: placement, and this combo chip's coex firmware
+   * taking response slots. The ACK-responder matrix (docs/scheduled-mac.md)
+   * had the 8812EU at 98% single-shot, so the silicon can do better.
    *
    * Unarmed, the MAC does not ACK the AP's unicast, so each downlink frame
    * airs AP_RETRY+1 = 4 times - the 3x duplicate ratio - and the wasted
@@ -293,9 +304,9 @@ struct AdapterCaps {
    * would refuse - one more reason the flag stays per measured die.
    * Same limits as above for power save/TIM/key lookup; near field; no soak.
    *
-   * FALSE on the 8822E and 8821C (ported, same code - no cell run), on the
-   * Jaguar1 8814A and 8821A (ported - no cell run), and on every other
-   * backend: not ported. */
+   * FALSE on the 8821C (ported, same code - no cell run), on the Jaguar1
+   * 8814A and 8821A (ported - no cell run), and on every other backend:
+   * not ported. */
   bool station_mode_ok = false;
 
   /* --- feature flags --- */
