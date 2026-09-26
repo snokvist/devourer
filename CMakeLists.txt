@@ -984,6 +984,9 @@ if(OpenSSL_FOUND)
     add_executable(CcmpSwBench tests/ccmp_sw_bench.cpp)
     target_include_directories(CcmpSwBench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
     target_link_libraries(CcmpSwBench PRIVATE OpenSSL::Crypto)
+# Standalone (no PUBLIC cxx_std_20 from `devourer`); the station headers use
+# inline variables and nested namespaces, which MSVC rejects below C++17.
+target_compile_features(CcmpSwBench PRIVATE cxx_std_20)
     add_test(NAME ccmp_software_roundtrip COMMAND CcmpSwBench --self-test)
 
     # src/sta/Eapol.h and src/sta/Supplicant.h - the station half of the
@@ -1010,6 +1013,9 @@ if(OpenSSL_FOUND)
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/tests)
     target_link_libraries(SupplicantSelftest PRIVATE OpenSSL::Crypto)
+# Standalone (no PUBLIC cxx_std_20 from `devourer`); the station headers use
+# inline variables and nested namespaces, which MSVC rejects below C++17.
+target_compile_features(SupplicantSelftest PRIVATE cxx_std_20)
     add_test(NAME supplicant COMMAND SupplicantSelftest)
 
     # src/sta/StationSm.h - the association state machine (Phase 3). Its
@@ -1021,6 +1027,9 @@ if(OpenSSL_FOUND)
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/tests)
     target_link_libraries(StationSmSelftest PRIVATE OpenSSL::Crypto)
+# Standalone (no PUBLIC cxx_std_20 from `devourer`); the station headers use
+# inline variables and nested namespaces, which MSVC rejects below C++17.
+target_compile_features(StationSmSelftest PRIVATE cxx_std_20)
     add_test(NAME station_sm COMMAND StationSmSelftest)
 
     # src/sta/Ccmp.h - the 802.11 CCMP framing both roles share. The vectors
@@ -1040,6 +1049,9 @@ if(OpenSSL_FOUND)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests
         ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(CcmpSelftest PRIVATE OpenSSL::Crypto)
+# Standalone (no PUBLIC cxx_std_20 from `devourer`); the station headers use
+# inline variables and nested namespaces, which MSVC rejects below C++17.
+target_compile_features(CcmpSelftest PRIVATE cxx_std_20)
     add_test(NAME ccmp_framing COMMAND CcmpSelftest)
 endif()
 
@@ -1153,6 +1165,9 @@ add_executable(BssTableSelftest tests/bss_table_selftest.cpp)
 target_include_directories(BssTableSelftest PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+# Standalone (no PUBLIC cxx_std_20 from `devourer`); the station headers use
+# inline variables and nested namespaces, which MSVC rejects below C++17.
+target_compile_features(BssTableSelftest PRIVATE cxx_std_20)
 add_test(NAME bss_table COMMAND BssTableSelftest)
 
 # src/sta/StationTable.h - the associated-station table (Phase 2b.2), the thing
@@ -1165,6 +1180,9 @@ add_executable(StationTableSelftest tests/station_table_selftest.cpp)
 target_include_directories(StationTableSelftest PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+# Standalone (no PUBLIC cxx_std_20 from `devourer`); the station headers use
+# inline variables and nested namespaces, which MSVC rejects below C++17.
+target_compile_features(StationTableSelftest PRIVATE cxx_std_20)
 add_test(NAME station_table COMMAND StationTableSelftest)
 
 # Headless guard for the TX quiesce seam (ITransport::quiesce_tx via
