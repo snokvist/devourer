@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "AckResponder.h"
+#include "StationArm.h"
 #include "logger.h"
 #include "BbDbgportReader.h"
 #include "LaCapture.h"
@@ -91,6 +92,9 @@ class RtlJaguarDevice : public IRtlRadio {
    * back into PinBeaconTbtt, so serialize the complete ownership checks and
    * multi-register transactions with a recursive mutex. */
   std::recursive_mutex _port0_mu;
+  /* The third port-0 claimant, next to the beacon and the ACK responder;
+   * each refuses while another holds the port. Under _port0_mu. */
+  devourer::StationArm _station;
 
   /* Shared by ClearAckResponder and SetAckResponder rollback. On 8812
    * silicon a gate-only clear was measured to leave the old MACID answering,
@@ -288,6 +292,12 @@ public:
   /* Hardware ACK responder (IRadio contract; src/AckResponder.h). */
   bool SetAckResponder(const devourer::MacAddr &mac) override;
   void ClearAckResponder() override;
+  /* Station identity (IRadio contract; src/StationArm.h): MACID = own,
+   * BSSID = the AP, net_type = Infra, restored exactly on clear - the
+   * CHIP_8812 gate-only-clear finding is why every die restores MACID. */
+  bool SetStationIdentity(const devourer::MacAddr &own,
+                          const devourer::MacAddr &bssid) override;
+  bool ClearStationIdentity() override;
   /* Schedule rxdemo's hardware-only live-disarm cell. False leaves the
    * request unset. Enabled for the shared CHIP_8812 implementation; measured
    * on a reference RTL8812AU, not separately on its RTL8811AU cut. */

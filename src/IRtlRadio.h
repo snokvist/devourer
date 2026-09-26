@@ -151,6 +151,60 @@ public:
    * tests/canary_diff.py. Reading a powered-down chip yields garbage or throws;
    * interpreting that is the caller's job. No-op where unsupported (default). */
   virtual void DumpChipState() {}
+  /* The MAC's TX-DMA fault latch, for a caller that needs to know its
+   * transmitter has stopped.
+   *
+   * This is not a statistic. The vendor driver treats ANY nonzero value as a
+   * fatal TXDMA error and answers it with a MAC silent reset
+   * (core/rtw_sreset.c, hal/rtl8822c/rtl8822c_ops.c in the rtl88x2cu tree);
+   * once a bit here is set the part has stopped transmitting and will not
+   * resume on its own. Measured on an RTL8812CU under a sustained downlink
+   * load: 0x00040000, BIT_TXPKTBUF_REQ_ERR, latched while the receiver went
+   * on working perfectly.
+   *
+   * NOT FOR THE SEND PATH. This is a register read over USB - see the
+   * standing rule in CLAUDE.md that nothing reads a register per frame - so
+   * poll it on a supervisory cadence, not per transmission.
+   *
+   * THROWS on a failed USB transfer, like every register read. A poller must
+   * catch and skip that sample - on a busy bus these fail while the chip
+   * works on (the measured rate is in src/jaguar2/CLAUDE.md).
+   *
+   * Returns 0 where unsupported, which is indistinguishable from healthy:
+   * check HasTxDmaStatus() before reading a 0 as "no fault". */
+  virtual uint32_t GetTxDmaStatus() { return 0; }
+  /* True where GetTxDmaStatus reads the real latch (Jaguar2, Jaguar3). */
+  virtual bool HasTxDmaStatus() const { return false; }
+  /* The whole MAC register window, 0x0000..0x0FFF, printed in the SAME
+   * format as the rtl88x2cu vendor driver's /proc/.../mac_reg_dump - one
+   * line per 16 bytes, "0x%04x 0x%08x  0x%08x  0x%08x  0x%08x" - so a dump
+   * from each can be diffed line by line. A STATE diff: it cannot see a bit
+   * that bring-up sets late but needed early (the TX page-ring defect was
+   * found by diffing register WRITES from usbmon instead -
+   * docs/jaguar3-tx-ring.md). 1024 register reads over USB: diagnostic use
+   * only. No-op where unsupported. */
+  virtual void DumpMacRegisters() {}
+  /* Read the chip's internal packet memory through the debug window
+   * (REG_PKTBUF_DBG_CTRL + 0x8000..0x8FFF), a port of halmac read_buf_88xx.
+   * `sel` 0 = TX FIFO, 1 = the LLT (the linked list that chains TX pages).
+   * `offset` is in bytes from the start of that memory. Diagnostic: it
+   * borrows a shared debug window, so never call it on the send path; the
+   * window is restored on every exit, a throw included. Not serialised
+   * against another user of the window in the same process. The vendor's
+   * dump_fifo gates the RX clock around the same read; this does not, so a
+   * FIFO read with RX running is a snapshot of moving memory.
+   * Throws on a failed USB transfer, like GetTxDmaStatus - catch it.
+   * PRECONDITIONS, refused with false: `offset` and `n` both multiples of 4,
+   * and the last window the read touches still inside the 12-bit window
+   * field of 0x0140. The size of the selected memory itself is NOT checked -
+   * reading past the end of the TX FIFO or LLT returns whatever the window
+   * maps there, so bound `offset + n` by the part's own sizes.
+   * Returns false where unsupported. */
+  virtual bool ReadPacketBuffer(int sel, uint32_t offset, uint8_t *out,
+                                size_t n) {
+    (void)sel; (void)offset; (void)out; (void)n;
+    return false;
+  }
   /* The MAC carrier-sense gate, one bit at a time.
    *
    * SetCcaMode is all-or-nothing, and on Jaguar1 and Jaguar3 it is two
@@ -245,10 +299,14 @@ protected:
   void busy_window_note_nhm_read() { _busy_window.note_nhm_read(); }
   void busy_window_note_retune() { _busy_window.note_retune(); }
 
-  /* Forget any armed window. Bring-up paths call it: a window armed before a
-   * re-Init describes a chip state that no longer exists, and leaving it
-   * armed would make the next unrelated GetChannelBusy() take the armed
-   * branch and report a stale period as if it were its own dwell. */
+  /* Forget any armed window. Bring-up AND teardown paths call it: a window
+   * armed before a re-Init — or before a Stop() — describes a chip state that
+   * no longer exists, and leaving it armed would make the next unrelated
+   * GetChannelBusy() take the armed branch and report a stale period as if it
+   * were its own dwell. Stop() is the half that is easy to miss, because
+   * clearing the flag with_ccx gates on does not stand in for it: on a
+   * backend whose retune re-runs bring-up, that flag comes straight back.
+   * See IRadio::ArmChannelBusy for the contract. */
   void busy_window_reset() { _busy_window = devourer::ClmWindow{}; }
 
   /* Serialises the CCX engine: the armed window's state, the arm/read, and

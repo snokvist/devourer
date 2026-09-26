@@ -1768,6 +1768,1667 @@ static int gate_ampdu(uint8_t chan, int count)
 	return 0;
 }
 
+/*
+ * Unicast TX cliff, bisected against a peer that actually answers.
+ *
+ * gate_ampdu above established that unicast collapses this part's transmit
+ * rate ~40x (3037 fps broadcast against 75 fps unicast, docs/mt7612u.md), and
+ * that neither txwi.ack_ctl's REQ bit nor the QoS No Ack policy prevents it.
+ * Both of those are host-side levers. The one variable they cannot change is
+ * whether an ACK comes back at all, and every arm measured so far addressed a
+ * peer that was never there.
+ *
+ * That matters now because a station's whole data plane is unicast to its AP.
+ * 75 fps is ~13.3 ms per frame; a single ACK timeout is tens of microseconds,
+ * so what is being measured is a retry ladder running to exhaustion - which
+ * should collapse to one ACK time the moment the first attempt is answered.
+ * This gate is what decides whether that reasoning survives contact.
+ *
+ * Five arms, one session, one channel, one rate, one frame size, so the
+ * comparison is internal and needs no cross-session calibration:
+ *
+ *   A  broadcast,            No Ack       the ceiling
+ *   B  unicast to nobody,    Normal Ack   the published cliff
+ *   C  unicast to nobody,    No Ack       the published cliff, other policy
+ *   D  unicast to the peer,  Normal Ack   THE QUESTION
+ *   E  unicast to the peer,  No Ack       separates the address from the ACK
+ *
+ * B and C are controls: until they reproduce the published cliff on this rig,
+ * D's number means nothing. wcid stays 0xff in every arm - the same no-station
+ * index the published table used - so addr1 and the ack policy are the only
+ * things that move.
+ *
+ * The peer is an independent radio armed as a hardware ACK responder for
+ * `peer` (an RTL8812AU running rxdemo with DEVOURER_ACK_RESPONDER). Air it on
+ * the same channel first. With no such peer armed, D and E degenerate into
+ * repeats of B and C, which is exactly what the gate reports.
+ *
+ * ch_busy corroborates: a MAC grinding through a retry ladder holds the
+ * channel busy far out of proportion to the frames it delivers.
+ */
+/*
+ * Arm V's receiver. An 802.11 ACK is FC 0xd4 0x00, duration, addr1 - ten
+ * bytes, and this part does not deliver the FCS, so `len` is 10 here rather
+ * than the 14 a Realtek witness reports. addr1 of an ACK is the address that
+ * solicited it, i.e. OUR addr2, which is what distinguishes our peer's ACKs
+ * from the ambient ACK traffic any busy channel carries.
+ */
+struct ucast_ack_count {
+	std::atomic<unsigned long> acks{0};
+	std::atomic<unsigned long> frames{0};
+	uint8_t ta[6];
+};
+
+static void ucast_rx_cb(void *user, const void *frame, size_t len,
+                        const struct mt7612u_rx_info *info)
+{
+	struct ucast_ack_count *c = (struct ucast_ack_count *)user;
+	const uint8_t *f = (const uint8_t *)frame;
+
+	(void)info;
+	c->frames.fetch_add(1, std::memory_order_relaxed);
+	if (len < 10 || len > 16) return;
+	if (f[0] != 0xd4 || f[1] != 0x00) return;
+	if (memcmp(f + 4, c->ta, 6) != 0) return;
+	c->acks.fetch_add(1, std::memory_order_relaxed);
+}
+
+static int parse_mac6(const char *s, uint8_t out[6])
+{
+	unsigned v[6];
+	int i;
+
+	if (!s) return -1;
+	if (sscanf(s, "%x:%x:%x:%x:%x:%x",
+	           &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6)
+		return -1;
+	for (i = 0; i < 6; i++) {
+		if (v[i] > 0xff) return -1;
+		out[i] = (uint8_t)v[i];
+	}
+	return 0;
+}
+
+static int gate_ucast(uint8_t chan, int secs, const char *peer_str, int bytes)
+{
+	/* Locally administered, and the same shape gate_ampdu used so the two
+	 * gates' numbers sit on the same axis. */
+	static const uint8_t src[6]  = { 0x02, 0x4d, 0x54, 0x76, 0x12, 0x01 };
+	static const uint8_t dead[6] = { 0x02, 0x4d, 0x54, 0x76, 0x12, 0x02 };
+	static const uint8_t bcast[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+	uint8_t peer[6] = { 0x02, 0x4d, 0x54, 0x76, 0x12, 0x0a };
+	static uint8_t frame[1600];
+	size_t flen;
+	struct mt7612u_link_stats ls;
+	struct mt_async_stats s0, s1;
+	unsigned io_before;
+	double ceiling = 0.0, cliff = 0.0, answered = 0.0;
+	long acks = 0, sent_v = 0;
+	double own_sa_fps = 0.0, own_sa_bcast = 0.0, sync_fps = 0.0;
+	double retry0_fps = 0.0, station_fps = 0.0;
+	/*
+	 * `own_sa` is the arm that matters most and the one the first draft of
+	 * this gate did not have. Every published measurement of the cliff - and
+	 * arms A-E here - transmits from an invented addr2 that is not the port
+	 * identity the MAC was brought up with. A real station transmits from its
+	 * OWN address. If the MAC treats a frame whose addr2 is not its own
+	 * differently, then the cliff is an artefact of injection and says
+	 * nothing about a station, which is the opposite conclusion from the one
+	 * arms A-E support. That is worth two extra arms.
+	 */
+	static const struct {
+		char tag; const uint8_t *a1; int no_ack; int own_sa; const char *what;
+	} arms[] = {
+		{ 'A', bcast, 1, 0, "broadcast,       No Ack" },
+		{ 'B', dead,  0, 0, "ucast nobody,    Normal" },
+		{ 'C', dead,  1, 0, "ucast nobody,    No Ack" },
+		{ 'D', peer,  0, 0, "ucast PEER,      Normal" },
+		{ 'E', peer,  1, 0, "ucast PEER,      No Ack" },
+		{ 'F', peer,  0, 1, "ucast PEER, ownSA Normal" },
+		{ 'G', bcast, 1, 1, "broadcast,  ownSA No Ack" },
+	};
+
+	if (secs <= 0) {
+		printf("GATE UCAST: FAIL - seconds per arm must be positive\n");
+		return 2;
+	}
+	/* The published bisect table is ~1400-byte frames: its 75 fps / 0.83
+	 * Mbit/s unicast row only closes at 1383 bytes, and its 3037 fps /
+	 * 34.01 Mbit/s broadcast row at 1400. A first draft of this gate used
+	 * gate_ampdu's 48-byte arms, which is a DIFFERENT measurement, and its
+	 * numbers were not on the published axis at all. Default to 1400. */
+	if (bytes < 40 || (size_t)bytes > sizeof frame) {
+		printf("GATE UCAST: FAIL - frame bytes must be 40..%zu\n", sizeof frame);
+		return 2;
+	}
+	flen = (size_t)bytes;
+	if (peer_str && parse_mac6(peer_str, peer)) {
+		printf("GATE UCAST: FAIL - bad peer MAC '%s'\n", peer_str);
+		return 2;
+	}
+	if (peer[0] & 0x01) {
+		printf("GATE UCAST: FAIL - peer %02x:%02x:%02x:%02x:%02x:%02x is "
+		       "multicast; a responder cannot ACK it\n",
+		       peer[0], peer[1], peer[2], peer[3], peer[4], peer[5]);
+		return 2;
+	}
+
+	if (mt_eeprom_init(&dev)) return 1;
+	if (mt_init_hardware(&dev, NULL)) return 1;
+	if (mt_set_channel(&dev, chan, MT7612U_BW_20)) return 1;
+	if (mt_mac_start(&dev, MT_RX_DRAIN_NONE)) return 1;
+	if (mt_async_start(&dev, NULL, NULL)) return 1;
+	mt7612u_link_stats_start(&dev);
+
+	printf("chan %u, HT MCS7 BW20, %zu-byte QoS data, wcid 0xff, %d s per arm\n",
+	       chan, flen, secs);
+	printf("io errors after bring-up: %u  (a nonzero count here means the "
+	       "channel set was degraded; re-run)\n", mt_io_errors(&dev));
+	printf("peer %02x:%02x:%02x:%02x:%02x:%02x  (arm this address as an ACK "
+	       "responder on another radio)\n\n",
+	       peer[0], peer[1], peer[2], peer[3], peer[4], peer[5]);
+	printf("  arm  %-24s %8s %10s %8s  %s\n", "configuration", "fps",
+	       "Mbit/s", "busy%", "done/err");
+
+	for (unsigned a = 0; a < sizeof arms / sizeof arms[0]; a++) {
+		struct mt7612u_tx_rate rate = { };
+		double t0, wall, fps, busy = -1.0;
+		long n = 0;
+
+		rate.phy = MT7612U_PHY_HT;
+		rate.mcs = 7;
+		rate.nss = 1;
+		rate.bw = MT7612U_BW_20;
+		rate.no_ack = (unsigned)arms[a].no_ack;
+
+		memset(frame, 0, sizeof frame);
+		frame[0] = 0x88;                        /* QoS Data */
+		frame[1] = 0x00;
+		{
+			const uint8_t *sa = arms[a].own_sa ? dev.macaddr : src;
+
+			memcpy(frame + 4,  arms[a].a1, 6);  /* addr1 */
+			memcpy(frame + 10, sa, 6);          /* addr2 */
+			memcpy(frame + 16, sa, 6);          /* addr3 */
+		}
+		/* QoS Control bits 6:5 - 00 Normal Ack, 01 No Ack. The txwi
+		 * no_ack flag above and this byte are separate levers and the
+		 * arms move them together on purpose: the published result is
+		 * that neither alone changes anything. */
+		frame[24] = arms[a].no_ack ? 0x20 : 0x00;
+		frame[25] = 0x00;
+		memcpy(frame + 26, "MT7612U-UCAST", 13);
+		frame[40] = (uint8_t)arms[a].tag;
+		io_before = mt_io_errors(&dev);
+
+		/* Discard whatever the previous arm left in the counters; each
+		 * read is an interval, so this one is the barrier. */
+		mt7612u_link_stats(&dev, &ls);
+		mt_async_stats(&dev, &s0);
+
+		t0 = now_ms();
+		while (now_ms() - t0 < secs * 1000.0 && !g_stop) {
+			frame[22] = (uint8_t)((n & 0xf) << 4);
+			frame[23] = (uint8_t)(n >> 4);
+			if (mt_tx_raw(&dev, frame, flen, &rate, 0xff, 0) == 0)
+				n++;
+		}
+		wall = now_ms() - t0;
+		mt_async_stats(&dev, &s1);
+		if (mt7612u_link_stats(&dev, &ls) == 0 && (ls.ch_busy + ls.ch_idle))
+			busy = 100.0 * ls.ch_busy / (double)(ls.ch_busy + ls.ch_idle);
+		fps = n * 1000.0 / wall;
+
+		/* submitted/done/err, not just fps. mt_async_tx_submit() BLOCKS
+		 * on a full 16-slot ring, so in steady state the submit rate IS
+		 * the completion rate - but a completion can be a 1000 ms URB
+		 * timeout as easily as a transmitted frame, and those two mean
+		 * opposite things. Without this column the arm cannot tell a MAC
+		 * that transmits slowly from a bulk-OUT endpoint that stalls. */
+		printf("  %c    %-24s %8.0f %10.2f %7.1f  %6llu/%-6llu%s%s\n",
+		       arms[a].tag, arms[a].what, fps,
+		       n * flen * 8.0 / wall / 1000.0,
+		       busy < 0 ? 0.0 : busy,
+		       (unsigned long long)(s1.tx_done - s0.tx_done),
+		       (unsigned long long)(s1.tx_err - s0.tx_err),
+		       busy < 0 ? " busy-n/a" : "",
+		       mt_io_errors(&dev) != io_before ? "   IO-ERRORS" : "");
+
+		if (arms[a].tag == 'A') ceiling = fps;
+		if (arms[a].tag == 'B') cliff = fps;
+		if (arms[a].tag == 'D') answered = fps;
+		if (arms[a].tag == 'F') own_sa_fps = fps;
+		if (arms[a].tag == 'G') own_sa_bcast = fps;
+
+		if (g_stop) break;
+		mt_usleep(200000);
+	}
+
+	/*
+	 * Arm R - the same frame with the RETRY LADDER DISABLED.
+	 *
+	 * This is the arm that decides the whole question, and the first draft
+	 * of the gate did not have it because the write-up had already talked
+	 * itself out of the retry-ladder explanation without doing the
+	 * arithmetic. The arithmetic, from the values this driver actually
+	 * programs:
+	 *
+	 *   MT_TX_RETRY_CFG = 0x47f01f0f (initvals.h) -> SHORT_RTY_LIMIT 15, and
+	 *   the 1400-byte MPDU is under the 2032-byte LONG_RTY_THRE, so 15 is
+	 *   the limit that applies. MT_WMM_CWMIN/CWMAX = 0x2344/0x34aa
+	 *   (init.cpp) -> AC_BE CWmin 15, CWmax 1023. At a 9 us 5 GHz slot the
+	 *   mean backoff over a ladder doubling 15,31,...,1023 sums to ~45.9 ms.
+	 *
+	 * Measured unicast: 45.5 ms per frame. So before blaming anything else,
+	 * remove the ladder and see if the cliff goes with it.
+	 */
+	{
+		struct mt7612u_tx_rate rate = { };
+		uint32_t saved = 0;
+		int have_saved = (mt_rr_chk(&dev, MT_TX_RETRY_CFG, &saved) == 0);
+		double t0, wall;
+		long n = 0;
+
+		if (!have_saved) {
+			printf("  R    (skipped - could not read MT_TX_RETRY_CFG)\n");
+		} else {
+			/* Keep every other field; zero only the two retry limits. */
+			mt_wr(&dev, MT_TX_RETRY_CFG, saved & 0xffff0000u);
+
+			rate.phy = MT7612U_PHY_HT;
+			rate.mcs = 7;
+			rate.nss = 1;
+			rate.bw = MT7612U_BW_20;
+
+			memset(frame, 0, sizeof frame);
+			frame[0] = 0x88;
+			memcpy(frame + 4,  peer, 6);
+			memcpy(frame + 10, dev.macaddr, 6);
+			memcpy(frame + 16, dev.macaddr, 6);
+			frame[24] = 0x00;
+			memcpy(frame + 26, "MT7612U-UCAST-R", 15);
+
+			t0 = now_ms();
+			while (now_ms() - t0 < secs * 1000.0 && !g_stop) {
+				frame[22] = (uint8_t)((n & 0xf) << 4);
+				frame[23] = (uint8_t)(n >> 4);
+				if (mt_tx_raw(&dev, frame, flen, &rate, 0xff, 0) == 0) n++;
+			}
+			wall = now_ms() - t0;
+			retry0_fps = n * 1000.0 / wall;
+			printf("  R    ucast PEER, ownSA, RETRIES=0     %8.0f fps  "
+			       "(MT_TX_RETRY_CFG 0x%08x -> 0x%08x)\n",
+			       retry0_fps, saved, saved & 0xffff0000u);
+			mt_wr(&dev, MT_TX_RETRY_CFG, saved);
+		}
+	}
+
+	mt_async_stop(&dev);
+
+	/*
+	 * Arm S - the same frame with NO async ring.
+	 *
+	 * Arms A-G all ride mt_async_tx_submit(), which blocks once all 16 ring
+	 * slots are in flight and gives each transfer a 1000 ms timeout
+	 * (async.cpp). Sixteen slots retiring on timeout is ~16-32 completions a
+	 * second, which is the same order as the 22 fps those arms report - so
+	 * the ring is a candidate explanation for the whole result, and it is a
+	 * hidden choice the first draft of this gate never disclosed.
+	 *
+	 * With d->a cleared, mt_tx_raw() takes the synchronous path: one bulk
+	 * write, 500 ms, a short write or an error reported per call (tx.cpp).
+	 * If arm S is fast, the cliff was the ring. If arm S is equally slow and
+	 * its writes succeed, the MAC really is servicing unicast at this rate.
+	 */
+	{
+		struct mt7612u_tx_rate rate = { };
+		double t0, wall;
+		long n = 0, fail = 0;
+
+		rate.phy = MT7612U_PHY_HT;
+		rate.mcs = 7;
+		rate.nss = 1;
+		rate.bw = MT7612U_BW_20;
+
+		memset(frame, 0, sizeof frame);
+		frame[0] = 0x88;
+		memcpy(frame + 4,  peer, 6);
+		memcpy(frame + 10, dev.macaddr, 6);
+		memcpy(frame + 16, dev.macaddr, 6);
+		frame[24] = 0x00;
+		memcpy(frame + 26, "MT7612U-UCAST-S", 15);
+
+		t0 = now_ms();
+		while (now_ms() - t0 < secs * 1000.0 && !g_stop) {
+			frame[22] = (uint8_t)((n & 0xf) << 4);
+			frame[23] = (uint8_t)(n >> 4);
+			if (mt_tx_raw(&dev, frame, flen, &rate, 0xff, 0) == 0) n++;
+			else fail++;
+		}
+		wall = now_ms() - t0;
+		sync_fps = n * 1000.0 / wall;
+		printf("  S    ucast PEER, ownSA, SYNC (no ring)  %.0f fps, "
+		       "%ld ok / %ld failed\n", sync_fps, n, fail);
+	}
+
+	mt_mac_stop(&dev);
+
+	if (g_stop) {
+		printf("\nGATE UCAST: INTERRUPTED - no verdict\n");
+		return 3;
+	}
+
+	/*
+	 * Arm V - was the peer ACKing at all?
+	 *
+	 * Without this the gate's FAIL verdict is unfalsifiable: a peer that is
+	 * off channel, unarmed, or deaf produces exactly the same number as a
+	 * MAC whose cliff genuinely survives being answered, and the operator is
+	 * left to take it on trust. So repeat arm D with the receiver up and
+	 * count the ACKs addressed to our own addr2.
+	 *
+	 * It is a SEPARATE arm, not the RX ring left on through A-E, because the
+	 * ring costs USB bandwidth and CPU that would land on the throughput
+	 * numbers the published table is being compared against. Arm V's fps is
+	 * therefore NOT comparable with arm D's; only its ACK count is evidence.
+	 *
+	 * Ordering is the wedge rule from Mt7612uRadio's header, and it is not
+	 * negotiable: the ring must be draining EP 4 BEFORE MAC RX comes on.
+	 * Then the monitor filter, because the managed value mt_mac_start()
+	 * leaves drops frames not addressed to the port identity - and the ACKs
+	 * are addressed to the injected addr2, not to the factory MAC.
+	 */
+	{
+		static struct ucast_ack_count ctr;
+		struct mt7612u_tx_rate rate = { };
+		double t0, wall;
+		long n = 0;
+
+		/* The TA must be the PORT IDENTITY, not the invented src. This MAC
+		 * matches an inbound ACK's addr1 against MT_MAC_ADDR_DW0/DW1; with
+		 * a foreign addr2 the ACK is counted on the host ring but rejected
+		 * by the MAC, so the ladder runs to exhaustion anyway and the arm
+		 * tests nothing about ACK termination. The first draft used `src`
+		 * and was therefore structurally unable to measure its own claim. */
+		memcpy(ctr.ta, dev.macaddr, 6);
+		rate.phy = MT7612U_PHY_HT;
+		rate.mcs = 7;
+		rate.nss = 1;
+		rate.bw = MT7612U_BW_20;
+		rate.no_ack = 0;
+
+		memset(frame, 0, sizeof frame);
+		frame[0] = 0x88;
+		memcpy(frame + 4,  peer, 6);
+		memcpy(frame + 10, dev.macaddr, 6);
+		memcpy(frame + 16, dev.macaddr, 6);
+		frame[24] = 0x00;                  /* Normal Ack, as arm D */
+		memcpy(frame + 26, "MT7612U-STATION", 15);
+
+		if (mt_mac_start(&dev, MT_RX_DRAIN_NONE)) return 1;
+		if (mt_async_start(&dev, ucast_rx_cb, &ctr)) { mt_mac_stop(&dev); return 1; }
+		if (mt_mac_start(&dev, MT_RX_DRAIN_RING)) {
+			mt_async_stop(&dev); mt_mac_stop(&dev); return 1;
+		}
+		mt7612u_set_monitor_rx(&dev, 0);
+
+		t0 = now_ms();
+		while (now_ms() - t0 < secs * 1000.0 && !g_stop) {
+			frame[22] = (uint8_t)((n & 0xf) << 4);
+			frame[23] = (uint8_t)(n >> 4);
+			if (mt_tx_raw(&dev, frame, flen, &rate, 0xff, 0) == 0)
+				n++;
+		}
+		wall = now_ms() - t0;
+		acks = (long)ctr.acks.load(std::memory_order_relaxed);
+		sent_v = n;
+		station_fps = n * 1000.0 / wall;
+		printf("  T    ucast PEER, ownSA, MAC RX ON   %8.0f fps  "
+		       "%ld sent, %ld ACKs to our TA, %lu frames seen\n",
+		       station_fps, n, acks,
+		       ctr.frames.load(std::memory_order_relaxed));
+		mt_async_stop(&dev);
+		mt_mac_stop(&dev);
+	}
+
+	if (sent_v > 0 && acks == 0) {
+		printf("\nGATE UCAST: VOID - no ACK to our TA was OBSERVED (%ld frames "
+		       "sent). Either the peer did not answer or this receiver did not "
+		       "deliver the control frames - the two are indistinguishable from "
+		       "here. Check the responder is armed on channel %u, and that "
+		       "arm V's frames-seen count is nonzero, before re-running.\n",
+		       sent_v, chan);
+		return 3;
+	}
+	if (ceiling <= 0.0 || cliff <= 0.0) {
+		printf("\nGATE UCAST: FAIL - a control arm aired nothing; no "
+		       "conclusion about the peer arm\n");
+		return 1;
+	}
+	/* The controls have to behave before D is allowed to mean anything: the
+	 * published cliff is ~40x, so anything under 5x says this rig is not
+	 * reproducing the phenomenon under test. */
+	if (ceiling / cliff < 5.0) {
+		printf("\nGATE UCAST: INCONCLUSIVE - the control cliff is only "
+		       "%.1fx (published ~40x); this rig does not reproduce it, "
+		       "so arm D measures nothing\n", ceiling / cliff);
+		return 3;
+	}
+	printf("\n  ceiling A %.0f, own-SA bcast control G %.0f, cliff B %.0f (%.0fx),\n"
+	       "  peer D %.0f, own-SA peer F %.0f, retries=0 R %.0f, sync S %.0f,\n"
+	       "  STATION CONFIG T %.0f fps (%ld ACKs)\n",
+	       ceiling, own_sa_bcast, cliff, ceiling / cliff, answered, own_sa_fps,
+	       retry0_fps, sync_fps, station_fps, acks);
+
+	/* Graded against arm G, the matched control: own-SA broadcast. Arm A is
+	 * foreign-SA and swings 50% run to run, so it is the wrong denominator
+	 * for an own-SA arm. */
+	{
+		const double ctrl = own_sa_bcast > 0.0 ? own_sa_bcast : ceiling;
+
+		if (station_fps >= 0.5 * ctrl) {
+			printf("GATE UCAST: PASS - the STATION configuration (own address, "
+			       "MAC receiver on, answering peer) runs at %.0f%% of its "
+			       "matched control. The cliff is a property of TX-only "
+			       "injection, not of a station.\n", 100.0 * station_fps / ctrl);
+			return 0;
+		}
+		if (retry0_fps >= 0.5 * ctrl) {
+			printf("GATE UCAST: EXPLAINED - the station configuration is still "
+			       "slow (%.0f fps), but zeroing the retry limits lifts unicast "
+			       "to %.0f fps against a %.0f control. The cliff IS the retry "
+			       "ladder; the open question is why the ACK does not "
+			       "terminate it.\n", station_fps, retry0_fps, ctrl);
+			return 1;
+		}
+	}
+	/* Checked BEFORE the D verdict: if transmitting from the port identity
+	 * lifts the cliff, then arms A-E measured injection from a foreign
+	 * address, and a station - which never does that - is unaffected. */
+	if (own_sa_fps >= 0.5 * ceiling) {
+		printf("GATE UCAST: PASS - unicast from the PORT IDENTITY runs at "
+		       "%.0f%% of the ceiling (%.0f fps) while unicast from an "
+		       "injected addr2 sits at %.0f fps. The cliff is an artefact of "
+		       "foreign-SA injection; a station transmits from its own "
+		       "address and is not subject to it.\n",
+		       100.0 * own_sa_fps / ceiling, own_sa_fps, answered);
+		return 0;
+	}
+	if (answered >= 0.5 * ceiling) {
+		printf("GATE UCAST: PASS - an answering peer recovers unicast "
+		       "(%.0f%% of the broadcast ceiling). A station data plane "
+		       "is viable on this part.\n", 100.0 * answered / ceiling);
+		return 0;
+	}
+	if (answered <= 2.0 * cliff) {
+		printf("GATE UCAST: FAIL - the cliff survives an answering peer "
+		       "(%.0f fps against a %.0f fps cliff). Arm V observed %ld ACKs "
+		       "addressed to our TA, so the PEER emitted them; whether this "
+		       "MAC consumed them is NOT tested here. Sync-path arm S ran at "
+		       "%.0f fps.\n", answered, cliff, acks, sync_fps);
+		return 1;
+	}
+	printf("GATE UCAST: INCONCLUSIVE - arm D landed between the ceiling and "
+	       "the cliff (%.0f fps). That needs an explanation, not a rerun.\n",
+	       answered);
+	return 3;
+}
+
+/*
+ * gate_txs - read the retry count off the chip instead of arguing about it.
+ *
+ * docs/station-mode-phase0.md closed its argument with arithmetic: 15 retries
+ * from MT_TX_RETRY_CFG, CWmin 15 / CWmax 1023 from MT_WMM_CWMIN/CWMAX, a 9 us
+ * slot, summing to ~46 ms against 45.5 ms measured. That is a good fit, and it
+ * is still an inference. The MAC counts the retries itself; nothing in this
+ * tree had ever asked it.
+ *
+ * Two questions this answers directly:
+ *
+ *  1. Does the ladder run to exhaustion when no ACK can arrive? Expect a retry
+ *     count near the 15 limit with SUCCESS clear.
+ *  2. Why do the No-Ack arms (txwi ACK_CTL_REQ clear AND QoS Ack Policy = No
+ *     Ack) still sit far below the broadcast ceiling instead of at it? If their
+ *     entries show retries, the no-ack request is not reaching the retry engine
+ *     - a devourer-side defect. If they show retry 0, the cost is elsewhere and
+ *     the ladder is not the explanation for those arms.
+ *
+ * Frames go out ONE AT A TIME with the FIFO drained between them. At the
+ * ~20-60 fps these configurations run, a drain costs nothing next to a 45 ms
+ * frame, and an entry cannot be attributed to the wrong arm. The status FIFO is
+ * shallow and mt76 polls it, so batch-then-drain would lose most of it.
+ */
+struct txs_sum {
+	long entries, success, retry_total, retry_max;
+};
+
+static void txs_drain(struct mt7612u_dev *d, struct txs_sum *o)
+{
+	int guard;
+
+	/* Bounded: a stuck VALID bit must not become an infinite loop inside a
+	 * gate holding the only USB lock for this adapter. */
+	for (guard = 0; guard < 64; guard++) {
+		uint32_t st = 0, ext = 0;
+		long r;
+
+		if (mt_rr_chk(d, MT_TX_STAT_FIFO, &st)) return;
+		if (!(st & MT_TX_STAT_FIFO_VALID)) return;
+		/* Read order matters: the EXT half describes the entry the main
+		 * read just popped (mt76x02_mac_load_tx_status). */
+		if (mt_rr_chk(d, MT_TX_STAT_FIFO_EXT, &ext)) return;
+		o->entries++;
+		if (st & MT_TX_STAT_FIFO_SUCCESS) o->success++;
+		r = (long)FIELD_GET(MT_TX_STAT_FIFO_EXT_RETRY, ext);
+		o->retry_total += r;
+		if (r > o->retry_max) o->retry_max = r;
+	}
+}
+
+/* ---------------------------------------------------------------- gate_sta
+ *
+ * R5: what does the BSSID programming actually do for a MANAGED STATION on
+ * this MAC? docs/station-mode-scope.md says in as many words that this is
+ * unmeasured, and that Phase 2 must answer it BY MEASUREMENT rather than
+ * assume a failure mode. This gate is that measurement.
+ *
+ * What is already known and is NOT re-derived here:
+ *   - On the AP side a wrong APC slot was silent: "beacons perfectly,
+ *     acknowledges nobody" (docs/mt7612u-ap-mode.md finding 2).
+ *   - The obvious extrapolation to a station is WRONG, but NOT for the reason
+ *     an earlier version of this comment gave. It argued that bit 3
+ *     (OTHER_BSS) is clear in the managed value 0x00015f97, so other-BSS
+ *     frames are accepted and a wrong slot cannot deafen a station. Bit **2**
+ *     (PROMISC) is SET in that value, and in mt76 bit 2 is the one mapped to
+ *     FIF_OTHER_BSS - init.cpp:552 describes 0x00015f97 as dropping exactly
+ *     what that argument said it accepted. Reading bit 3 alone is how this
+ *     gate came to overwrite the filter it was supposed to be testing under.
+ *     Do not reason about this register from one bit.
+ *
+ *     The extrapolation is wrong for a plainer reason: the AP-side finding's
+ *     own words are "beacons perfectly, ACKNOWLEDGES nobody", so it is about
+ *     acknowledgement, not reception. And the answer here is now measured
+ *     rather than argued - see docs/mt7612u-station-identity.md.
+ *   - The auto-response engine matches address 1 against MT_MAC_ADDR, which
+ *     init leaves at the factory address, so a station should auto-ACK its own
+ *     unicast with no call at all (R6). NO ARM HERE TOUCHES MT_MAC_ADDR -
+ *     moving it is precisely what would break ACK for our own traffic, and is
+ *     why the IRadio seam is SetStationIdentity and not SetAckResponder.
+ *
+ * So the open question is narrow: does programming the joined BSSID anywhere
+ * change what a station RECEIVES, and is a wrong value silent, harmless, or
+ * fatal?
+ *
+ * WHAT THIS GATE CANNOT SEE. It counts RX only. Whether the MAC auto-ACKed is
+ * a property of what the AP observed, not of what we received, and this
+ * process cannot ask. Do NOT read a healthy RX arm as evidence about ACKing -
+ * conflating "I received it" with "I acknowledged it" is exactly the mistake
+ * the AP harness's auto-ACK check made and carried for months.
+ *
+ *   bringup sta <chan> <secs-per-arm> <ap-bssid>
+ */
+struct sta_rx_count {
+	std::atomic<unsigned long> total{0};     /* every frame off the ring */
+	std::atomic<unsigned long> from_bss{0};  /* addr2 == the AP          */
+	std::atomic<unsigned long> to_us{0};     /* addr1 == our own MAC     */
+	std::atomic<unsigned long> to_us_data{0};
+	std::atomic<unsigned long> beacons{0};
+	uint8_t bssid[6];
+	uint8_t own[6];
+};
+
+static void sta_rx_cb(void *user, const void *frame, size_t len,
+                      const struct mt7612u_rx_info *info)
+{
+	struct sta_rx_count *c = (struct sta_rx_count *)user;
+	const uint8_t *f = (const uint8_t *)frame;
+
+	(void)info;
+	c->total.fetch_add(1, std::memory_order_relaxed);
+	if (len < 24) return;
+
+	/* addr1 at 4, addr2 at 10, addr3 at 16 - true for every non-4-address
+	 * frame, which is all an infrastructure station ever sees. */
+	if (memcmp(f + 10, c->bssid, 6) == 0)
+		c->from_bss.fetch_add(1, std::memory_order_relaxed);
+	if (memcmp(f + 4, c->own, 6) == 0) {
+		c->to_us.fetch_add(1, std::memory_order_relaxed);
+		if ((f[0] & 0x0c) == 0x08)
+			c->to_us_data.fetch_add(1, std::memory_order_relaxed);
+	}
+	if (f[0] == 0x80 && memcmp(f + 16, c->bssid, 6) == 0)
+		c->beacons.fetch_add(1, std::memory_order_relaxed);
+}
+
+/* mt76's APC slot derivation (mt76x02_util.c:310): for a locally administered
+ * address, idx = 1 + (((mbss_base[0] ^ addr[0]) >> 2) & 7); 0 otherwise. */
+static int sta_apc_idx(const uint8_t *base, const uint8_t *addr)
+{
+	if (!(addr[0] & 0x02))
+		return 0;
+	/* & 7 after the +1, as mt76 and this tree's own mt_ap_set_bssid() both
+	 * do. Without it the expression reaches 8, and slot 8 is off the end of
+	 * an 8-entry table: the write lands at 0x10d0 while the hardware
+	 * consults slot 0, and the arm becomes a silent no-op that still prints
+	 * a plausible slot number. */
+	return (1 + (((base[0] ^ addr[0]) >> 2) & 7)) & 7;
+}
+
+/* Local copies: beacon.cpp's equivalents are static to that file. */
+static int sta_set_bss_base(struct mt7612u_dev *d, const uint8_t *a)
+{
+	const uint32_t dw0 = (uint32_t)a[0] | ((uint32_t)a[1] << 8) |
+	                     ((uint32_t)a[2] << 16) | ((uint32_t)a[3] << 24);
+	const uint32_t dw1 = (uint32_t)a[4] | ((uint32_t)a[5] << 8);
+
+	if (mt_wr_chk(d, MT_MAC_BSSID_DW0, dw0))
+		return -1;
+	return mt_rmw(d, MT_MAC_BSSID_DW1, MT_MAC_BSSID_DW1_ADDR, dw1);
+}
+
+/* Read a slot back into `out`. docs/station-mode-scope.md's R5 asked for this
+ * from the start - "whatever the arm path does it should read the slot back" -
+ * and the first three revisions of this gate did not, so arm F could have been
+ * writing a slot the hardware never consults and the table would have looked
+ * identical either way. */
+static int sta_read_apc(struct mt7612u_dev *d, int idx, uint8_t *out)
+{
+	uint32_t lo = 0, hi = 0;
+
+	if (mt_rr_chk(d, MT_MAC_APC_BSSID_L(idx), &lo) ||
+	    mt_rr_chk(d, MT_MAC_APC_BSSID_H(idx), &hi))
+		return -1;
+	out[0] = (uint8_t)(lo & 0xff);
+	out[1] = (uint8_t)((lo >> 8) & 0xff);
+	out[2] = (uint8_t)((lo >> 16) & 0xff);
+	out[3] = (uint8_t)((lo >> 24) & 0xff);
+	out[4] = (uint8_t)(hi & 0xff);
+	out[5] = (uint8_t)((hi >> 8) & 0xff);
+	return 0;
+}
+
+/* The slot-0 high register's BIT(16) is MT_MAC_APC_BSSID0_H_EN upstream in
+ * mt76; this tree has never defined it, and no arm has ever set it. If a
+ * per-slot enable is real on this part then every "slot programmed" arm may
+ * have written a slot the engine was not consulting - which would make R5's
+ * null result mean something much weaker than it appears to. The gate cannot
+ * settle that, but it CAN report the bit rather than leave it unmentioned. */
+static uint32_t sta_apc_high_raw(struct mt7612u_dev *d, int idx)
+{
+	uint32_t hi = 0;
+
+	mt_rr_chk(d, MT_MAC_APC_BSSID_H(idx), &hi);
+	return hi;
+}
+
+static int sta_write_apc(struct mt7612u_dev *d, int idx, const uint8_t *a)
+{
+	const uint32_t lo = (uint32_t)a[0] | ((uint32_t)a[1] << 8) |
+	                    ((uint32_t)a[2] << 16) | ((uint32_t)a[3] << 24);
+	const uint32_t hi = (uint32_t)a[4] | ((uint32_t)a[5] << 8);
+
+	if (mt_wr_chk(d, MT_MAC_APC_BSSID_L(idx), lo))
+		return -1;
+	return mt_rmw(d, MT_MAC_APC_BSSID_H(idx), MT_MAC_APC_BSSID_H_ADDR, hi);
+}
+
+static int gate_sta(uint8_t chan, int secs, const char *bssid_str)
+{
+	static const uint8_t wrong[6] = { 0x02, 0x00, 0x00, 0xde, 0xad, 0x01 };
+	static struct sta_rx_count ctr;
+	uint8_t bssid[6];
+	unsigned long base_bss = 0, base_bcn = 0;
+	int any_beacon = 0;
+
+	static const struct {
+		char tag; int mbss; int apc_derived; int apc0; int bad;
+		const char *what;
+	} arms[] = {
+		{ 'A', 0, 0, 0, 0, "init only - nothing programmed" },
+		{ 'B', 1, 0, 0, 0, "MT_MAC_BSSID = AP" },
+		{ 'C', 0, 0, 1, 0, "APC slot 0 = AP" },
+		{ 'D', 0, 1, 0, 0, "APC slot (mt76 rule) = AP" },
+		{ 'E', 1, 1, 0, 0, "MT_MAC_BSSID + derived slot = AP" },
+		{ 'F', 1, 1, 0, 1, "both programmed WRONG (is it silent?)" },
+	};
+
+	if (parse_mac6(bssid_str, bssid)) {
+		printf("GATE STA: FAIL - need the AP's BSSID, e.g.\n"
+		       "  bringup sta 6 20 02:42:75:05:d6:00\n");
+		return 2;
+	}
+	if (bssid[0] & 0x01) {
+		printf("GATE STA: FAIL - %02x:%02x:%02x:%02x:%02x:%02x is multicast\n",
+		       bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
+		return 2;
+	}
+
+	if (mt_eeprom_init(&dev)) return 1;
+	if (mt_init_hardware(&dev, NULL)) return 1;
+	if (mt_set_channel(&dev, chan, MT7612U_BW_20)) return 1;
+
+	printf("=== GATE STA: what the BSSID registers do for a managed station ===\n");
+	printf("chan %u, %d s per arm, AP %02x:%02x:%02x:%02x:%02x:%02x, "
+	       "own %02x:%02x:%02x:%02x:%02x:%02x\n",
+	       chan, secs, bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5],
+	       dev.macaddr[0], dev.macaddr[1], dev.macaddr[2],
+	       dev.macaddr[3], dev.macaddr[4], dev.macaddr[5]);
+	printf("RX ONLY - whether the MAC auto-ACKed is not visible from here.\n");
+	printf("No arm touches MT_MAC_ADDR (R6).\n\n");
+	printf("  arm  %-38s %5s %8s %8s %7s %8s\n",
+	       "configuration", "slot", "rx_total", "from_bss", "beacons", "to_us");
+
+	for (unsigned a = 0; a < sizeof arms / sizeof arms[0]; a++) {
+		const uint8_t *want = arms[a].bad ? wrong : bssid;
+		int derived = sta_apc_idx(dev.macaddr, want);
+		uint32_t dw0 = 0, dw1 = 0, filtr = 0, apc_hi = 0;
+		uint8_t apc_rb[6] = { 0 };
+		int wrote_slot = -1, apc_ok = 1, apc_read_ok = 0;
+		double t0;
+
+		memcpy(ctr.bssid, bssid, 6);
+		memcpy(ctr.own, dev.macaddr, 6);
+		ctr.total = 0; ctr.from_bss = 0; ctr.to_us = 0;
+		ctr.to_us_data = 0; ctr.beacons = 0;
+
+		/* Put BOTH register families back to their init state, so an arm
+		 * cannot inherit its predecessor's. Resetting only the MBSS base
+		 * was not enough: mac_setaddr() zeroes the eight APC slots once at
+		 * init and never again, so arm C's correct slot 0 was still live
+		 * during arm F - which claimed to have "both programmed WRONG"
+		 * while the right answer sat in the slot next door. */
+		sta_set_bss_base(&dev, dev.macaddr);
+		for (int z = 0; z < 8; z++) {
+			mt_wr(&dev, MT_MAC_APC_BSSID_L(z), 0);
+			mt_rmw(&dev, MT_MAC_APC_BSSID_H(z), MT_MAC_APC_BSSID_H_ADDR, 0);
+		}
+
+		if (arms[a].mbss) sta_set_bss_base(&dev, want);
+		if (arms[a].apc0) {
+			wrote_slot = 0;
+			apc_ok = (sta_write_apc(&dev, 0, want) == 0);
+		}
+		if (arms[a].apc_derived) {
+			wrote_slot = derived;
+			apc_ok = (sta_write_apc(&dev, derived, want) == 0);
+		}
+
+		if (mt_mac_start(&dev, MT_RX_DRAIN_NONE)) return 1;
+		if (mt_async_start(&dev, sta_rx_cb, &ctr)) { mt_mac_stop(&dev); return 1; }
+		/* The RECEIVER must be on. This is the whole lesson of Phase 0,
+		 * where every arm ran with ENABLE_RX clear and the gate was
+		 * structurally unable to test its own claim. */
+		if (mt_mac_start(&dev, MT_RX_DRAIN_RING)) {
+			mt_async_stop(&dev); mt_mac_stop(&dev); return 1;
+		}
+		/*
+		 * DO NOT call mt7612u_set_monitor_rx() here.
+		 *
+		 * The first version of this gate did, with the comment "managed
+		 * filter, not monitor" - which is exactly inverted. That function
+		 * writes MT_RX_FILTR_CFG = PHY_ERR|CRC_ERR and nothing else; its
+		 * own doc says it "clears everything except the two error
+		 * classes", i.e. it turns every address and BSS drop bit OFF.
+		 * Every arm therefore ran PROMISCUOUS, the hardware never
+		 * consulted MT_MAC_BSSID or the APC table to decide acceptance,
+		 * and six identical arms were guaranteed before the dwell began.
+		 * The null result that produced was a tautology, and it was the
+		 * Phase 0 defect again: a gate unable to test its own claim,
+		 * two lines below a comment congratulating itself about Phase 0.
+		 *
+		 * What we want is what mt_mac_start() already left: 0x00015f97,
+		 * mt76's managed-station value. Leave it alone.
+		 */
+		mt_rr_chk(&dev, MT_RX_FILTR_CFG, &filtr);
+
+		mt_rr_chk(&dev, MT_MAC_BSSID_DW0, &dw0);
+		mt_rr_chk(&dev, MT_MAC_BSSID_DW1, &dw1);
+		/* Read the slot back AFTER the filter write, for the same reason
+		 * the BSSID registers are read here: anything written earlier
+		 * could have been overwritten since. */
+		if (wrote_slot >= 0) {
+			apc_read_ok = (sta_read_apc(&dev, wrote_slot, apc_rb) == 0);
+			apc_hi = sta_apc_high_raw(&dev, wrote_slot);
+		}
+
+		t0 = now_ms();
+		while (now_ms() - t0 < secs * 1000.0 && !g_stop)
+			usleep(20000);
+
+		mt_async_stop(&dev);
+		mt_mac_stop(&dev);
+
+		printf("  %c    %-38s %5d %8lu %8lu %7lu %8lu\n",
+		       arms[a].tag, arms[a].what, derived,
+		       ctr.total.load(), ctr.from_bss.load(),
+		       ctr.beacons.load(), ctr.to_us.load());
+		printf("       bssid_dw0=%08x dw1=%08x  filtr=%08x%s  to_us_data=%lu\n",
+		       dw0, dw1, filtr,
+		       /* The label reads the way the BIT does, not the way the
+		        * word sounds: these are DROP bits, so PROMISC SET means
+		        * "drop frames not addressed here" - the managed state we
+		        * want. Clear means promiscuous, which is the monitor
+		        * filter and the thing that voided two earlier gates. The
+		        * first version of this alarm said "PROMISC-OFF!", which
+		        * reads as reassurance for exactly the failure case. */
+		       (filtr & MT_RX_FILTR_CFG_PROMISC)
+		           ? "" : "  *** MONITOR FILTER - THIS ARM IS PROMISCUOUS ***",
+		       ctr.to_us_data.load());
+		if (wrote_slot >= 0) {
+			if (!apc_ok)
+				printf("       APC slot %d WRITE FAILED - this arm "
+				       "programmed nothing\n", wrote_slot);
+			else if (!apc_read_ok)
+				printf("       APC slot %d could not be read back - "
+				       "this arm is unverified\n", wrote_slot);
+			else if (memcmp(apc_rb, want, 6) != 0)
+				printf("       APC slot %d READ BACK WRONG: "
+				       "%02x:%02x:%02x:%02x:%02x:%02x - the write did "
+				       "not stick, so this arm tested nothing\n",
+				       wrote_slot, apc_rb[0], apc_rb[1], apc_rb[2],
+				       apc_rb[3], apc_rb[4], apc_rb[5]);
+			else
+				printf("       APC slot %d verified, high reg %08x "
+				       "(bit16 %s - mt76's per-slot enable, which this "
+				       "tree never sets)\n",
+				       wrote_slot, apc_hi,
+				       (apc_hi & (1u << 16)) ? "SET" : "clear");
+		}
+
+		if (ctr.beacons.load()) any_beacon = 1;
+		if (a == 0) { base_bss = ctr.from_bss.load(); base_bcn = ctr.beacons.load(); }
+		if (g_stop) break;
+	}
+
+	printf("\nHow to read this:\n");
+	if (!any_beacon) {
+		printf("  NO BEACONS IN ANY ARM. The AP was not on channel %u, or its\n"
+		       "  BSSID is not the one given. Nothing here is comparable and\n"
+		       "  the run says NOTHING about R5 - fix the rig and re-run.\n", chan);
+		printf("GATE STA: INCONCLUSIVE\n");
+		return 2;
+	}
+	printf("  arm A baseline: from_bss=%lu beacons=%lu\n", base_bss, base_bcn);
+	printf("  - if B..E match A, the BSSID registers do not gate a station's\n");
+	printf("    RX on this MAC, and R5's answer for receive is 'nothing'.\n");
+	printf("  - if arm F (deliberately WRONG) also matches, then a wrong slot\n");
+	printf("    is HARMLESS for RX here - the opposite of the AP-side finding,\n");
+	printf("    and worth stating explicitly rather than leaving implied.\n");
+	printf("  - a to_us count needs the AP to send US unicast; drive that, and\n");
+	printf("    the ACK half, from the AP side.\n");
+	printf("GATE STA: measured (verdict is the operator's - see above)\n");
+	return 0;
+}
+
+/* ------------------------------------------------------------- gate_staack
+ *
+ * R6's ACK half, measured from the DUT alone.
+ *
+ * docs/station-mode-scope.md asserts, as "good news", that because the
+ * auto-response engine matches address 1 against MT_MAC_ADDR and
+ * MT_AUTO_RSP_EN is on from init, an MT7612U station auto-ACKs the AP's
+ * unicast with NO call at all. That is load-bearing for SetStationIdentity -
+ * it is the reason the seam must NOT move MT_MAC_ADDR - and it was asserted
+ * from a register reading, never measured.
+ *
+ * WHY THIS IS HARD, AND WHAT DOES NOT WORK. To know whether we acknowledged a
+ * frame, somebody must observe the ACK. The transmitting AP cannot: the ACK
+ * arrives a SIFS after its own transmission, and its monitor vif does not
+ * hand it up. Injecting at ourselves from a monitor vif on the AP's phy and
+ * capturing ACKs there was tried and produced ZERO in both the DUT-present
+ * and DUT-absent arms - the control said the method was void, which is the
+ * only reason that non-result is not written up as "the station does not
+ * ACK". Monitor-injected frames also default to no-ack in mac80211, so they
+ * never solicited one in the first place.
+ *
+ * WHAT WORKS. Make the AP send US something through its NORMAL transmit path,
+ * with retries, and count the copies. A directed probe request from our own
+ * address makes hostapd answer with a unicast probe response addressed to us.
+ * Then:
+ *
+ *   - if we ACK it, the AP is done: we see ONE copy, FC Retry clear.
+ *   - if we do not, the AP's MAC retransmits until its limit, and we see the
+ *     SAME response again with FC Retry SET.
+ *
+ * So `retried` is the signal - but READ THIS BEFORE TRUSTING THIS GATE. This
+ * "count the retried copies" method was WITHDRAWN on 2026-09-20. Its
+ * single-variable control (clear MT_AUTO_RSP_EN, hold reception constant) does
+ * not move, so the method cannot fail and therefore cannot measure; it is the
+ * second of the two failed methods recorded in
+ * docs/mt7612u-station-identity.md. An earlier version of this header called
+ * it "the sound form of the auto-ACK test", which it is not.
+ *
+ * R6 was answered instead by asking the TRANSMITTER -
+ * tests/mt7612u_sta_autoack.sh reads a Realtek peer's per-frame CCX reports.
+ * This gate is kept for the register-level state it prints, not for its
+ * verdict.
+ *
+ * A high retried fraction is evidence we are NOT acknowledging. A low one,
+ * with responses actually arriving, is evidence we are.
+ *
+ *   bringup staack <chan> <secs> <ap-bssid>
+ */
+struct staack_count {
+	std::atomic<unsigned long> resp{0};      /* probe responses to us      */
+	std::atomic<unsigned long> resp_retry{0};/* ... with FC Retry set      */
+	std::atomic<unsigned long> other_to_us{0};
+	std::atomic<unsigned long> other_retry{0};
+	uint8_t own[6];
+	uint8_t bssid[6];
+};
+
+static void staack_rx_cb(void *user, const void *frame, size_t len,
+                         const struct mt7612u_rx_info *info)
+{
+	struct staack_count *c = (struct staack_count *)user;
+	const uint8_t *f = (const uint8_t *)frame;
+	int retry;
+
+	(void)info;
+	if (len < 24) return;
+	if (memcmp(f + 4, c->own, 6) != 0) return;       /* addr1 must be us */
+	if (memcmp(f + 10, c->bssid, 6) != 0) return;    /* from the AP      */
+
+	retry = (f[1] & 0x08) ? 1 : 0;                   /* FC Retry */
+	if (f[0] == 0x50) {                              /* probe response */
+		c->resp.fetch_add(1, std::memory_order_relaxed);
+		if (retry) c->resp_retry.fetch_add(1, std::memory_order_relaxed);
+	} else {
+		c->other_to_us.fetch_add(1, std::memory_order_relaxed);
+		if (retry) c->other_retry.fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
+static int gate_staack(uint8_t chan, int secs, const char *bssid_str)
+{
+	static struct staack_count ctr;
+	struct mt7612u_tx_rate rate = { };
+	uint8_t bssid[6];
+	static uint8_t probe[128];
+	size_t plen;
+	double t0, a_frac = -1.0, b_frac = -1.0, c_frac = -1.0;
+	unsigned long sent = 0, resp = 0, retried = 0;
+	unsigned long a_resp = 0, b_resp = 0, c_resp = 0;
+
+	if (parse_mac6(bssid_str, bssid)) {
+		printf("GATE STAACK: FAIL - need the AP's BSSID\n");
+		return 2;
+	}
+
+	if (mt_eeprom_init(&dev)) return 1;
+	if (mt_init_hardware(&dev, NULL)) return 1;
+	if (mt_set_channel(&dev, chan, MT7612U_BW_20)) return 1;
+
+	memcpy(ctr.own, dev.macaddr, 6);
+	memcpy(ctr.bssid, bssid, 6);
+	ctr.resp = 0; ctr.resp_retry = 0; ctr.other_to_us = 0; ctr.other_retry = 0;
+
+	/* Directed probe request: addr1 = addr3 = the AP, addr2 = US. Addressed
+	 * to the AP rather than broadcast so the response comes back unicast to
+	 * our address, which is the frame whose acknowledgement we are testing. */
+	memset(probe, 0, sizeof probe);
+	probe[0] = 0x40;                       /* probe request */
+	memcpy(probe + 4,  bssid, 6);
+	memcpy(probe + 10, dev.macaddr, 6);
+	memcpy(probe + 16, bssid, 6);
+	plen = 24;
+	probe[plen++] = 0x00;                  /* SSID element, wildcard */
+	probe[plen++] = 0x00;
+	probe[plen++] = 0x01;                  /* supported rates */
+	probe[plen++] = 0x04;
+	probe[plen++] = 0x82; probe[plen++] = 0x84;
+	probe[plen++] = 0x8b; probe[plen++] = 0x96;
+
+	rate.phy = MT7612U_PHY_OFDM;
+	rate.mcs = 0;                          /* 6 Mbit/s - robust */
+	rate.nss = 1;
+	rate.bw = MT7612U_BW_20;
+	rate.no_ack = 0;
+
+	printf("=== GATE STAACK: does this MAC auto-ACK unicast to its own address? ===\n");
+	printf("chan %u, %d s per arm, AP %02x:%02x:%02x:%02x:%02x:%02x, own %02x:%02x:%02x:%02x:%02x:%02x\n",
+	       chan, secs, bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5],
+	       dev.macaddr[0], dev.macaddr[1], dev.macaddr[2],
+	       dev.macaddr[3], dev.macaddr[4], dev.macaddr[5]);
+	printf("\n");
+
+	/*
+	 * THREE ARMS. Arm A is the claim; arm B is the control that lets it
+	 * mean anything; arm C is a diagnostic.
+	 *
+	 * Arm B used to be "retarget MT_MAC_ADDR", which was wrong as a control
+	 * and the gate said so itself: under the MANAGED receive filter that a
+	 * station actually runs, moving the port identity also makes the filter
+	 * drop the AP's responses, so arm B received NOTHING and the gate
+	 * correctly reported INCONCLUSIVE - it could not tell "we did not
+	 * acknowledge" from "we did not receive". (The 98% retried figure an
+	 * earlier revision quoted came from a run with the monitor filter
+	 * installed by mistake, where every retransmission was visible. It is
+	 * withdrawn.)
+	 *
+	 * The clean control changes ONE thing: clear MT_AUTO_RSP_EN and leave
+	 * MT_MAC_ADDR alone. Reception is then identical to arm A - same port
+	 * identity, same filter, the AP's responses still addressed to us and
+	 * still accepted - and the only difference is that the MAC stops
+	 * answering them. Retried copies must rise. If they do not, the
+	 * retried-copy signal does not track acknowledgement on this rig and
+	 * arm A proves nothing.
+	 *
+	 * Arm C is the old one, kept because it demonstrates the R6 hazard
+	 * rather than asserting it: what SetAckResponder(bssid) would do to a
+	 * station. Under the managed filter the expected result is that the
+	 * station goes deaf as well as silent, which is a LARGER failure than
+	 * the one the seam was designed around.
+	 */
+	for (int armi = 0; armi < 3; armi++) {
+		static const uint8_t foreign[6] =
+			{ 0x02, 0x00, 0x00, 0xac, 0x1d, 0x01 };
+		double frac;
+
+		ctr.resp = 0; ctr.resp_retry = 0;
+		ctr.other_to_us = 0; ctr.other_retry = 0;
+		sent = 0;
+
+		if (mt_mac_start(&dev, MT_RX_DRAIN_NONE)) return 1;
+		if (mt_async_start(&dev, staack_rx_cb, &ctr)) { mt_mac_stop(&dev); return 1; }
+		if (mt_mac_start(&dev, MT_RX_DRAIN_RING)) {
+			mt_async_stop(&dev); mt_mac_stop(&dev); return 1;
+		}
+		/* Same inverted-comment trap as gate_sta: mt7612u_set_monitor_rx()
+		 * installs the MONITOR filter, not the managed one. Leave what
+		 * mt_mac_start() programmed. R6's conclusion does not rest on the
+		 * filter - a probe response addressed to us is accepted either way
+		 * - but the arm should still run in the configuration a station
+		 * uses. */
+
+		if (armi == 1) {
+			/* The single-variable control: stop answering, keep
+			 * receiving. */
+			if (mt_rmw(&dev, MT_AUTO_RSP_CFG, MT_AUTO_RSP_EN, 0)) {
+				printf("  B  could not clear MT_AUTO_RSP_EN - no control\n");
+				mt_async_stop(&dev); mt_mac_stop(&dev);
+				return 2;
+			}
+		} else if (armi == 2 && mt7612u_set_ack_responder(&dev, foreign)) {
+			printf("  C  could not retarget MT_MAC_ADDR\n");
+			mt_async_stop(&dev); mt_mac_stop(&dev);
+			return 2;
+		}
+
+		printf("  %c  %s\n", (char)('A' + armi),
+		       armi == 0 ? "nothing armed - MT_MAC_ADDR as init left it" :
+		       armi == 1 ? "MT_AUTO_RSP_EN CLEARED (control: same RX, no ACK)"
+		                 : "MT_MAC_ADDR RETARGETED away (the R6 hazard)");
+
+		t0 = now_ms();
+		while (now_ms() - t0 < secs * 1000.0 && !g_stop) {
+			probe[22] = (uint8_t)((sent & 0xf) << 4);
+			probe[23] = (uint8_t)(sent >> 4);
+			if (mt_tx_raw(&dev, probe, plen, &rate, 0xff, 0) == 0)
+				sent++;
+			usleep(200000);            /* 5/s - inside any AP's rate */
+		}
+
+		resp = ctr.resp.load();
+		retried = ctr.resp_retry.load();
+		frac = resp ? 100.0 * (double)retried / (double)resp : -1.0;
+
+		if (armi == 1)
+			mt_rmw(&dev, MT_AUTO_RSP_CFG, MT_AUTO_RSP_EN, MT_AUTO_RSP_EN);
+		else if (armi == 2)
+			mt7612u_clear_ack_responder(&dev);
+		mt_async_stop(&dev);
+		mt_mac_stop(&dev);
+
+		printf("     sent %lu, responses to us %lu, retried %lu",
+		       sent, resp, retried);
+		if (frac >= 0.0) printf("  -> %.1f%% retried\n", frac);
+		else             printf("  -> no responses\n");
+		printf("     other unicast to us %lu (retried %lu)\n",
+		       ctr.other_to_us.load(), ctr.other_retry.load());
+
+		if (armi == 0)      { a_resp = resp; a_frac = frac; }
+		else if (armi == 1) { b_resp = resp; b_frac = frac; }
+		else                { c_resp = resp; c_frac = frac; }
+		if (g_stop) break;
+	}
+
+	printf("\n");
+	if (a_resp == 0) {
+		printf("Arm A got no probe response at all. Either the AP is not on this\n"
+		       "channel/BSSID or our probe requests are not reaching it. This says\n"
+		       "NOTHING about acknowledgement - do not read it as a failure to ACK.\n"
+		       "GATE STAACK: INCONCLUSIVE\n");
+		return 2;
+	}
+	if (b_resp == 0) {
+		printf("Arm B got no probe response, so the control could not run and\n"
+		       "arm A's %.1f%% is UNCONTROLLED - do not quote it. Clearing\n"
+		       "MT_AUTO_RSP_EN should not have changed what we RECEIVE, so if\n"
+		       "this happens the assumption behind the control is wrong too.\n"
+		       "GATE STAACK: INCONCLUSIVE\n", a_frac);
+		return 2;
+	}
+	printf("A (nothing armed)       : %5.1f%% retried over %lu responses\n", a_frac, a_resp);
+	printf("B (AUTO_RSP_EN cleared) : %5.1f%% retried over %lu responses\n", b_frac, b_resp);
+	if (c_resp)
+		printf("C (MT_MAC_ADDR moved)   : %5.1f%% retried over %lu responses\n",
+		       c_frac, c_resp);
+	else
+		printf("C (MT_MAC_ADDR moved)   : received NOTHING - under the managed\n"
+		       "                          filter the station goes DEAF as well\n"
+		       "                          as silent. A larger failure than the\n"
+		       "                          one this seam was designed around.\n");
+
+	if (b_frac > a_frac + 10.0) {
+		printf("\nB rose with reception held constant, so the retried-copy signal\n"
+		       "does track acknowledgement here and A is meaningful: this MAC\n"
+		       "DOES auto-ACK unicast addressed to its own address with nothing\n"
+		       "armed at all (R6).\n");
+		printf("GATE STAACK: PASS\n");
+		return 0;
+	}
+	printf("\nB did NOT rise above A even though only the answering engine was\n"
+	       "disabled. Either this MAC acknowledges by some path MT_AUTO_RSP_EN\n"
+	       "does not gate, or retried copies do not track acknowledgement on\n"
+	       "this rig. Either way the method did not demonstrate it can fail, so\n"
+	       "A's number proves nothing.\n");
+	printf("GATE STAACK: INCONCLUSIVE\n");
+	return 2;
+}
+
+/* -------------------------------------------------------------- gate_staid
+ *
+ * The SetStationIdentity contract, checked against real hardware. No AP and
+ * no peer: every property here is about what this MAC holds and what the
+ * function refuses, which is the whole of the job on this part.
+ *
+ * The case that matters is 5. mt7612u_set_ack_responder() retargets
+ * MT_MAC_ADDR, which is the register the auto-response engine matches address
+ * 1 against - and under the managed receive filter gate_staack measured
+ * reception itself going to zero when it moves. (An earlier revision of this
+ * header quoted "0.8% retried becomes 98.0%"; that control ran with the
+ * monitor filter and is withdrawn - gate_staack's own body says so.) So a
+ * station identity armed while an
+ * ACK responder holds the port identity would be a station that cannot
+ * acknowledge anything, silently. It must be REFUSED, and this checks that it
+ * is, on the hardware, rather than trusting the branch to be right.
+ *
+ *   bringup staid
+ */
+static int gate_staid(void)
+{
+	static const uint8_t bssid[6]   = { 0x02, 0x42, 0x75, 0x05, 0xd6, 0xaa };
+	static const uint8_t foreign[6] = { 0x02, 0x00, 0x00, 0xac, 0x1d, 0x01 };
+	static const uint8_t mcast[6]   = { 0x01, 0x00, 0x5e, 0x00, 0x00, 0x01 };
+	uint8_t own[6], got[6];
+	int pass = 0, fail = 0;
+
+	if (mt_eeprom_init(&dev)) return 1;
+	if (mt_init_hardware(&dev, NULL)) return 1;
+
+	memcpy(own, dev.macaddr, 6);
+	printf("=== GATE STAID: the SetStationIdentity contract on hardware ===\n");
+	printf("own %02x:%02x:%02x:%02x:%02x:%02x   bssid %02x:%02x:%02x:%02x:%02x:%02x\n\n",
+	       own[0], own[1], own[2], own[3], own[4], own[5],
+	       bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
+
+#define CHK(cond, what) do {                                            \
+		if (cond) { pass++; printf("  ok    %s\n", what); }     \
+		else      { fail++; printf("  FAIL  %s\n", what); }     \
+	} while (0)
+
+	/* 1. the ordinary case */
+	CHK(mt7612u_set_station_identity(&dev, own, bssid) == 0,
+	    "arms with the factory address as own");
+	CHK(mt7612u_station_bssid(&dev, got) == 0 && memcmp(got, bssid, 6) == 0,
+	    "records the BSSID it was given");
+
+	/* 2. an address this MAC is not holding */
+	CHK(mt7612u_set_station_identity(&dev, foreign, bssid) != 0,
+	    "refuses an `own` that is not the port identity");
+
+	/* 3. malformed arguments */
+	/* Not an isolating test: `mcast` is also not the port identity, so the
+	 * later branch would refuse it even if the multicast branch were
+	 * deleted. Kept because the refusal is still the required behaviour,
+	 * and labelled so nobody reads it as coverage of that branch. */
+	CHK(mt7612u_set_station_identity(&dev, mcast, bssid) != 0,
+	    "refuses a multicast own (not an isolating test - see comment)");
+	CHK(mt7612u_set_station_identity(&dev, own, mcast) != 0,
+	    "refuses a multicast bssid");
+	CHK(mt7612u_set_station_identity(&dev, own, own) != 0,
+	    "refuses own == bssid");
+
+	/* 4. clear */
+	mt7612u_clear_station_identity(&dev);
+	CHK(mt7612u_station_bssid(&dev, got) != 0,
+	    "reports no BSSID once cleared");
+
+	/*
+	 * 5. THE ONE THAT MATTERS. Arm an ACK responder on a foreign address -
+	 * which moves MT_MAC_ADDR - and the station arm must refuse, because a
+	 * station whose port identity points elsewhere acknowledges nothing.
+	 */
+	if (mt7612u_set_ack_responder(&dev, foreign) == 0) {
+		CHK(mt7612u_set_station_identity(&dev, own, bssid) != 0,
+		    "REFUSES while an ACK responder holds the port identity");
+		mt7612u_clear_ack_responder(&dev);
+		CHK(mt7612u_set_station_identity(&dev, own, bssid) == 0,
+		    "arms again once the responder has given it back");
+	} else {
+		printf("  SKIP  could not arm an ACK responder - case 5 not run\n");
+		fail++;   /* the most important case did not run; do not pass. */
+	}
+	mt7612u_clear_station_identity(&dev);
+
+	/*
+	 * 6. THE OTHER ORDERING, which is the one a real caller is likelier to
+	 * hit and which nothing protected until now. Case 5 covers "responder
+	 * first, station second" - refused. This covers "station first,
+	 * responder second", where the refusal has already happened and cannot
+	 * help: the responder moves MT_MAC_ADDR out from under a live station
+	 * and it simply stops being acknowledged.
+	 *
+	 * It is not refused - the beacon and responder paths are older and a
+	 * station arm is not entitled to veto them - but it must not be silent,
+	 * and the stale armed state must not go on claiming a station is
+	 * configured when its identity has been taken.
+	 */
+	if (mt7612u_set_station_identity(&dev, own, bssid) == 0 &&
+	    mt7612u_set_ack_responder(&dev, foreign) == 0) {
+		CHK(mt7612u_station_bssid(&dev, got) != 0,
+		    "drops the armed station when a responder takes the identity");
+		mt7612u_clear_ack_responder(&dev);
+	} else {
+		printf("  SKIP  could not set up case 6\n");
+		fail++;
+	}
+	mt7612u_clear_station_identity(&dev);
+
+#undef CHK
+	printf("\nGATE STAID: %d passed, %d failed\n", pass, fail);
+	return fail ? 1 : 0;
+}
+
+/* -------------------------------------------------------------- gate_norsp
+ *
+ * Receive with MT_AUTO_RSP_EN CLEARED, for the single-variable arm of
+ * tests/mt7612u_sta_autoack.sh.
+ *
+ * That harness establishes that this MAC acknowledges unicast addressed to it
+ * with nothing armed (100% ok, retries 0.45) against three controls that pin at
+ * the retry limit. What it does not establish is WHICH mechanism answers, and
+ * SetStationIdentity refuses to arm when MT_AUTO_RSP_EN is clear - a branch
+ * shipped on the assumption that the bit matters. This is that assumption's
+ * test: same receiver, same port identity, same filter, one bit different.
+ *
+ * If the peer's ok rate collapses here, the refusal is justified. If it does
+ * not, MT_AUTO_RSP_EN is not the gate on this part and that branch is
+ * refusing for a reason that does not hold - which is worth knowing before
+ * Phase 3 builds on it.
+ *
+ * The third argument selects which side of the comparison this is:
+ *   1 (default) - clear MT_AUTO_RSP_EN: the CONTROL
+ *   0           - leave it set: the CLAIM
+ * Both run the SAME code path with the SAME managed filter, so the two arms
+ * differ by exactly one bit. They did not before: the claim arm used
+ * `bringup arx`, which installs the MONITOR filter
+ * (mt7612u_set_monitor_rx at the top of gate_arx), so the comparison varied
+ * the receive filter AND the init path as well as the bit, while the write-up
+ * called it single-variable. Caught in review, not on the bench.
+ *
+ *   bringup norsp <chan> <secs> [clear_rsp]
+ */
+static void norsp_rx_cb(void *user, const void *frame, size_t len,
+                        const struct mt7612u_rx_info *info)
+{
+	(void)user; (void)frame; (void)len; (void)info;
+}
+
+static int gate_norsp(uint8_t chan, int secs, int clear_rsp)
+{
+	uint32_t before = 0, after = 0;
+	double t0;
+
+	if (mt_eeprom_init(&dev)) return 1;
+	if (mt_init_hardware(&dev, NULL)) return 1;
+	if (mt_set_channel(&dev, chan, MT7612U_BW_20)) return 1;
+	if (mt_mac_start(&dev, MT_RX_DRAIN_NONE)) return 1;
+	/* A NON-NULL callback, because mt_async_start(NULL) starts the TX slots
+	 * and NOT the RX ring - and mac_start(MT_RX_DRAIN_RING) then refuses,
+	 * correctly, with "no ring draining EP4". The first version of this gate
+	 * passed NULL and died there. */
+	if (mt_async_start(&dev, norsp_rx_cb, NULL)) { mt_mac_stop(&dev); return 1; }
+	if (mt_mac_start(&dev, MT_RX_DRAIN_RING)) {
+		mt_async_stop(&dev); mt_mac_stop(&dev); return 1;
+	}
+	/* Managed filter left exactly as mt_mac_start() programmed it - do NOT
+	 * call mt7612u_set_monitor_rx(), which installs the monitor value and
+	 * is how the first R5/R6 gates came to measure the wrong thing. */
+
+	if (mt_rr_chk(&dev, MT_AUTO_RSP_CFG, &before)) {
+		printf("GATE NORSP: FAIL - cannot read MT_AUTO_RSP_CFG\n");
+		mt_async_stop(&dev); mt_mac_stop(&dev); return 1;
+	}
+	if (clear_rsp) {
+		if (mt_rmw(&dev, MT_AUTO_RSP_CFG, MT_AUTO_RSP_EN, 0)) {
+			printf("GATE NORSP: FAIL - cannot clear MT_AUTO_RSP_EN\n");
+			mt_async_stop(&dev); mt_mac_stop(&dev); return 1;
+		}
+		mt_rr_chk(&dev, MT_AUTO_RSP_CFG, &after);
+		if (after & MT_AUTO_RSP_EN) {
+			printf("GATE NORSP: FAIL - MT_AUTO_RSP_EN did not stay clear "
+			       "(%08x -> %08x); the arm would measure nothing\n",
+			       before, after);
+			mt_rmw(&dev, MT_AUTO_RSP_CFG, MT_AUTO_RSP_EN, MT_AUTO_RSP_EN);
+			mt_async_stop(&dev); mt_mac_stop(&dev); return 2;
+		}
+	} else {
+		after = before;
+		if (!(after & MT_AUTO_RSP_EN)) {
+			printf("GATE NORSP: FAIL - asked to LEAVE MT_AUTO_RSP_EN set but "
+			       "it is already clear (%08x); this arm would be the control, "
+			       "not the claim\n", after);
+			mt_async_stop(&dev); mt_mac_stop(&dev); return 2;
+		}
+	}
+
+	printf("MT_AUTO_RSP_CFG %08x -> %08x (EN %s), managed filter, "
+	       "receiving %d s on ch%u\n", before, after,
+	       clear_rsp ? "CLEARED" : "left SET", secs, chan);
+
+	t0 = now_ms();
+	while (now_ms() - t0 < secs * 1000.0 && !g_stop)
+		usleep(20000);
+
+	/* Put it back: this is the state init leaves and everything else on the
+	 * part assumes. */
+	if (clear_rsp)
+		mt_rmw(&dev, MT_AUTO_RSP_CFG, MT_AUTO_RSP_EN, MT_AUTO_RSP_EN);
+	mt_async_stop(&dev);
+	mt_mac_stop(&dev);
+	printf("GATE NORSP: done (restored)\n");
+	return 0;
+}
+
+/* -------------------------------------------------------------- gate_bssen
+ *
+ * The last caveat on R5: a WRONG BSSID in an APC slot that is actually
+ * ENABLED.
+ *
+ * R5's six arms all left the slot-0 high register's BIT(16) clear - upstream
+ * mt76 calls it MT_MAC_APC_BSSID0_H_EN and this tree has never defined it. So
+ * every "slot programmed" arm may have written a slot the engine was not
+ * consulting, which would make R5's null result mean far less than it looks:
+ * "a wrong BSSID changes nothing" is uninteresting if nothing was reading the
+ * BSSID.
+ *
+ * This arm programs a deliberately WRONG BSSID into both MT_MAC_BSSID and the
+ * derived APC slot, sets that bit, verifies it stuck, and then receives. The
+ * peer (tests/mt7612u_sta_autoack.sh) transmits unicast at this station's own
+ * address throughout. If acknowledgement and reception survive that, the
+ * BSSID plane does not gate a station on this part even when its enable is
+ * set - and R5 is closed rather than merely measured.
+ *
+ * If the bit will not stick, that is reported and the arm refuses: an
+ * unsettable bit is not evidence about anything.
+ *
+ *   bringup bssen <chan> <secs>
+ */
+static int gate_bssen(uint8_t chan, int secs)
+{
+	static const uint8_t wrong[6] = { 0x02, 0x00, 0x00, 0xde, 0xad, 0x02 };
+	uint8_t rb[6] = { 0 };
+	uint32_t hi = 0;
+	int idx;
+	double t0;
+
+	if (mt_eeprom_init(&dev)) return 1;
+	if (mt_init_hardware(&dev, NULL)) return 1;
+	if (mt_set_channel(&dev, chan, MT7612U_BW_20)) return 1;
+	if (mt_mac_start(&dev, MT_RX_DRAIN_NONE)) return 1;
+	if (mt_async_start(&dev, norsp_rx_cb, NULL)) { mt_mac_stop(&dev); return 1; }
+	if (mt_mac_start(&dev, MT_RX_DRAIN_RING)) {
+		mt_async_stop(&dev); mt_mac_stop(&dev); return 1;
+	}
+	/* Managed filter as mt_mac_start() left it. */
+
+	idx = sta_apc_idx(dev.macaddr, wrong);
+	sta_set_bss_base(&dev, wrong);
+	sta_write_apc(&dev, idx, wrong);
+	/* The enable bit mt76 has and this tree does not. */
+	mt_rmw(&dev, MT_MAC_APC_BSSID_H(idx), 1u << 16, 1u << 16);
+
+	if (sta_read_apc(&dev, idx, rb) || memcmp(rb, wrong, 6) != 0) {
+		printf("GATE BSSEN: FAIL - the slot did not read back\n");
+		mt_async_stop(&dev); mt_mac_stop(&dev); return 2;
+	}
+	hi = sta_apc_high_raw(&dev, idx);
+	if (!(hi & (1u << 16))) {
+		printf("GATE BSSEN: INCONCLUSIVE - BIT(16) of the APC high register "
+		       "would not stay set (%08x). Either it is not a per-slot "
+		       "enable on this part, or it is not writable here; either way "
+		       "this arm proves nothing about an enabled slot.\n", hi);
+		mt_async_stop(&dev); mt_mac_stop(&dev); return 2;
+	}
+
+	printf("WRONG BSSID %02x:%02x:%02x:%02x:%02x:%02x in MT_MAC_BSSID and APC "
+	       "slot %d, BIT(16) SET (high reg %08x)\n",
+	       wrong[0], wrong[1], wrong[2], wrong[3], wrong[4], wrong[5], idx, hi);
+	printf("receiving %d s on ch%u as %02x:%02x:%02x:%02x:%02x:%02x\n",
+	       secs, chan, dev.macaddr[0], dev.macaddr[1], dev.macaddr[2],
+	       dev.macaddr[3], dev.macaddr[4], dev.macaddr[5]);
+
+	t0 = now_ms();
+	while (now_ms() - t0 < secs * 1000.0 && !g_stop)
+		usleep(20000);
+
+	mt_async_stop(&dev);
+	mt_mac_stop(&dev);
+	printf("GATE BSSEN: done\n");
+	return 0;
+}
+
+static int gate_txs(uint8_t chan, int frames, const char *peer_str)
+{
+	static const uint8_t src[6]   = { 0x02, 0x4d, 0x54, 0x76, 0x12, 0x01 };
+	static const uint8_t bcast[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+	uint8_t peer[6] = { 0x02, 0x4d, 0x54, 0x76, 0x12, 0x0a };
+	static uint8_t frame[1600];
+	const size_t flen = 1400;
+	static struct ucast_ack_count ctr;
+	int rx_on;
+
+	/*
+	 * Arms e-h attack what is left of the open question.
+	 *
+	 * The receiver-OFF No-Ack arm (c) settles at 0.0 retries and 100%
+	 * success and STILL costs ~20 ms a frame, so whatever that cost is, it
+	 * is not the retry engine (docs/mt7612u-tx-retry.md). The candidates
+	 * that can be separated with a register write and a txwi bit are: the
+	 * no-station WCID index, the transmit queue the frame is filed into,
+	 * and aggregation. Each gets an arm against the same reference.
+	 *
+	 * `wcid` 1 means a real station-table entry installed with
+	 * mt_wcid_setup() - the plumbing exists and tools/bringup.cpp's rate-LUT
+	 * gate is its only caller anywhere; no library path installs a station.
+	 * The published bisect measured wcid=1 as WORSE than 0xff against a dead
+	 * peer, which is itself unexplained, so this is a re-measurement under
+	 * known-good accounting rather than a repeat.
+	 */
+	static const struct {
+		char tag; int own_sa; int bcast_a1; int no_ack;
+		uint8_t wcid; unsigned opts; const char *what;
+	} arms[] = {
+		{ 'a', 0, 1, 1, 0xff, 0, "broadcast,       No Ack" },
+		{ 'b', 0, 0, 0, 0xff, 0, "ucast peer,      Normal" },
+		{ 'c', 0, 0, 1, 0xff, 0, "ucast peer,      No Ack" },
+		{ 'd', 1, 0, 0, 0xff, 0, "ucast peer ownSA Normal" },
+		{ 'e', 1, 0, 1, 0x01, 0, "ucast peer ownSA NoAck wcid1" },
+		{ 'f', 1, 0, 1, 0xff, MT_TXOPT_QSEL_MGMT, "ucast NoAck QSEL_MGMT" },
+		{ 'g', 1, 0, 1, 0xff, MT_TXOPT_AMPDU | MT_TXOPT_QSEL_MGMT,
+		  "ucast NoAck AMPDU+MGMT" },
+		{ 'h', 0, 1, 1, 0x01, 0, "broadcast, wcid1 control" },
+	};
+
+	if (frames <= 0) {
+		printf("GATE TXS: FAIL - frames must be positive\n");
+		return 2;
+	}
+	if (peer_str && parse_mac6(peer_str, peer)) {
+		printf("GATE TXS: FAIL - bad peer MAC '%s'\n", peer_str);
+		return 2;
+	}
+
+	if (mt_eeprom_init(&dev)) return 1;
+	if (mt_init_hardware(&dev, NULL)) return 1;
+	if (mt_set_channel(&dev, chan, MT7612U_BW_20)) return 1;
+	/* DEVOURER_TX_RETRY_LIMIT=N: the knob Mt7612uRadio applies, so this gate
+	 * can verify it - an unacknowledged Normal arm must then report a mean
+	 * retry of N+1 (the limit plus the first attempt) instead of 16. */
+	if (const char *rl = getenv("DEVOURER_TX_RETRY_LIMIT")) {
+		if (mt7612u_set_retry_limit(&dev, atoi(rl))) {
+			printf("GATE TXS: FAIL - retry limit %s not set\n", rl);
+			return 2;
+		}
+		printf("retry limit set to %d (MT_TX_RETRY_CFG %08x)\n", atoi(rl),
+		       mt_rr(&dev, MT_TX_RETRY_CFG));
+	}
+
+	printf("chan %u, HT MCS7 BW20, %zu-byte QoS data, wcid 0xff, %d frames/arm\n",
+	       chan, flen, frames);
+	printf("peer %02x:%02x:%02x:%02x:%02x:%02x\n",
+	       peer[0], peer[1], peer[2], peer[3], peer[4], peer[5]);
+
+	/* Both halves of the Phase 0 finding in one session: the same arms with
+	 * the MAC receiver off, then on. The receiver decides whether an ACK can
+	 * terminate the ladder, so it is the variable under test, not a setting. */
+	for (rx_on = 0; rx_on <= 1; rx_on++) {
+		unsigned a;
+
+		memcpy(ctr.ta, dev.macaddr, 6);
+		ctr.acks.store(0);
+		ctr.frames.store(0);
+
+		if (mt_mac_start(&dev, MT_RX_DRAIN_NONE)) return 1;
+		if (mt_async_start(&dev, rx_on ? ucast_rx_cb : NULL,
+		                   rx_on ? (void *)&ctr : NULL)) {
+			mt_mac_stop(&dev);
+			return 1;
+		}
+		if (rx_on) {
+			if (mt_mac_start(&dev, MT_RX_DRAIN_RING)) {
+				mt_async_stop(&dev);
+				mt_mac_stop(&dev);
+				return 1;
+			}
+			mt7612u_set_monitor_rx(&dev, 0);
+		}
+
+		/* A WCID entry has to exist before an arm can select it; without
+		 * this, wcid 1 names an empty slot and the arm measures nothing
+		 * it claims to. */
+		mt_wcid_setup(&dev, 1, peer);
+
+		printf("\n  MAC receiver %s\n", rx_on ? "ON" : "OFF");
+		printf("  arm  %-28s %7s %9s %8s %9s %6s\n", "configuration",
+		       "fps", "entr/sent", "success", "mean rtry", "max");
+
+		for (a = 0; a < sizeof arms / sizeof arms[0]; a++) {
+			struct mt7612u_tx_rate rate = { };
+			struct txs_sum sum = { 0, 0, 0, 0 };
+			const uint8_t *sa = arms[a].own_sa ? dev.macaddr : src;
+			const uint8_t *a1 = arms[a].bcast_a1 ? bcast : peer;
+			double t0, wall;
+			long n = 0;
+			int settled = 0;
+
+			rate.phy = MT7612U_PHY_HT;
+			rate.mcs = 7;
+			rate.nss = 1;
+			rate.bw = MT7612U_BW_20;
+			rate.no_ack = (unsigned)arms[a].no_ack;
+
+			memset(frame, 0, sizeof frame);
+			frame[0] = 0x88;
+			memcpy(frame + 4, a1, 6);
+			memcpy(frame + 10, sa, 6);
+			memcpy(frame + 16, sa, 6);
+			frame[24] = arms[a].no_ack ? 0x20 : 0x00;
+			memcpy(frame + 26, "MT7612U-TXS", 11);
+
+			txs_drain(&dev, &sum);   /* discard the previous arm's tail */
+			sum.entries = 0; sum.success = 0;
+			sum.retry_total = 0; sum.retry_max = 0;
+
+			t0 = now_ms();
+			while (n < frames && !g_stop) {
+				frame[22] = (uint8_t)((n & 0xf) << 4);
+				frame[23] = (uint8_t)(n >> 4);
+				if (mt_tx_raw(&dev, frame, flen, &rate,
+				              arms[a].wcid,
+				              MT_TXOPT_TXS | arms[a].opts) == 0)
+					n++;
+				txs_drain(&dev, &sum);
+			}
+			/*
+			 * Wait for the status the MAC still owes us before
+			 * moving on. A 16-slot ring plus a 45 ms-per-frame
+			 * ladder means the last frames of an arm are still in
+			 * flight when the send loop ends, and their entries
+			 * would otherwise be counted against the NEXT arm -
+			 * which is exactly what the first run of this gate
+			 * did, reporting 0 entries for one arm and 3 for
+			 * another at rates that could not be real.
+			 *
+			 * Bounded by the worst case that matters: `frames` at
+			 * the full 16-rung ladder, ~50 ms each, plus slack.
+			 */
+			{
+				double deadline = now_ms() + frames * 60.0 + 2000.0;
+
+				while (sum.entries < n && now_ms() < deadline
+				       && !g_stop) {
+					mt_usleep(2000);
+					txs_drain(&dev, &sum);
+				}
+				settled = (sum.entries >= n);
+			}
+			wall = now_ms() - t0;
+
+			/* fps here is submit-and-settle over the whole arm, so it
+			 * is NOT the steady-state figure gate_ucast reports -
+			 * `frames` is small by design and the ring absorbs most
+			 * of it. The retry columns are the point of this gate. */
+			printf("  %c    %-28s %7.0f %4ld/%-4ld %8ld %9.1f %6ld%s\n",
+			       arms[a].tag, arms[a].what, n * 1000.0 / wall,
+			       sum.entries, n, sum.success,
+			       sum.entries ? (double)sum.retry_total / sum.entries : 0.0,
+			       sum.retry_max, settled ? "" : "  UNSETTLED");
+			if (g_stop) break;
+			mt_usleep(100000);
+		}
+		if (rx_on)
+			printf("  (receiver saw %lu frames, %lu ACKs to our TA)\n",
+			       (unsigned long)ctr.frames.load(),
+			       (unsigned long)ctr.acks.load());
+
+		mt_async_stop(&dev);
+		mt_mac_stop(&dev);
+		if (g_stop) break;
+	}
+
+	if (g_stop) {
+		printf("\nGATE TXS: INTERRUPTED\n");
+		return 3;
+	}
+	printf("\nGATE TXS: reported. A zero entry count means the MAC filed no\n"
+	       "status at all - check MT_TXOPT_TXS reached the txwi pktid before\n"
+	       "reading anything into the retry columns.\n");
+	return 0;
+}
+
 /* Somebody has to read EP 4 whenever MAC RX is on; this gate does not care
  * what arrives, only that the endpoint keeps being drained. */
 static void drain_cb(void *user, const void *frame, size_t len,
@@ -1812,9 +3473,12 @@ static int gate_caps(uint8_t chan)
 	       c.max_mpdu_tx, c.max_mpdu_rx,
 	       mt_rr(&dev, MT_MAX_LEN_CFG) & 0xfff);
 
+	int8_t rssi_offset[2], lna_gain;
+	mt_rx_corr_unpack(dev.cal.rx_corr.load(std::memory_order_relaxed),
+	                  rssi_offset, &lna_gain);
 	printf("\nRX gain from EEPROM: rssi_offset=[%d,%d] lna_gain=%d "
 	       "high_gain=[%d,%d] mcu_gain=0x%08x\n",
-	       dev.cal.rssi_offset[0], dev.cal.rssi_offset[1], dev.cal.lna_gain,
+	       rssi_offset[0], rssi_offset[1], lna_gain,
 	       dev.cal.high_gain[0], dev.cal.high_gain[1], dev.cal.mcu_gain);
 	printf("  raw EEPROM: LNA_GAIN=0x%04x RSSI_OFF_5G_0=0x%04x "
 	       "RSSI_OFF_5G_1=0x%04x GRP4_5_RX_HIGH_GAIN=0x%04x\n",
@@ -3702,6 +5366,32 @@ int main(int argc, char **argv)
 	} else if (!strcmp(cmd, "ampdu")) {
 		rc = gate_ampdu(argc > 2 ? (uint8_t)atoi(argv[2]) : 149,
 		                argc > 3 ? atoi(argv[3]) : 400);
+	} else if (!strcmp(cmd, "txs")) {
+		rc = gate_txs(argc > 2 ? (uint8_t)atoi(argv[2]) : 149,
+		              argc > 3 ? atoi(argv[3]) : 40,
+		              argc > 4 ? argv[4] : NULL);
+	} else if (!strcmp(cmd, "bssen")) {
+		rc = gate_bssen(argc > 2 ? (uint8_t)atoi(argv[2]) : 6,
+		                argc > 3 ? atoi(argv[3]) : 25);
+	} else if (!strcmp(cmd, "norsp")) {
+		rc = gate_norsp(argc > 2 ? (uint8_t)atoi(argv[2]) : 6,
+		                argc > 3 ? atoi(argv[3]) : 25,
+		                argc > 4 ? atoi(argv[4]) : 1);
+	} else if (!strcmp(cmd, "staid")) {
+		rc = gate_staid();
+	} else if (!strcmp(cmd, "staack")) {
+		rc = gate_staack(argc > 2 ? (uint8_t)atoi(argv[2]) : 6,
+		                 argc > 3 ? atoi(argv[3]) : 20,
+		                 argc > 4 ? argv[4] : NULL);
+	} else if (!strcmp(cmd, "sta")) {
+		rc = gate_sta(argc > 2 ? (uint8_t)atoi(argv[2]) : 6,
+		              argc > 3 ? atoi(argv[3]) : 15,
+		              argc > 4 ? argv[4] : NULL);
+	} else if (!strcmp(cmd, "ucast")) {
+		rc = gate_ucast(argc > 2 ? (uint8_t)atoi(argv[2]) : 149,
+		                argc > 3 ? atoi(argv[3]) : 5,
+		                argc > 4 ? argv[4] : NULL,
+		                argc > 5 ? atoi(argv[5]) : 1400);
 	} else if (!strcmp(cmd, "pwr")) {
 		rc = gate_pwr(argc > 2 ? (uint8_t)atoi(argv[2]) : 149);
 	} else if (!strcmp(cmd, "soak")) {

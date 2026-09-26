@@ -77,7 +77,7 @@ Emitters: L = library, RX/TX/... = demo. Optional fields in [brackets];
 | ev | emitter | fields |
 |---|---|---|
 | `init.timing` | L (`src/InitTimer.h`) + demos | stage ("scope.stage", e.g. "demo.first_rx_frame", "txdemo.first_tx_submit"), ms, [xfers] (register transfers the stage spent on that adapter's transport, USB only — present on the Jaguar3 `j3hal.*` / `j3init.*` stages) |
-| `adapter.caps` | RX, TX, doctor, txpower (`examples/common/caps_event.h`) | supported, chip, names, chip_id "0x..", gen, variant, transport, tx_chains, rx_chains, n_ss, stbc, ldpc, sgi, bw_max, bw[] (MHz), txpwr_max, txpwr_step_qdb, txpwr_step_measured, txpwr_min_qdb, txpwr_max_qdb, txpwr_rate_diffs, txpwr_rate_diffs_hw, txpwr_rate_diffs_measured, tune_2g4[]\|null, tune_5g[]\|null, char_2g4[]\|null, char_5g[]\|null, ldpc_rx_ht, ldpc_rx_vht, ldpc_rx_flag, vht_2g4, per_pkt_txpwr, per_pkt_txpwr_steps, per_pkt_txpwr_step_qdb, per_pkt_txpwr_min_qdb, per_pkt_txpwr_max_qdb, per_pkt_txpwr_measured, narrowband, fastretune, ack_responder, tx_retry_limit, he_er_su, per_chain_rssi, hw_rx_tsf, hw_beacon_txtsf, tsf_write, xtal_cap_max, xtal_cap_default |
+| `adapter.caps` | RX, TX, doctor, txpower (`examples/common/caps_event.h`) | supported, chip, names, chip_id "0x..", gen, variant, transport, tx_chains, rx_chains, n_ss, stbc, ldpc, sgi, bw_max, bw[] (MHz), txpwr_max, txpwr_step_qdb, txpwr_step_measured, txpwr_min_qdb, txpwr_max_qdb, txpwr_rate_diffs, txpwr_rate_diffs_hw, txpwr_rate_diffs_measured, tune_2g4[]\|null, tune_5g[]\|null, char_2g4[]\|null, char_5g[]\|null, ldpc_rx_ht, ldpc_rx_vht, ldpc_rx_flag, vht_2g4, per_pkt_txpwr, per_pkt_txpwr_steps, per_pkt_txpwr_step_qdb, per_pkt_txpwr_min_qdb, per_pkt_txpwr_max_qdb, per_pkt_txpwr_measured, narrowband, fastretune, ack_responder, station_mode, tx_retry_limit, he_er_su, per_chain_rssi, hw_rx_tsf, hw_beacon_txtsf, tsf_write, xtal_cap_max, xtal_cap_default |
 | `debug.wreg` | L (`DEVOURER_LOG_WRITES`) | addr "0x0nnn", width, val "0x…" |
 | `hop.prof` | L (`DEVOURER_HOP_PROF`) | gen, ch, `<stage>_us`…, total_us |
 | `tx.fail` | L (send failure; regress.py keys on it) | {status, actual_len, timeout} or {rc, timeout} |
@@ -100,7 +100,7 @@ Emitters: L = library, RX/TX/... = demo. Optional fields in [brackets];
 | `rx.scrambler` | RX (`DEVOURER_DUMP_SCRAMBLER`) | seed "0xNN", rate, hits, len |
 | `rx.energy` | RX (`DEVOURER_RX_ENERGY_MS` / sweep) | t, [ch], cca_ofdm\|null, cca_cck\|null, fa_ofdm\|null, fa_cck\|null, igi\|null, abs_noise_floor_dbm\|null, clm\|null (CCX busy airtime %), nhm_env\|null (NHM mass above the receiver's own floor, %), [retune_us], frames, frames_ldpc, frames_stbc, crc_err, icv_err, rssi_mean, rssi_max, snr_mean, snr_min, evm_mean — crc/icv nonzero only under `DEVOURER_RX_KEEP_CORRUPTED` (the parser drops failed frames otherwise) |
 | `rx.nhm` | RX | [ch], peak, busy (naive mass above bucket 0 — rails ~100 on a quiet channel), ratio, env (same mass with the IC's own noise-floor cluster removed — the comparable one), dur, hist[12] |
-| `rx.quality` | RX (`DEVOURER_RXQUALITY`) | verdict, frames, rssi_mean_dbm, rssi_max_dbm, snr_mean_db, snr_min_db, evm_db\|null, noise_floor_dbm\|null, abs_noise_floor_dbm\|null, igi |
+| `rx.quality` | RX (`DEVOURER_RXQUALITY`) | verdict, frames, rssi_mean_dbm, rssi_max_dbm, snr_mean_db\|null, snr_min_db\|null, evm_db\|null, noise_floor_dbm\|null, abs_noise_floor_dbm\|null, igi |
 | `adapter.rxpaths` | RX (`DEVOURER_RXQUALITY`) | active_mask "0xNN", n_active, n_chains, frames, rssi_dbm[], snr_db[], evm_db[] — GetActiveRxPaths live per-chain activity (the caps rx_chains companion); snr_db/evm_db only when a chain carried the metric this window (EVM -128 no-stream rail excluded) |
 | `link.health` | RX (`DEVOURER_LINKHEALTH`) | verdict, rssi_dbm, snr_db, evm_db\|null, frames, fa_ofdm\|null, igi\|null, [igi_floor], [igi_ceil], cause, fix |
 | `fw.c2h` | RX, duplex (`DEVOURER_TX_STATUS`) | len, bytes hex |
@@ -109,7 +109,7 @@ Emitters: L = library, RX/TX/... = demo. Optional fields in [brackets];
 | ev | emitter | fields |
 |---|---|---|
 | `tx.frame` | TX | n, rc — precoder demo variant: n, ok |
-| `tx.stats` | TX | submitted, failed, was_timeout, last_rc |
+| `tx.stats` | TX | submitted, failed, was_timeout, last_rc; periodic events (not the `final:1` one) also carry `txdma_status` (the MAC TX-DMA fault latch; nonzero = the transmitter has stopped) where the backend reads it (`IRtlRadio::HasTxDmaStatus`: Jaguar2, Jaguar3), or `txdma_read_failed:1` when that sample's register read failed |
 | `tx.agg` | L (`DEVOURER_TX_USB_AGG`, send_packets) | frames, bytes, shim, ok — one per multi-frame bulk-OUT URB. The sync-TX generations (Jaguar2/Jaguar3/RTL8733B) also emit `sent` — bytes actually transferred, OR the negative libusb rc on a transport error (deliberately raw: this event is the only machine-readable carrier of the aggregated-path error code) — and set `ok` only on a FULL write, so `ok=false` splits as `sent < 0` transport error vs `0 <= sent < bytes` short write. Jaguar1 TX is async: its `ok` means URB accepted by the transport and there is no `sent` field (bytes resolve at completion reaping) |
 | `tx.report` | L (`DEVOURER_TX_REPORT`, CCX decode) | t, state (0=delivered, 1=retry-drop), ok, retries, final_rate, queue_time_raw, bmc, macid, fmt ("8812"\|"halmac"); halmac adds tag (SW_DEFINE echo), rts_retries, missed (fw-stuffed constant on Jaguar3 — tag gaps are the drop signal; `tests/txrpt_coverage_attrib.py`) — t is the achieved-report-rate timebase (the CCX emission ceiling is reports/s) |
 | `tx.status` | RX, duplex (C2H TX_RPT decode) | hoff, queue, retry, airtime_us, rate |
@@ -187,6 +187,10 @@ Emitters: L = library, RX/TX/... = demo. Optional fields in [brackets];
 | `stream.done` | streamtx (stderr) | sent |
 | `svc.stats` | svctx | frames, crit, t0, t1, t2, t3plus |
 | `doctor.verdict` | doctor | verdict, reasons "0x…", efuse_reads, efuse_mismatch, efuse_bad_id, efuse_id, fw_attempted, fw_ready, rx_ok, rx_crc, init |
+| `sta.tick` | sta_client (`DEVOURER_STA_TICK_MS`) | t_ms, state, beacons, beacons_ours, associations, reconnects, enc_rx, enc_tx, mic_fail, replays, tap_to_host, tap_from_host, aired, send_fail, q_drop |
+| `ccmp.profile` | sta_client, ap_wpa2 (`DEVOURER_CCMP_PROFILE`) | path "software", tx_frames, tx_ns, rx_frames, rx_ns |
+| `udp_blast.send` / `udp_blast.recv` | udp_blast (station-mode harness) | datagrams, bytes, refused, seconds, offered_mbps / datagrams, bytes, lost (from sequence 0), reordered, duplicated, first_seq, window_s, span_s, goodput_mbps, loss_pct (-1 when nothing arrived) |
+| `ccmp.sw_bench` | CcmpSwBench | bytes, operation, iterations, wall_seconds, cpu_seconds, wall_ns_per_frame, cpu_ns_per_frame, cpu_payload_mbps, radio_payload_mbps, projected_core_pct |
 
 ## Not JSON by design
 

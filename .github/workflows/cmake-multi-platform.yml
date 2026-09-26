@@ -124,6 +124,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # OpenSSL so the station crypto acceptance cells (supplicant, station_sm,
+      # ccmp_framing - the KRACK and known-answer tests) build and run here
+      # too; CMakeLists gates them on find_package(OpenSSL) and they would
+      # otherwise be skipped on this job without a failure.
       - name: Set up MSYS2 / mingw-w64
         uses: msys2/setup-msys2@v2
         with:
@@ -135,6 +139,7 @@ jobs:
             mingw-w64-x86_64-ninja
             mingw-w64-x86_64-libusb
             mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-openssl
 
       - name: Configure CMake (mingw, pkg-config libusb, no vcpkg)
         # VCPKG_ROOT is unset, so CMakeLists takes the pkg-config path — the

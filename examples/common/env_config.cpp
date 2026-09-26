@@ -96,6 +96,7 @@ devourer::DeviceConfig devourer_config_from_env() {
     cfg.tx.ep = static_cast<uint8_t>(v);
   if (env_long("DEVOURER_TX_TIMEOUT_MS", &v))
     cfg.tx.timeout_ms = static_cast<unsigned>(v);
+  cfg.tx.no_cancel_multipkt = env_flag("DEVOURER_TX_NO_CANCEL_MULTIPKT");
   cfg.tx.legacy_8812_desc = env_flag("DEVOURER_TX_LEGACY_8812_DESC");
   if (env_long("DEVOURER_TX_PWR", &v))
     cfg.tx.power_index = static_cast<int>(v & 0x3f);
@@ -125,8 +126,13 @@ devourer::DeviceConfig devourer_config_from_env() {
     /* 1..255; out-of-range low keeps the library default (a 0 collapsing
      * to 1 us would write off every frame). */
     cfg.tx.ack_timeout_us = static_cast<int>(v > 255 ? 255 : v);
-  if (env_long("DEVOURER_TX_RETRY_LIMIT", &v))
+  if (env_long("DEVOURER_TX_RETRY_LIMIT", &v)) {
+    /* BOTH statements are conditional: retry_limit_set on an unset variable
+     * made every MT7612U session write MT_TX_RETRY_CFG = 0 and switch its
+     * hardware retransmission off (see the field doc in DeviceConfig.h). */
     cfg.tx.retry_limit = static_cast<int>(v < 0 ? 0 : (v > 63 ? 63 : v));
+    cfg.tx.retry_limit_set = true;
+  }
   if (const char *e = env_str("DEVOURER_TX_RETRY_FALLBACK")) {
     if (str_ieq(e, "off")) {
       cfg.tx.retry_fallback = devourer::RetryFallback::Off;
@@ -162,6 +168,10 @@ devourer::DeviceConfig devourer_config_from_env() {
    * library nor the device class consults ambient process state. */
   if (const char *e = env_str("DEVOURER_MT7612U_FW_DIR"))
     cfg.mt7612u.firmware_dir = std::string(e);
+  /* Only an explicit "0" disables the tick: a typo must not silently turn
+   * off the receiver's calibration. */
+  if (const char *e = env_str("DEVOURER_MT7612U_PHY_TICK"))
+    cfg.mt7612u.phy_tick = std::strcmp(e, "0") != 0;
 
   /* ---- tuning ---- */
   /* Defaults ON, so this reads the negation: only an explicit 0 disables it. */

@@ -11,8 +11,12 @@ harnesses under `tests/`, not a library API — the pieces (beacon, RX callback,
 responses, DHCP/ARP/ICMP, the WPA2 4-way handshake, software CCMP) lives in the
 harness. All bench-validated against the real Linux `rtw88`/`mac80211` stack.
 
-A dense beacon interval (`DEVOURER_BCN_TU=25`) is needed throughout, so a
-supplicant's fast channel-hopping scan catches the AP. The AP adapter must
+A dense beacon interval (`DEVOURER_BCN_TU=25`) was believed to be needed
+throughout, so a supplicant's fast channel-hopping scan catches the AP. **That
+does not reproduce on the MT7612U bench**: `tests/mt7612u_ap_onair.sh` scores
+14/14 on both bands at the default 100 TU, and its `stop` cell's binary
+hardcodes 100 TU and has always passed its scan checks. Treat 25 as a knob to
+reach for if a particular station misses the beacon, not as a requirement. The AP adapter must
 run `StartBeacon` (all generations) plus full-duplex `StartRxLoop` — the AP
 harnesses are bench-validated on J2/J3 adapters; the station is a second
 Realtek adapter bound to the kernel (rtw88 auto-probes a VBUS-cold dongle to a
@@ -33,6 +37,14 @@ station bound to `rtw88` runs `iw scan` and lists devourer, parsing every elemen
     capability: ESS   SSID: devourerAP
     Supported rates: 1.0* 2.0* 5.5* 11.0* 18.0 24.0 36.0 54.0
     DS Parameter set: channel 6   TIM: DTIM Count 0 Period 1   ERP: <no flags>
+
+**That `TIM` line is now reproducible**, and was not when this note was first
+written: `tests/ap_responder.cpp` and `tests/ap_wpa2.cpp` emit one via
+`devourer::sta::append_tim()`, and `DTIM Count 0 Period 1` is byte-for-byte
+what its default produces — confirmed on air by a passive scan.
+`tests/mt7612u_beacon_stop_check.cpp` still emits none. Do NOT read the
+element as evidence that power save is handled: it advertises "nothing
+buffered", which is true, and nothing is buffered — see the scope note.
 
 Confirmed on **both bands** — ch6 (2437 MHz) and ch36 (5180 MHz).
 
@@ -84,7 +96,12 @@ interoperate. So devourer is a complete zero-config WPA2-PSK AP: associate → 4
 
 CCMP framing detail: the AAD masks the FC subtype/retry/pwr-mgmt/more-data bits and
 sets protected, and masks the sequence number (keeping the fragment number); the
-nonce is `0 | A2 | PN(6, big-endian)`; the CCMP header carries the 48-bit PN + the
+nonce is `flags | A2 | PN(6, big-endian)` — and note that this file
+said `0 | A2 | PN` until 2026-09-20, which is **wrong** and matched the same
+misreading in `src/sta/Ccmp.h:113` and `tests/ccmp_gen_vectors.py:109`.
+802.11-2016 12.5.3.3.4 defines the flags octet as Priority (b0..b3) |
+Management (b4), so it is the QoS TID, not zero. See "A CCMP defect this design
+would inherit" in `docs/station-mode-scope.md`; the CCMP header carries the 48-bit PN + the
 ext-IV key id. A hardware CCMP offload would instead need the J3 security TX/RX
 descriptor fields, which are absent in devourer (only Jaguar1 has
 `SET_TX_DESC_SEC_TYPE_8812`) — software CCMP sidesteps that.
@@ -92,9 +109,36 @@ descriptor fields, which are absent in devourer (only Jaguar1 has
 ## Scope
 
 These harnesses implement enough AP-side logic to interoperate with a real station
-end to end. What is intentionally out of scope (AP-*stack* breadth, not driver
-parity): multiple concurrent clients, GTK broadcast/rekey, routing/NAT, and a real
-DHCP address pool. The bench caveat is that a single clean end-to-end run of the
+end to end. What is out of scope *for these harnesses as they stand* (AP-*stack* breadth,
+not driver parity): multiple concurrent clients, GTK broadcast/rekey,
+routing/NAT, and a real DHCP address pool.
+
+**Three of those four are now IMPLEMENTED, not merely targets.**
+Phase 2b landed all three on 2026-09-20: multiple concurrent clients (a
+seven-slot station table), a GTK transmit path (key id 1, one key per BSS, its
+own PN space) and an address pool derived from the AID. Two stations now
+exchange encrypted unicast through the AP and both decrypt a group frame —
+`docs/station-mode-plan.md` has the measurements. Routing/NAT remains out of
+scope, and whether the AP stays a gateway or becomes a transparent bridge is
+still undecided in `docs/station-mode-scope.md`.
+
+Note that the single-lease and single-client statements elsewhere in this file
+describe `tests/ap_responder.cpp`, which was NOT rewired onto the station
+table; only `tests/ap_wpa2.cpp` was.
+
+**802.11 power save is out of scope too, and this is the one that bites.**
+Nothing is buffered for a dozing peer — every reply is enqueued the moment the
+request is parsed and airs whether or not the station is listening. The
+beacons do now carry a TIM, which closed a conformance gap and gave a station
+a DTIM schedule; it did NOT fix the loss, because the loss is the buffering. A
+station in power save therefore loses most of what the AP sends it. Measured
+on the MT7612U bench, open network, 60 pings at 1/s, changing only the
+station's setting: `power_save on` gave 0/60 received and the link dropped
+mid-run; `power_save off` gave 60/60 at 0% loss, RTT 0.735/1.530/7.644 ms.
+`tests/mt7612u_ap_onair.sh` now requires power save off and says so in its
+summary line — which also means its 14/14 does **not** certify these harnesses
+against a default-configured Linux station, because Linux defaults to
+power save on. The bench caveat is that a single clean end-to-end run of the
 whole WPA2 chain is flaky after many cycles when the AP adapter has no VBUS reset
 (an xhci root-hub port) — cold-cycle the station between runs, and prefer a
 VBUS-cyclable AP adapter.

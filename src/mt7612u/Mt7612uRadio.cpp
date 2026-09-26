@@ -189,7 +189,11 @@ void Mt7612uRadio::bring_up(SelectedChannel channel) {
     throw std::runtime_error("MT7612U channel set failed");
   _channel = channel;
   apply_config();
-  start_tick();
+  if (_cfg.mt7612u.phy_tick)
+    start_tick();
+  else
+    _logger->warn("MT7612U: 1 Hz PHY tick disabled by config - a receiver "
+                  "under a fast peer will collapse; measurement control only");
 }
 
 /* Every DeviceConfig knob this backend can reach, and a loud line for each one
@@ -219,6 +223,17 @@ void Mt7612uRadio::apply_config() {
                   "backend - the MAC keeps its own default, so the range "
                   "budget this knob implies does not apply here",
                   _cfg.tx.ack_timeout_us);
+
+  /* tx.retry_limit, only when the caller chose it: this part's limit is a
+   * GLOBAL register (every ACK-requested frame), and its hardware default of
+   * 15 is what a station relies on. Refusal is fatal like the responder's -
+   * a caller that asked for 5 must not get 15 silently. */
+  if (_cfg.tx.retry_limit_set) {
+    if (mt7612u_set_retry_limit(_dev, _cfg.tx.retry_limit) != 0)
+      throw std::runtime_error("MT7612U retry limit could not be set");
+    _logger->info("MT7612U: hardware retry limit {} (global, ACK-requested "
+                  "frames only)", _cfg.tx.retry_limit);
+  }
 
   if (_cfg.tuning.disable_cca)
     _logger->warn("MT7612U: DEVOURER_DIS_CCA / tuning.disable_cca is not "
@@ -1011,6 +1026,32 @@ void Mt7612uRadio::ClearAckResponder() {
     mt7612u_clear_ack_responder(_dev);
 }
 
+/* Thin, like the rest of the control plane, and thin for a reason the HAL
+ * side documents: on this part a station identity is a check, not a
+ * configuration. See docs/mt7612u-station-identity.md and station.cpp.
+ *
+ * The ordering note IRadio requires is at the declaration
+ * (Mt7612uRadio.h). A future revision that starts writing registers here has
+ * to revisit it. */
+bool Mt7612uRadio::SetStationIdentity(const devourer::MacAddr &own,
+                                      const devourer::MacAddr &bssid) {
+  std::lock_guard<std::recursive_mutex> lock(_mu);
+  if (!_dev)
+    return false;
+  return mt7612u_set_station_identity(_dev, own.data(), bssid.data()) == 0;
+}
+
+bool Mt7612uRadio::ClearStationIdentity() {
+  std::lock_guard<std::recursive_mutex> lock(_mu);
+  if (!_dev)
+    return false;
+  mt7612u_clear_station_identity(_dev);
+  /* True without qualification only because the arm wrote no hardware state
+   * on this part. A backend that starts writing registers here must return
+   * what it actually verified. */
+  return true;
+}
+
 /* The beacon plane. Thin on purpose: the sequence these wrap is the one the
  * bring-up harness's Stage A and Stage B gates run, device-verified on
  * 2026-09-08 - beacon on air on both bands, hardware TSF and sequence, and a
@@ -1234,9 +1275,15 @@ devourer::AdapterCaps Mt7612uRadio::GetAdapterCaps() {
   c.tsf_write_ok = hw.tsf_write;
   /* Measured on air: 0 frames at the stimulus radio unarmed, 3500+ armed. */
   c.ack_responder_ok = true;
-  /* Unmeasured, so false rather than optimistic - nothing here drives the
-   * hardware retry counter. */
-  c.tx_retry_limit_ok = false;
+  /* station_mode_ok: TRUE. The evidence, its controls and its limits -
+   * the promiscuous station RX path included - are kept in ONE place, at the
+   * AdapterCaps::station_mode_ok declaration, with the full record in
+   * docs/mt7612u-station-identity.md (read its retraction section first). */
+  c.station_mode_ok = true;
+  /* tx.retry_limit reaches MT_TX_RETRY_CFG (global, not per frame; only
+   * when tx.retry_limit_set) and is read back. On air: see
+   * docs/jaguar3-tx-ring.md item 6. */
+  c.tx_retry_limit_ok = true;
   c.narrowband_ok = false;
   /* Measured 526 ms full / 48 ms with calibration skipped, against 0.5-2.5 ms
    * on the Realtek parts: the RF plane lives behind the MCU. Not "fast". */

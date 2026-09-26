@@ -12,6 +12,7 @@
 #include "IRtlRadio.h"
 #include "TxMode.h"
 #include "RtlAdapter.h"
+#include "StationArm.h"
 #include "SelectedChannel.h"
 #include "CfoTracker.h"
 #include "HalJaguar2.h"
@@ -75,6 +76,12 @@ public:
   /* Hardware ACK responder (IRadio contract; src/AckResponder.h). */
   bool SetAckResponder(const devourer::MacAddr &mac) override;
   void ClearAckResponder() override;
+  /* Station identity (IRadio contract; src/StationArm.h): MACID = own,
+   * BSSID = the AP, net_type = Infra, under _reg_mu; refused before bring-up
+   * and while a beacon or ACK responder owns port 0. */
+  bool SetStationIdentity(const devourer::MacAddr &own,
+                          const devourer::MacAddr &bssid) override;
+  bool ClearStationIdentity() override;
   /* A-MPDU TX mode (IRadio contract; src/AmpduMode.h). Programs the
    * 8822B pacing regs (0x455 max-time, 0x4BC burst-mode) under _reg_mu and
    * records the descriptor state the TX path reads. */
@@ -92,6 +99,14 @@ public:
    * ride the steer re-download; interval/TBTT/port identity untouched. */
   bool UpdateBeaconPayload(const uint8_t *beacon, size_t len) override;
   bool StopBeacon() override;
+  /* Read-only TX-path diagnostics, the same halmac read_buf_88xx port as
+   * Jaguar3 (the 88xx common code: TX FIFO window 0x780, LLT 0x650, selected
+   * through REG_PKTBUF_DBG_CTRL; TXDMA_STATUS at 0x0210). Safe on a chip whose
+   * transmitter has stopped. */
+  uint32_t GetTxDmaStatus() override;
+  bool HasTxDmaStatus() const override { return true; }
+  bool ReadPacketBuffer(int sel, uint32_t offset, uint8_t *out,
+                        size_t n) override;
   /* Disable/restore the MAC EDCCA gate (BIT_DIS_EDCCA 0x520[15] + EDCCA-mask
    * 0x524[11] — HalMAC-common with J3) so a TBTT beacon airs on schedule. */
   void SetCcaMode(bool disabled) override;
@@ -255,6 +270,24 @@ private:
   jaguar2::HalmacJaguar2MacInit _macinit;
   jaguar2::HalmacJaguar2Fw _fw;
   SelectedChannel _channel{};
+  /* Mirrors _channel.ChannelWidth as a devourer bw code (0/1/2 = 20/40/80 MHz)
+   * so the RX completion handler reads the tuned width without taking
+   * _reg_mu: parse_phy_sts_jgr2 resolves rxsc 0 ("full configured
+   * bandwidth", phydm_rxsc_2_bw) against it. Written wherever the tuned width
+   * changes (Init, InitWrite, SetMonitorChannel, FastSetBandwidth). */
+  std::atomic<uint8_t> _rx_bw_code{0};
+  /* ChannelWidth_t -> devourer RX bw code. An explicit switch, not a cast;
+   * narrowband 5/10 MHz has no bw code and folds to 20. */
+  static uint8_t channel_width_to_bw_code(ChannelWidth_t w) {
+    switch (w) {
+    case CHANNEL_WIDTH_40:
+      return 1;
+    case CHANNEL_WIDTH_80:
+      return 2;
+    default:
+      return 0;
+    }
+  }
   Action_ParsedRadioPacket _packetProcessor = nullptr;
   /* Runtime TX-power knobs (atomic so GetTxPowerState's cached snapshot is
    * readable cross-thread; setters are control-plane-thread calls). Flat
@@ -326,6 +359,7 @@ private:
    * FastRetune / the TX-power setters / GetThermalStatus by _reg_mu (the RF
    * read window is a multi-transfer sequence that must not tear). */
   std::mutex _reg_mu;
+  devourer::StationArm _station; /* under _reg_mu */
   std::thread _pwrtrack_thread;
   std::atomic<bool> _pwrtrack_stop{false};
   void start_pwrtrack();

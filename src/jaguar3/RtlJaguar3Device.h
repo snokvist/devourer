@@ -11,6 +11,7 @@
 #include "IRtlRadio.h"
 #include "TxMode.h"
 #include "RtlAdapter.h"
+#include "StationArm.h"
 #include "SelectedChannel.h"
 #include "ChipVariant.h"
 #include "HalJaguar3.h"
@@ -74,7 +75,21 @@ public:
   size_t send_packets(const TxPacketView *pkts, size_t count) override;
   /* Hardware ACK responder (IRadio contract; src/AckResponder.h). */
   bool SetAckResponder(const devourer::MacAddr &mac) override;
+  /* The TX/beacon register witness — see the definition. Read-only; safe to
+   * call on a chip whose transmitter has stopped, which is the whole point. */
+  void DumpChipState() override;
+  uint32_t GetTxDmaStatus() override;
+  bool HasTxDmaStatus() const override { return true; }
+  void DumpMacRegisters() override;
+  bool ReadPacketBuffer(int sel, uint32_t offset, uint8_t *out,
+                        size_t n) override;
   void ClearAckResponder() override;
+  /* Station identity (IRadio contract; src/StationArm.h): MACID = own,
+   * BSSID = the AP, net_type = Infra, under _reg_mu; refused before bring-up
+   * and while a beacon or ACK responder owns port 0. */
+  bool SetStationIdentity(const devourer::MacAddr &own,
+                          const devourer::MacAddr &bssid) override;
+  bool ClearStationIdentity() override;
   /* A-MPDU TX mode (IRadio contract; src/AmpduMode.h). Programs the 8822C
    * aggregate-fill timer (0x455) under _reg_mu (serialized against the coex
    * thread) and records the descriptor state the TX path reads. */
@@ -244,6 +259,22 @@ private:
     return true;
   }
 
+  /* Maps ChannelWidth_t to the devourer RX bw code (0/1/2 = 20/40/80 MHz),
+   * for _rx_bw_code below. Explicit switch rather than a cast: the enum's
+   * numeric values happen to line up today (CHANNEL_WIDTH_20/40/80 = 0/1/2)
+   * but that is not a contract this code should rely on, and the narrowband
+   * 5/10 MHz widths have no RX-bw-code equivalent (fold to 20). */
+  static uint8_t channel_width_to_bw_code(ChannelWidth_t w) {
+    switch (w) {
+    case CHANNEL_WIDTH_40:
+      return 1;
+    case CHANNEL_WIDTH_80:
+      return 2;
+    default:
+      return 0;
+    }
+  }
+
   /* Parse one send_packet-contract buffer (radiotap + 802.11) and build its
    * TXDMA block — 48-byte descriptor, pkt_offset×8 pad, frame — at `out`
    * (zeroed, sized desc + pad + frame by the caller). Performs the per-packet
@@ -252,6 +283,12 @@ private:
    * send_packet (pkt_offset=0) and the send_packets URB packer. */
   size_t build_tx_block(const uint8_t *packet, size_t length, uint8_t *out,
                         uint8_t pkt_offset);
+  /* The QSEL build_tx_block will stamp on this buffer, WITHOUT building it,
+   * so send_packets can end a URB run at a queue change before anything is
+   * built - build_tx_block has side effects (the CCX report tag, a TX-power
+   * bank, a retune) that must run once per frame. Mirrors build_tx_block's
+   * QSEL writes; change the two together. */
+  uint8_t peek_tx_qsel(const uint8_t *packet, size_t length) const;
 
   RtlAdapter _device;
   const devourer::DeviceConfig _cfg;
@@ -266,6 +303,14 @@ private:
    * thread every ~2 s like the vendor watchdog. */
   jaguar3::PhydmRuntimeJaguar3 _phydm;
   SelectedChannel _channel{};
+  /* Mirrors _channel.ChannelWidth as a devourer bw code (0/1/2 = 20/40/80 MHz)
+   * so the RX completion handler can read the currently-tuned width without
+   * taking _reg_mu — same relaxed-atomic-mirror pattern as _txpkt_img below.
+   * parse_phy_sts_jgr3 needs it on every frame to resolve rxsc 0 ("full
+   * configured bandwidth", phydm_rxsc_2_bw) to an actual width. Written
+   * wherever _channel.ChannelWidth is set (Init, InitWrite, SetMonitorChannel,
+   * FastSetBandwidth); FastRetune never changes width. */
+  std::atomic<uint8_t> _rx_bw_code{0};
   Action_ParsedRadioPacket _packetProcessor = nullptr;
   /* Runtime TX-power knobs (atomic so GetTxPowerState's cached snapshot is
    * readable cross-thread). Flat override -1 = the chip's efuse-calibrated
@@ -422,6 +467,7 @@ private:
   /* Serializes the coex housekeeping tick against StartRxLoop's register
    * restore (the only two register writers during an active TX session). */
   std::mutex _reg_mu;
+  devourer::StationArm _station; /* under _reg_mu */
 };
 
 #endif /* RTL_JAGUAR3_DEVICE_H */

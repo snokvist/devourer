@@ -445,7 +445,7 @@ int mt7612u_beacon_start(struct mt7612u_dev *dev, const void *buf, size_t len,
 		 * caller can act on. Silence is a worse outcome than a deaf AP only if
 		 * you are not told about it.
 		 */
-		if (mt7612u_set_ack_responder(dev, ta))
+		if (mt7612u_set_ack_responder_as(dev, ta, "a beacon"))
 			goto fail_post;
 		if (mt_mac_set_bss_base(dev, ta))
 			goto fail_post;

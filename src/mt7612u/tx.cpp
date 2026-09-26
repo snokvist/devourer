@@ -191,7 +191,11 @@ int mt_tx_build(struct mt7612u_dev *d, uint8_t *buf, size_t bufsz,
 		}
 		txwi[18] = FIELD_PREP(MT_TX_PWR_ADJ, (uint32_t)(adj & 0xf));
 	}
-	txwi[19] = 0;                                           /* pktid */
+	/* pktid: zero means "do not report", which is what every normal send
+	 * wants - a status entry per frame is FIFO traffic nobody drains. With
+	 * MT_TXOPT_TXS the MAC files one entry per MPDU in MT_TX_STAT_FIFO, and
+	 * the caller is responsible for draining it. */
+	txwi[19] = (opts & MT_TXOPT_TXS) ? 1 : 0;               /* pktid */
 
 	/* frame, with the header pad inserted if needed */
 	memcpy(buf + 4 + MT_TXWI_LEN, f, (size_t)hdrlen);

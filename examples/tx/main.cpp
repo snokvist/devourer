@@ -2277,11 +2277,35 @@ int main(int argc, char **argv) {
        * climbing failed with was_timeout=1 is a full TX FIFO (recoverable
        * back-pressure); a hard rc is a broken path. */
       auto ts = rtlDevice->GetTxStats();
-      devourer::Ev(*g_ev, "tx.stats")
-          .f("submitted", (unsigned long long)ts.submitted)
+      /* The MAC's TX-DMA fault latch (IRtlRadio::GetTxDmaStatus), on the
+       * same 1-in-500 cadence as the rest of this event - never per frame.
+       * A nonzero value means the part has stopped transmitting whatever
+       * `submitted` says; the vendor answers it with a MAC reset. */
+      /* A register read can throw under load (a control transfer racing the
+       * bulk-IN); that sample then omits the field and says so, rather than
+       * reporting a 0 that reads as healthy - or killing the demo. */
+      /* Only where the backend reads the real latch (HasTxDmaStatus): its 0
+       * default elsewhere would read as "healthy" for a chip never asked. */
+      uint32_t txdma = 0;
+      bool txdma_have = false, txdma_ok = true;
+      if (auto *rr = dynamic_cast<IRtlRadio *>(rtlDevice);
+          rr && rr->HasTxDmaStatus()) {
+        txdma_have = true;
+        try {
+          txdma = rr->GetTxDmaStatus();
+        } catch (const std::exception &) {
+          txdma_ok = false;
+        }
+      }
+      auto ev = devourer::Ev(*g_ev, "tx.stats");
+      ev.f("submitted", (unsigned long long)ts.submitted)
           .f("failed", (unsigned long long)ts.failed)
           .f("was_timeout", ts.last_was_timeout ? 1 : 0)
           .f("last_rc", ts.last_error_rc);
+      if (txdma_have && txdma_ok)
+        ev.f("txdma_status", (unsigned long long)txdma);
+      else if (txdma_have)
+        ev.f("txdma_read_failed", 1);
     }
     /* Thermal telemetry via the generation-agnostic GetThermalStatus
      * (previously Jaguar1-only): every family reads its RF 0x42 meter —

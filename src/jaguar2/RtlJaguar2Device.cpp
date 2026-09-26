@@ -298,7 +298,13 @@ void RtlJaguar2Device::start_pwrtrack() {
         continue;
       int cck = -1, ofdm = -1, mcs7 = -1;
       _hal.txagc_shadow(cck, ofdm, mcs7);
-      _cal->pwr_track(ofdm);
+      /* Same hazard as the DIG thread: a register read that throws under RX
+       * load must skip this tick, not terminate the process. */
+      try {
+        _cal->pwr_track(ofdm);
+      } catch (const std::exception &e) {
+        _logger->warn("Jaguar2 thermal track: tick skipped ({})", e.what());
+      }
     }
   });
   _logger->info("RtlJaguar2Device: thermal-track thread started");
@@ -378,6 +384,16 @@ bool RtlJaguar2Device::SetAckResponder(const devourer::MacAddr &mac) {
                    "Jaguar2", mac.bytes[0]);
     return false;
   }
+  /* Under _reg_mu END TO END, like Jaguar3: the station check and the port
+   * write must be one step, or a SetStationIdentity between them has its
+   * identity overwritten while it still reads as armed. Every caller of this
+   * (the Init/InitWrite config arms included) holds no _reg_mu. */
+  std::lock_guard<std::mutex> lk(_reg_mu);
+  if (_station.armed()) {
+    _logger->error("Jaguar2: ACK responder refused: a station identity "
+                   "owns port 0 (ClearStationIdentity first)");
+    return false;
+  }
   /* Hardware ACK responder (src/AckResponder.h): port identity + net_type so
    * the MAC auto-ACKs unicast frames to `mac`. Same registers the proven
    * StartBeacon/AP path programs, minus the beacon machinery. */
@@ -397,7 +413,37 @@ bool RtlJaguar2Device::SetAckResponder(const devourer::MacAddr &mac) {
   return true;
 }
 
+bool RtlJaguar2Device::SetStationIdentity(const devourer::MacAddr &own,
+                                          const devourer::MacAddr &bssid) {
+  std::lock_guard<std::mutex> lk(_reg_mu);
+  if (!_brought_up) {
+    _logger->error("Jaguar2: station identity refused before bring-up");
+    return false;
+  }
+  /* The beacon's own record, not net_type: a ClearAckResponder can close the
+   * gate under a live beacon, and net_type alone would then read "free". */
+  if (!_bcn_mpdu.empty()) {
+    _logger->error("Jaguar2: station identity refused: the beacon owns port "
+                   "0 (StopBeacon first)");
+    return false;
+  }
+  return _station.arm(_device, own, bssid, _logger, "Jaguar2");
+}
+
+bool RtlJaguar2Device::ClearStationIdentity() {
+  std::lock_guard<std::mutex> lk(_reg_mu);
+  return _station.clear(_device, _logger, "Jaguar2");
+}
+
 void RtlJaguar2Device::ClearAckResponder() {
+  std::lock_guard<std::mutex> lk(_reg_mu);
+  /* The gate this closes is the station's too: a clear here would leave the
+   * station deaf to its AP while it still reads as armed. */
+  if (_station.armed()) {
+    _logger->error("Jaguar2: ACK responder clear refused: port 0 belongs to "
+                   "a station identity (ClearStationIdentity instead)");
+    return;
+  }
   if (!devourer::ack::disable_verified(_device)) {
     _logger->error("Jaguar2: ACK responder disarm did not latch");
     return;
@@ -452,8 +498,16 @@ void RtlJaguar2Device::Init(Action_ParsedRadioPacket packetProcessor,
     std::lock_guard<std::mutex> ccx(busy_window_mutex());
     busy_window_reset();
   }
+  /* Likewise a station arm: the bring-up below power-cycles the MAC, so the
+   * snapshot StationArm holds describes nothing (StationArm::forget). */
+  {
+    std::lock_guard<std::mutex> lk(_reg_mu);
+    _station.forget();
+  }
   _channel = channel;
   bring_up(channel);
+  _rx_bw_code.store(channel_width_to_bw_code(channel.ChannelWidth),
+                    std::memory_order_relaxed);
 
   /* DEVOURER_BF_ARM_BFEE=aa:bb:cc:dd:ee:ff — beamforming self-sounding
    * (beamformee side), Jaguar-2 variant. Arms the hardware CSI responder to
@@ -523,9 +577,21 @@ void RtlJaguar2Device::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
   _dig_stop = false;
   if (!_cfg.tuning.skip_dig) {
     _dig_thread = std::thread([this] {
+      uint64_t skipped = 0;
       while (!_dig_stop && !g_devourer_should_stop) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        _hal.dig_step();
+        /* A control-transfer read can race the async bulk-IN and throw under
+         * RX load (the same hazard the CFO tracker guards below). Uncaught on
+         * this thread it is std::terminate - it killed an 8812BU AP mid-way
+         * through a 14-20 Mbit/s uplink. DIG is a tracking loop: a failed
+         * tick is skipped, counted, and the next one re-reads everything. */
+        try {
+          _hal.dig_step();
+        } catch (const std::exception &e) {
+          if (skipped++ % 100 == 0)
+            _logger->warn("Jaguar2 DIG: tick skipped after a failed register "
+                          "access ({}), {} so far", e.what(), skipped);
+        }
       }
     });
     _logger->info("RtlJaguar2Device: DIG thread started");
@@ -638,7 +704,8 @@ void RtlJaguar2Device::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
         if (!is_c2h && f.physt && f.drvinfo_size >= 28)
           phy = jaguar2::parse_phy_sts_jgr2(
               data + off + jaguar2::RXDESC_SIZE_8822B, f.drvinfo_size,
-              f.rx_rate <= 3, p.RxAtrib);
+              f.rx_rate <= 3, _rx_bw_code.load(std::memory_order_relaxed),
+              p.RxAtrib);
         /* The RAW descriptor bit, matching the field's meaning on Jaguar1 /
          * Jaguar3 / RTL8733B; `phy` says which fields are safe to fold. */
         p.RxAtrib.physt = f.physt;
@@ -690,12 +757,20 @@ void RtlJaguar2Device::InitWrite(SelectedChannel channel) {
     std::lock_guard<std::mutex> ccx(busy_window_mutex());
     busy_window_reset();
   }
+  /* Likewise a station arm: the bring-up below power-cycles the MAC, so the
+   * snapshot StationArm holds describes nothing (StationArm::forget). */
+  {
+    std::lock_guard<std::mutex> lk(_reg_mu);
+    _station.forget();
+  }
   _channel = channel;
   /* TX shares the full cold bring-up (config_trx_mode enables the TX antenna
    * paths, enable_rx sets CR MACTXEN). The chip transmits at its
    * efuse/table-calibrated TXAGC; DEVOURER_TX_PWR=0xNN forces a flat reference
    * (SDR-visibility debug knob). */
   bring_up(channel);
+  _rx_bw_code.store(channel_width_to_bw_code(channel.ChannelWidth),
+                    std::memory_order_relaxed);
   /* DEVOURER_TX_PWR=0xNN forces a flat per-rate TXAGC reference (SDR-visibility
    * debug knob) over the efuse-calibrated level bring_up applied — routed
    * through the runtime flat-override knob so it composes with the offset and
@@ -922,6 +997,16 @@ void RtlJaguar2Device::SetMonitorChannel(SelectedChannel channel) {
   _hal.set_channel_bw(static_cast<uint8_t>(channel.Channel),
                       static_cast<uint8_t>(channel.ChannelWidth), _rfe,
                       channel.ChannelOffset);
+  /* Stored after the retune. rxsc 0 is resolved against the width configured
+   * when the frame is PARSED, as the vendor does (phydm_rxsc_2_bw reads the
+   * current dm->band_width): a frame delivered while the retune runs uses the
+   * old width, but one received before the change and delivered after this
+   * store uses the new one. Nothing per-frame could do better — the RX
+   * descriptor and PHY status carry no receive-time bandwidth the vendor
+   * uses (Jaguar2's type1 rf_mode bits only reach a debug print; Jaguar3's
+   * layout comments them out). */
+  _rx_bw_code.store(channel_width_to_bw_code(channel.ChannelWidth),
+                    std::memory_order_relaxed);
   /* Runtime TX-power knobs in use: re-fold them against the NEW channel's
    * efuse group so the offset stays relative to the calibrated table (TXAGC
    * registers are not per-channel — a cross-group move would otherwise keep
@@ -978,6 +1063,8 @@ void RtlJaguar2Device::FastSetBandwidth(ChannelWidth_t bw) {
     busy_window_note_retune();
     if (_hal.fast_set_bandwidth(static_cast<uint8_t>(bw))) {
       _channel.ChannelWidth = bw;
+      _rx_bw_code.store(channel_width_to_bw_code(bw),
+                        std::memory_order_relaxed);
       return;
     }
   }
@@ -1232,6 +1319,10 @@ devourer::AdapterCaps RtlJaguar2Device::GetAdapterCaps() {
    * bench cell yet, so its flags stay false-as-unmeasured. */
   c.ack_responder_ok = _variant == jaguar2::ChipVariant::C8822B;
   c.tx_retry_limit_ok = _variant == jaguar2::ChipVariant::C8822B;
+  /* station_mode_ok: SetStationIdentity is ported on both dies (shared
+   * StationArm); the flag waits for an on-air cell per die, like the two
+   * above - the 8821C has none. */
+  c.station_mode_ok = _variant == jaguar2::ChipVariant::C8822B;
   c.hw_rx_timestamp = true;  /* FrameParserJaguar2 fills RxAtrib.tsfl */
   c.hw_beacon_txtsf = true;  /* StartBeacon: MAC inserts the egress TSF into beacons */
   c.tsf_write_ok = true;     /* WriteTsf: REG_TSFTR (8822B readback) */
@@ -1339,7 +1430,7 @@ bool RtlJaguar2Device::send_packet(const uint8_t *packet, size_t length) {
                                  0);
   if (build_tx_block(packet, length, usb_frame.data(), 0) == 0)
     return false;
-  int rc = _device.bulk_send_sync_ep(_device.first_bulk_out_ep(),
+  int rc = _device.bulk_send_data_sync_ep(_device.first_bulk_out_ep(),
                                      usb_frame.data(), usb_frame.size(),
                                      /*timeout_ms=*/20);
   /* bulk_send_sync_ep returns BYTES SUBMITTED, so `rc >= 0` would also cover
@@ -1435,7 +1526,7 @@ size_t RtlJaguar2Device::send_packets(const TxPacketView *pkts, size_t count) {
     SET_TX_DESC_DMA_TXAGG_NUM_8822B(first, plan.frames());
     jaguar2::cal_txdesc_chksum_8822b(first);
 
-    const int rc = _device.bulk_send_sync_ep(_device.first_bulk_out_ep(),
+    const int rc = _device.bulk_send_data_sync_ep(_device.first_bulk_out_ep(),
                                              urb.data(), urb.size(),
                                              /*timeout_ms=*/50);
     /* Full write or nothing submitted: a truncated URB means the chip got a
@@ -1733,6 +1824,11 @@ bool RtlJaguar2Device::GetPermanentMacAddress(uint8_t out[6]) {
 bool RtlJaguar2Device::StartBeacon(const uint8_t *beacon, size_t len,
                                    int interval_tu) {
   std::lock_guard<std::mutex> lk(_reg_mu);
+  if (_station.armed()) {
+    _logger->error("beacon-tbtt(J2): refused: a station identity owns port 0 "
+                   "(ClearStationIdentity first)");
+    return false;
+  }
   /* Mirrors the working Jaguar3 path (RtlJaguar3Device::StartBeacon) — the same
    * two bugs (beacon at page 0, radiotap-in-rsvd-page) applied here. Validated on
    * hardware: RTL8812BU (2357:012d, Jaguar2) auto-transmits the beacon at TBTT,
@@ -1801,6 +1897,60 @@ bool RtlJaguar2Device::UpdateBeaconPayload(const uint8_t *beacon, size_t len) {
    * replaces the TBTT engine's buffer and re-arms the valid latch (its poll is
    * the success signal). Interval/TBTT/port identity untouched. */
   return redownload_beacon_locked();
+}
+
+uint32_t RtlJaguar2Device::GetTxDmaStatus() {
+  return _device.rtw_read<uint32_t>(0x0210); /* REG_TXDMA_STATUS */
+}
+
+bool RtlJaguar2Device::ReadPacketBuffer(int sel, uint32_t offset,
+                                        uint8_t *out, size_t n) {
+  uint32_t base;
+  if (sel == 0)
+    base = 0x780; /* TX FIFO */
+  else if (sel == 1)
+    base = 0x650; /* LLT */
+  else
+    return false;
+  /* Dword-aligned, and inside a window index that fits the 12-bit field -
+   * the same preconditions as the Jaguar3 copy (see the declaration). */
+  if (n % 4 || offset % 4)
+    return false;
+  if (((static_cast<uint64_t>(offset) + n + 0xFFF) >> 12) + base > 0x1000)
+    return false;
+  uint32_t win = (offset >> 12) + base;
+  uint32_t residue = offset & 0xFFF;
+  const uint16_t saved = _device.rtw_read16(0x0140); /* REG_PKTBUF_DBG_CTRL */
+  /* Restore the borrowed window on every exit, a throwing read included: a
+   * read that fails mid-walk must not leave 0x0140 pointing into the TX FIFO
+   * for the next user of the window (LaCapture snapshots and restores it). A
+   * destructor must not throw, so a failed restore is swallowed. */
+  struct WindowRestore {
+    RtlAdapter &dev;
+    uint16_t value;
+    ~WindowRestore() {
+      try {
+        dev.rtw_write16(0x0140, value);
+      } catch (...) {
+      }
+    }
+  } restore{_device, saved};
+  const uint16_t hi = static_cast<uint16_t>(saved & 0xF000);
+  size_t got = 0;
+  while (got < n) {
+    _device.rtw_write16(0x0140, static_cast<uint16_t>(win | hi));
+    for (uint32_t a = 0x8000 + residue; a <= 0x8FFF && got < n; a += 4) {
+      const uint32_t v = _device.rtw_read<uint32_t>(static_cast<uint16_t>(a));
+      out[got + 0] = static_cast<uint8_t>(v);
+      out[got + 1] = static_cast<uint8_t>(v >> 8);
+      out[got + 2] = static_cast<uint8_t>(v >> 16);
+      out[got + 3] = static_cast<uint8_t>(v >> 24);
+      got += 4;
+    }
+    residue = 0;
+    win++;
+  }
+  return true;
 }
 
 bool RtlJaguar2Device::StopBeacon() {
@@ -2013,6 +2163,30 @@ bool RtlJaguar2Device::WriteTsf(uint64_t tsf) {
 }
 
 void RtlJaguar2Device::Stop() {
+  /* The armed window dies with the session. Nothing else forgets it:
+   * with_ccx gates on _brought_up, which Stop() does not clear, so a window
+   * armed before a Stop stays visible afterwards and the next retune's note
+   * hands the caller a spoil reason earned by a session that no longer
+   * exists. Measured on an RTL8822BU with this reset removed: an
+   * arm/Stop/retune/read sequence reports spoil=retuned; with it, none.
+   *
+   * Note this Stop does NOT tear the chip down — it only joins the runtime
+   * threads below — so after the reset the sampled path still answers, with
+   * a live 2 ms window. That is why the on-air `revive` arm asserts the spoil
+   * REASON rather than the reading's validity. Scoped; neither joined thread
+   * takes the CCX lock.
+   *
+   * What this does NOT close: no lock spans this Stop(), so a concurrent
+   * ArmChannelBusy can still land after the reset and during teardown, and
+   * with_ccx gates on _brought_up, which nothing here clears — so an arm
+   * issued AFTER a Stop still succeeds against a torn-down chip.
+   * ArmChannelBusy is single-control-thread by contract (IRadio.h); closing
+   * the rest means clearing _brought_up, which gates other paths. The
+   * contract and this residual are both at IRadio::ArmChannelBusy. */
+  {
+    std::lock_guard<std::mutex> ccx(busy_window_mutex());
+    busy_window_reset();
+  }
   stop_pwrtrack();
   stop_dig();
 }

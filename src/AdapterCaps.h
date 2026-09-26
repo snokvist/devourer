@@ -225,11 +225,102 @@ struct AdapterCaps {
    * (tests/rtl8733b_retry_limit_onair.sh); Kestrel
    * 8832CU witness-measured — the AX WD DATA_TXCNT_LMT field counts
    * ATTEMPTS, folded +1 to the N-retries contract, limits {0,2,8} -> modal
-   * on-air copies {1,3,8-9}). FALSE on the 8814A die (the vendor
+   * on-air copies {1,3,8-9}; the MT7612U by its own TX status FIFO -
+   * mt7612uprobe txs, an unacknowledged frame settles at 6 attempts with
+   * limit 5 and 16 with the hardware default; a global register there, not
+   * per frame). FALSE on the 8814A die (the vendor
    * DATA_RETRY_LIMIT=0 carve-out is kept — knob inert) and
    * false-as-unmeasured on the 8821C. */
   bool ack_responder_ok = false;
   bool tx_retry_limit_ok = false;
+
+  /* station_mode_ok: IRadio::SetStationIdentity can program this MAC for the
+   * STATION half of an infrastructure BSS, and the behaviour a station needs
+   * from the silicon has been measured on air. Gate
+   * station-mode callers on this rather than on SetStationIdentity's return
+   * value alone, so a caller can refuse before it starts a handshake it
+   * cannot finish.
+   *
+   * False means "not ported / not measured", never "the silicon cannot". Do
+   * not set it from a code-reading: the bar is an on-air cell showing this
+   * adapter receiving unicast addressed to it and being ACKed for what it
+   * sends - the same shape of evidence ack_responder_ok carries, measured per
+   * die. (The MT7612U cells use a raw injector and an armed ACK responder as
+   * the peer, not an AP; the Realtek cells below use a devourer AP.)
+   *
+   * TRUE on MT7612U, and read docs/mt7612u-station-identity.md - its
+   * retraction section first - before quoting a number from it. Both halves
+   * of the bar are measured there, with controls, but note the limits the
+   * measurements do NOT clear and which a caller should know:
+   *
+   *   - every cell ran an UNASSOCIATED station receiving traffic it had not
+   *     negotiated, so power save, TIM parsing, cross-BSS duplicate detection
+   *     and hardware key lookup are untested;
+   *   - those cells did not drive SetStationIdentity. The associated
+   *     end-to-end runs that do - tests/sta_client.cpp arming through
+   *     IRadio, against hostapd (tests/mt7612u_sta_onair.sh) and a devourer
+   *     AP (tests/sta_d2d_onair.sh) - run the library's own station RX
+   *     path, which is PROMISCUOUS: Mt7612uRadio::StartRxLoop calls
+   *     mt7612u_set_monitor_rx() unconditionally, so they do not run the
+   *     managed filter the cells above describe (the managed filter as a
+   *     role-selected value is recorded as open work in
+   *     docs/station-mode-scope.md, "The target").
+   *   - one DUT, one peer, one channel, near field, no soak.
+   *
+   * TRUE ALSO on the Realtek 8822C and 8822E (Jaguar3), the 8822B (Jaguar2)
+   * and the Jaguar1 8812 die, since
+   * 2026-09-26 (Phase 6: src/StationArm.h, MACID = own, BSSID = the AP,
+   * net_type = Infra). Unlike the MT7612U cells above, these drove the seam
+   * itself, associated, end to end: tests/sta_d2d_onair.sh `thru` against a
+   * devourer AP (ch36, MCS7, AP_RETRY=3), one run per arm, STA_ARM=1 against
+   * the single-variable control STA_ARM=0 (SetStationIdentity never called):
+   *
+   *   station (AP)       armed: dups / delivered   unarmed: dups / delivered
+   *   8812CU (8812BU)         2 / 24111                  42122 / 14126 (2.98x)
+   *   8812BU (8812CU)        13 / 24115                  35117 / 11744 (2.99x)
+   *   8812AU (8812CU)        38 / 24110                     27 / 24114  (!)
+   *   8812EU (8812CU)      3994 / 24089 (*)              35541 / 11899 (2.99x)
+   *
+   * (!) The Jaguar1 8812 row does NOT discriminate, and was predicted not
+   * to: its bring-up programs `own` into MACID and that die's MACID answers
+   * with net_type NoLink, so the port ACKs with or without the arm. TRUE
+   * there because the station behaviour is measured, not because the arm
+   * produces it (RtlJaguarDevice::GetAdapterCaps).
+   *
+   * (*) The 8822E discriminates (unarmed 2.99x) but its ARMED port ACKs
+   * only ~83% of the AP's frames: 3994/24089, 4259/24083 (a repeat) and
+   * 4267/23151 at MCS3 - so not the peer's rate - and 4129/24073 with the
+   * arm writing net_type AP instead of Infra (an uncommitted experiment) -
+   * so not net_type either. ROOT CAUSE, same day: NOT the 8822E - the AP.
+   * An mt76 monitor witness saw the 8812EU's ACK on air after 96.8% of the
+   * airings the 8812CU AP re-aired (same 6M rate, same -30 dBm as the ACKs
+   * it took), and with the station 10 dB down (DEVOURER_STA_TXPWR_QDB=-40)
+   * re-aired MSDUs fell 11% -> 0.6% and duplicates 669 -> 13: the AP's
+   * receiver missing an ACK too strong right after its own TX - near-field
+   * placement on this bench. Roles swapped (8812CU station, 8812EU AP):
+   * 0.2% re-aired. The arm is fine; the bench is too close.
+   *
+   * Unarmed, the MAC does not ACK the AP's unicast, so each downlink frame
+   * airs AP_RETRY+1 = 4 times - the 3x duplicate ratio - and the wasted
+   * airtime collapsed the 14 Mbit/s rung (52%/64% loss vs 0.03%/0.00%).
+   * The uplink half (the AP ACKing the station) held in every arm: 20/3
+   * AP-side duplicates armed, 40/16 unarmed. `wpa2` read 8/8 on the 8812CU.
+   * Two limits on what that shows: the ACK evidence is INDIRECT (the
+   * station-side duplicate ratio; no witness capture, no AP tx.report), and
+   * the control moves two registers at once - these dies' bring-up never
+   * programs MACID, so unarmed differs in MACID AND net_type. The arm as a
+   * whole makes the port answer; which register gates it is not separated.
+   * The arm also reads BSSID back, so a die whose 0x0618 does not read back
+   * would refuse - one more reason the flag stays per measured die.
+   * Same limits as above for power save/TIM/key lookup; near field; no soak.
+   *
+   * The Jaguar1 flag keys on CHIP_8812, so the 1T1R RTL8811AU cut, which
+   * rides the 8812 path, INHERITS it UNMEASURED - no 8811AU cell was run.
+   *
+   * FALSE on the 8821C (ported, same code - no cell run), on the Jaguar1
+   * 8814A and 8821A (ported - no cell run), and on every other backend:
+   * not ported. */
+  bool station_mode_ok = false;
 
   /* --- feature flags --- */
   /* Per-packet TX power: a per-frame power trim driven by radiotap

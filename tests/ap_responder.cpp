@@ -30,7 +30,7 @@
 // show as repeated retries; here retry=0).
 //
 // Build: g++ -std=c++20 -O2 -Isrc -Iexamples/common tests/ap_responder.cpp \
-//   examples/common/env_config.cpp build/libdevourer.a \
+//   examples/common/env_config.cpp examples/common/usb_select.cpp build/libdevourer.a \
 //   $(pkg-config --cflags --libs libusb-1.0) -lpthread -o build/ap_responder
 // Run: sudo DEVOURER_PID=0xc812 DEVOURER_CHANNEL=6 DEVOURER_TX_WITH_RX=thread \
 //   build/ap_responder [sec]
@@ -49,6 +49,7 @@
 #include <unistd.h>
 #include <libusb.h>
 #include "RadiotapBuilder.h"
+#include "sta/Dot11.h"
 #include "RxPacket.h"
 #include "SelectedChannel.h"
 #include "TxMode.h"
@@ -56,6 +57,8 @@
 #include "WiFiDriver.h"
 #include "env_config.h"
 #include "logger.h"
+#include "usb_select.h"
+#include "rx_mpdu.h"
 
 // BSSID MUST be UNICAST — the first octet's I/G bit (bit 0) must be 0. The
 // canonical test SA 0x57... has that bit SET (multicast), which is invalid as a
@@ -65,6 +68,8 @@
 static const uint8_t kBssid[6] = {0x02, 0x42, 0x75, 0x05, 0xd6, 0x00};
 static IRadio* g_dev = nullptr;
 static std::vector<uint8_t> g_rt;
+static const char* kSsid = "devourerAP";
+static devourer::sta::SeqCounter g_seq;
 static uint8_t g_chan = 6;
 static std::atomic<uint64_t> g_probe{0}, g_auth{0}, g_assoc{0}, g_sent{0}, g_data{0};
 static std::mutex g_q_mu;
@@ -82,13 +87,11 @@ static uint16_t csum16(const uint8_t* d, int len) {
 // Build an AP->STA data frame (from-DS): 802.11 data hdr + LLC/SNAP + payload.
 static std::vector<uint8_t> build_data(const uint8_t* sta, uint16_t eth,
                                        const uint8_t* pl, int plen) {
-  std::vector<uint8_t> m = {0x08, 0x02, 0x00, 0x00,      // data, from-DS
-      sta[0],sta[1],sta[2],sta[3],sta[4],sta[5],          // addr1 = STA (DA)
-      kBssid[0],kBssid[1],kBssid[2],kBssid[3],kBssid[4],kBssid[5],  // addr2 = BSSID (TA)
-      kBssid[0],kBssid[1],kBssid[2],kBssid[3],kBssid[4],kBssid[5],  // addr3 = SA
-      0x00, 0x00,
-      0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00,                 // LLC/SNAP
-      (uint8_t)(eth >> 8), (uint8_t)(eth & 0xff)};
+  // Sequence-numbered like the management responses. This is the path that
+  // feeds a peer's duplicate detector in volume; it was pinned at 0.
+  std::vector<uint8_t> m = devourer::sta::data_hdr_from_ds(
+      sta, kBssid, kBssid, /*protect=*/false, g_seq.next());
+  devourer::sta::append_llc_snap(m, eth);
   m.insert(m.end(), pl, pl + plen);
   return m;
 }
@@ -128,18 +131,60 @@ static std::vector<uint8_t> build_dhcp_reply(const uint8_t* sta, const uint8_t* 
 // CCK basic rates (1/2/5.5/11) do not exist on 5 GHz — advertising them makes a
 // 5 GHz station skip the BSS with "rate sets do not match" (silent, only in
 // wpa_supplicant -d), so no association on any 5 GHz channel.
+// Now src/sta/Dot11.h's, byte for byte.
+//
+// NOT the same set a station advertises, and that stopped being true on
+// 2026-09-21: append_supported_rates() is the AP's on-air-validated set and
+// deliberately omits 6, 9, 12 and 48 Mbps, while a STATION sends
+// append_supported_rates_sta(), which carries the mandatory OFDM rates
+// because an AP whose basic set includes one the station did not advertise
+// refuses the association with status 18. Do not "restore" the AP set on the
+// station side; that is the bug 03d2478 fixed.
 static void append_rates(std::vector<uint8_t>& m) {
-  if (g_chan <= 14)  // 2.4 GHz: 1*,2*,5.5*,11*,18,24,36,54
-    m.insert(m.end(), {0x01, 0x08, 0x82, 0x84, 0x8b, 0x96, 0x24, 0x30, 0x48, 0x6c});
-  else               // 5 GHz: 6*,9,12*,18,24*,36,48,54 (basic = high bit set)
-    m.insert(m.end(), {0x01, 0x08, 0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48, 0x60, 0x6c});
+  if (g_chan <= 14) devourer::sta::append_supported_rates(m);
+  else devourer::sta::append_supported_rates_5g(m);
 }
+/* Refuse to run if the TIM wiring is wrong.
+ *
+ * tests/dot11_selftest.cpp covers append_tim() itself and MODELS this wiring
+ * with a local lambda - so deleting the `beacon` flag here would leave that
+ * test green. This reads what THIS harness builds. Same drift that let
+ * `fc0 == 0x88` survive being fixed in the shared module, and that let the
+ * ap_onair witness selftest diverge from the harness it guards.
+ *
+ * Runs BEFORE the USB open, deliberately: the first version ran after it and
+ * an injected defect went uncaught on a host with no adapter, which is the
+ * only place a wiring check is cheap to run.
+ *
+ * The TIM belongs in the BEACON ONLY (802.11-2016 9.4.2.6); in a probe
+ * response it is a malformed frame some stations reject outright. */
+static bool tim_wiring_ok(const std::vector<uint8_t>& beacon_ies,
+                          const std::vector<uint8_t>& probe_ies) {
+  size_t n = 0;
+  const bool in_beacon = devourer::sta::find_ie(
+      beacon_ies.data(), beacon_ies.size(), devourer::sta::kEidTim, &n) != nullptr;
+  const bool in_probe = devourer::sta::find_ie(
+      probe_ies.data(), probe_ies.size(), devourer::sta::kEidTim, &n) != nullptr;
+  if (!in_beacon)
+    fprintf(stderr, "FATAL: the beacon carries no TIM element\n");
+  if (in_probe)
+    fprintf(stderr, "FATAL: a TIM leaked into the probe response\n");
+  return in_beacon && !in_probe;
+}
+
 // Common: [SSID + rates + DS] IE tail for probe/assoc responses.
 static void append_ies(std::vector<uint8_t>& m, bool with_ssid) {
-  if (with_ssid) { const char* s = "devourerAP";
-    m.insert(m.end(), {0x00, 0x0a}); m.insert(m.end(), s, s + 10); }
+  if (with_ssid) devourer::sta::append_ssid(m, kSsid);
   append_rates(m);
-  m.insert(m.end(), {0x03, 0x01, g_chan});
+  devourer::sta::append_ds_params(m, (uint8_t)g_chan);
+}
+// The beacon's tail: the same elements plus the TIM, which is beacon-only
+// (802.11-2016 9.4.2.6). Factored out of main()'s inline construction so the
+// startup check below reads the SAME bytes the beacon airs, rather than a
+// model of them.
+static void append_beacon_ies(std::vector<uint8_t>& m) {
+  append_ies(m, true);
+  devourer::sta::append_tim(m);
 }
 static void enqueue(std::vector<uint8_t> mpdu) {
   std::vector<uint8_t> f; f.reserve(g_rt.size() + mpdu.size());
@@ -148,16 +193,28 @@ static void enqueue(std::vector<uint8_t> mpdu) {
   std::lock_guard<std::mutex> lk(g_q_mu);
   if (g_q.size() < 128) g_q.push_back(std::move(f));
 }
+// An AP answering a station is (da=sta, sa=bssid, bssid); a station addressing
+// its AP is (da=bssid, sa=own, bssid). One builder, two argument orders - the
+// asymmetry that used to justify a private copy in every role.
+//
+// These responses now carry a real sequence number. The MediaTek MAC assigns
+// one only for beacons (MT_TXWI_ACK_CTL_NSEQ rides MT_TXOPT_BEACON and nothing
+// else), so every management response used to air as sequence 0. An AP gets
+// away with it because it sends so few; a station's data plane would not.
 static std::vector<uint8_t> mgmt_hdr(uint8_t subtype_fc, const uint8_t* sta) {
-  return {subtype_fc, 0x00, 0x00, 0x00,
-          sta[0],sta[1],sta[2],sta[3],sta[4],sta[5],
-          kBssid[0],kBssid[1],kBssid[2],kBssid[3],kBssid[4],kBssid[5],
-          kBssid[0],kBssid[1],kBssid[2],kBssid[3],kBssid[4],kBssid[5],
-          0x00, 0x00};
+  std::vector<uint8_t> m =
+      devourer::sta::mgmt_hdr(subtype_fc, sta, kBssid, kBssid);
+  devourer::sta::assign_seq(m, g_seq.next());
+  return m;
 }
 
 static void on_rx(const Packet& p) {
-  if (p.Data.size() < 24 || p.RxAtrib.crc_err) return;
+  /* NOT p.Data.size() - see the note in ap_wpa2.cpp's on_rx and
+   * tests/rx_mpdu.h. This harness has no MIC to get wrong, but it slices
+   * ARP and ICMP out of the payload by length, and four phantom bytes at the
+   * end would be answered as if they were data. */
+  const size_t mlen = devourer::test::mpdu_len(p);
+  if (mlen < 24 || p.RxAtrib.crc_err) return;
   const uint8_t fc0 = p.Data[0], fc1 = p.Data[1];
   const uint8_t* a1 = p.Data.data() + 4;             // addr1 (RA)
   const uint8_t* sta = p.Data.data() + 10;           // addr2 (TA = station)
@@ -174,6 +231,11 @@ static void on_rx(const Packet& p) {
     enqueue(std::move(m));
   } else if (fc0 == 0xb0 && to_us) {                 // authentication
     g_auth.fetch_add(1);
+    /* The 24-byte guard above covers the HEADER; the auth body adds
+     * algorithm, sequence and status. A frame that stops after the header is
+     * something a radio delivers - the body is not guaranteed by the FCS
+     * being valid - and reading it anyway walks past the span. */
+    if (mlen < 24 + 6) return;
     uint16_t alg = p.Data[24] | (p.Data[25] << 8), seq = p.Data[26] | (p.Data[27] << 8);
     fprintf(stderr, "  AUTH req from %02x:%02x:%02x:%02x:%02x:%02x alg=%u seq=%u retry=%d\n",
             sta[0],sta[1],sta[2],sta[3],sta[4],sta[5], alg, seq, retry);
@@ -188,15 +250,18 @@ static void on_rx(const Packet& p) {
     m.insert(m.end(), {0x01,0x00, 0x00,0x00, 0x01,0xc0});   // cap, status 0, AID 1
     append_ies(m, false);
     enqueue(std::move(m));
-  } else if ((fc0 == 0x08 || fc0 == 0x88) && (fc1 & 0x01) && to_us) {  // data, to-DS
+  } else if ((fc0 == 0x08 || devourer::sta::is_qos_data(fc0)) &&
+             (fc1 & 0x01) && to_us) {                   // data, to-DS
     // Data plane: answer ARP + ICMP echo so an associated station can ping the AP.
-    int hlen = 24 + (fc0 == 0x88 ? 2 : 0);               // QoS data adds 2 bytes
-    if ((int)p.Data.size() < hlen + 8) return;
+    // Every QoS subtype, not just QoS Data - a QoS Null read as a 24-byte
+    // header finds its LLC/SNAP two bytes early and is silently dropped.
+    int hlen = (int)devourer::sta::data_hdr_len(fc0, fc1);
+    if ((int)mlen < hlen + 8) return;
     const uint8_t* llc = p.Data.data() + hlen;
     if (!(llc[0] == 0xaa && llc[1] == 0xaa && llc[2] == 0x03)) return;
     uint16_t eth = (llc[6] << 8) | llc[7];
     const uint8_t* pl = llc + 8;
-    int pllen = (int)p.Data.size() - (hlen + 8);
+    int pllen = (int)mlen - (hlen + 8);
     if (eth == 0x0806 && pllen >= 28) {                  // ARP
       uint16_t oper = (pl[6] << 8) | pl[7];
       const uint8_t* sha = pl + 8; const uint8_t* spa = pl + 14; const uint8_t* tpa = pl + 24;
@@ -243,16 +308,20 @@ static void on_rx(const Packet& p) {
 
 int main(int argc, char** argv) {
   int sec = argc > 1 ? atoi(argv[1]) : 60;
+  {   /* before the radio - see tim_wiring_ok's note */
+    std::vector<uint8_t> b, pr;
+    append_beacon_ies(b);
+    append_ies(pr, true);
+    if (!tim_wiring_ok(b, pr)) return 1;
+  }
   if (const char* c = std::getenv("DEVOURER_CHANNEL")) g_chan = (uint8_t)atoi(c);
   auto logger = std::make_shared<Logger>();
   apply_logging_env(*logger);
   libusb_context* ctx = nullptr; libusb_init(&ctx);
   libusb_set_option(ctx, LIBUSB_OPTION_LOG_LEVEL, LIBUSB_LOG_LEVEL_WARNING);
-  uint16_t vid = 0x0bda, pid = 0xc812;
-  if (const char* v = std::getenv("DEVOURER_VID")) vid = (uint16_t)strtoul(v, 0, 0);
-  if (const char* p = std::getenv("DEVOURER_PID")) pid = (uint16_t)strtoul(p, 0, 0);
-  auto* h = libusb_open_device_with_vid_pid(ctx, vid, pid);
-  if (!h) { fprintf(stderr, "open %04x:%04x fail\n", vid, pid); return 1; }
+  static const uint16_t pids[] = {0xc812};
+  auto* h = open_selected_usb(ctx, logger, pids, 1);
+  if (!h) return 1;
   std::shared_ptr<devourer::UsbDeviceLock> lk;
   if (devourer::claim_interface_then_reset(h, devourer::find_wifi_interface(h), logger, true, lk) != 0) return 1;
   WiFiDriver wifi(logger);
@@ -268,10 +337,7 @@ int main(int argc, char** argv) {
       kBssid[0],kBssid[1],kBssid[2],kBssid[3],kBssid[4],kBssid[5],
       kBssid[0],kBssid[1],kBssid[2],kBssid[3],kBssid[4],kBssid[5],
       0x00,0x00, 0,0,0,0,0,0,0,0, 0x64,0x00, 0x01,0x00};
-  { const char* s = "devourerAP"; bcn.insert(bcn.end(), {0x00,0x0a});
-    bcn.insert(bcn.end(), s, s + 10);
-    append_rates(bcn);
-    bcn.insert(bcn.end(), {0x03,0x01,g_chan}); }
+  append_beacon_ies(bcn);
   int bcn_tu = 100;
   if (const char* iv = std::getenv("DEVOURER_BCN_TU")) bcn_tu = atoi(iv);
   bool bok = g_dev->StartBeacon(bcn.data(), bcn.size(), bcn_tu);

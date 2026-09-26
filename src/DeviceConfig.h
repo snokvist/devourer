@@ -202,6 +202,24 @@ struct DeviceConfig {
     /* env: DEVOURER_TX_TIMEOUT_MS — TX bulk-OUT transfer timeout (unset =
      * USB_TIMEOUT). */
     std::optional<unsigned> timeout_ms;
+    /* env: DEVOURER_TX_NO_CANCEL_MULTIPKT=1 — USB: a synchronous data send
+     * (ITransport::tx_sync_data) longer than one bulk packet gets no
+     * timeout; a single-packet one keeps its caller's. libusb cancels on
+     * timeout, and a multi-packet bulk-OUT cancelled after the chip took part
+     * of it leaves the endpoint wedged: with several sender threads queued,
+     * the next transfer streams in as the rest of the half-received packet,
+     * the TXDMA misparses it, and every later bulk-OUT is NAKed until re-init
+     * (observed on an 8822EU with 4 sender threads under a carrier-sense-free
+     * jam: `rc=-7 got 1536/4439`, then nothing). The cost: a frame the chip
+     * NAKs indefinitely blocks its sender indefinitely, and Stop() cannot
+     * interrupt it. Firmware download and reserved-page writes are never
+     * affected. Jaguar2, Jaguar3 and Kestrel data sends only. The RTL8733B
+     * keeps every send bounded: its send path holds the device register lock
+     * across the transfer, so an unbounded one would also stall retunes and
+     * Stop(). Jaguar1 sends asynchronously and the MT7612U has its own TX
+     * path, so both ignore it. Default off: every send uses its finite
+     * timeout. See src/BulkOutTimeout.h. */
+    bool no_cancel_multipkt = false;
     /* env: DEVOURER_TX_LEGACY_8812_DESC — 8814A: keep the legacy 8812-style
      * TX-descriptor bits instead of the 8814-native layout. */
     bool legacy_8812_desc = false;
@@ -220,14 +238,23 @@ struct DeviceConfig {
     /* env: DEVOURER_TX_RETRY_LIMIT — per-frame hardware retry limit (0..63;
      * Kestrel ceiling 62 — its attempts-counting WD field folds +1). Maps to
      * the TX descriptor DATA_RETRY_LIMIT / RTS_DATA_RTY_LMT field on the
-     * 11ac generations and the RTL8733B, and wd_info DATA_TXCNT_LMT on
-     * Kestrel. 0 = no retries
+     * 11ac generations and the RTL8733B, wd_info DATA_TXCNT_LMT on
+     * Kestrel, and on the MT7612U the GLOBAL MAC register MT_TX_RETRY_CFG
+     * (short and long limit alike, every ACK-requested frame; only when
+     * retry_limit_set - see below). 0 = no retries
      * (WFB default: FEC provides reliability, not MAC retries). On a busy
      * half-duplex link retries flood the air and blind the receiver.
      * Hardware-ARQ (SetAckResponder + unicast TA, docs/scheduled-mac.md)
      * needs a nonzero value. Inert on the 8814A die only (vendor
      * DATA_RETRY_LIMIT=0 carve-out kept pending its bench). */
     int retry_limit = 0;
+    /* True when the caller CHOSE retry_limit (env_config sets it whenever
+     * DEVOURER_TX_RETRY_LIMIT is given). Backends whose hardware default is
+     * not 0 keep that default while this is false: the MT7612U's retry limit
+     * is a global MAC register the initvals leave at 15, and a station needs
+     * it - applying the Realtek-convention 0 by default would switch every
+     * MT7612U station's retransmission off. The Realtek backends ignore it. */
+    bool retry_limit_set = false;
     /* env: DEVOURER_ACK_TIMEOUT_US — hardware ACK response window in µs
      * (1..255, clamped), the hardware-ARQ RANGE lever: the MAC writes a
      * frame off (and retries) when no ACK is counted within this window,
@@ -472,9 +499,11 @@ struct DeviceConfig {
      * against the vendor driver's end state. */
     std::string replay_wseq;
     /* env: DEVOURER_TX_QSEL — EXPERIMENTAL (A-MPDU spike, tests/ampdu_spike):
-     * override the data TX-descriptor QSEL (default 0x12 = MGMT queue, the
-     * monitor-inject convention). Data-queue values are the TID (0..7);
-     * hardware A-MPDU formation is expected only on data queues. */
+     * override the TX-descriptor QSEL. The default is 0x12 (MGMT) for
+     * management/control frames and, on Jaguar3, 0 (TID0/BE, LOW queue) for
+     * 802.11 data frames - see src/jaguar3/CLAUDE.md. Data-queue values are
+     * the TID (0..7); hardware A-MPDU formation is expected only on data
+     * queues. On Jaguar3 the bulk-OUT endpoint follows the final QSEL. */
     std::optional<uint8_t> tx_qsel;
     /* env: DEVOURER_TX_RATEID — EXPERIMENTAL (retry-ladder probe,
      * tests/retry_ladder_probe.sh): override the TX-descriptor RATE_ID (the
@@ -554,6 +583,15 @@ struct DeviceConfig {
      * device class both stay free of ambient process state; the demos fold the
      * variable in, the way they do for every other knob in this file. */
     std::optional<std::string> firmware_dir;
+    /* env: DEVOURER_MT7612U_PHY_TICK — 0 disables the backend's 1 Hz PHY tick
+     * (MCU channel calibration + temperature calibration + RX gain tracking,
+     * mt7612u_phy_tick()). Measurement control only: without the tick a
+     * receiver under a fast peer collapses to a few frames per 10 s
+     * (docs/mt7612u.md), so the only reason to turn it off is to measure that
+     * arm - the benchmark that says whether some other periodic reader (a
+     * channel-busy poller, say) is disturbing the tick has no meaning without
+     * the no-tick control beside it. Default on. */
+    bool phy_tick = true;
     /* No adapter selector here on purpose. devourer chooses the adapter before
      * a backend exists (DEVOURER_USB_BUS / _PORT / _VID / _PID) and hands the
      * backend an already-claimed handle, so a MediaTek-specific selector would

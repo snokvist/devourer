@@ -104,6 +104,12 @@ void RtlJaguarDevice::InitWrite(SelectedChannel channel) {
     std::lock_guard<std::mutex> ccx(busy_window_mutex());
     busy_window_reset();
   }
+  /* Likewise a station arm: the bring-up below rewrites port 0, so the
+   * snapshot StationArm holds describes nothing (StationArm::forget). */
+  {
+    std::lock_guard<std::recursive_mutex> lock(_port0_mu);
+    _station.forget();
+  }
   std::optional<uint64_t> configured_arm_generation;
   JaguarScopeExit rollback([&] {
     if (!configured_arm_generation)
@@ -565,6 +571,11 @@ bool RtlJaguarDevice::StartBeacon(const uint8_t *beacon, size_t len,
                    "responder is armed; clear the responder first");
     return false;
   }
+  if (_station.armed()) {
+    _logger->error("beacon(J1): cannot claim port 0 while a station "
+                   "identity is armed; ClearStationIdentity first");
+    return false;
+  }
   /* Mirrors RtlJaguar2Device::StartBeacon on the pre-HalMAC registers, in the
    * VENDOR ORDER: port/beacon configuration first, reserved-page download
    * LAST. A download issued before the port is configured latches BCN_VALID
@@ -862,6 +873,11 @@ bool RtlJaguarDevice::SetAckResponder(const devourer::MacAddr &mac) {
                    "beacon owns MACID/BSSID/net_type");
     return false;
   }
+  if (_station.armed()) {
+    _logger->error("Jaguar1: ACK responder cannot be armed while a station "
+                   "identity owns port 0; ClearStationIdentity first");
+    return false;
+  }
   if (_eepromManager->version_id.ICType == CHIP_8812) {
     const bool had_restore_identity = _ack_restore_identity.has_value();
     if (!_ack_restore_identity) {
@@ -995,6 +1011,27 @@ bool RtlJaguarDevice::disarm_ack_responder() {
                 "(MACID/BSSID back to the pre-arm identity; "
                 "net_type=NoLink)");
   return true;
+}
+
+bool RtlJaguarDevice::SetStationIdentity(const devourer::MacAddr &own,
+                                         const devourer::MacAddr &bssid) {
+  std::lock_guard<std::recursive_mutex> lock(_port0_mu);
+  if (!_brought_up) {
+    _logger->error("Jaguar1: station identity refused before bring-up");
+    return false;
+  }
+  if (_port0_beacon_claimed || _port0_ack_claimed) {
+    _logger->error("Jaguar1: station identity refused: port 0 is claimed "
+                   "by the {}",
+                   _port0_beacon_claimed ? "beacon" : "ACK responder");
+    return false;
+  }
+  return _station.arm(_device, own, bssid, _logger, "Jaguar1");
+}
+
+bool RtlJaguarDevice::ClearStationIdentity() {
+  std::lock_guard<std::recursive_mutex> lock(_port0_mu);
+  return _station.clear(_device, _logger, "Jaguar1");
 }
 
 void RtlJaguarDevice::ClearAckResponder() {
@@ -1624,6 +1661,12 @@ void RtlJaguarDevice::Init(Action_ParsedRadioPacket packetProcessor,
     std::lock_guard<std::mutex> ccx(busy_window_mutex());
     busy_window_reset();
   }
+  /* Likewise a station arm: the bring-up below rewrites port 0, so the
+   * snapshot StationArm holds describes nothing (StationArm::forget). */
+  {
+    std::lock_guard<std::recursive_mutex> lock(_port0_mu);
+    _station.forget();
+  }
   std::optional<uint64_t> configured_arm_generation;
   JaguarScopeExit rollback([&] {
     if (!configured_arm_generation)
@@ -2229,6 +2272,17 @@ devourer::AdapterCaps RtlJaguarDevice::GetAdapterCaps() {
    * the vendor retry carve-out (knob inert). */
   c.ack_responder_ok = true;
   c.tx_retry_limit_ok = _eepromManager->version_id.ICType != CHIP_8814A;
+  /* station_mode_ok: TRUE on CHIP_8812 (measured on an 8812AU, 2026-09-26 -
+   * see the table at the AdapterCaps declaration), and read what the
+   * measurement is: the station behaviour holds, the ARM is not what makes
+   * it hold. Bring-up programs the EFUSE MAC into MACID (the station's
+   * `own`), and on this die the MACID answers with net_type NoLink - so the
+   * STA_ARM=0 control ACKed too (27 duplicates vs 38 armed, where a port
+   * that does not answer shows ~3x delivered). The arm is harmless and
+   * verified; Clear (MACID back to `own`) cannot silence the port. The
+   * 8814A/8821A dies are unmeasured and stay false. The 1T1R 8811AU cut is
+   * CHIP_8812 too, so it inherits TRUE UNMEASURED - no 8811AU cell ran. */
+  c.station_mode_ok = _eepromManager->version_id.ICType == CHIP_8812;
   /* Per-packet TX power: 8814A only — its dword5 [30:28] descriptor LUT (the
    * 8822B TXPWR_OFSET position; vendor-defined, vendor-unused). measured
    * stays false until tests/txpkt_pwr_ofset_onair.sh proves it moves on-air
@@ -2395,6 +2449,28 @@ bool RtlJaguarDevice::NetDevOpen(SelectedChannel selectedChannel) {
  * Best-effort: a chip that already dropped off the bus makes the writes fail,
  * which is fine on a teardown path. */
 void RtlJaguarDevice::Stop() {
+  /* The armed window dies with the session. Nothing else forgets it: this
+   * generation's with_ccx gates on _brought_up, which Stop() does not clear,
+   * so a window armed before a Stop stays visible afterwards and the next
+   * retune's note hands the caller a spoil reason earned by a session that no
+   * longer exists. Measured on an RTL8812AU with this reset removed: an
+   * arm/Stop/retune/read sequence reports spoil=retuned; with it, none.
+   * Scoped; nothing below takes the CCX lock. This generation has no
+   * FAMILY-WIDE register lock to order against (it has _port0_mu, a
+   * narrower one over the port0/TSF block, which is never taken under the
+   * CCX lock).
+   *
+   * What this does NOT close: no lock spans this Stop(), so a concurrent
+   * ArmChannelBusy can still land after the reset and during teardown, and
+   * with_ccx gates on _brought_up, which nothing here clears — so an arm
+   * issued AFTER a Stop still succeeds against a torn-down chip.
+   * ArmChannelBusy is single-control-thread by contract (IRadio.h); closing
+   * the rest means clearing _brought_up, which gates other paths. The
+   * contract and this residual are both at IRadio::ArmChannelBusy. */
+  {
+    std::lock_guard<std::mutex> ccx(busy_window_mutex());
+    busy_window_reset();
+  }
   _device.quiesce_tx();
   if (!_cfg.tuning.teardown_power_down) {
     _logger->info("Jaguar1: Stop() leaving the chip powered "

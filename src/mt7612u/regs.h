@@ -222,6 +222,11 @@ enum mt_mcu_cr_mode { MT_RF_CR, MT_BBP_CR, MT_RF_BBP_CR, MT_HL_TEMP_CR_UPDATE };
 #define MT_TX_RTS_CFG        0x1344
 #define MT_TX_RTS_CFG_RETRY_LIMIT GENMASK(7, 0)
 #define MT_TX_RETRY_CFG      0x134c
+/* rt2800 TX_RTY_CFG layout (initvals 0x47f01f0f = short 15, long 31, long
+ * threshold 2032 bytes): a frame longer than the threshold uses the long
+ * limit, anything else the short one. */
+#define MT_TX_RETRY_CFG_SHORT GENMASK(7, 0)
+#define MT_TX_RETRY_CFG_LONG  GENMASK(15, 8)
 #define MT_TX_LINK_CFG       0x1350
 #define MT_TX_CFACK_EN       BIT(12)
 #define MT_TX_PWR_CFG_0      0x1314
@@ -353,6 +358,32 @@ enum mt_mcu_cr_mode { MT_RF_CR, MT_BBP_CR, MT_RF_BBP_CR, MT_HL_TEMP_CR_UPDATE };
 #define MT_TX_STA_1          0x1710
 #define MT_TX_STA_2          0x1714
 /* 16 registers, two 16-bit buckets each: the A-MPDU length histogram. */
+/*
+ * Per-MPDU transmit status. mt76x02 pops one entry per read of
+ * MT_TX_STAT_FIFO while VALID is set, and the matching retry count and pktid
+ * live in the separate EXT register (mt76x02_mac_load_tx_status).
+ *
+ * The MAC only files an entry for a frame whose txwi pktid is non-zero, which
+ * is why MT_TXOPT_TXS exists: the library's normal send path leaves pktid 0
+ * and therefore generates no status traffic at all.
+ *
+ * Without these, this driver cannot observe its own retry behaviour - the
+ * Phase 0 unicast investigation (docs/station-mode-phase0.md) had to INFER a
+ * 15-deep backoff ladder from MT_TX_RETRY_CFG and MT_WMM_CWMIN/CWMAX
+ * arithmetic, and two reviewers argued about it, because nothing could read
+ * the number the chip already knows.
+ */
+#define MT_TX_STAT_FIFO      0x1718
+#define MT_TX_STAT_FIFO_VALID     BIT(0)
+#define MT_TX_STAT_FIFO_SUCCESS   BIT(5)
+#define MT_TX_STAT_FIFO_AGGR      BIT(6)
+#define MT_TX_STAT_FIFO_ACKREQ    BIT(7)
+#define MT_TX_STAT_FIFO_WCID      GENMASK(15, 8)
+#define MT_TX_STAT_FIFO_RATE      GENMASK(31, 16)
+#define MT_TX_STAT_FIFO_EXT  0x1798
+#define MT_TX_STAT_FIFO_EXT_RETRY GENMASK(7, 0)
+#define MT_TX_STAT_FIFO_EXT_PKTID GENMASK(15, 8)
+
 #define MT_TX_AGG_CNT_BASE0  0x1720
 #define MT_TX_AGG_CNT_BASE1  0x174c
 #define MT_TX_AGG_CNT(_id)   ((_id) < 8 ? MT_TX_AGG_CNT_BASE0 + ((_id) << 2) \

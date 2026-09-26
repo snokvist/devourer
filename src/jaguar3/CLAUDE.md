@@ -35,6 +35,37 @@ narrowband dividers, RF18 encoding), strategy interfaces `Jaguar3Calibration`
 - The rtl8822e's hardware-bisected constraints (DPDT/pin-mux front end,
   single-path 1SS TX, spur channels, LCK, the 2.4 GHz TX kernel-parity
   limitation) live in `docs/8822e-quirks.md`.
+- **PROTOCOL_EN must be set before the LLT init.** halmac writes
+  `MAC_TRX_ENABLE = 0xFF` to `REG_CR` just before the auto-LLT init; this port
+  wrote the DMA-only `0x0F`. Without PROTOCOL_EN (bit 4) at that moment the
+  TX page allocator never terminates the data ring at `rsvd_boundary`: a
+  sustained load runs into the reserved region and overwrites the beacon
+  page, and the next TBTT latches `TXDMA_STATUS` `BIT_TXPKTBUF_REQ_ERR` - TX
+  dead for the life of the process. Bisected on an 8812CU: `0x1F` (DMA +
+  PROTOCOL) clean; `0x2F` (+SCHEDULE) and `0xCF` (+MACTX/MACRX) fault. The
+  later full-CR write (`0x06FF`) is too late. The code uses the vendor's full
+  `0xFF`; the 8822E was fixed with it (its `0x0F` control faulted at 172
+  frames, `0xFF` ran 4000/4000) and not bisected. With it the hardware
+  writes `LLT[rsvd_boundary - 1] = 0` itself by the end of a run past one
+  traversal; the LLT reads `0x792` at init either way (8822C and 8822E, and
+  the vendor driver's chip too), so an init-time LLT read proves nothing -
+  inject past a wrap and read it after (`ap_wpa2` with `DEVOURER_AP_INJECT` +
+  `DEVOURER_AP_PKTBUF`). Found by diffing the vendor's usbmon register writes
+  against ours from the TRX enable to the LLT init: `REG_CR` was the one
+  difference. Plain injection never showed it - no beacon engine reads the
+  page. `GENERAL_INFO`/`PHYDM_INFO` H2C packets were ruled out as the
+  mechanism (sent byte-exact, consumed by the firmware, no effect on the LLT).
+  Record: `docs/jaguar3-tx-ring.md`.
+- **Data frames go to the LOW queue.** `fill_data_tx_desc_8822c` stamps
+  QSEL 0x12 (MGNT) on everything; `build_tx_block` moves 802.11 data frames
+  to QSEL 0 (BE) and `send_packet` derives the bulk-OUT endpoint from the
+  final QSEL (halmac `get_usb_bulkout_id_88xx`: HIGH 0x05, NORMAL 0x06,
+  LOW 0x08). QSEL and endpoint must agree: QSEL alone was measured to change
+  nothing; the endpoint alone was not run (a reviewer predicted it would set
+  `TXDMA_STATUS`'s `EP_QSEL_DIFF` bit). The aggregated-URB path
+  (`send_packets`) follows the same rule, ending a URB run at a queue change
+  decided before the build (`peek_tx_qsel`), so no frame is built twice.
+  Management and beacons stay on HIGH.
 
 ## Bring-up cost and the pipelined register writes
 
@@ -105,6 +136,17 @@ On-air-validated on 8822CU + 8822EU, sticky across
 same TSSI reshape as its offset slope).
 
 ## CCX energy sensing (`clm` / `nhm_env`)
+
+**`Stop()` forgets any armed busy window** — the rule, and the residual it
+does not close, are at `IRadio::ArmChannelBusy`, the one declaration site
+where they can be kept true. What is specific to this die:
+
+Measured on an RTL8812CU with the reset removed: arm, `Stop()`, retune, read
+reports `spoil=retuned`; with it, `spoil=none` and no reading (`Stop()` runs
+`rtw_hal_deinit()`). The reset sits OUTSIDE `_reg_mu`, unlike the RTL8733B's,
+and deliberately: `Stop()` joins the coex thread, and that thread takes
+`_reg_mu`, so holding it across the join would deadlock. The coex loop never
+takes the CCX lock, which is what makes this ordering safe.
 
 **An armed busy window (`ArmChannelBusy`) is DESTROYED by an NHM read on this
 map.** Measured on an RTL8812CU: a clean 240 ms window read 60.4-61.6% under

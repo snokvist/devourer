@@ -44,6 +44,25 @@ Jaguar1 (shared `PhyTableLoader`).
   instead (`fw_switch_confirm`). Classic 8-byte H2Cs ride the HMEBOX
   mailboxes (0x1d0/0x1f0 + 0x1cc busy bits), distinct from MacInit's 32-byte
   h2c-pkt queue.
+- **The whole MAC must be enabled before the LLT init** (`MAC_TRX_ENABLE =
+  0xFF`, halmac's value for both 8822B and 8821C; this port had the DMA-only
+  `0x0F`). The same defect and fix as Jaguar3 (`src/jaguar3/CLAUDE.md`, where
+  the bit - PROTOCOL_EN - was bisected on the 8822C; not bisected here). On
+  an 8812BU (`rsvd_boundary` 1938 too): with `0x0F`, 4000 frames injected
+  with a beacon armed overwrote page 1938 and latched `TXDMA_STATUS` `0x10`
+  then `0x15` (bits not decoded; the TBTT trigger was bisected on the 8822C
+  only) at 358 frames, then every bulk-OUT timed out; with `0xFF`, 4000/4000
+  clean and `LLT[1937] = 0` by the end of the run. The 8821C and the PCIe
+  8821CE ride the same constant and are unverified.
+- **Runtime threads must survive a failed register read.** A control-transfer
+  read can race the async bulk-IN and throw under RX load; the DIG and
+  thermal-track threads now skip the tick and count it. Before that guard, an
+  uncaught `rtw_read: iostream error` in the DIG thread terminated an 8812BU AP
+  mid-way through a 14-20 Mbit/s uplink, and the guard has fired about once
+  per throughput ladder since - it is a recurring event, not a one-off.
+  It applies to EVERY periodic reader, caller-side too: under a 4+4 Mbit/s
+  soak about one control read a minute fails while the chip works on, and an
+  unguarded `GetTxDmaStatus` poll in `ap_wpa2` killed the AP at minute 9.
 
 ## TX power
 
@@ -71,6 +90,18 @@ The 8822B/8821C descriptor `TXPWR_OFSET` is a hardware LUT
 (0/-3/-7/-11/+3/+6 dB); session default via `SetTxPacketPowerStep`.
 
 ## CCX energy sensing (`clm` / `nhm_env`)
+
+**`Stop()` forgets any armed busy window** — the rule, and the residual it
+does not close, are at `IRadio::ArmChannelBusy`, the one declaration site
+where they can be kept true. What is specific to this die:
+
+Measured on an RTL8822BU with the reset removed: arm, `Stop()`, retune, read
+reports `spoil=retuned`; with it, `spoil=none`. Note this `Stop()` does NOT
+tear the chip down — it only joins `stop_pwrtrack()`/`stop_dig()` — so after
+the reset the sampled path still answers, with a live 2 ms window. That is
+why the on-air `revive` arm asserts the spoil REASON rather than the reading's
+validity: asserting "invalid" would encode another family's teardown depth as
+a contract and fail this one. Neither joined thread takes the CCX lock.
 
 `GetRxEnergy(with_nhm=true)` runs the shared CCX window (`src/NhmReader.h`) on
 the 11AC register map; on-air validated on an RTL8822BU.

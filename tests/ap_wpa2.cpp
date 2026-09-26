@@ -24,15 +24,18 @@
 // number (keep frag); the nonce is 0|A2|PN(6, big-endian).
 //
 // Build: g++ -std=c++20 -O2 -Isrc -Iexamples/common tests/ap_wpa2.cpp \
-//   examples/common/env_config.cpp build/libdevourer.a \
+//   examples/common/env_config.cpp examples/common/usb_select.cpp build/libdevourer.a \
 //   $(pkg-config --cflags --libs libusb-1.0) -lcrypto -lpthread -o build/ap_wpa2
 // Run: sudo DEVOURER_VID=0x2357 DEVOURER_PID=0x012d DEVOURER_CHANNEL=6 \
 //   DEVOURER_WPA2_PSK=devourer123 DEVOURER_BCN_TU=25 DEVOURER_TX_WITH_RX=thread \
 //   build/ap_wpa2 [sec]
+#include <algorithm>
 #include <atomic>
-#include <array>
 #include <chrono>
+#include <csignal>
 #include <cstdint>
+#include <poll.h>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -43,63 +46,378 @@
 #include <unistd.h>
 #include <libusb.h>
 #include <openssl/evp.h>
+#include <openssl/crypto.h>
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
 #include "RadiotapBuilder.h"
+#include <fcntl.h>
+#include <linux/if.h>
+#include <linux/if_tun.h>
+#include <sys/ioctl.h>
+
+#include "sta/BssTable.h"
+#include "sta/Ccmp.h"
+#include "sta/StationSm.h"
+#include "sta/StationTable.h"
+#include "sta/Dot11.h"
 #include "RxPacket.h"
 #include "SelectedChannel.h"
 #include "TxMode.h"
 #include "UsbOpen.h"
+#include "IRtlRadio.h"
 #include "WiFiDriver.h"
 #include "env_config.h"
 #include "logger.h"
+#include "usb_select.h"
+#include "ccmp_software.h"
+#include "openssl_crypto_ops.h"
+#include "rx_mpdu.h"
 
 static const uint8_t kBssid[6] = {0x02, 0x42, 0x75, 0x05, 0xd6, 0x00};
 static const char* kSsid = "devourerAP";
+
+/* A KILLED AP LEAVES NO LEDGER AND A BEACON STILL ON THE AIR.
+ *
+ * Everything below the run loop - the data-plane ledger the on-air cells
+ * grade, the CCMP profile, and the StopBeacon retry that the chip needs
+ * because it beacons autonomously - runs only when the loop ENDS. A harness
+ * that drives this AP for a cell and then kills it gets none of it, and the
+ * beacon keeps airing until the adapter is re-enumerated. tests/sta_client.cpp
+ * has had this since Phase 4; the AP did not, and the devourer-to-devourer
+ * harness is the first thing to notice, because it is the first caller that
+ * ever needed the AP's ledger at a time of its own choosing. */
+static volatile std::sig_atomic_t g_stop = 0;
+extern "C" void ap_on_signal(int) { g_stop = 1; }
 static IRadio* g_dev = nullptr;
 static std::vector<uint8_t> g_rt;
 static uint8_t g_chan = 6;
 static const char* g_psk = "devourer123";
 static std::atomic<uint64_t> g_sent{0};
+/* The two ways a frame this AP built never reaches the air: the transmit
+ * queue was full when it was enqueued, or send_packet refused it. Neither
+ * was counted, so the ledger's "frames sent" was the only transmit figure
+ * and there was nothing to compare it against. */
+static std::atomic<uint64_t> g_q_drop{0}, g_send_fail{0};
+/* A refusal is a RETRY, not a loss: the frame goes back to the front of the
+ * queue and is booked once, wherever it finally ends up (sent, a queue drop,
+ * or refused after the breaker opened). This counts the refusals themselves,
+ * so a backing-off link is visible without breaking the ledger identity. */
+static std::atomic<uint64_t> g_send_refused{0};
+/* Every frame handed to enqueue(), so the transmit chain closes:
+ * queued == aired + queue dropped + send failed. */
+static std::atomic<uint64_t> g_q_in{0};
+/* How many times the send loop backed off rather than hammering a chip that
+ * was refusing. Its own counter, because "we waited" and "we lost a frame"
+ * are different events and the ledger already conflated enough of those. */
+static std::atomic<uint64_t> g_backoffs{0};
+/* How many frames the send loop hands the chip in one pass. See the note at
+ * the send site: the beacon shares this path and a full-batch burst starves
+ * it. */
+static constexpr size_t kTxBurst = 16;
+/* THE CIRCUIT BREAKER, and it exists because this harness wedged an adapter.
+ *
+ * A sustained downlink load does not merely throttle the Jaguar3 transmit
+ * path - it WEDGES it. Measured: the AP kept receiving perfectly (17 of 17
+ * authentication requests logged) while nothing it sent reached the air; its
+ * beacon stopped, its management replies stopped, and it did not recover for
+ * the life of the process. An earlier occurrence survived process restarts
+ * AND a USB `authorized` toggle, and was only cleared by physically
+ * unplugging the adapter.
+ *
+ * send_packet's own definition warns about precisely this: "The caller backs
+ * off when these fail repeatedly ... hammering a non-draining endpoint is
+ * exactly what wedged its USB core." Backing off is not enough - this loop
+ * backed off 1021 times in the run that wedged it. So it also STOPS.
+ *
+ * Once tripped the AP keeps running and keeps receiving, so the run still
+ * produces a ledger and the operator still gets a diagnosis; it just stops
+ * feeding an endpoint that is not draining. Data frames are refused and
+ * counted from then on. There is no automatic re-arm: if the chip needs a
+ * power cycle, pretending otherwise would wedge it again a second later. */
+static constexpr uint64_t kTxGiveUp = 250;
+/* THE BEACON KEEPALIVE, and it is the vendor driver's design rather than a
+ * guess. RtlJaguar3Device::StartBeacon says "A SINGLE download is enough -
+ * the hardware auto-transmits the beacon at every TBTT", bench-verified at
+ * ~8 beacons/s indefinitely. That verification was on an IDLE link. Under a
+ * downlink load this AP's beacons fall to 8% of their idle rate, measured
+ * three ways.
+ *
+ * The rtl88x2cu vendor driver does not rely on the hardware on USB at all.
+ * Its send_beacon() re-issues the beacon and POLLS BCN_VALID until the MAC
+ * confirms it took, retrying up to a hundred times, with an issue_bcn_fail
+ * counter and a CONFIG_BCN_RECOVERY path behind it - losing a beacon to
+ * contention is treated as normal and expected on this bus.
+ *
+ * UpdateBeaconPayload re-downloads the reserved page and polls that same
+ * valid bit, so the keepalive needs no library change to test. Off by
+ * default: every figure already recorded was taken without it. */
+static std::atomic<uint64_t> g_bcn_refresh{0}, g_bcn_refresh_fail{0},
+    g_bcn_retry{0};
+/* The vendor driver allows a hundred; this is a test harness on a shared
+ * bench, so it allows ten and reports how many it used. */
+static constexpr int kBcnRetries = 10;
+static std::atomic<uint64_t> g_tx_broken{0};   /* frames refused after tripping */
+static bool g_tx_circuit_open = false;
+/* Host frames this AP actually turned into an 802.11 frame. Without it the
+ * host-side identity has the losses but not the successes. */
+static std::atomic<uint64_t> g_tap_framed{0};
+static bool g_ccmp_profile = false;
+static std::atomic<uint64_t> g_ccmp_tx_frames{0}, g_ccmp_tx_bytes{0}, g_ccmp_tx_ns{0};
+static std::atomic<uint64_t> g_ccmp_rx_frames{0}, g_ccmp_rx_bytes{0}, g_ccmp_rx_ns{0};
 static std::mutex g_q_mu;
 static std::vector<std::vector<uint8_t>> g_q;
 
 // WPA2-PSK / CCMP RSN IE (group=CCMP, pairwise=CCMP, akm=PSK).
-static const uint8_t kRsn[] = {0x30, 0x14, 0x01,0x00,
-    0x00,0x0f,0xac,0x04, 0x01,0x00, 0x00,0x0f,0xac,0x04,
-    0x01,0x00, 0x00,0x0f,0xac,0x02, 0x00,0x00};
+// The RSN element, built once by src/sta/Dot11.h and reused for both the
+// beacon/probe advertisement and the msg3 key data. It used to be a literal
+// here AND a builder there; the bytes agreed, but nothing enforced that, and a
+// drift would only have shown up as a station refusing its own AP.
+static const std::vector<uint8_t>& rsn_ie() {
+  static const std::vector<uint8_t> ie = [] {
+    std::vector<uint8_t> v;
+    devourer::sta::append_rsn_ccmp_psk(v);
+    return v;
+  }();
+  return ie;
+}
 
 // Per-station 4-way state (single client for the demo).
-static uint8_t g_anonce[32], g_snonce[32], g_ptk[48], g_gtk[16];
-static uint8_t g_replay[8];
-static uint8_t g_sta[6];
-static int g_state = 0;  // 0 idle, 1 sent msg1, 2 done
+//
+// THE AUTHENTICATOR RETRANSMITS. It used to send msg1 and msg3 exactly once,
+// which means a single frame lost in the air stalled the handshake forever:
+// the station waits for a message that will never come again, and this side
+// sits in "4-way in progress" until the run times out. On a real link that is
+// not an edge case - it is what the acceptance harness's wpa2 cell failed on,
+// and 802.11-2016 12.7.6.4 requires the retransmission that was missing.
+//
+// Two rules the retransmission has to obey, both of which a naive "just call
+// send_msg1() again" gets wrong:
+//   - msg1 must carry the SAME ANonce, and msg3 the SAME GTK. Regenerating
+//     either would derive a different PTK from the one the station already
+//     installed, or install a group key this AP will not use.
+//   - the Key Replay Counter must be INCREMENTED on every retransmission, and
+//     the MIC recomputed over it, so the station can tell copies apart.
+// Hence the `first` flag: it selects "generate fresh material" and nothing
+// else. Everything after it is rebuilt per transmission.
+// Per-station state lives in the table now (Phase 2b.2). Everything that was
+// a file-scope singleton here - g_sta, g_anonce, g_snonce, g_ptk, g_replay,
+// g_state, g_txpn and the CCMP receive window - is a field of
+// devourer::sta::Station, one record per associated station.
+static devourer::sta::StationTable g_stas;   // guarded by g_hs_mu
+
+// The GTK is NOT per-station, and this line is why the distinction matters.
+// It used to sit on the same declaration as g_anonce/g_snonce/g_ptk and was
+// regenerated inside send_msg3(first=true) - once per four-way. With one
+// station that was invisible. With two, the second station's handshake
+// silently revoked the first station's group key. It is generated ONCE, for
+// the BSS, before the radio comes up.
+static uint8_t g_gtk[16];
+// Guards every field above. The RX callback and the main loop's retransmit
+// tick both touch them now; before the timer existed only the RX thread did.
+static std::mutex g_hs_mu;
+// src/sta/Station holds its retransmission timestamp as a plain double so the
+// table stays free of <chrono> and of any OS notion of time; the harness owns
+// the clock.
+static double now_ms() {
+  return std::chrono::duration<double, std::milli>(
+             std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+static constexpr int kHsMaxTries = 4;                   // 1 + 3 retransmissions
+static constexpr auto kHsTimeout = std::chrono::milliseconds(250);
+
+static bool profiled_ccmp(bool encrypt, const uint8_t* key, const uint8_t* nonce,
+                          const uint8_t* aad, int aadlen, const uint8_t* input,
+                          int input_len, uint8_t* output, uint8_t* tag) {
+  if (!g_ccmp_profile)
+    return devourer::test::ccmp_software(encrypt, key, nonce, aad, aadlen,
+                                         input, input_len, output, tag);
+  const auto before = std::chrono::steady_clock::now();
+  bool ok = devourer::test::ccmp_software(encrypt, key, nonce, aad, aadlen,
+                                          input, input_len, output, tag);
+  uint64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - before).count();
+  auto& frames = encrypt ? g_ccmp_tx_frames : g_ccmp_rx_frames;
+  auto& bytes = encrypt ? g_ccmp_tx_bytes : g_ccmp_rx_bytes;
+  auto& elapsed = encrypt ? g_ccmp_tx_ns : g_ccmp_rx_ns;
+  frames.fetch_add(1, std::memory_order_relaxed);
+  bytes.fetch_add(static_cast<uint64_t>(input_len), std::memory_order_relaxed);
+  elapsed.fetch_add(ns, std::memory_order_relaxed);
+  return ok;
+}
+
+/* THE BEACON PAGE AND THE LLT, read out of the chip (DEVOURER_AP_PKTBUF=1).
+ *
+ * The fault latches at a TBTT after data has been through the ring, which
+ * says the beacon engine read a page data had written. Two ways that could
+ * happen - the free list spans the reserved region from the start, or the
+ * hardware returns the beacon's page after each transmission - and they need
+ * different fixes. This reads the answer rather than inferring it: the first
+ * bytes of the beacon page (the injected frames are filled with 0x5a, so an
+ * overwrite is recognisable), and the LLT entries around the ACQ boundary
+ * (1938) and the end of the FIFO (2047), to see where the list actually
+ * links. */
+/* A diagnostic knob is ON when set to anything but "" or "0" - so
+ * DEVOURER_AP_PKTBUF=0 means off, as DEVOURER_AP_NO_BEACON=0 always has. */
+static bool env_on(const char* name) {
+  const char* v = std::getenv(name);
+  return v && *v && std::strcmp(v, "0") != 0;
+}
+
+/* DumpChipState on the FAULT paths - the breaker trip, a TXDMA transition, a
+ * beacon that will not load - which run exactly when the USB path is least
+ * healthy. It is ~20 register reads, and any of them can throw; uncaught,
+ * that terminates the AP past joinable threads, with no ledger, no
+ * StopBeacon and no destructor power-down. Same rule as the TX-DMA watchdog
+ * and the end-of-run dump. */
+static void dump_chip_state_safe(IRtlRadio* rtl) {
+  try {
+    rtl->DumpChipState();
+  } catch (const std::exception& e) {
+    fprintf(stderr, "  chip-state read failed (%s)\n", e.what());
+  }
+}
+
+static void probe_pktbuf_body(const char* when);
+static void probe_pktbuf(const char* when) {
+  /* A diagnostic must not take the AP down: its reads can throw under load
+   * like any register read (see the TX-DMA watchdog). */
+  try {
+    probe_pktbuf_body(when);
+  } catch (const std::exception& e) {
+    fprintf(stderr, "  PKTBUF %s: read failed (%s), probe skipped\n", when,
+            e.what());
+  }
+}
+static void probe_pktbuf_body(const char* when) {
+  auto* rtl = dynamic_cast<IRtlRadio*>(g_dev);
+  if (!rtl) return;
+  /* The reserved boundary is per die (1938 on the 8822C); the bring-up log
+   * prints it. DEVOURER_AP_PKTBUF_BNDY=N points the probe at another die's. */
+  uint32_t b = 1938;
+  if (const char* e = std::getenv("DEVOURER_AP_PKTBUF_BNDY")) {
+    const unsigned long v = std::strtoul(e, nullptr, 0);
+    /* The probe reads pages b-2..b+1 of a 2048-page FIFO. */
+    if (v >= 2 && v <= 2046)
+      b = (uint32_t)v;
+    else
+      fprintf(stderr, "  PKTBUF: DEVOURER_AP_PKTBUF_BNDY=%s is outside 2..2046, "
+              "using 1938\n", e);
+  }
+  uint8_t pg[32];
+  if (rtl->ReadPacketBuffer(0, b << 7, pg, sizeof pg)) {
+    fprintf(stderr, "  PKTBUF %s: page %u =", when, b);
+    for (size_t i = 0; i < sizeof pg; i++) fprintf(stderr, " %02x", pg[i]);
+    fprintf(stderr, "\n");
+  }
+  /* LLT: one 32-bit entry per page is the most likely layout; print raw
+   * words so the layout can be read off rather than assumed. */
+  const uint32_t pages[] = {0, 1, b - 2, b - 1, b, b + 1, 2046, 2047};
+  fprintf(stderr, "  LLT %s:", when);
+  for (uint32_t p : pages) {
+    uint8_t e[4];
+    if (rtl->ReadPacketBuffer(1, p * 4, e, 4))
+      fprintf(stderr, " [%u]=%02x%02x%02x%02x", p, e[3], e[2], e[1], e[0]);
+  }
+  fprintf(stderr, "\n");
+}
 
 static void enqueue(std::vector<uint8_t> mpdu) {
   std::vector<uint8_t> f; f.reserve(g_rt.size() + mpdu.size());
   f.insert(f.end(), g_rt.begin(), g_rt.end());
   f.insert(f.end(), mpdu.begin(), mpdu.end());
   std::lock_guard<std::mutex> lk(g_q_mu);
+  g_q_in.fetch_add(1);
+  /* THE DROP IS COUNTED NOW, and finding out that it was not is the whole
+   * reason this counter exists. Under a flood ping the AP's ledger read
+   * "TAP: from host=1437, dropped=0" beside "frames sent=232" - 1205 frames
+   * accepted from the host, aired nowhere, and every counter in the ledger
+   * saying nothing was lost. They were discarded HERE, by this cap, in
+   * silence. tests/sta_client.cpp has counted the same cap since Phase 4;
+   * this file was the copy that drifted. */
   if (g_q.size() < 128) g_q.push_back(std::move(f));
+  else g_q_drop.fetch_add(1);
 }
+static devourer::sta::SeqCounter g_seq;
+// (da=sta, sa=bssid, bssid) for an AP answering; a station swaps the first two.
+// These now carry a real sequence number - see the note in ap_responder.cpp.
 static std::vector<uint8_t> mgmt_hdr(uint8_t fc, const uint8_t* sta) {
-  return {fc,0,0,0, sta[0],sta[1],sta[2],sta[3],sta[4],sta[5],
-      kBssid[0],kBssid[1],kBssid[2],kBssid[3],kBssid[4],kBssid[5],
-      kBssid[0],kBssid[1],kBssid[2],kBssid[3],kBssid[4],kBssid[5], 0,0};
+  std::vector<uint8_t> m = devourer::sta::mgmt_hdr(fc, sta, kBssid, kBssid);
+  devourer::sta::assign_seq(m, g_seq.next());
+  return m;
 }
-static void append_ies(std::vector<uint8_t>& m, bool ssid) {
-  if (ssid) { m.insert(m.end(), {0x00,(uint8_t)strlen(kSsid)});
-    m.insert(m.end(), kSsid, kSsid+strlen(kSsid)); }
+/* `beacon` adds the TIM. It is deliberately NOT added to probe or
+ * association responses: 802.11-2016 9.4.2.6 puts the TIM in the Beacon
+ * frame body only, and a TIM in a probe response is a malformed frame that
+ * some stations will reject outright. The element order below is the
+ * standard's: SSID, Supported Rates, DS Parameter Set, TIM, then RSN. */
+/* Refuse to run if the TIM wiring is wrong.
+ *
+ * tests/dot11_selftest.cpp covers append_tim() itself and MODELS this wiring
+ * with a local lambda - so deleting the `beacon` flag here would leave that
+ * test green. This reads what THIS harness builds. Same drift that let
+ * `fc0 == 0x88` survive being fixed in the shared module, and that let the
+ * ap_onair witness selftest diverge from the harness it guards.
+ *
+ * Runs BEFORE the USB open, deliberately: the first version ran after it and
+ * an injected defect went uncaught on a host with no adapter, which is the
+ * only place a wiring check is cheap to run.
+ *
+ * The TIM belongs in the BEACON ONLY (802.11-2016 9.4.2.6); in a probe
+ * response it is a malformed frame some stations reject outright. */
+static bool tim_wiring_ok(const std::vector<uint8_t>& beacon_ies,
+                          const std::vector<uint8_t>& probe_ies) {
+  size_t n = 0;
+  const bool in_beacon = devourer::sta::find_ie(
+      beacon_ies.data(), beacon_ies.size(), devourer::sta::kEidTim, &n) != nullptr;
+  const bool in_probe = devourer::sta::find_ie(
+      probe_ies.data(), probe_ies.size(), devourer::sta::kEidTim, &n) != nullptr;
+  if (!in_beacon)
+    fprintf(stderr, "FATAL: the beacon carries no TIM element\n");
+  if (in_probe)
+    fprintf(stderr, "FATAL: a TIM leaked into the probe response\n");
+  return in_beacon && !in_probe;
+}
+
+static void append_ies(std::vector<uint8_t>& m, bool ssid, bool beacon = false) {
+  if (ssid) devourer::sta::append_ssid(m, kSsid);
   // Band-correct Supported Rates: CCK+OFDM on 2.4 GHz, OFDM-only on 5 GHz. CCK
   // basic rates (1/2/5.5/11) do not exist on 5 GHz — advertising them makes a
   // 5 GHz station skip the BSS ("rate sets do not match"), so no association.
-  if (g_chan <= 14)
-    m.insert(m.end(), {0x01,0x08,0x82,0x84,0x8b,0x96,0x24,0x30,0x48,0x6c});
-  else
-    m.insert(m.end(), {0x01,0x08,0x8c,0x12,0x98,0x24,0xb0,0x48,0x60,0x6c});
-  m.insert(m.end(), {0x03,0x01,g_chan});
-  m.insert(m.end(), kRsn, kRsn+sizeof(kRsn));           // RSN IE -> advertise WPA2
+  // Byte-identical to what this harness carried; now shared with the station
+  // side so the two cannot drift apart unnoticed.
+  if (g_chan <= 14) devourer::sta::append_supported_rates(m);
+  else devourer::sta::append_supported_rates_5g(m);
+  devourer::sta::append_ds_params(m, (uint8_t)g_chan);
+  if (beacon) devourer::sta::append_tim(m);
+  m.insert(m.end(), rsn_ie().begin(), rsn_ie().end());   // RSN IE -> advertise WPA2
 }
+
+/* THE BEACON THIS AP AIRS, in one place.
+ *
+ * The first ten bytes are NOT 802.11: they are a RADIOTAP header, which is
+ * what StartBeacon's contract accepts ("strips the header if present" - see
+ * beacon_split in src/mt7612u/beacon.cpp), and the frame control is at offset
+ * 10. An earlier version of this comment called it a MediaTek beacon-offload
+ * header, which it is not. That is worth knowing before reading the literal,
+ * and it is why kBeaconHdrLen exists - a parser handed this buffer from byte
+ * 0 reads the radiotap header as a frame control and refuses it.
+ *
+ * `--self-test`'s cross-role cell parses what this returns, so the station
+ * side is tested against the bytes main() actually transmits. It used to be a
+ * second copy of the same literal, with a comment claiming it was "the one
+ * this AP actually airs" - true until somebody changed one of them. */
+static constexpr size_t kBeaconHdrLen = 10;
+
+static std::vector<uint8_t> build_beacon(int tu) {
+  std::vector<uint8_t> bcn = {0,0,0x0a,0,0,0x80,0,0,0x08,0,
+      0x80,0,0,0, 0xff,0xff,0xff,0xff,0xff,0xff,
+      kBssid[0],kBssid[1],kBssid[2],kBssid[3],kBssid[4],kBssid[5],
+      kBssid[0],kBssid[1],kBssid[2],kBssid[3],kBssid[4],kBssid[5],
+      0,0, 0,0,0,0,0,0,0,0, (uint8_t)(tu&0xff),(uint8_t)(tu>>8), 0x11,0x00};
+  append_ies(bcn, true, /*beacon=*/true);
+  return bcn;
+}
+
 
 // --- WPA2 crypto (openssl) --------------------------------------------------
 static void prf(const uint8_t* key, int klen, const char* label,
@@ -114,34 +432,82 @@ static void prf(const uint8_t* key, int klen, const char* label,
     int c = (olen-gen < 20) ? olen-gen : 20; memcpy(out+gen, d, c);
   }
 }
-static void compute_ptk() {
-  const uint8_t *aa = kBssid, *sa = g_sta;
+/* Derive into a CALLER-SUPPLIED buffer, never straight into the station.
+ * msg2 used to run this against st.ptk and only then check the MIC, so a
+ * forged msg2 - and the replay counter it has to quote is readable from
+ * cleartext msg1 - overwrote a station's in-flight key material before
+ * anything authenticated it. A legitimate msg2 re-derived the right key, so
+ * the damage was a stallable handshake rather than disclosure, but mutating
+ * state ahead of its authentication is the wrong shape regardless. */
+static void compute_ptk_into(const uint8_t own[6], const uint8_t anonce[32],
+                             const uint8_t snonce[32], uint8_t out_ptk[48]) {
+  const uint8_t *aa = kBssid, *sa = own;
   uint8_t b[76]; int p = 0;
   const uint8_t* mn = memcmp(aa,sa,6) < 0 ? aa : sa;
   const uint8_t* mx = memcmp(aa,sa,6) < 0 ? sa : aa;
   memcpy(b+p, mn, 6); p+=6; memcpy(b+p, mx, 6); p+=6;
-  const uint8_t* nn = memcmp(g_anonce,g_snonce,32) < 0 ? g_anonce : g_snonce;
-  const uint8_t* nx = memcmp(g_anonce,g_snonce,32) < 0 ? g_snonce : g_anonce;
+  const uint8_t* nn = memcmp(anonce,snonce,32) < 0 ? anonce : snonce;
+  const uint8_t* nx = memcmp(anonce,snonce,32) < 0 ? snonce : anonce;
   memcpy(b+p, nn, 32); p+=32; memcpy(b+p, nx, 32); p+=32;
+  /* THE SAME PMK RULE AS THE STATION (src/sta/Eapol.h pmk_from_psk): 64 hex
+   * digits are the raw PMK, anything else is an 8..63-character passphrase
+   * through PBKDF2. This used to PBKDF2 any string, so a hex PSK - or a
+   * passphrase the station refuses - derived a different PMK at each end and
+   * failed as a MIC mismatch instead of as what it was. main() refuses an
+   * invalid PSK up front, so the failure branch here is a backstop. */
   uint8_t pmk[32];
-  PKCS5_PBKDF2_HMAC(g_psk, strlen(g_psk), (const unsigned char*)kSsid,
-                    strlen(kSsid), 4096, EVP_sha1(), 32, pmk);
-  prf(pmk, 32, "Pairwise key expansion", b, p, g_ptk, 48);
+  static devourer::test::OpenSslCryptoOps pmk_crypto;
+  if (!devourer::sta::pmk_from_psk(pmk_crypto, g_psk, kSsid, pmk)) {
+    memset(out_ptk, 0, 48);
+    return;
+  }
+  prf(pmk, 32, "Pairwise key expansion", b, p, out_ptk, 48);
 }
 // MIC over the EAPOL frame with the MIC field (offset 81, 16 bytes) zeroed.
-static void set_mic(std::vector<uint8_t>& e) {
+static void set_mic(std::vector<uint8_t>& e, const devourer::sta::Station& st) {
   memset(e.data()+81, 0, 16);
   unsigned int l; uint8_t d[20];
-  HMAC(EVP_sha1(), g_ptk, 16 /*KCK*/, e.data(), e.size(), d, &l);
+  HMAC(EVP_sha1(), st.ptk, 16 /*KCK*/, e.data(), e.size(), d, &l);
   memcpy(e.data()+81, d, 16);
 }
-static bool check_mic(const uint8_t* e, int len) {
+/* Takes the KCK explicitly, so a candidate key can be verified BEFORE it is
+ * committed to the station. */
+static bool check_mic_kck(const uint8_t* e, int len, const uint8_t kck[16]) {
   std::vector<uint8_t> t(e, e+len);
   uint8_t got[16]; memcpy(got, t.data()+81, 16);
   memset(t.data()+81, 0, 16);
   unsigned int l; uint8_t d[20];
-  HMAC(EVP_sha1(), g_ptk, 16, t.data(), t.size(), d, &l);
-  return memcmp(got, d, 16) == 0;
+  HMAC(EVP_sha1(), kck, 16, t.data(), t.size(), d, &l);
+  /* Constant-time, as src/sta/Eapol.h's eapol_mic_ok is: an early-exit
+   * memcmp over a MAC on attacker-supplied input is a forgery oracle. */
+  return CRYPTO_memcmp(got, d, 16) == 0;
+}
+static bool check_mic(const uint8_t* e, int len,
+                      const devourer::sta::Station& st) {
+  return check_mic_kck(e, len, st.ptk);
+}
+
+/* THE KEY REPLAY COUNTER IS A WINDOW, NOT A VALUE.
+ *
+ * send_msg1/send_msg3 bump the counter on EVERY transmission, retransmissions
+ * included - deliberately, so the station can tell copies apart. The first
+ * version of this check then demanded exact equality with the current value,
+ * which fights that machinery: msg1 goes out as 1, the station's reply is
+ * delayed past kHsTimeout, hs_tick retransmits as 2, and the legitimate msg2
+ * quoting 1 is dropped. On a lossy link a station that answers only the first
+ * copy never associates, and 4way_state stops being usable evidence.
+ *
+ * hostapd keeps a short history for exactly this reason. This is that history:
+ * the counter only ever increments by one per transmission, so "one of the
+ * last kHsMaxTries values" is a range check. */
+static uint64_t replay_ctr(const uint8_t c[8]) {
+  uint64_t v = 0;
+  for (int i = 0; i < 8; i++) v = (v << 8) | c[i];
+  return v;
+}
+static bool replay_ctr_recent(const uint8_t got[8], const uint8_t cur[8]) {
+  const uint64_t g = replay_ctr(got), c = replay_ctr(cur);
+  return g <= c && (c - g) < (uint64_t)kHsMaxTries;
 }
 // AES key wrap (RFC 3394) with the KEK (PTK bytes 16..31), for msg3 key data.
 static int aes_wrap(const uint8_t* kek, const uint8_t* in, int inlen, uint8_t* out) {
@@ -157,39 +523,54 @@ static int aes_wrap(const uint8_t* kek, const uint8_t* in, int inlen, uint8_t* o
 
 // Build an EAPOL-Key data frame (from-DS) to the station.
 static std::vector<uint8_t> eapol_frame(uint16_t keyinfo, const uint8_t* nonce,
-                                        const uint8_t* keydata, int kdlen, bool mic) {
+                                        const uint8_t* keydata, int kdlen, bool mic,
+                                        const devourer::sta::Station& st) {
   std::vector<uint8_t> e(99, 0);
   e[0]=2; e[1]=3;                                       // EAPOL v2, type Key
   int blen = 95 + kdlen; e[2]=blen>>8; e[3]=blen&0xff;
   e[4]=2;                                               // RSN key descriptor
   e[5]=keyinfo>>8; e[6]=keyinfo&0xff;
   e[7]=0; e[8]=16;                                      // key length 16
-  memcpy(e.data()+9, g_replay, 8);
+  memcpy(e.data()+9, st.eapol_replay, 8);
   if (nonce) memcpy(e.data()+17, nonce, 32);
   e[97]=kdlen>>8; e[98]=kdlen&0xff;
   if (keydata && kdlen) e.insert(e.end(), keydata, keydata+kdlen);
-  if (mic) set_mic(e);
+  if (mic) set_mic(e, st);
   // wrap in 802.11 data (from-DS) + LLC/SNAP ethertype 0x888e
-  std::vector<uint8_t> m = {0x08,0x02,0,0,
-      g_sta[0],g_sta[1],g_sta[2],g_sta[3],g_sta[4],g_sta[5],
-      kBssid[0],kBssid[1],kBssid[2],kBssid[3],kBssid[4],kBssid[5],
-      kBssid[0],kBssid[1],kBssid[2],kBssid[3],kBssid[4],kBssid[5], 0,0,
-      0xaa,0xaa,0x03,0x00,0x00,0x00, 0x88,0x8e};
+  // Sequence-numbered like every other data frame. These carry the handshake
+  // and a retransmission of one feeds the station's duplicate detector; they
+  // were missed when the data planes were fixed.
+  std::vector<uint8_t> m = devourer::sta::data_hdr_from_ds(
+      st.addr, kBssid, kBssid, /*protect=*/false, g_seq.next());
+  devourer::sta::append_llc_snap(m, 0x888e);
   m.insert(m.end(), e.begin(), e.end());
   return m;
 }
-static void send_msg1() {
-  RAND_bytes(g_anonce, 32);
-  for (int i=7;i>=0;--i) if (++g_replay[i]) break;      // bump replay counter
-  enqueue(eapol_frame(0x008a, g_anonce, nullptr, 0, false));  // ver2|pair|ack
-  g_state = 1;
-  fprintf(stderr, "  WPA2: sent msg1 (ANonce) to %02x:%02x:%02x:%02x:%02x:%02x\n",
-          g_sta[0],g_sta[1],g_sta[2],g_sta[3],g_sta[4],g_sta[5]);
+/* Caller holds g_hs_mu. `first` = generate a fresh ANonce; a retransmission
+ * must reuse it or the station's PTK will not match ours. */
+static void send_msg1(devourer::sta::Station& st, bool first) {
+  if (first) { RAND_bytes(st.anonce, 32); st.hs_tries = 0; }
+  for (int i=7;i>=0;--i) if (++st.eapol_replay[i]) break;   // bump replay counter
+  enqueue(eapol_frame(0x008a, st.anonce, nullptr, 0, false, st)); // ver2|pair|ack
+  st.state = devourer::sta::HsState::WaitMsg2;
+  st.hs_tx_ms = now_ms();
+  ++st.hs_tries;
+  fprintf(stderr, "  WPA2: sent msg1 (ANonce) to %02x:%02x:%02x:%02x:%02x:%02x%s\n",
+          st.addr[0],st.addr[1],st.addr[2],st.addr[3],st.addr[4],st.addr[5],
+          first ? "" : " [retransmit]");
 }
-static void send_msg3() {
-  RAND_bytes(g_gtk, 16);
+/* Caller holds g_hs_mu.
+ *
+ * `first` no longer touches the GTK. It used to run RAND_bytes(g_gtk) here,
+ * which was correct-looking for one station and wrong for two: the second
+ * station's handshake handed it a fresh group key and silently revoked the
+ * first station's. The BSS generates its GTK once, before the radio comes up.
+ * The replay counter still advances and the MIC is recomputed on every
+ * transmission, which is what 802.11-2016 12.7.6.4 asks for. */
+static void send_msg3(devourer::sta::Station& st, bool first) {
+  if (first) { st.hs_tries = 0; }
   // key data = RSN IE + GTK KDE, padded to /8, then AES-wrapped with the KEK.
-  std::vector<uint8_t> kd(kRsn, kRsn+sizeof(kRsn));
+  std::vector<uint8_t> kd(rsn_ie().begin(), rsn_ie().end());
   uint8_t gtkkde[24] = {0xdd,0x16,0x00,0x0f,0xac,0x01,0x01,0x00};
   memcpy(gtkkde+8, g_gtk, 16);
   kd.insert(kd.end(), gtkkde, gtkkde+24);
@@ -198,79 +579,374 @@ static void send_msg3() {
     while (kd.size() % 8) kd.push_back(0x00);
   }
   std::vector<uint8_t> wrapped(kd.size()+8);
-  int wl = aes_wrap(g_ptk+16, kd.data(), kd.size(), wrapped.data());
-  for (int i=7;i>=0;--i) if (++g_replay[i]) break;
-  enqueue(eapol_frame(0x13ca, g_anonce, wrapped.data(), wl, true));  // install|ack|mic|secure|enc
-  fprintf(stderr, "  WPA2: sent msg3 (GTK, MIC) — 4-way in progress\n");
+  int wl = aes_wrap(st.ptk+16, kd.data(), kd.size(), wrapped.data());
+  for (int i=7;i>=0;--i) if (++st.eapol_replay[i]) break;
+  enqueue(eapol_frame(0x13ca, st.anonce, wrapped.data(), wl, true, st));  // install|ack|mic|secure|enc
+  st.state = devourer::sta::HsState::WaitMsg4;
+  st.hs_tx_ms = now_ms();
+  ++st.hs_tries;
+  fprintf(stderr, "  WPA2: sent msg3 (GTK, MIC) — 4-way in progress%s\n",
+          first ? "" : " [retransmit]");
+}
+
+/* Called from the main loop. Resends whichever message this side is still
+ * waiting on, up to kHsMaxTries transmissions in total. */
+static void hs_tick() {
+  using devourer::sta::HsState;
+  const double timeout_ms =
+      std::chrono::duration<double, std::milli>(kHsTimeout).count();
+  std::lock_guard<std::mutex> l(g_hs_mu);
+  /* Every station retransmits on its own schedule. A single shared deadline
+   * would let one station's handshake reset another's timer. */
+  for (int i = 0; i < g_stas.capacity(); i++) {
+    devourer::sta::Station* st = g_stas.at(i);
+    if (!st) continue;
+    if (st->state != HsState::WaitMsg2 && st->state != HsState::WaitMsg4) continue;
+    if (now_ms() - st->hs_tx_ms < timeout_ms) continue;
+    if (st->hs_tries >= kHsMaxTries) {
+      if (st->hs_tries == kHsMaxTries) {
+        ++st->hs_tries;   // latch, so this prints once per station
+        fprintf(stderr, "  WPA2: gave up after %d transmissions of msg%d"
+                        " to %02x:%02x:%02x:%02x:%02x:%02x - slot freed\n",
+                kHsMaxTries, st->state == HsState::WaitMsg2 ? 1 : 3,
+                st->addr[0],st->addr[1],st->addr[2],
+                st->addr[3],st->addr[4],st->addr[5]);
+        /* FREE IT. The deauth handler only covers the polite departure, which
+         * was never the problem: seven associations that never finish a
+         * four-way - a wrong PSK, a client that walks out of range, an
+         * attacker sending association requests - filled the table
+         * permanently, and nothing timed a record out. That was a regression
+         * this phase introduced; before the table, a single g_sta was simply
+         * overwritten and the AP could not wedge. */
+        uint8_t gone[6];
+        std::memcpy(gone, st->addr, 6);
+        g_stas.remove(gone);
+      }
+      continue;
+    }
+    if (st->state == HsState::WaitMsg2) send_msg1(*st, false);
+    else                                send_msg3(*st, false);
+  }
 }
 
 // --- CCMP data plane (software AES-CCM) so the station pings encrypted --------
 static const uint8_t kApIp[4] = {192, 168, 99, 1};
-static uint64_t g_txpn = 1;                              // AP outbound packet number
+// src/sta/Ccmp.h takes its cipher as a vtable so libdevourer stays free of
+// OpenSSL. This is the harness's side of that seam, and it routes through
+// profiled_ccmp() so the `bench` cell's per-frame timing is unaffected.
+/* The three non-CCM methods used to be stubs that returned false, on the
+ * reasoning that this harness only ever encrypts. That stopped being true
+ * when `--self-test` started driving devourer::sta::Supplicant against this
+ * AP: a supplicant needs PBKDF2, HMAC-SHA1 and AES key unwrap, and a stub
+ * would have failed the handshake in a way that looked like a protocol bug.
+ * So the complete implementation is inherited, and only aes_ccm is wrapped -
+ * for the `bench` cell's per-frame timing. */
+struct HarnessCrypto : devourer::test::OpenSslCryptoOps {
+  bool aes_ccm(bool encrypt, const uint8_t key[16], const uint8_t nonce[13],
+               const uint8_t* aad, size_t aad_len, const uint8_t* in,
+               size_t in_len, uint8_t* out, uint8_t* tag) override {
+    return profiled_ccmp(encrypt, key, nonce, aad, (int)aad_len, in,
+                         (int)in_len, out, tag);
+  }
+};
+static HarnessCrypto g_crypto;
+// The replay window is now a deployed control rather than a tested fixture.
+// It is reset on every fresh PTK install: a new key is a new PN space.
+// Data-plane visibility. The one thing the on-air runs could not answer was
+// whether encrypted frames were arriving at all, because nothing counted them.
+static std::atomic<uint64_t> g_enc_rx{0}, g_mic_fail{0}, g_replayed{0};
+/* Retransmissions a lost ACK caused, dropped before decrypt (802.11
+ * duplicate detection) - so `replays rejected` stays a count of replays. */
+static std::atomic<uint64_t> g_dup_drop{0};
+/* THE RECEIVE PATH, counted at the door. Every frame the device hands us, and
+ * every 802.11 data frame addressed to this BSS BEFORE any filter, with each
+ * exit that used to be silent named. The encrypted counter above only sees
+ * frames that reached the decrypt; a frame the MAC ACKed and something
+ * between here and there dropped was invisible, and that is exactly the
+ * ACKed-but-undelivered loss this exists to locate. */
+static std::atomic<uint64_t> g_rx_cb{0}, g_rx_data_us{0}, g_rx_data_crc{0},
+    g_rx_data_short{0}, g_rx_malformed{0};
+/* Frames whose DESTINATION is not this AP. Until Phase 2b.3 nothing read
+ * addr3, so every decrypted frame was handed to the local IP responders no
+ * matter who it was addressed to - harmless while the AP is the only thing on
+ * the BSS worth addressing, and not harmless once there is a second station.
+ * Counted rather than relayed: the relay is 2b.7, and a counter that moves is
+ * how that gate will be read. */
+static std::atomic<uint64_t> g_to_peer{0};      /* DA is another associated station */
+static std::atomic<uint64_t> g_to_elsewhere{0}; /* DA is off-BSS entirely */
+static std::atomic<uint64_t> g_relayed{0};      /* ...and actually forwarded */
+static std::atomic<uint64_t> g_relay_drop{0};   /* ...dropped: peer not keyed, or cipher refused */
+static std::atomic<uint64_t> g_group_tx{0};     /* group-addressed frames aired under the GTK */
+static std::atomic<uint64_t> g_to_group{0};     /* received with a GROUP destination */
+static std::atomic<uint64_t> g_to_ap{0};        /* received for the AP's own address */
+/* Frames refused before they could be relayed, because relaying them would
+ * corrupt them. See the fragmentation / A-MSDU note in the data branch. */
+static std::atomic<uint64_t> g_frag_drop{0};
+static std::atomic<uint64_t> g_amsdu_drop{0};
+static std::atomic<uint64_t> g_group_drop{0};   /* group flood the cipher refused */
+
 static uint16_t csum16(const uint8_t* d, int len) {
   uint32_t s = 0; for (int i=0;i+1<len;i+=2) s += (d[i]<<8)|d[i+1];
   if (len&1) s += d[len-1]<<8; while (s>>16) s=(s&0xffff)+(s>>16); return (uint16_t)~s;
 }
-// CCMP AAD + nonce from the 802.11 header (802.11i 8.3.3.3.2/.3).
-static void ccmp_aad_nonce(const uint8_t* hdr, uint64_t pn, const uint8_t* a2,
-                           uint8_t* aad, int* aadlen, uint8_t* nonce) {
-  uint16_t fc = hdr[0] | (hdr[1] << 8);
-  fc &= ~0x0070; fc &= ~(0x0800|0x1000|0x2000); fc |= 0x4000;  // mask subtype/retry/pm/md, set prot
-  aad[0]=fc&0xff; aad[1]=fc>>8;
-  memcpy(aad+2, hdr+4, 18);                              // addr1,2,3
-  uint16_t seq = (hdr[22]|(hdr[23]<<8)) & 0x000f;        // keep frag, mask seqnum
-  aad[20]=seq&0xff; aad[21]=seq>>8; *aadlen=22;
-  nonce[0]=0; memcpy(nonce+1, a2, 6);
-  for (int i=0;i<6;i++) nonce[7+i] = (pn >> (8*(5-i))) & 0xff;
-}
-static bool ccm(bool enc, const uint8_t* key, const uint8_t* nonce, const uint8_t* aad,
-                int aadlen, const uint8_t* in, int inlen, uint8_t* out, uint8_t* tag) {
-  EVP_CIPHER_CTX* c = EVP_CIPHER_CTX_new(); int l; bool ok=true;
-  if (enc) {
-    EVP_EncryptInit_ex(c, EVP_aes_128_ccm(), 0,0,0);
-    EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_AEAD_SET_IVLEN, 13, 0);
-    EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_AEAD_SET_TAG, 8, 0);
-    EVP_EncryptInit_ex(c, 0,0,key,nonce);
-    EVP_EncryptUpdate(c, 0,&l,0,inlen); EVP_EncryptUpdate(c,0,&l,aad,aadlen);
-    EVP_EncryptUpdate(c, out,&l,in,inlen); EVP_EncryptFinal_ex(c,out+l,&l);
-    EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_AEAD_GET_TAG, 8, tag);
-  } else {
-    EVP_DecryptInit_ex(c, EVP_aes_128_ccm(), 0,0,0);
-    EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_AEAD_SET_IVLEN, 13, 0);
-    EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_AEAD_SET_TAG, 8, tag);
-    EVP_DecryptInit_ex(c, 0,0,key,nonce);
-    EVP_DecryptUpdate(c, 0,&l,0,inlen); EVP_DecryptUpdate(c,0,&l,aad,aadlen);
-    ok = EVP_DecryptUpdate(c, out,&l,in,inlen) > 0;
-  }
-  EVP_CIPHER_CTX_free(c); return ok;
-}
+// The CCMP AAD/nonce/header rules now live in src/sta/Ccmp.h, known-answer
+// tested against vectors from a third implementation (ctest ccmp_framing).
+// They used to be inline here and in nobody's test.
 // Encrypt an AP->STA payload (LLC/SNAP+eth+data) into a CCMP data frame.
+/* ------------------------------------------------------------ TAP (2b.8)
+ *
+ * One TAP for the whole BSS, opt-in with DEVOURER_AP_TAP=<ifname>. Unset -
+ * which is how every existing cell runs it - and nothing below executes, so
+ * the AP behaves exactly as it did.
+ *
+ * WHY ONE TAP AND NOT ONE PER STATION, and why the bridge is not the switch:
+ * a Linux bridge never forwards a frame back out its ingress port, so with
+ * one TAP carrying the BSS, A->B arrives on the only port B is reachable
+ * through and is dropped. Intra-BSS relay is therefore OURS - it short-
+ * circuits in decide_forward() before the TAP is ever involved - and what the
+ * TAP buys is host-stack access and an upstream port. That is the conclusion
+ * docs/station-mode-scope.md reached after two reviews took the opposite
+ * claim apart.
+ *
+ * WHO OWNS ARP, ICMP AND DHCP - the question the scope document said the
+ * implementation had to answer. With a TAP, the HOST does. The userspace
+ * responders in handle_plain() and the AID-derived address pool are disabled
+ * for the duration, because two things answering ARP for the same subnet is
+ * an address conflict, not redundancy. Without a TAP they own it, as before.
+ */
+static int g_tap_fd = -1;
+static std::atomic<bool> g_tap_stop{false}; /* the TAP reader's exit */
+/* ONE COUNTER PER DIRECTION. `g_tap_drop` served both the radio->host path
+ * and the host->radio path, so "did everything the host handed us go
+ * somewhere named?" was not a question this ledger could answer - the sum it
+ * needed contained drops from the opposite direction. The station harness
+ * had the same defect and both were found by the same review. */
+static std::atomic<uint64_t> g_tap_tx{0}, g_tap_rx{0}, g_tap_drop{0},
+    g_tap_down_drop{0};
+
+static int tap_open(const char* name) {
+  int fd = ::open("/dev/net/tun", O_RDWR);
+  if (fd < 0) { perror("  TAP: open /dev/net/tun"); return -1; }
+  struct ifreq ifr;
+  std::memset(&ifr, 0, sizeof ifr);
+  ifr.ifr_flags = IFF_TAP | IFF_NO_PI;     /* layer 2, no 4-byte prefix */
+  std::snprintf(ifr.ifr_name, IFNAMSIZ, "%s", name);
+  if (::ioctl(fd, TUNSETIFF, &ifr) < 0) {
+    perror("  TAP: TUNSETIFF (CAP_NET_ADMIN?)");
+    ::close(fd);
+    return -1;
+  }
+  fprintf(stderr, "  TAP: %s open - the host stack owns ARP/ICMP/DHCP now,"
+                  " the userspace responders are OFF\n", ifr.ifr_name);
+  return fd;
+}
+
+/* THE GROUP TRANSMIT PATH (Phase 2b.6).
+ *
+ * Until now the GTK was generated, wrapped into msg3 and installed by every
+ * station - and then never used to encrypt anything. Stations held a group key
+ * nothing would ever arrive under, so broadcast and multicast simply did not
+ * exist on this BSS: a station's ARP request reached the AP's own responder
+ * and no further.
+ *
+ * Three things had to be right, and only the second was:
+ *
+ *  - KEY ID 1. msg3 advertises the GTK at key id 1 (the GTK KDE's third byte),
+ *    while the only data transmit path hardcoded key id 0. A group frame sent
+ *    at key id 0 is looked up as the PAIRWISE key at the station and fails its
+ *    MIC with no diagnostic at either end.
+ *  - ONE GTK PER BSS. Fixed in 2b.2 - it used to be regenerated inside every
+ *    four-way, so a second association revoked the first station's group key.
+ *  - ITS OWN PN SPACE. The group key is shared, so its packet numbers cannot
+ *    come from any station's pairwise counter; two stations' frames would
+ *    then collide in one PN space under one key.
+ *
+ * Power save off by fleet policy is what keeps this simple: a conforming AP
+ * must buffer group traffic and release it after a DTIM beacon, and with no
+ * dozing stations there is nothing to buffer. That is recorded in the scope
+ * document as a policy, not an oversight.
+ *
+ * Caller holds g_hs_mu. */
+static uint64_t g_gtk_pn = 1;
+
+static std::vector<uint8_t> ccmp_group_tx(const uint8_t* src,
+                                          const uint8_t* msdu, int len) {
+  static const uint8_t kBroadcast[6] = {0xff,0xff,0xff,0xff,0xff,0xff};
+  std::vector<uint8_t> hdr = devourer::sta::data_hdr_from_ds(
+      kBroadcast, kBssid, src, /*protect=*/true, g_seq.next());
+  const uint64_t pn = g_gtk_pn++;
+  std::vector<uint8_t> m(devourer::sta::ccmp_encrypted_len(hdr.size(),
+                                                           (size_t)len));
+  const size_t n = devourer::sta::ccmp_encrypt(
+      g_crypto, g_gtk, hdr.data(), hdr.size(), kBssid, pn, /*key_id=*/1,
+      msdu, (size_t)len, m.data(), m.size());
+  m.resize(n);
+  return m;
+}
+
+/* UP: a decrypted MSDU becomes an Ethernet frame on the host's TAP.
+ * Caller holds g_hs_mu, which is not needed here but is simpler than
+ * releasing it; the write is non-blocking and the fd is set once at startup. */
+static void tap_up(const uint8_t* da, const uint8_t* sa,
+                   const uint8_t* msdu, int len) {
+  if (g_tap_fd < 0) return;
+  uint8_t eth[2048];
+  const size_t n = devourer::sta::msdu_to_eth(da, sa, msdu, (size_t)len,
+                                              eth, sizeof eth);
+  /* 0 means the MSDU was not an ethertype SNAP, or would not fit. Either way
+   * it is not something to hand the host as an Ethernet frame. */
+  if (n == 0) { g_tap_drop.fetch_add(1); return; }
+  if (::write(g_tap_fd, eth, n) == (ssize_t)n) g_tap_tx.fetch_add(1);
+  else g_tap_drop.fetch_add(1);
+}
+
+/* INTRA-BSS RELAY (Phase 2b.7).
+ *
+ * Take a frame station A sent for station B, and air it to B. The MSDU is
+ * already decrypted and still carries its LLC/SNAP header, so it passes
+ * through untouched - only the 802.11 header is rebuilt and only the key
+ * changes.
+ *
+ * You cannot forward the ciphertext. A's frame is encrypted under A's PTK,
+ * and the CCMP AAD authenticates addr1/addr2/addr3 while the nonce carries
+ * A2, so rewriting the header invalidates both. It has to be decrypted under
+ * A's key and re-encrypted under B's, with a fresh PN in B's own space.
+ *
+ * addr2 stays the BSSID because the AP is the transmitter, which is also why
+ * the nonce's A2 is unchanged; only addr3 becomes A rather than the AP. That
+ * is the one thing data_hdr_from_ds already took a parameter for and every
+ * caller was passing kBssid to.
+ *
+ * Caller holds g_hs_mu. */
+static std::vector<uint8_t> ccmp_relay(const uint8_t* dst, const uint8_t* src,
+                                       const uint8_t* msdu, int len) {
+  devourer::sta::Station* st = g_stas.find(dst);
+  if (!st || !st->keyed()) return {};
+  std::vector<uint8_t> hdr = devourer::sta::data_hdr_from_ds(
+      dst, kBssid, src, /*protect=*/true, g_seq.next());
+  const uint64_t pn = st->tx_pn++;              /* B's PN space, not A's */
+  std::vector<uint8_t> m(devourer::sta::ccmp_encrypted_len(hdr.size(),
+                                                           (size_t)len));
+  const size_t n = devourer::sta::ccmp_encrypt(
+      g_crypto, st->ptk + 32, hdr.data(), hdr.size(), kBssid, pn, 0,
+      msdu, (size_t)len, m.data(), m.size());
+  m.resize(n);                                   /* 0 means the cipher refused */
+  return m;
+}
+
+/* DOWN: one Ethernet frame from the host becomes one protected 802.11 frame.
+ *
+ * Lifted out of the TAP reader thread's lambda so it is reachable without a
+ * TAP device: the thread is now a read() loop around this call, and
+ * `ap_wpa2 --self-test` calls it directly with a pipe standing in for the fd.
+ *
+ * Takes g_hs_mu itself - it is called from the reader thread, which holds
+ * nothing. */
+static void tap_down_one(const uint8_t* eth, size_t len) {
+  uint8_t msdu[2048], da[6], sa[6];
+  /* COUNTED FIRST: "from host" must mean every frame the host handed us, or
+   * a malformed one is a loss that no total contains. */
+  g_tap_rx.fetch_add(1);
+  const size_t m =
+      devourer::sta::eth_to_msdu(eth, len, msdu, sizeof msdu, da, sa);
+
+  if (m == 0) { g_tap_down_drop.fetch_add(1); return; }
+
+  std::lock_guard<std::mutex> l(g_hs_mu);
+  std::vector<uint8_t> f;
+  if (da[0] & 0x01) {
+    /* Group: one frame under the GTK reaches every station, so this is the
+     * path that does NOT fan out. */
+    /* COUNTED. This return discarded a frame the host had already been
+     * credited with handing us, at no counter at all - the same silent loss
+     * as the uncounted queue cap, in the same function, found by the same
+     * review. No station means no group key anyone holds. */
+    if (g_stas.count() == 0) { g_tap_down_drop.fetch_add(1); return; }
+    f = ccmp_group_tx(sa, msdu, (int)m);
+  } else if (g_stas.find(da)) {
+    f = ccmp_relay(da, sa, msdu, (int)m);
+  } else {
+    /* The host sent something for an address that is not on this BSS.
+     * Dropping is right: flooding a unicast would leak it to every
+     * station. */
+    g_tap_down_drop.fetch_add(1);
+    return;
+  }
+  if (!f.empty()) { g_tap_framed.fetch_add(1); enqueue(std::move(f)); }
+  else g_tap_down_drop.fetch_add(1);
+}
+
+/* Caller holds g_hs_mu: every path into here runs inside the RX callback's
+ * data branch, which takes the lock to look the station up in the first
+ * place. An unkeyed or unknown destination emits nothing rather than airing a
+ * frame under someone else's key. */
 static std::vector<uint8_t> ccmp_tx(const uint8_t* sta, uint16_t eth,
                                     const uint8_t* pl, int plen) {
+  devourer::sta::Station* st = g_stas.find(sta);
+  if (!st || !st->keyed()) return {};
   std::vector<uint8_t> pt = {0xaa,0xaa,0x03,0,0,0,(uint8_t)(eth>>8),(uint8_t)(eth&0xff)};
   pt.insert(pt.end(), pl, pl+plen);
-  std::vector<uint8_t> hdr = {0x08,0x42,0,0,             // data, from-DS + protected
-      sta[0],sta[1],sta[2],sta[3],sta[4],sta[5],
-      kBssid[0],kBssid[1],kBssid[2],kBssid[3],kBssid[4],kBssid[5],
-      kBssid[0],kBssid[1],kBssid[2],kBssid[3],kBssid[4],kBssid[5], 0,0};
-  uint64_t pn = g_txpn++;
-  uint8_t aad[32], nonce[13], mic[8]; int aadlen;
-  ccmp_aad_nonce(hdr.data(), pn, kBssid, aad, &aadlen, nonce);
-  std::vector<uint8_t> ct(pt.size());
-  ccm(true, g_ptk+32, nonce, aad, aadlen, pt.data(), pt.size(), ct.data(), mic);
-  uint8_t ch8[8] = {(uint8_t)(pn&0xff),(uint8_t)((pn>>8)&0xff),0,0x20,
-      (uint8_t)((pn>>16)&0xff),(uint8_t)((pn>>24)&0xff),(uint8_t)((pn>>32)&0xff),(uint8_t)((pn>>40)&0xff)};
-  std::vector<uint8_t> m = hdr;
-  m.insert(m.end(), ch8, ch8+8); m.insert(m.end(), ct.begin(), ct.end());
-  m.insert(m.end(), mic, mic+8);
+  // The data plane carries a sequence number now. The management-frame fix was
+  // the visible half; THIS is the path that feeds a peer's duplicate detector
+  // in volume, and it was still pinned at 0. Built by the shared helper so the
+  // AP's downlink and a station's uplink cannot disagree about the layout.
+  std::vector<uint8_t> hdr = devourer::sta::data_hdr_from_ds(
+      sta, kBssid, kBssid, /*protect=*/true, g_seq.next());
+  uint64_t pn = st->tx_pn++;   /* one PN space per station */
+  // A NON-QoS header, so ccmp_aad/ccmp_nonce derive the non-QoS form from the
+  // frame itself - there is no qos_tid parameter any more, and has not been
+  // since the AAD started reading the TID out of the header it is given. This
+  // AP airs plain data frames, which is what has been validated on air; a
+  // station sending QoS data needs the other form, and ctest ccmp_framing
+  // asserts that a frame built under one does not verify under the other.
+  std::vector<uint8_t> m(devourer::sta::ccmp_encrypted_len(hdr.size(),
+                                                           pt.size()));
+  size_t n = devourer::sta::ccmp_encrypt(g_crypto, st->ptk + 32, hdr.data(),
+                                         hdr.size(), kBssid, pn, 0, pt.data(),
+                                         pt.size(), m.data(), m.size());
+  // A zero return means the cipher refused. The old code ignored the result
+  // and aired a frame with an uninitialised MIC; emitting nothing is the
+  // honest failure, and the caller drops an empty vector.
+  m.resize(n);
   return m;
 }
 // DHCP OFFER/ACK payload (IP+UDP+BOOTP) leasing 192.168.99.2 — encrypted by ccmp_tx.
-static const uint8_t kLeaseIp[4] = {192,168,99,2};
-static std::vector<uint8_t> dhcp_payload(const uint8_t* sta, const uint8_t* xid, uint8_t mt) {
+/* THE ADDRESS POOL (Phase 2b.4).
+ *
+ * A station's address is derived from its AID: 192.168.99.(1 + aid), so AIDs
+ * 1..7 map to .2 .. .8 and the AP keeps .1. There is deliberately no separate
+ * allocator and no parallel binding table - the station table IS the binding
+ * table. That means an address cannot outlive its lease, cannot be
+ * double-allocated, and is freed by the same deauth path that frees the key
+ * material, with no second structure to keep in sync.
+ *
+ * Before this, kLeaseIp was the single hardcoded 192.168.99.2 handed to
+ * whoever asked, so a second station was offered an address the first one was
+ * already using. The two-station cell worked around it with static
+ * addressing; it does not need to now. */
+static void sta_ip(const devourer::sta::Station& st, uint8_t out[4]) {
+  out[0] = 192; out[1] = 168; out[2] = 99;
+  out[3] = (uint8_t)(1 + st.aid);
+}
+
+/* Reverse lookup for the ARP responder. Caller holds g_hs_mu. */
+static devourer::sta::Station* sta_by_ip(const uint8_t ip[4]) {
+  if (ip[0] != 192 || ip[1] != 168 || ip[2] != 99) return nullptr;
+  for (int i = 0; i < g_stas.capacity(); i++) {
+    devourer::sta::Station* st = g_stas.at(i);
+    if (!st) continue;
+    uint8_t a[4];
+    sta_ip(*st, a);
+    if (std::memcmp(a, ip, 4) == 0) return st;
+  }
+  return nullptr;
+}
+
+static std::vector<uint8_t> dhcp_payload(const uint8_t* sta, const uint8_t* xid,
+                                         uint8_t mt, const uint8_t lease[4]) {
   std::vector<uint8_t> b(236, 0);
   b[0]=2; b[1]=1; b[2]=6; memcpy(&b[4],xid,4);
-  memcpy(&b[16],kLeaseIp,4); memcpy(&b[20],kApIp,4); memcpy(&b[28],sta,6);
+  memcpy(&b[16],lease,4); memcpy(&b[20],kApIp,4); memcpy(&b[28],sta,6);
   const uint8_t opt[]={0x63,0x82,0x53,0x63, 53,1,mt, 54,4,kApIp[0],kApIp[1],kApIp[2],kApIp[3],
       51,4,0,1,0x51,0x80, 1,4,255,255,255,0, 3,4,kApIp[0],kApIp[1],kApIp[2],kApIp[3],
       6,4,kApIp[0],kApIp[1],kApIp[2],kApIp[3], 255};
@@ -289,11 +965,38 @@ static void handle_plain(const uint8_t* sta, const uint8_t* d, int len) {
   if (len < 8 || d[0]!=0xaa) return;                    // not LLC/SNAP (e.g. IPv6 ND)
   uint16_t eth = (d[6]<<8)|d[7]; const uint8_t* pl = d+8; int pllen = len-8;
   if (eth==0x0806 && pllen>=28) {                        // ARP
-    if (((pl[6]<<8)|pl[7])==1 && memcmp(pl+24,kApIp,4)==0) {
-      uint8_t a[28]={0,1,8,0,6,4,0,2, kBssid[0],kBssid[1],kBssid[2],kBssid[3],kBssid[4],kBssid[5],
-        kApIp[0],kApIp[1],kApIp[2],kApIp[3], pl[8],pl[9],pl[10],pl[11],pl[12],pl[13],
-        pl[14],pl[15],pl[16],pl[17]};
-      enqueue(ccmp_tx(sta,0x0806,a,28));
+    if (((pl[6]<<8)|pl[7])==1) {                         // request
+      /* AN ARP RESPONDER KEYED ON THE ASSOCIATION TABLE (Phase 2b.5).
+       *
+       * It answers for the AP's own address as before, and now also for any
+       * associated station's address - WITH THAT STATION'S REAL MAC.
+       *
+       * That last detail is the whole point. RFC 1027 proxy ARP answers with
+       * the PROXY's MAC, which would make this AP an L3 next hop: the
+       * requester would address B's traffic to the AP itself, and an L2 relay
+       * could never see it. Answering with B's own MAC keeps the traffic
+       * layer 2, which is what the relay in 2b.7 needs.
+       *
+       * This is also why the pool had to land first: without a binding table
+       * there is nothing to answer FROM. */
+      const uint8_t* tip = pl + 24;
+      const uint8_t* rmac = nullptr;
+      if (memcmp(tip, kApIp, 4) == 0) {
+        rmac = kBssid;
+      } else if (devourer::sta::Station* t = sta_by_ip(tip)) {
+        /* Never answer a station's query about itself - it would look like an
+         * address conflict to the requester. */
+        if (memcmp(t->addr, sta, 6) != 0) rmac = t->addr;
+      }
+      if (rmac) {
+        uint8_t a[28]={0,1,8,0,6,4,0,2, rmac[0],rmac[1],rmac[2],rmac[3],rmac[4],rmac[5],
+          tip[0],tip[1],tip[2],tip[3], pl[8],pl[9],pl[10],pl[11],pl[12],pl[13],
+          pl[14],pl[15],pl[16],pl[17]};
+        /* ccmp_tx returns an EMPTY vector on an unkeyed station or a
+         * cipher refusal; enqueue() would air that as a radiotap-only
+         * frame. Same at the two sites below. */
+        if (auto f = ccmp_tx(sta,0x0806,a,28); !f.empty()) enqueue(std::move(f));
+      }
     }
   } else if (eth==0x0800 && pllen>=28) {                 // IPv4/ICMP
     const uint8_t* ip=pl; int ihl=(ip[0]&0x0f)*4;
@@ -303,7 +1006,8 @@ static void handle_plain(const uint8_t* sta, const uint8_t* d, int len) {
       r[10]=r[11]=0; uint16_t ic=csum16(r.data(),ihl); r[10]=ic>>8; r[11]=ic&0xff;
       r[ihl]=0; r[ihl+2]=r[ihl+3]=0;
       uint16_t cc=csum16(r.data()+ihl,pllen-ihl); r[ihl+2]=cc>>8; r[ihl+3]=cc&0xff;
-      enqueue(ccmp_tx(sta,0x0800,r.data(),pllen));
+      if (auto f = ccmp_tx(sta,0x0800,r.data(),pllen); !f.empty())
+        enqueue(std::move(f));
     } else if (ip[9]==17 && pllen>=ihl+8+240) {          // UDP -> DHCP
       const uint8_t* udp=ip+ihl;
       if (((udp[2]<<8)|udp[3])==67) {
@@ -311,15 +1015,40 @@ static void handle_plain(const uint8_t* sta, const uint8_t* d, int len) {
         for (const uint8_t* o=dh+240; o+1<end && *o!=0xff; ) {
           if (*o==0){o++;continue;} if (*o==53 && o+2<end) m=o[2]; o+=2+o[1]; }
         uint8_t reply = (m==1)?2 : (m==3)?5 : 0;
-        if (reply) { auto dp=dhcp_payload(sta, dh+4, reply);
-          enqueue(ccmp_tx(sta,0x0800,dp.data(),(int)dp.size())); }
+        if (reply) {
+          /* The lease is this station's own address, not a shared constant. */
+          devourer::sta::Station* me = g_stas.find(sta);
+          if (!me) return;
+          uint8_t lease[4];
+          sta_ip(*me, lease);
+          auto dp = dhcp_payload(sta, dh+4, reply, lease);
+          if (auto f = ccmp_tx(sta,0x0800,dp.data(),(int)dp.size());
+              !f.empty())
+            enqueue(std::move(f));
+          fprintf(stderr, "  DHCP: %s %u.%u.%u.%u to aid=%u\n",
+                  reply == 2 ? "OFFER" : "ACK",
+                  lease[0], lease[1], lease[2], lease[3], me->aid);
+        }
       }
     }
   }
 }
 
 static void on_rx(const Packet& p) {
-  if (p.Data.size() < 24 || p.RxAtrib.crc_err) return;
+  /* NOT p.Data.size(): on every Realtek generation that buffer still carries
+   * the four trailing FCS bytes, and feeding that length to a CCMP decrypt
+   * puts the expected MIC four bytes late so EVERY frame fails to
+   * authenticate - which this harness's ledger would then report as MIC
+   * failures, i.e. as an attack. See tests/rx_mpdu.h. */
+  const size_t mlen = devourer::test::mpdu_len(p);
+  g_rx_cb.fetch_add(1);
+  if (p.Data.size() >= 10 && (p.Data[0] & 0x0c) == 0x08 && (p.Data[1] & 0x01) &&
+      std::memcmp(p.Data.data() + 4, kBssid, 6) == 0) {
+    g_rx_data_us.fetch_add(1);
+    if (p.RxAtrib.crc_err) g_rx_data_crc.fetch_add(1);
+    else if (mlen < 24) g_rx_data_short.fetch_add(1);
+  }
+  if (mlen < 24 || p.RxAtrib.crc_err) return;
   const uint8_t fc0 = p.Data[0], fc1 = p.Data[1];
   const uint8_t* a1 = p.Data.data() + 4;
   const uint8_t* sta = p.Data.data() + 10;
@@ -337,92 +1066,873 @@ static void on_rx(const Packet& p) {
     fprintf(stderr, "  AUTH from %02x:%02x:%02x:%02x:%02x:%02x\n",
             sta[0],sta[1],sta[2],sta[3],sta[4],sta[5]);
   } else if ((fc0 == 0x00 || fc0 == 0x20) && to_us) {   // (re)assoc
-    auto m = mgmt_hdr(0x10, sta);
-    m.insert(m.end(), {0x11,0x00, 0x00,0x00, 0x01,0xc0});
-    append_ies(m, false); enqueue(std::move(m));
-    memcpy(g_sta, sta, 6); memset(g_replay, 0, 8); g_state = 0;
-    fprintf(stderr, "  ASSOC from %02x:%02x:%02x:%02x:%02x:%02x -> start 4-way\n",
-            sta[0],sta[1],sta[2],sta[3],sta[4],sta[5]);
-    send_msg1();
-  } else if ((fc0 == 0x08 || fc0 == 0x88) && (fc1 & 0x01) && to_us) {  // data to-DS
-    int hlen = 24 + (fc0 == 0x88 ? 2 : 0);
-    if ((fc1 & 0x40) && g_state == 2) {                 // PROTECTED (CCMP) data
-      int len = (int)p.Data.size();
-      if (len < hlen + 8 + 8) return;                   // hdr + CCMP hdr + MIC
-      const uint8_t* d = p.Data.data();
-      const uint8_t* cc = d + hlen;                     // CCMP header
-      uint64_t pn = cc[0] | (cc[1]<<8) | ((uint64_t)cc[4]<<16) | ((uint64_t)cc[5]<<24)
-                  | ((uint64_t)cc[6]<<32) | ((uint64_t)cc[7]<<40);
-      int ctlen = len - hlen - 8 - 8;
-      const uint8_t* ct = d + hlen + 8; const uint8_t* mic = ct + ctlen;
-      uint8_t aad[32], nonce[13], tag[8]; int aadlen;
-      ccmp_aad_nonce(d, pn, sta, aad, &aadlen, nonce);   // A2 = station
-      memcpy(tag, mic, 8);
-      std::vector<uint8_t> pt(ctlen);
-      if (ccm(false, g_ptk+32, nonce, aad, aadlen, ct, ctlen, pt.data(), tag))
-        handle_plain(sta, pt.data(), ctlen);             // decrypted -> ARP/ICMP
+    /* Allocate BEFORE answering, because the association response has to carry
+     * the AID we allocated. It used to hardcode `0x01,0xc0` - AID 1 - which
+     * was true by accident while the AP served one station and tells every
+     * station it is AID 1 now that it serves several. The AID is what a TIM
+     * bitmap indexes, so two stations sharing one is not cosmetic the moment
+     * power save stops being off by policy.
+     *
+     * One lock for the whole branch. enqueue() takes g_q_mu underneath it,
+     * which is the same g_hs_mu -> g_q_mu order hs_tick uses. */
+    std::lock_guard<std::mutex> l(g_hs_mu);
+    /* add() returns the existing record for a re-association, so a station
+     * that loops back through assoc restarts its handshake instead of
+     * consuming a second AID. */
+    devourer::sta::Station* st = g_stas.add(sta);
+    if (!st) {
+      fprintf(stderr, "  ASSOC refused: the station table is full (%d)\n",
+              g_stas.capacity());
       return;
     }
-    if ((int)p.Data.size() < hlen + 8) return;
+    auto m = mgmt_hdr(0x10, sta);
+    const uint16_t aid_field = (uint16_t)(0xc000 | st->aid);   /* AID | the two reserved top bits */
+    m.insert(m.end(), {0x11,0x00, 0x00,0x00,
+                       (uint8_t)(aid_field & 0xff), (uint8_t)(aid_field >> 8)});
+    append_ies(m, false); enqueue(std::move(m));
+    fprintf(stderr, "  ASSOC from %02x:%02x:%02x:%02x:%02x:%02x (aid=%u) -> start 4-way\n",
+            sta[0],sta[1],sta[2],sta[3],sta[4],sta[5], st->aid);
+    memset(st->eapol_replay, 0, 8);
+    st->state = devourer::sta::HsState::Idle;
+    send_msg1(*st, true);
+  } else if ((fc0 == 0xc0 || fc0 == 0xa0) && to_us) {   // deauth / disassoc
+    /* WITHOUT THIS THE TABLE ONLY EVER GROWS. StationTable::remove() had no
+     * caller outside its own selftest, so seven distinct addresses filled the
+     * table permanently and every station after them got "the station table is
+     * full". That is not an attack - Android randomises its MAC per network by
+     * default, so it is ordinary client behaviour - and it was an effective
+     * regression: before the table, an eighth station simply overwrote the
+     * single g_sta.
+     *
+     * Freeing the record also wipes its key material, which is the other half
+     * of what a deauth should mean. */
+    std::lock_guard<std::mutex> l(g_hs_mu);
+    if (g_stas.remove(sta))
+      fprintf(stderr, "  %s from %02x:%02x:%02x:%02x:%02x:%02x -> slot freed (%d left)\n",
+              fc0 == 0xc0 ? "DEAUTH" : "DISASSOC",
+              sta[0],sta[1],sta[2],sta[3],sta[4],sta[5], g_stas.count());
+  } else if ((fc0 == 0x08 || devourer::sta::is_qos_data(fc0)) &&
+             (fc1 & 0x01) && to_us) {                   // data to-DS
+    // data_hdr_len(), not `fc0 == 0x88`: QoS Null (0xc8) is a frame real
+    // stations send, and an exact test gives it a 24-byte header. The TID read
+    // below and the AAD would then both come from the wrong offset - and with
+    // is_qos_data() used for the TID and an exact test for the length, the two
+    // would actively disagree.
+    int hlen = (int)devourer::sta::data_hdr_len(fc0, fc1);
+    // The lock is held across the whole protected-data branch: it guards the
+    // table the sender is looked up in, the key the frame is decrypted with,
+    // that station's replay window, and - through handle_plain -> ccmp_tx -
+    // its TX PN. hs_tick() takes the same lock and then enqueues, so the
+    // order is always g_hs_mu before g_q_mu and there is no inversion.
+    std::unique_lock<std::mutex> dl(g_hs_mu, std::defer_lock);
+    // Station::keyed() is WaitMsg4 or Done, NOT Done alone: the PTK exists
+    // once msg3 has been sent, and a station that received msg3 installs its
+    // keys and can put protected data on the air before its msg4 reaches us.
+    // Gating on the completed handshake dropped those frames.
+    devourer::sta::Station* sender = nullptr;
+    if (fc1 & 0x40) { dl.lock(); sender = g_stas.find(sta); }
+    if ((fc1 & 0x40) && sender && sender->keyed()) {    // PROTECTED (CCMP) data
+      int len = (int)mlen;
+      if (len < hlen + 8 + 8) { g_rx_data_short.fetch_add(1); return; }
+      const uint8_t* d = p.Data.data();
+      {
+        const bool fa = (fc1 & (devourer::sta::kFcToDs | devourer::sta::kFcFromDs)) ==
+                        (devourer::sta::kFcToDs | devourer::sta::kFcFromDs);
+        const int dtid = devourer::sta::is_qos_data(fc0)
+                             ? (d[fa ? 30 : 24] & 0x0f)
+                             : devourer::sta::DupDetector::kNonQosTid;
+        const uint16_t sc = (uint16_t)(d[22] | (d[23] << 8));
+        if (sender->rx_dup.is_duplicate((fc1 & devourer::sta::kFcRetry) != 0, sc, dtid)) {
+          g_dup_drop.fetch_add(1);
+          return;
+        }
+      }
+      // The header length is passed explicitly, so a QoS frame's AAD includes
+      // its TID as 802.11-2016 12.5.3.3.3 requires. This is a deliberate
+      // CORRECTNESS change, not byte-identity: the previous code folded the
+      // QoS Control field out and built a 22-byte AAD for every frame, which
+      // is wrong for QoS and survived only because the validated runs used a
+      // station that associated legacy and sent non-QoS data. A real 802.11n
+      // station sends QoS, and every one of its frames would have failed the
+      // MIC with no diagnostic at either end.
+      std::vector<uint8_t> pt(len);
+      size_t ptlen = 0;
+      uint64_t pn = 0;
+      if (devourer::sta::ccmp_decrypt(g_crypto, sender->ptk + 32, d, (size_t)len,
+                                      (size_t)hlen, sta, pt.data(), pt.size(),
+                                      &ptlen, &pn)) {
+        // Replay check, AFTER the MIC verifies and never before: admitting a
+        // PN from an unauthenticated frame would let anyone advance the window
+        // and lock out the real peer. The TID comes from the QoS header when
+        // there is one, because 802.11 keeps one counter per TID.
+        //
+        // The QoS Control field is at offset 24 for a 3-address frame and 30
+        // for a 4-address one - ccmp_aad() in the same module already encodes
+        // that, and this site did not: on a 4-address QoS frame it read
+        // addr4[0] and used the low nibble of an ADDRESS as the TID. Not a
+        // replay bypass (addr4 is authenticated, so a replay maps to the same
+        // wrong window and is still refused) but it pollutes another TID's
+        // window and can drop legitimate frames. These BSSes air 3-address
+        // frames only, so it was latent.
+        const bool four_addr =
+            (fc1 & (devourer::sta::kFcToDs | devourer::sta::kFcFromDs)) ==
+            (devourer::sta::kFcToDs | devourer::sta::kFcFromDs);
+        const size_t qoff = four_addr ? 30 : 24;
+        const int tid = devourer::sta::is_qos_data(fc0)
+                            ? (d[qoff] & 0x0f)
+                            : devourer::sta::CcmpReplay::kNonQosTid;
+        /* DEVOURER_AP_PN_LOG=<path>: every CCMP PN this AP decrypted, one per
+         * line. A station stamps consecutive PNs on everything it encrypts,
+         * so a PN missing here - checked against a witness capture of the
+         * air - is either a frame that aired and this AP lost, or one the
+         * station never put on the air. Diagnostic; off by default. */
+        static FILE* pn_log = [] {
+          const char* path = std::getenv("DEVOURER_AP_PN_LOG");
+          FILE* f = path && *path ? std::fopen(path, "w") : nullptr;
+          /* Line-buffered: the harness ends this process with a signal, and
+           * a fully-buffered log lost its last ~170 lines - which read as
+           * frames the AP never received. */
+          if (f) std::setvbuf(f, nullptr, _IOLBF, 0);
+          return f;
+        }();
+        if (pn_log) std::fprintf(pn_log, "%llu\n", (unsigned long long)pn);
+        if (sender->rx_replay.accept(pn, tid)) {
+          /* WHO IS THIS FOR? addr3 on a to-DS frame, which nothing in this
+           * tree read before 2b.3. A group DA - a station's broadcast ARP, its
+           * DHCP DISCOVER - still reaches the local responders, because those
+           * are exactly the requests this AP answers. */
+          /* WHERE DOES THIS FRAME GO? The decision - and the two refusals
+           * that go with it - is sta::decide_forward(), a pure function in
+           * src/sta/ with its own ctest. It used to live here, inline, in a
+           * file that no test target builds, so four Phase 2b gates rested on
+           * a narrated bench run. Moving it out is also what lets a TAP
+           * forwarder reuse the same decision instead of writing a second
+           * copy that drifts.
+           *
+           * The refusals are deliberately checked BEFORE the destination: a
+           * fragmented frame addressed to the AP itself is still not
+           * something to hand a parser that expects a whole MSDU. */
+          const devourer::sta::ForwardDecision fwd =
+              devourer::sta::decide_forward(d, (size_t)hlen, kBssid, g_stas);
+          switch (fwd.what) {
+          case devourer::sta::Disposition::RefuseFragmented:
+            g_frag_drop.fetch_add(1);
+            return;
+          case devourer::sta::Disposition::RefuseAmsdu:
+            g_amsdu_drop.fetch_add(1);
+            return;
+          case devourer::sta::Disposition::Malformed:
+            g_rx_malformed.fetch_add(1);
+            return;
+          case devourer::sta::Disposition::Group:
+            g_to_group.fetch_add(1);
+            tap_up(fwd.da, sta, pt.data(), (int)ptlen);
+            /* Answer it locally AND flood it to the BSS. A station's broadcast
+             * is both a request this AP may answer (ARP for the AP's own
+             * address, DHCP DISCOVER) and traffic its peers are entitled to
+             * see. Before 2b.6 only the first half happened.
+             *
+             * The sender receives its own broadcast back, which is what a
+             * group-addressed frame means and what every AP does; a station
+             * discards a frame whose SA is its own. */
+            if (g_tap_fd < 0)
+              handle_plain(sta, pt.data(), (int)ptlen);  // decrypted -> ARP/ICMP
+            if (g_stas.count() > 1) {
+              std::vector<uint8_t> f = ccmp_group_tx(sta, pt.data(), (int)ptlen);
+              if (!f.empty()) {
+                enqueue(std::move(f));
+                g_group_tx.fetch_add(1);
+              } else {
+                g_group_drop.fetch_add(1);
+              }
+            }
+            break;
+          case devourer::sta::Disposition::Local:
+            g_to_ap.fetch_add(1);
+            /* With a TAP the host answers; without one, our own responders
+             * do. Never both - see the TAP note above. */
+            if (g_tap_fd >= 0) tap_up(fwd.da, sta, pt.data(), (int)ptlen);
+            else handle_plain(sta, pt.data(), (int)ptlen);
+            break;
+          case devourer::sta::Disposition::Relay: {
+            g_to_peer.fetch_add(1);
+            std::vector<uint8_t> f =
+                ccmp_relay(fwd.da, sta, pt.data(), (int)ptlen);
+            if (!f.empty()) {
+              enqueue(std::move(f));
+              g_relayed.fetch_add(1);
+            } else {
+              /* The peer is associated but has no usable key yet, or the
+               * cipher refused. Dropping is right - airing it in the clear or
+               * under the wrong key would be worse than losing it. */
+              g_relay_drop.fetch_add(1);
+            }
+            break;
+          }
+          case devourer::sta::Disposition::OffBss:
+            g_to_elsewhere.fetch_add(1);
+            /* Not on this BSS: the host stack is the only thing that might
+             * know where it goes. Without a TAP it is simply lost, which is
+             * what it was before 2b.8. */
+            tap_up(fwd.da, sta, pt.data(), (int)ptlen);
+            break;
+          }
+        } else {
+          g_replayed.fetch_add(1);
+        }
+      } else {
+        g_mic_fail.fetch_add(1);
+      }
+      g_enc_rx.fetch_add(1);
+      return;
+    }
+    /* RELEASE BEFORE FALLING THROUGH. A protected frame from a station we
+     * hold no key for skips the block above with the lock still held, and the
+     * EAPOL path below takes g_hs_mu itself. std::mutex is not recursive, so
+     * keeping it here self-deadlocks on any ciphertext whose first eight
+     * bytes happen to look like an EAPOL LLC/SNAP header. Unlikely, reachable,
+     * and introduced by the Phase 2b.2 rewiring - caught in self-review
+     * because the on-air gate could not run. */
+    if (dl.owns_lock()) dl.unlock();
+    if ((int)mlen < hlen + 8) return;
     const uint8_t* llc = p.Data.data() + hlen;
     if (!(llc[0]==0xaa && llc[6]==0x88 && llc[7]==0x8e)) return;  // EAPOL
-    const uint8_t* e = llc + 8; int elen = (int)p.Data.size() - (hlen + 8);
+    const uint8_t* e = llc + 8; int elen = (int)mlen - (hlen + 8);
     if (elen < 99 || e[1] != 3) return;                 // EAPOL-Key
     uint16_t ki = (e[5]<<8) | e[6];
     if ((ki & 0x0008) && (ki & 0x0100) && !(ki & 0x0040) && !(ki & 0x0200)) {
       // msg2: pairwise + MIC, no install/secure -> SNonce + MIC
-      memcpy(g_snonce, e+17, 32);
-      compute_ptk();
-      if (!check_mic(e, elen)) { fprintf(stderr, "  WPA2: msg2 MIC FAIL\n"); return; }
+      std::lock_guard<std::mutex> l(g_hs_mu);
+      devourer::sta::Station* st = g_stas.find(sta);
+      // Not associated, or not waiting on msg2: a duplicate msg2 must not
+      // re-run this, and an EAPOL frame from a station with no record is not
+      // a handshake at all.
+      if (!st || st->state != devourer::sta::HsState::WaitMsg2) return;
+      /* THE KEY REPLAY COUNTER, CHECKED. 802.11-2016 12.7.6.3: msg2 must echo
+       * the counter this AP put in msg1. Until now neither this branch nor the
+       * msg4 one read the field at all (it is at e+9..e+16, which is where
+       * eapol_frame writes it) - acceptance rested on the key-info bits and
+       * the MIC alone. The comment above this handshake claims the counter
+       * lets copies be told apart; that was only ever half-wired, because the
+       * station could and this AP could not. Pre-existing, not introduced by
+       * the per-station rewiring: the single-g_sta code did not check it
+       * either. */
+      if (!replay_ctr_recent(e+9, st->eapol_replay)) {
+        fprintf(stderr, "  WPA2: msg2 key replay counter out of window - dropped\n");
+        return;
+      }
+      /* Derive and verify against a CANDIDATE key; commit only after the MIC
+       * holds. Nothing about this station changes until then. */
+      uint8_t cand_snonce[32], cand_ptk[48];
+      memcpy(cand_snonce, e+17, 32);
+      compute_ptk_into(st->addr, st->anonce, cand_snonce, cand_ptk);
+      if (!check_mic_kck(e, elen, cand_ptk)) {
+        fprintf(stderr, "  WPA2: msg2 MIC FAIL\n"); return; }
+      memcpy(st->snonce, cand_snonce, 32);
+      memcpy(st->ptk, cand_ptk, 48);
       fprintf(stderr, "  WPA2: msg2 OK (SNonce, MIC verified) — PTK derived\n");
-      send_msg3();
-    } else if ((ki & 0x0100) && (ki & 0x0200)) {        // msg4: MIC + secure
-      if (check_mic(e, elen)) {
-        g_state = 2;
+      // The PN space belongs to the KEY, so the replay window resets where a
+      // new PTK is derived - here - and nowhere else. It used to reset on
+      // msg4, which is a MIC-only cleartext frame an attacker can capture and
+      // replay at will: the MIC still verifies under the same PTK, the window
+      // resets mid-session, and every captured data frame becomes admissible
+      // again. That defeats the control entirely. A legitimate msg4
+      // retransmission did the same thing by accident.
+      st->rx_replay.reset();
+      st->tx_pn = 1;          // a new key is a new PN space, both directions
+      send_msg3(*st, true);
+    } else if ((ki & 0x0100) && (ki & 0x0200) && (ki & 0x0008) &&
+               !(ki & 0x0040)) {                        // msg4: pairwise MIC+secure
+      /* PAIRWISE, and not Install. MIC+secure alone is ALSO the shape of a
+       * group handshake's message 2 (key info 0x0302), which a station sends
+       * in answer to a group rekey - unreachable today because this AP never
+       * sends a group message 1, and a latent misclassification the moment it
+       * does. Found by a branch-wide review. */
+      std::lock_guard<std::mutex> l(g_hs_mu);
+      devourer::sta::Station* st = g_stas.find(sta);
+      /* 12.7.6.5: msg4 must echo msg3's counter - or one of the recent ones,
+       * for the retransmission reason above. */
+      if (st && !replay_ctr_recent(e+9, st->eapol_replay)) {
+        fprintf(stderr, "  WPA2: msg4 key replay counter out of window - dropped\n");
+        return;
+      }
+      if (st && st->state == devourer::sta::HsState::WaitMsg4 &&
+          check_mic(e, elen, *st)) {
+        st->state = devourer::sta::HsState::Done;
         fprintf(stderr, "  WPA2: msg4 OK — 4-WAY HANDSHAKE COMPLETE (station keyed)\n");
       }
     }
   }
 }
 
+/* The headless cells. Included rather than linked because everything they
+ * drive is static in this file; see the note at the top of that file. */
+#include "ap_wpa2_selftest.inc"
+
 int main(int argc, char** argv) {
   int sec = argc > 1 ? atoi(argv[1]) : 60;
+  {   /* before the radio: a wiring check that needs one is no check at all */
+    std::vector<uint8_t> b, pr;
+    append_ies(b, true, /*beacon=*/true);
+    append_ies(pr, true);
+    if (!tim_wiring_ok(b, pr)) return 1;
+  }
+  /* One GTK for the BSS, before the radio comes up. Generating it inside the
+   * four-way - which is what this harness did until Phase 2b.2 - hands the
+   * second station a fresh group key and revokes the first station's. */
+  RAND_bytes(g_gtk, 16);
+  /* HEADLESS. Everything above this line is the wiring check and the BSS's
+   * group key, both of which the cells need; everything below it is a radio.
+   * `ap_wpa2 --self-test` is what ctest runs, and it touches no device. */
+  if (argc > 1 && std::strcmp(argv[1], "--self-test") == 0) return self_test();
+  if (const char* t = std::getenv("DEVOURER_AP_TAP")) g_tap_fd = tap_open(t);
   if (const char* c = std::getenv("DEVOURER_CHANNEL")) g_chan = (uint8_t)atoi(c);
   if (const char* k = std::getenv("DEVOURER_WPA2_PSK")) g_psk = k;
+  {
+    devourer::test::OpenSslCryptoOps co;
+    uint8_t probe[32];
+    if (!devourer::sta::pmk_from_psk(co, g_psk, kSsid, probe)) {
+      fprintf(stderr, "ap_wpa2: DEVOURER_WPA2_PSK is neither an 8..63-character "
+                      "passphrase nor 64 hex digits - refused\n");
+      return 2;
+    }
+  }
+  if (const char* p = std::getenv("DEVOURER_CCMP_PROFILE"))
+    g_ccmp_profile = std::strcmp(p, "0") != 0;
   auto logger = std::make_shared<Logger>(); apply_logging_env(*logger);
   libusb_context* ctx = nullptr; libusb_init(&ctx);
   libusb_set_option(ctx, LIBUSB_OPTION_LOG_LEVEL, LIBUSB_LOG_LEVEL_WARNING);
-  uint16_t vid = 0x0bda, pid = 0xc812;
-  if (const char* v = std::getenv("DEVOURER_VID")) vid = (uint16_t)strtoul(v, 0, 0);
-  if (const char* p = std::getenv("DEVOURER_PID")) pid = (uint16_t)strtoul(p, 0, 0);
-  auto* h = libusb_open_device_with_vid_pid(ctx, vid, pid);
-  if (!h) { fprintf(stderr, "open %04x:%04x fail\n", vid, pid); return 1; }
+  static const uint16_t pids[] = {0xc812};
+  auto* h = open_selected_usb(ctx, logger, pids, 1);
+  if (!h) return 1;
   std::shared_ptr<devourer::UsbDeviceLock> lk;
   if (devourer::claim_interface_then_reset(h, devourer::find_wifi_interface(h), logger, true, lk) != 0) return 1;
   WiFiDriver wifi(logger);
   auto dev = wifi.CreateRadio(h, ctx, lk, devourer_config_from_env());
   g_dev = dev.get(); if (!g_dev) return 1;
-  g_rt = devourer::build_stream_radiotap(devourer::parse_tx_mode_str("6M"));
+  /* THE RATE EVERY FRAME AIRS AT, and until now it was 6M legacy, hardcoded,
+   * with no way to ask for anything else. That is a reasonable default - it
+   * is the most robust OFDM rate there is, and a link that will not come up
+   * at 6M has a problem worth seeing - but it is also a 6 Mbit/s ceiling on
+   * a part that does 80 MHz VHT, and every throughput figure this project
+   * has ever quoted for a station link was measured under it.
+   *
+   * There is no rate control here and there is not going to be: this is a
+   * test harness, and picking a rate per frame from link statistics is the
+   * integrator's job (docs/station-mode-scope.md says so about the scanner
+   * and the reconnect policy for the same reason). What the harness owes is
+   * the ability to ASK, so the ceiling can be measured rather than assumed. */
+  const char* rate_s = std::getenv("DEVOURER_TX_RATE");
+  if (!rate_s || !*rate_s) rate_s = "6M";
+  g_rt = devourer::build_stream_radiotap(devourer::parse_tx_mode_str(rate_s));
+  std::fprintf(stderr, "  TX rate: %s\n", rate_s);
   g_dev->InitWrite(SelectedChannel{g_chan, 0, CHANNEL_WIDTH_20});
   int tu = 25; if (const char* i = std::getenv("DEVOURER_BCN_TU")) tu = atoi(i);
-  std::vector<uint8_t> bcn = {0,0,0x0a,0,0,0x80,0,0,0x08,0,
-      0x80,0,0,0, 0xff,0xff,0xff,0xff,0xff,0xff,
-      kBssid[0],kBssid[1],kBssid[2],kBssid[3],kBssid[4],kBssid[5],
-      kBssid[0],kBssid[1],kBssid[2],kBssid[3],kBssid[4],kBssid[5],
-      0,0, 0,0,0,0,0,0,0,0, (uint8_t)(tu&0xff),(uint8_t)(tu>>8), 0x11,0x00};
-  append_ies(bcn, true);
-  bool bok = g_dev->StartBeacon(bcn.data(), bcn.size(), tu);
+  std::vector<uint8_t> bcn = build_beacon(tu);
+  /* TWO DIAGNOSTIC KNOBS, both off by default, for one question: does the
+   * TX-DMA fault need the BEACON to be armed?
+   *
+   * The fault fires after ~2048 pages of transmission - one full traversal
+   * of the TX page ring - predicted and confirmed at two frame sizes. But
+   * txdemo, driving the same RTL8812CU through the same send path with the
+   * RX thread running, aired 5050 frames across several traversals with
+   * TXDMA_STATUS at zero throughout, and the FPV downlink has always pushed
+   * far more than 256 KB through this path. So it is not Jaguar3 TX in
+   * general. The obvious difference is that this AP arms a beacon in the
+   * reserved region, enables the beacon function and sets net_type=AP.
+   *
+   * DEVOURER_AP_NO_BEACON=1 skips StartBeacon. DEVOURER_AP_INJECT=N queues N
+   * 1476-byte data frames at a dummy unicast address straight after
+   * bring-up, so the A/B needs no station and no association: same binary,
+   * same descriptor, same queue, beacon on or off. */
+  /* DEVOURER_AP_PRE_INJECT=N: send N 1476-byte data frames synchronously,
+   * with NO beacon armed, before StartBeacon. Absolute or relative? If the
+   * fault is the TX ring pointer reaching a page the beacon engine reads,
+   * pre-loading the ring moves the fault EARLIER after the beacon starts; if
+   * it is something that counts from beacon start, it does not move. These
+   * frames bypass enqueue(), so `queued` at the fault counts only frames
+   * sent after the beacon was armed. */
+  if (const char* pre = std::getenv("DEVOURER_AP_PRE_INJECT")) {
+    const uint64_t n = std::strtoull(pre, nullptr, 10);
+    static const uint8_t kDummy[6] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01};
+    uint64_t ok = 0;
+    for (uint64_t i = 0; i < n; i++) {
+      std::vector<uint8_t> m = devourer::sta::data_hdr_from_ds(
+          kDummy, kBssid, kBssid, /*protect=*/false, g_seq.next());
+      m.resize(m.size() + 1452, 0x5a);
+      std::vector<uint8_t> f(g_rt);
+      f.insert(f.end(), m.begin(), m.end());
+      if (g_dev->send_packet(f.data(), f.size())) ok++;
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    fprintf(stderr, "  DIAGNOSTIC: pre-injected %llu/%llu frames with no beacon\n",
+            (unsigned long long)ok, (unsigned long long)n);
+  }
+  if (auto* rtl = dynamic_cast<IRtlRadio*>(g_dev)) {
+    fprintf(stderr, "  --- chip state BEFORE THE BEACON ---\n");
+    rtl->DumpChipState();
+    if (env_on("DEVOURER_AP_PKTBUF")) probe_pktbuf("before beacon");
+    /* The whole LLT, in the vendor driver's fifo_dump byte layout, so the two
+     * can be diffed entry for entry (DEVOURER_AP_LLT_FULL=1). */
+    if (env_on("DEVOURER_AP_LLT_FULL")) {
+      std::vector<uint8_t> llt(8192);
+      if (rtl->ReadPacketBuffer(1, 0, llt.data(), llt.size())) {
+        fprintf(stderr, "LLT FIFO DUMP [start_addr:0x0000 , size:8192]\n");
+        for (size_t i = 0; i < llt.size(); i += 16) {
+          for (size_t k = 0; k < 16; k++)
+            fprintf(stderr, "%02X%s", llt[i + k], (k % 4 == 3) ? "  " : " ");
+          fprintf(stderr, "\n");
+        }
+      }
+    }
+  }
+  const bool no_beacon = std::getenv("DEVOURER_AP_NO_BEACON") &&
+                         std::strcmp(std::getenv("DEVOURER_AP_NO_BEACON"), "0") != 0;
+  bool bok = no_beacon ? true
+                       : g_dev->StartBeacon(bcn.data(), bcn.size(), tu);
+  if (no_beacon) fprintf(stderr, "  DIAGNOSTIC: beacon NOT started\n");
+  /* A BISECTION OF StartBeacon, with no library change. StopBeacon undoes
+   * exactly three of StartBeacon's steps - EN_BCN_FUNCTION, EN_BCNQ_DL and
+   * net_type - and leaves the rest: the reserved-page download, the port
+   * identity, the interval and the H2C. Start then immediately stop, then
+   * inject: if the fault survives, the culprit is in the half StopBeacon
+   * leaves behind; if it disappears, it is in the half it undoes. */
+  if (!no_beacon && env_on("DEVOURER_AP_STOP_BEACON_FIRST")) {
+    const bool stopped = g_dev->StopBeacon();
+    fprintf(stderr, "  DIAGNOSTIC: beacon started then stopped (%s)\n",
+            stopped ? "ok" : "FAILED");
+  }
   std::thread rx([&]{ g_dev->StartRxLoop(on_rx); });
+
+  /* DOWN: the host's frames become 802.11, addressed and keyed per station.
+   * Its own thread because read() blocks; it exits on g_tap_stop (see the
+   * shutdown: closing the fd does not wake a blocked read). */
+  std::thread tap_rd;
+  if (g_tap_fd >= 0) {
+    /* The loop is the thread's; the decision is tap_down_one()'s, so
+     * `ap_wpa2 --self-test` can drive it without a TAP device or a thread. */
+    tap_rd = std::thread([&]{
+      uint8_t eth[2048];
+      const int fd = g_tap_fd;
+      for (;;) {
+        pollfd pf{fd, POLLIN, 0};
+        const int r = ::poll(&pf, 1, 200);
+        if (g_tap_stop.load()) return;
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) { if (r < 0) return; continue; }
+        const ssize_t got = ::read(fd, eth, sizeof eth);
+        if (got <= 0) return;                 /* a fatal error */
+        tap_down_one(eth, (size_t)got);
+      }
+    });
+  }
   fprintf(stderr, "ap_wpa2 up: SSID %s WPA2-PSK '%s' ch%d beacon=%s\n",
           kSsid, g_psk, g_chan, bok ? "OK" : "FAIL");
+  /* THE HEALTHY BASELINE. A dump from a wedged chip is uninterpretable on its
+   * own - every value needs a known-good counterpart to be read against. */
+  if (auto* rtl = dynamic_cast<IRtlRadio*>(g_dev)) {
+    fprintf(stderr, "  --- chip state WHILE HEALTHY ---\n");
+    rtl->DumpChipState();
+    if (env_on("DEVOURER_AP_PKTBUF")) probe_pktbuf("healthy");
+    /* The full-window diff source - see IRtlRadio::DumpMacRegisters. */
+    if (env_on("DEVOURER_AP_MAC_DUMP")) rtl->DumpMacRegisters();
+  }
+  /* DEVOURER_AP_CCA_GATES=primary|edcca|both - DIAGNOSTIC: clear ONE MAC
+   * carrier-sense gate after bring-up (IRtlRadio::SetCcaGates), the other left
+   * as bring-up set it. DEVOURER_DIS_CCA is both-or-neither, and on Jaguar1
+   * both-off was measured WORSE than the right one alone (CLAUDE.md). Added
+   * for the 8812AU-as-AP ch6 deferral (2026-09-26): which gate holds it off.
+   * Read back and printed; anything else is refused, loudly. */
+  if (const char* g = std::getenv("DEVOURER_AP_CCA_GATES"); g && *g) {
+    const bool both = std::strcmp(g, "both") == 0;
+    const bool pri = both || std::strcmp(g, "primary") == 0;
+    const bool ed = both || std::strcmp(g, "edcca") == 0;
+    auto* rtl = dynamic_cast<IRtlRadio*>(g_dev);
+    bool rp = false, re = false;
+    const bool ok = (pri || ed) && rtl && rtl->SetCcaGates(pri, ed) &&
+                    rtl->GetCcaGates(rp, re);
+    fprintf(stderr,
+            "  CCA gates: asked '%s' -> %s (read back: primary %s, edcca %s)\n",
+            g, ok ? "applied" : "REFUSED", rp ? "OFF" : "on", re ? "OFF" : "on");
+  }
+  std::signal(SIGINT, ap_on_signal);
+  std::signal(SIGTERM, ap_on_signal);
+  int tx_backoff_ms = 0;
+  uint64_t inject_left = 0;
+  if (const char* n = std::getenv("DEVOURER_AP_INJECT"))
+    inject_left = std::strtoull(n, nullptr, 10);
+  uint64_t consecutive_fail = 0;
+  /* THE TX-DMA WATCHDOG. Polled, not per-frame: a register read costs USB
+   * round trips and CLAUDE.md's standing rule is that nothing reads a
+   * register on the send path. Ten times a second is enough to catch WHEN
+   * the fault latches, which is the question - a fault that appears with the
+   * very first frames is a different bug from one that appears after N. */
+  auto last_txdma = std::chrono::steady_clock::now();
+  uint32_t txdma_seen = 0;
+  uint32_t bcn_refresh_ms = 0;
+  if (const char* r = std::getenv("DEVOURER_AP_BCN_REFRESH_MS"))
+    bcn_refresh_ms = (uint32_t)std::strtoul(r, nullptr, 10);
+  auto last_bcn = std::chrono::steady_clock::now();
   auto end = std::chrono::steady_clock::now() + std::chrono::seconds(sec);
-  while (std::chrono::steady_clock::now() < end) {
+  while (!g_stop && std::chrono::steady_clock::now() < end) {
+    hs_tick();                                   // 4-way retransmissions
+    if (inject_left) {
+      /* One per iteration, and only while the queue is short, so the
+       * injection is paced by the chip rather than overflowing the cap. */
+      size_t qn;
+      { std::lock_guard<std::mutex> l(g_q_mu); qn = g_q.size(); }
+      if (qn < 8) {
+        static const uint8_t kDummy[6] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01};
+        std::vector<uint8_t> f = devourer::sta::data_hdr_from_ds(
+            kDummy, kBssid, kBssid, /*protect=*/false, g_seq.next());
+        f.resize(f.size() + 1452, 0x5a);          /* 24 + 1452 = 1476 bytes */
+        enqueue(std::move(f));
+        if (--inject_left == 0)
+          fprintf(stderr, "  DIAGNOSTIC: injection finished\n");
+      }
+    }
     std::vector<std::vector<uint8_t>> batch;
     { std::lock_guard<std::mutex> l(g_q_mu); batch.swap(g_q); }
-    for (auto& f : batch) if (g_dev->send_packet(f.data(), f.size())) g_sent.fetch_add(1);
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    /* THE BACKOFF THE LIBRARY ASKS FOR, AND THIS HARNESS NEVER DID.
+     *
+     * RtlJaguar3Device::send_packet says it plainly at its definition: "The
+     * caller backs off when these fail repeatedly ... hammering a
+     * non-draining endpoint is exactly what wedged its USB core." This loop
+     * hammered. It took the whole batch and pushed every frame at a chip
+     * that was already refusing, each refusal costing a 20 ms blocking
+     * bulk-OUT timeout.
+     *
+     * WHAT THAT COST, measured with a third radio: THE AP STOPPED BEACONING.
+     * Idle it airs 36.0 beacons a second (25 TU, confirmed by an RTL8812AU
+     * in monitor mode); under a 4 Mbit/s downlink it aired 1.7 a second - 5%
+     * - because the beacon is DMA'd from a reserved page by the hardware at
+     * TBTT and cannot get out past a saturated TX path. The station's
+     * supervision then fires at 1024 ms, it re-associates, and everything
+     * the AP's host offers in the meantime is discarded. That is the whole
+     * of the "station drops its association under load" open question, and
+     * it was never the station.
+     *
+     * So: stop at the first refusal, put the rest back at the FRONT of the
+     * queue (they are not lost, and their order is the order they were
+     * built in), and give the chip time to drain. The backoff doubles to a
+     * ceiling, because a chip that refuses once usually refuses the next
+     * one too and each attempt costs 20 ms of this thread. */
+    /* AND A CEILING ON HOW MUCH GOES IN AT ONCE. The loop used to hand the
+     * chip the WHOLE batch - up to 128 frames, ~190 KB of 1476-byte MPDUs -
+     * in one uninterrupted burst. The beacon is DMA'd from a reserved page
+     * by the hardware at TBTT and has to find room in the same TX path, so a
+     * burst that fills it is a beacon that does not air. Measured: our
+     * beacons fall to 8% of their idle rate under a downlink load while
+     * NEIGHBOURS' beacons, decoded by the same receiver in the same seconds,
+     * stay at 87%.
+     *
+     * A cap costs nothing here - the loop runs every millisecond, so 16
+     * frames an iteration is 16000 a second, far above anything this AP
+     * sustains - and it leaves the chip room to breathe between bursts. */
+    size_t burst = batch.size() < kTxBurst ? batch.size() : kTxBurst;
+    size_t i = 0;
+    bool refused = false;
+    if (g_tx_circuit_open) {
+      /* Tripped: drop the batch, counted, and do not touch the device -
+       * and send NOTHING below: `burst` was sized from the batch just
+       * cleared, and indexing it would read destroyed frames. */
+      g_tx_broken.fetch_add(batch.size());
+      batch.clear();
+      burst = 0;
+    }
+    for (; i < burst; i++) {
+      if (g_dev->send_packet(batch[i].data(), batch[i].size())) {
+        g_sent.fetch_add(1);
+        tx_backoff_ms = 0;
+        consecutive_fail = 0;
+      } else {
+        g_send_refused.fetch_add(1);
+        if (++consecutive_fail >= kTxGiveUp && !g_tx_circuit_open) {
+          g_tx_circuit_open = true;
+          /* THE REGISTERS, AT THE MOMENT IT STOPS. Compare against the
+           * healthy dump taken at startup: if the beacon gates have been
+           * cleared the fix is to notice and re-assert them, and if they are
+           * untouched the failure is below the register interface and the
+           * fix is elsewhere. Either answer is progress; neither was
+           * askable before IRtlRadio::DumpChipState existed on this
+           * backend. */
+          if (auto* rtl = dynamic_cast<IRtlRadio*>(g_dev)) {
+            fprintf(stderr, "  --- chip state WHEN TX STOPPED ---\n");
+            dump_chip_state_safe(rtl);
+          }
+          fprintf(stderr,
+                  "\n  *** TX PATH NOT DRAINING: %llu consecutive refusals.\n"
+                  "  *** This AP is no longer submitting data frames. Hammering a\n"
+                  "  *** non-draining endpoint WEDGES the chip - measured: beacons\n"
+                  "  *** and management replies stop, the receiver keeps working,\n"
+                  "  *** and only a physical replug clears it.\n"
+                  "  *** The ledger below is still valid; the link is not.\n\n",
+                  (unsigned long long)consecutive_fail);
+        }
+        refused = true;
+        break;
+      }
+    }
+    if (i < batch.size()) {
+      /* Back at the front, ahead of anything enqueued while we were
+       * sending. Not through enqueue(): these were counted in g_q_in when
+       * they were first offered, and counting them twice would break the
+       * ledger identity the on-air cells check. The cap still applies -
+       * anything beyond it is a queue drop like any other.
+       *
+       * THE REFUSED FRAME IS REQUEUED TOO. One 20 ms NAK is back-pressure,
+       * not a verdict - dropping it cost a DHCP, EAPOL or TCP frame the
+       * next iteration would have delivered. It was booked in g_send_fail
+       * at the refusal once, and then AGAIN in g_sent when it aired, so the
+       * ledger identity broke; now a refusal is only g_send_refused and the
+       * frame is booked once, where it ends up. */
+      (void)refused;
+      const size_t from = i;
+      std::lock_guard<std::mutex> l(g_q_mu);
+      for (size_t k = batch.size(); k-- > from;) {
+        if (g_q.size() < 128) g_q.insert(g_q.begin(), std::move(batch[k]));
+        else g_q_drop.fetch_add(1);
+      }
+      tx_backoff_ms = tx_backoff_ms ? std::min(tx_backoff_ms * 2, 16) : 1;
+      g_backoffs.fetch_add(1);
+    }
+    {
+      const auto now_d = std::chrono::steady_clock::now();
+      if (std::chrono::duration_cast<std::chrono::milliseconds>(now_d - last_txdma)
+              .count() >= 100) {
+        last_txdma = now_d;
+        if (auto* rtl = dynamic_cast<IRtlRadio*>(g_dev)) {
+          /* A register read, and on a busy Jaguar2 one in a few thousand
+           * throws (a control transfer racing the bulk-IN - measured ~1 a
+           * minute under a 4+4 Mbit/s soak). Uncaught here it killed the AP
+           * nine minutes in. A failed sample keeps the last value, so it can
+           * never read as a fault transition, and is counted. */
+          static uint64_t txdma_read_fail = 0;
+          uint32_t st = txdma_seen;
+          try {
+            st = rtl->GetTxDmaStatus();
+          } catch (const std::exception& e) {
+            fprintf(stderr, "  TX-DMA watchdog: read failed (%s), sample skipped "
+                    "(%llu so far)\n", e.what(),
+                    (unsigned long long)++txdma_read_fail);
+          }
+          /* THE PAGE COUNTS AT THE TRANSITION, beside the dump taken while
+           * healthy - two snapshots, not a trace, so a gradual decline
+           * between them is not visible. Two stories fit "the fault fires at
+           * 2048 pages": the pages leak and the allocator runs out, or they
+           * are freed normally and the write pointer walks past the ACQ
+           * boundary into the reserved region. Healthy counts at the fault
+           * favour the second - and the reserved region is where the beacon
+           * lives. */
+          if (st != txdma_seen && g_dev) {
+            if (auto* r2 = dynamic_cast<IRtlRadio*>(g_dev)) {
+              fprintf(stderr, "  pages at the transition:\n");
+              dump_chip_state_safe(r2);
+            }
+          }
+          if (st != txdma_seen && env_on("DEVOURER_AP_PKTBUF"))
+            probe_pktbuf("at fault");
+          if (st != txdma_seen) {
+            fprintf(stderr,
+                    "  TXDMA_STATUS 0x%08x -> 0x%08x  after queued=%llu "
+                    "sent=%llu send_failed=%llu qdrop=%llu\n",
+                    txdma_seen, st, (unsigned long long)g_q_in.load(),
+                    (unsigned long long)g_sent.load(),
+                    (unsigned long long)g_send_fail.load(),
+                    (unsigned long long)g_q_drop.load());
+            txdma_seen = st;
+          }
+        }
+      }
+    }
+    if (bcn_refresh_ms) {
+      const auto now_b = std::chrono::steady_clock::now();
+      if (std::chrono::duration_cast<std::chrono::milliseconds>(now_b - last_bcn)
+              .count() >= (long)bcn_refresh_ms) {
+        last_bcn = now_b;
+        /* RETRIED, the way the vendor driver retries. rtl88x2cu's
+         * send_beacon() re-issues and polls BCN_VALID up to a HUNDRED times
+         * before giving up; a single attempt per interval failed 37 times
+         * out of 56 under load, which is the same "bxmitok == _FALSE" it
+         * treats as routine on USB. */
+        bool ok = false;
+        for (int try_i = 0; try_i < kBcnRetries && !ok; try_i++) {
+          ok = g_dev->UpdateBeaconPayload(bcn.data(), bcn.size());
+          if (!ok) {
+            g_bcn_retry.fetch_add(1);
+            std::this_thread::yield();
+          }
+        }
+        if (ok) {
+          g_bcn_refresh.fetch_add(1);
+        } else {
+          g_bcn_refresh_fail.fetch_add(1);
+          /* THE REGISTERS AT THE MOMENT THE BEACON CANNOT BE LOADED, once.
+           * This is the event of interest - the circuit breaker never trips
+           * in these runs, so the wedge dump was never taken. Compare
+           * against the healthy dump printed at startup. */
+          static bool dumped = false;
+          if (!dumped) {
+            dumped = true;
+            if (auto* rtl = dynamic_cast<IRtlRadio*>(g_dev)) {
+              fprintf(stderr, "  --- chip state WHEN THE BEACON WOULD NOT LOAD ---\n");
+              dump_chip_state_safe(rtl);
+            }
+          }
+        }
+      }
+    }
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(tx_backoff_ms ? tx_backoff_ms : 1));
   }
-  fprintf(stderr, "sent=%llu 4way_state=%d\n", (unsigned long long)g_sent.load(), g_state);
+  /* THE TAP CLOSES BEFORE THE LEDGER IS PRINTED, and the queue is drained
+   * after that. Otherwise the reader thread can frame and enqueue between the
+   * loop's last drain and the print, and the two identities the ledger states
+   * are off by whatever was in flight at that instant. */
+  /* A STOP FLAG AND A POLL, not "it exits when the fd is closed": on Linux a
+   * close() from another thread does NOT wake a read() already blocked on the
+   * fd. With the peer gone and nothing more arriving on the TAP, the reader
+   * sat in read() forever and the join below hung the process - measured,
+   * 2026-09-26: a Jaguar1 AP soak whose chunks all passed, then ~30 min
+   * stuck in exit, SIGTERM ignored (gdb: main in join, the reader in read).
+   * Earlier runs got out only because a stray host packet woke the reader. */
+  const bool had_tap = g_tap_fd >= 0;      /* the ledger below asks AFTER the close */
+  g_tap_stop.store(true);
+  if (tap_rd.joinable()) tap_rd.join();
+  if (g_tap_fd >= 0) { ::close(g_tap_fd); g_tap_fd = -1; }
+  {
+    std::vector<std::vector<uint8_t>> batch;
+    { std::lock_guard<std::mutex> l(g_q_mu); batch.swap(g_q); }
+    /* The breaker holds at shutdown too: a tripped TX path gets the batch
+     * booked as broken, not hammered once more at ~20 ms a refusal. */
+    if (g_tx_circuit_open) {
+      g_tx_broken.fetch_add(batch.size());
+      batch.clear();
+    }
+    for (auto& f : batch) {
+      if (g_dev->send_packet(f.data(), f.size())) g_sent.fetch_add(1);
+      else g_send_fail.fetch_add(1);
+    }
+  }
+  /* The same probe once the traffic is over: whether the ring terminator
+   * appeared on its own, and whether the beacon page is still a beacon. */
+  if (env_on("DEVOURER_AP_PKTBUF")) probe_pktbuf("end of run");
+  /* DEVOURER_AP_CHIPSTATE_END=1: the chip-state dump once more after the
+   * traffic - the RX-side overflow flags are sticky, so this is where a
+   * receive FIFO that overflowed during the run shows. */
+  if (env_on("DEVOURER_AP_CHIPSTATE_END"))
+    if (auto* rtl = dynamic_cast<IRtlRadio*>(g_dev)) {
+      fprintf(stderr, "  --- chip state AT THE END OF THE RUN ---\n");
+      try {
+        rtl->DumpChipState();
+      } catch (const std::exception& e) {
+        fprintf(stderr, "  chip-state read failed (%s)\n", e.what());
+      }
+    }
+  {
+    std::lock_guard<std::mutex> l(g_hs_mu);
+    fprintf(stderr, "sent=%llu stations=%d", (unsigned long long)g_sent.load(),
+            g_stas.count());
+    for (int i = 0; i < g_stas.capacity(); i++)
+      if (devourer::sta::Station* st = g_stas.at(i))
+        fprintf(stderr, " [aid=%u %02x:%02x:%02x:%02x:%02x:%02x 4way_state=%d]",
+                st->aid, st->addr[0],st->addr[1],st->addr[2],
+                st->addr[3],st->addr[4],st->addr[5], (int)st->state);
+    fprintf(stderr, "\n");
+  }
+  if (g_ccmp_profile) {
+    /* A machine event, so stdout - the event plane (root CLAUDE.md). */
+    fprintf(stdout,
+            "{\"ev\":\"ccmp.profile\",\"path\":\"software\","
+            "\"tx_frames\":%llu,\"tx_bytes\":%llu,\"tx_ns\":%llu,"
+            "\"rx_frames\":%llu,\"rx_bytes\":%llu,\"rx_ns\":%llu}\n",
+            (unsigned long long)g_ccmp_tx_frames.load(),
+            (unsigned long long)g_ccmp_tx_bytes.load(),
+            (unsigned long long)g_ccmp_tx_ns.load(),
+            (unsigned long long)g_ccmp_rx_frames.load(),
+            (unsigned long long)g_ccmp_rx_bytes.load(),
+            (unsigned long long)g_ccmp_rx_ns.load());
+    fflush(stdout);
+  }
+  /* The data-plane ledger. The on-air runs could not tell an AP that never
+   * RECEIVED an encrypted frame from one that received and failed to decrypt
+   * them, because nothing counted either - so a 100%-ping-loss result had no
+   * diagnosis attached. Printed unconditionally, at every exit. */
+  /* The caveat that used to stand here - "on Realtek every protected frame
+   * would be counted as a MIC failure, because on_rx does not trim the
+   * trailing FCS" - is OBSOLETE, and saying so is cheaper than leaving a
+   * warning about a fixed bug where a reader will trust it. on_rx trims via
+   * devourer::test::mpdu_len(p) (see tests/rx_mpdu.h), and the ledger has
+   * since been read off a Realtek AP - an RTL8812CU, Jaguar3 - with a
+   * MediaTek station decrypting every frame it sent. */
+  /* COUNTED, NOT INFERRED. "to this AP" used to be computed as
+   * g_enc_rx - g_to_peer - g_to_elsewhere, but g_enc_rx counts every protected
+   * frame - group frames, MIC failures and replay rejections included - and
+   * none of those increments the two it subtracted. The figure overstated
+   * itself by at least the group traffic, and it is the line the plan quotes
+   * as this phase's acceptance evidence. Each destination class now has its
+   * own counter. */
+  fprintf(stderr,
+          "  addressing: to this AP=%llu, group=%llu, to a peer station=%llu"
+          " (relayed=%llu dropped=%llu), off-BSS=%llu,"
+          " group frames aired=%llu\n",
+          (unsigned long long)g_to_ap.load(),
+          (unsigned long long)g_to_group.load(),
+          (unsigned long long)g_to_peer.load(),
+          (unsigned long long)g_relayed.load(),
+          (unsigned long long)g_relay_drop.load(),
+          (unsigned long long)g_to_elsewhere.load(),
+          (unsigned long long)g_group_tx.load());
+  /* TWO IDENTITIES, printed so a caller can check them rather than believe
+   * them:
+   *   from host == framed + dropped down
+   *   queued    == aired + queue dropped + send failed
+   * Both hold exactly, because the TAP reader is stopped and the queue
+   * drained before this runs. */
+  if (had_tap)
+    fprintf(stderr, "  TAP: to host=%llu, from host=%llu, framed=%llu,"
+                    " dropped up=%llu, dropped down=%llu\n",
+            (unsigned long long)g_tap_tx.load(),
+            (unsigned long long)g_tap_rx.load(),
+            (unsigned long long)g_tap_framed.load(),
+            (unsigned long long)g_tap_drop.load(),
+            (unsigned long long)g_tap_down_drop.load());
+  fprintf(stderr,
+          "  refused before relay: fragmented=%llu, A-MSDU=%llu,"
+          " group flood cipher-refused=%llu\n",
+          (unsigned long long)g_frag_drop.load(),
+          (unsigned long long)g_amsdu_drop.load(),
+          (unsigned long long)g_group_drop.load());
+  fprintf(stderr,
+          "  rx path: frames from the device=%llu, data to this BSS=%llu "
+          "(crc-flagged %llu, short %llu), malformed=%llu\n",
+          (unsigned long long)g_rx_cb.load(),
+          (unsigned long long)g_rx_data_us.load(),
+          (unsigned long long)g_rx_data_crc.load(),
+          (unsigned long long)g_rx_data_short.load(),
+          (unsigned long long)g_rx_malformed.load());
+  fprintf(stderr,
+          "  data plane: encrypted frames received=%llu, MIC failures=%llu, "
+          "replays rejected=%llu, duplicates dropped=%llu, queued=%llu, frames sent=%llu, "
+          "queue dropped=%llu, send failed=%llu, backoffs=%llu,"
+          " refused after the TX circuit opened=%llu,"
+          " beacon refreshes=%llu (failed %llu, retries %llu),"
+          " send refusals retried=%llu\n",
+          (unsigned long long)g_enc_rx.load(),
+          (unsigned long long)g_mic_fail.load(),
+          (unsigned long long)g_replayed.load(),
+          (unsigned long long)g_dup_drop.load(),
+          (unsigned long long)g_q_in.load(),
+          (unsigned long long)g_sent.load(),
+          (unsigned long long)g_q_drop.load(),
+          (unsigned long long)g_send_fail.load(),
+          (unsigned long long)g_backoffs.load(),
+          (unsigned long long)g_tx_broken.load(),
+          (unsigned long long)g_bcn_refresh.load(),
+          (unsigned long long)g_bcn_refresh_fail.load(),
+          (unsigned long long)g_bcn_retry.load(),
+          (unsigned long long)g_send_refused.load());
+
   /* Retried, and the failure reported. StopBeacon can now genuinely fail (an
    * EP0 stall during teardown), IRadio.h says such a failure "must be retried
    * ... before its shared port is reused", and `_exit(0)` below means there is

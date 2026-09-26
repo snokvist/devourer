@@ -387,6 +387,7 @@ if(DEVOURER_MT7612U)
         src/mt7612u/phy.cpp
         src/mt7612u/radiotap.cpp
         src/mt7612u/rx.cpp
+        src/mt7612u/station.cpp
         src/mt7612u/tx.cpp
         src/mt7612u/usb.cpp
         src/mt7612u/Mt7612uRadio.cpp src/mt7612u/Mt7612uRadio.h
@@ -686,6 +687,16 @@ add_executable(txdemo
 target_link_libraries(txdemo PUBLIC devourer PRIVATE PkgConfig::libusb)
 target_include_directories(txdemo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
 
+# examples/common/env_config.cpp headless: the env-var -> DeviceConfig map
+# every demo shares. No device, no libusb calls.
+add_executable(EnvConfigSelftest
+    tests/env_config_selftest.cpp
+    examples/common/env_config.cpp
+)
+target_link_libraries(EnvConfigSelftest PUBLIC devourer)
+target_include_directories(EnvConfigSelftest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
+add_test(NAME env_config COMMAND EnvConfigSelftest)
+
 # dwell-1 A/B injection over the firmware channel switch (issue #272 data
 # plane): one admitted data-frame opportunity per wall-clock slot, with
 # bounded admission so a frame for context A can never air on B.
@@ -965,6 +976,231 @@ if(DEVOURER_MT7612U)
     add_test(NAME mt7612u_tsf_api COMMAND Mt7612uTsfApiSelftest)
 endif()
 
+# The exact userspace CCMP primitive used by tests/ap_wpa2.cpp, isolated from
+# USB and airtime.  This is the CPU-ceiling half of the MT7612U hardware-offload
+# decision (#425); the executable's normal mode is a benchmark, while ctest
+# only runs its roundtrip + bad-tag guard.  OpenSSL is optional for the main
+# library and for platforms on which this AP harness is not built.
+find_package(OpenSSL QUIET)
+if(OpenSSL_FOUND)
+    # The name does not end in "Selftest", so the aggregate at the bottom of
+    # this file does not collect it - and it registers a ctest, which makes it
+    # a "Not Run" failure on any host that builds only `selftests` and has
+    # OpenSSL. That is the exact defect 903c69e fixed for ApWpa2; it escapes
+    # the mingw job today only because OpenSSL is absent there, which is luck
+    # rather than design. Added to the aggregate explicitly instead of
+    # renaming, because `CcmpSwBench` is a BENCHMARK whose ctest mode is one
+    # flag - the name is right and the aggregate is what was wrong.
+    add_executable(CcmpSwBench tests/ccmp_sw_bench.cpp)
+    target_include_directories(CcmpSwBench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(CcmpSwBench PRIVATE OpenSSL::Crypto)
+# Standalone (no PUBLIC cxx_std_20 from `devourer`); the station headers use
+# inline variables and nested namespaces, which MSVC rejects below C++17.
+target_compile_features(CcmpSwBench PRIVATE cxx_std_20)
+    add_test(NAME ccmp_software_roundtrip COMMAND CcmpSwBench --self-test)
+
+    # src/sta/Eapol.h and src/sta/Supplicant.h - the station half of the
+    # WPA2-PSK key exchange (Phase 3). OpenSSL because the cells need a
+    # CryptoOps and tests/openssl_crypto_ops.h is the one complete
+    # implementation in the tree; the modules themselves link nothing.
+    #
+    # It also carries tests/eapol_kernel_vectors.h: the four EAPOL-Key frames
+    # hostapd and wpa_supplicant actually exchanged over a virtual rig, with
+    # the PTK wpa_supplicant derived and the GTK it installed. That is the
+    # only thing in the tree that pins the PRF, the EAPOL MIC and the GTK KDE
+    # layout against software that has never read this repository - the
+    # fixture authenticator in the same file cannot, because it shares an
+    # author with the code it tests. Regenerate with
+    # tests/eapol_capture_vectors.sh; checked in, so ctest needs no rig.
+    #
+    # THIS TARGET IS THE PHASE'S ACCEPTANCE. Two of its cells are named after
+    # defects that shipped in a reviewed PR (#335): a forged EAPOL-Key MIC
+    # must be rejected, and an equal-counter replayed group rekey must be
+    # rejected. It also carries the IEEE 802.11i Annex H.4 passphrase-to-PSK
+    # known answers, which is the class of test that PR had none of.
+    add_executable(SupplicantSelftest tests/supplicant_selftest.cpp)
+    target_include_directories(SupplicantSelftest PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(SupplicantSelftest PRIVATE OpenSSL::Crypto)
+# Standalone (no PUBLIC cxx_std_20 from `devourer`); the station headers use
+# inline variables and nested namespaces, which MSVC rejects below C++17.
+target_compile_features(SupplicantSelftest PRIVATE cxx_std_20)
+    add_test(NAME supplicant COMMAND SupplicantSelftest)
+
+    # src/sta/StationSm.h - the association state machine (Phase 3). Its
+    # timeouts are assertable at all only because the clock is an argument:
+    # the AP harness reads a steady_clock for the same job, which is why its
+    # retry schedule could only ever be watched on a bench.
+    add_executable(StationSmSelftest tests/station_sm_selftest.cpp)
+    target_include_directories(StationSmSelftest PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(StationSmSelftest PRIVATE OpenSSL::Crypto)
+# Standalone (no PUBLIC cxx_std_20 from `devourer`); the station headers use
+# inline variables and nested namespaces, which MSVC rejects below C++17.
+target_compile_features(StationSmSelftest PRIVATE cxx_std_20)
+    add_test(NAME station_sm COMMAND StationSmSelftest)
+
+    # src/sta/Ccmp.h - the 802.11 CCMP framing both roles share. The vectors
+    # (tests/ccmp_gen_vectors.py) pin the CIPHER against a third
+    # implementation; they do NOT independently pin the framing, because
+    # generator and header share one author's reading - which is how a wrong
+    # CCM nonce stayed green. See the note atop tests/ccmp_selftest.cpp.
+    # tests/ccmp_kernel_vectors.h closes that gap from the other side: frames
+    # the LINUX KERNEL encrypted, at all eight TIDs, captured off a virtual
+    # two-radio rig by tests/ccmp_capture_vectors.sh. Checked in, so this
+    # target stays hardware-free and needs neither hwsim nor root.
+    # Also pins the AAD masking rules, the 48-bit PN packing, and the replay
+    # gate's `<=`, which PR #335 shipped as `<` - a KRACK-class defect its
+    # review caught. Header-only; no libusb, no device.
+    add_executable(CcmpSelftest tests/ccmp_selftest.cpp)
+    target_include_directories(CcmpSelftest PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(CcmpSelftest PRIVATE OpenSSL::Crypto)
+# Standalone (no PUBLIC cxx_std_20 from `devourer`); the station headers use
+# inline variables and nested namespaces, which MSVC rejects below C++17.
+target_compile_features(CcmpSelftest PRIVATE cxx_std_20)
+    add_test(NAME ccmp_framing COMMAND CcmpSelftest)
+else()
+    # Said out loud: without OpenSSL the station's crypto ACCEPTANCE cells are
+    # not built, and a green ctest here has run none of them.
+    message(WARNING "OpenSSL not found: the station crypto selftests "
+                    "(supplicant, station_sm, ccmp_framing, "
+                    "ccmp_software_roundtrip) are NOT built on this host")
+endif()
+
+# tests/ap_wpa2.cpp itself, headless.
+#
+# THE DEFECT THIS CLOSES. Phase 2b shipped with this written down as its
+# largest carried-forward gap: the WPA2 AP harness had no build target of any
+# kind, so the four-way handshake, the intra-BSS relay's crypto and the TAP
+# forwarder existed only inside an on-air script, and four phase gates rested
+# on a narrated bench run. `ap_wpa2 --self-test` drives the real on_rx() with
+# synthetic frames and reads the real transmit queue back; it returns before
+# libusb is opened, so ctest needs no adapter, no root and no airtime.
+#
+# It links libusb and OpenSSL because the harness does, not because the cells
+# do. LINUX ONLY, and not merely UNIX: tests/ap_wpa2.cpp includes <linux/if.h>
+# and <linux/if_tun.h> unconditionally for the TAP forwarder, so on a macOS
+# job where find_package(OpenSSL) succeeds - Homebrew - the build matrix would
+# define this target and die at "'linux/if.h' file not found". Every other
+# target under the OpenSSL guard is portable; this is the first that is not.
+#
+# The name must end in "Selftest": the `selftests` aggregate at the bottom of
+# this file collects by that convention, the mingw job builds only that
+# aggregate and then runs ctest, and a registered test whose binary was never
+# built is a "Not Run" failure - the exact outcome the aggregate exists to
+# prevent. Named ApWpa2 at first, which sat outside it.
+if(OpenSSL_FOUND AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(ApWpa2Selftest
+        tests/ap_wpa2.cpp
+        examples/common/env_config.cpp
+        examples/common/usb_select.cpp
+    )
+    target_link_libraries(ApWpa2Selftest PUBLIC devourer
+                          PRIVATE PkgConfig::libusb OpenSSL::Crypto)
+    target_include_directories(ApWpa2Selftest PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
+    add_test(NAME ap_wpa2_headless COMMAND ApWpa2Selftest --self-test)
+
+    # tests/sta_client.cpp headless - the STATION harness (Phase 4).
+    #
+    # The mirror of ApWpa2Selftest above, and it exists for the same reason:
+    # everything this harness owns is the part src/sta/ deliberately refused
+    # to guess at - the scan, the reconnect policy, and which key the data
+    # plane uses per frame - and none of it has any other test. Without this
+    # target those three would live only inside an on-air script, which is
+    # the exact gap Phase 2b recorded as its largest carried-forward defect.
+    #
+    # `sta_client --self-test` returns before libusb is opened, so ctest needs
+    # no adapter, no root and no airtime. It drives the real rx_frame() with
+    # real frames from a fixture authenticator and reads the real transmit
+    # queue back.
+    #
+    # Same guards as ApWpa2Selftest, for the same reasons: OpenSSL because
+    # the CryptoOps is tests/openssl_crypto_ops.h, and Linux because the TAP
+    # forwarder includes <linux/if_tun.h> unconditionally. And the name ends
+    # in "Selftest" so the `selftests` aggregate collects it - a registered
+    # test whose binary the mingw job never built is a "Not Run" failure,
+    # which is what 903c69e fixed for ApWpa2 and 2fef219 for CcmpSwBench.
+    add_executable(StaClientSelftest
+        tests/sta_client.cpp
+        examples/common/env_config.cpp
+        examples/common/usb_select.cpp
+    )
+    target_link_libraries(StaClientSelftest PUBLIC devourer
+                          PRIVATE PkgConfig::libusb OpenSSL::Crypto)
+    target_include_directories(StaClientSelftest PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
+    add_test(NAME sta_client_headless COMMAND StaClientSelftest --self-test)
+endif()
+
+# tests/udp_blast.cpp - one-way UDP throughput, because nothing in this tree
+# measured throughput at all: every station-link figure so far came from a
+# flood ping, which is round-trip bound and therefore a LATENCY measurement.
+# No device and no library - it is BSD sockets and a sequence number - so it
+# builds and self-tests in every job. The cells pin the loss, reorder and
+# duplicate accounting against known answers over loopback; 6/6 mutations
+# caught, including one that only bites past the 1024-slot reorder window.
+if(UNIX)
+    add_executable(UdpBlast tests/udp_blast.cpp)
+    add_test(NAME udp_blast_selftest COMMAND UdpBlast --self-test)
+    # The station soak's graders, mutation-swept over a real run's ledger
+    # lines (tests/fixtures/soak_grade). No radio, no root.
+    add_test(NAME soak_grade_selftest
+             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/soak_grade_selftest.sh)
+endif()
+
+# src/sta/Dot11.h - the management-frame module the AP harnesses and a station
+# share. Pure and header-only, so this needs neither OpenSSL nor libusb and
+# runs in every CI job. Covers the IE walker against truncated and hostile
+# lengths, the builders' exact wire bytes, and the 12-bit sequence counter the
+# MediaTek MAC does not assign for anything but a beacon.
+add_executable(Dot11Selftest tests/dot11_selftest.cpp)
+target_include_directories(Dot11Selftest PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+# rx_mpdu.h pulls in RxPacket.h, which uses std::span.
+target_compile_features(Dot11Selftest PRIVATE cxx_std_20)
+add_test(NAME dot11_frames COMMAND Dot11Selftest)
+
+# src/sta/BssTable.h - the scan result, and which BSS is worth joining
+# (Phase 3). Pure and header-only, so no OpenSSL and no libusb. The two cells
+# that matter are select(), which must not offer a BSS this station cannot
+# finish a handshake with, and observe(), which must not invent a BSS out of a
+# frame that is not a beacon - every management frame shares the same 24-byte
+# header, so a deauth handed to parse_beacon reads its reason code as part of
+# a timestamp.
+add_executable(BssTableSelftest tests/bss_table_selftest.cpp)
+target_include_directories(BssTableSelftest PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+# Standalone (no PUBLIC cxx_std_20 from `devourer`); the station headers use
+# inline variables and nested namespaces, which MSVC rejects below C++17.
+target_compile_features(BssTableSelftest PRIVATE cxx_std_20)
+add_test(NAME bss_table COMMAND BssTableSelftest)
+
+# src/sta/StationTable.h - the associated-station table (Phase 2b.2), the thing
+# that stops the AP harnesses being single-client. Pure and header-only like
+# the rest of src/sta/, so no OpenSSL and no libusb: it runs in every CI job.
+# The load-bearing cell is test_two_stations_are_independent(), which is the
+# phase gate - two stations with their own PTKs, TX PN spaces and CCMP receive
+# windows, none of which a file-scope `g_sta`/`g_ptk`/`g_txpn` shape can hold.
+add_executable(StationTableSelftest tests/station_table_selftest.cpp)
+target_include_directories(StationTableSelftest PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+# Standalone (no PUBLIC cxx_std_20 from `devourer`); the station headers use
+# inline variables and nested namespaces, which MSVC rejects below C++17.
+target_compile_features(StationTableSelftest PRIVATE cxx_std_20)
+add_test(NAME station_table COMMAND StationTableSelftest)
+
 # Headless guard for the TX quiesce seam (ITransport::quiesce_tx via
 # RtlAdapter): the explicit "stop TX and wait it out" call every device makes
 # before anything is released. UsbTransport's cancel/drain is validated on
@@ -988,6 +1224,18 @@ target_link_libraries(AckResponderSelftest PRIVATE devourer PkgConfig::libusb)
 
 add_test(NAME ack_responder_recipe COMMAND AckResponderSelftest)
 
+# Headless guard for the Realtek station arm (src/StationArm.h over the
+# AckResponder.h recipe): exact registers both ways, refusals that write
+# nothing, port-0 ownership, re-arm keeping the first snapshot, readback
+# catching a write that did not land. Silicon behaviour (the MAC ACKing the
+# AP's unicast once armed) is on-air only: tests/sta_d2d_onair.sh STA_ARM.
+add_executable(StationArmSelftest
+    tests/station_arm_selftest.cpp
+)
+target_link_libraries(StationArmSelftest PRIVATE devourer PkgConfig::libusb)
+
+add_test(NAME station_arm COMMAND StationArmSelftest)
+
 # Headless guard for the windowed RX-receipt primitives (src/cell/RxReceipt.h):
 # TLV round-trip, ring eviction, late accounting, ledger merge idempotence,
 # strict-parse rejections. The on-air halves are tests/receipt_verify.py over
@@ -1007,6 +1255,16 @@ target_include_directories(NoiseFloorMathSelftest PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 add_test(NAME noise_floor_math COMMAND NoiseFloorMathSelftest)
+
+# Headless guard for src/BulkOutTimeout.h: under
+# DeviceConfig::Tx::no_cancel_multipkt a multi-packet bulk-OUT data send gets
+# no timeout (a cancel mid-transfer lets another sender's queued bytes splice
+# into the packet and wedges the Realtek TXDMA). Pure, header-only.
+add_executable(BulkOutTimeoutSelftest tests/bulk_out_timeout_selftest.cpp)
+target_include_directories(BulkOutTimeoutSelftest PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+add_test(NAME bulk_out_timeout COMMAND BulkOutTimeoutSelftest)
 
 # Headless guard for the NHM utility reduction (src/NhmEnvMath.h): bucket
 # weights, the rounded ratio helper shared with CLM, and the noise-floor-cluster
@@ -1058,6 +1316,17 @@ target_include_directories(HeRadiotapSelftest PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 add_test(NAME he_radiotap COMMAND HeRadiotapSelftest)
+
+# Headless guard for the radiotap TX_FLAGS NOACK choice - the flag that
+# decides whether a unicast frame is retried (MT7612U: NOACK disables the
+# hardware retry). Every builder layout, default and both explicit settings.
+add_executable(RadiotapNoackSelftest
+    tests/radiotap_noack_selftest.cpp
+)
+target_link_libraries(RadiotapNoackSelftest PRIVATE devourer)
+target_include_directories(RadiotapNoackSelftest PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src)
+add_test(NAME radiotap_noack COMMAND RadiotapNoackSelftest)
 
 # Headless round-trip guard for the 802.11ax Trigger frame path (src/TriggerTwt.h
 # build_basic_trigger + he_ru_alloc, src/TriggerParse.h parse_trigger): build ->
@@ -1456,6 +1725,35 @@ add_executable(ChanMigGateSelftest tests/chanmig_gate_selftest.cpp)
 target_link_libraries(ChanMigGateSelftest PRIVATE devourer)
 add_test(NAME chanmig_gate_policy COMMAND ChanMigGateSelftest)
 
+# The MT7612U station-identity decision and the ownership hand-off
+# (src/mt7612u/StationIdentity.h). Phase 2's plan asked for a headless guard
+# on the hand-off "in the style of tests/ack_responder_selftest.cpp"; this is
+# it. The policy is split from the register I/O precisely so it can run here -
+# both defects this logic has had were decisions, not writes, and neither is
+# visible in a register trace. Hardware coverage is `bringup staid`.
+if(DEVOURER_MT7612U)
+    add_executable(Mt7612uStationSelftest tests/mt7612u_station_selftest.cpp)
+    target_include_directories(Mt7612uStationSelftest PRIVATE
+                               ${CMAKE_CURRENT_SOURCE_DIR}/src/mt7612u)
+    add_test(NAME mt7612u_station_identity COMMAND Mt7612uStationSelftest)
+endif()
+
+# The AP on-air acceptance harness (tests/mt7612u_ap_onair.sh) needs root, a
+# claimed MT7612U and a second station adapter, so none of it can run in CI.
+# Its two verdict functions are pure text processing, though, and both of them
+# replaced a check that could not fail - so those get a headless guard here.
+# Unix-only: it is a bash script driving awk.
+if(UNIX)
+    find_program(BASH_EXECUTABLE bash)
+    if(BASH_EXECUTABLE)
+        add_test(
+            NAME ap_onair_witness
+            COMMAND ${BASH_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/ap_onair_witness_selftest.sh
+        )
+    endif()
+endif()
+
 # ChanMigReplay: replay a recorded gate-input trace through the SHIPPING
 # MigGate policy (no re-implementation), for the #279 shadow / metrics runs.
 add_executable(ChanMigReplay tests/chanmig_replay_main.cpp)
@@ -1543,3 +1841,15 @@ foreach(_dvr_t IN LISTS _dvr_targets)
         add_dependencies(selftests ${_dvr_t})
     endif()
 endforeach()
+# CcmpSwBench registers a ctest but is a benchmark, so its name does not match
+# the convention above. Named here rather than renamed: a target that
+# registers a test and is not collected reports "Not Run", which is the
+# failure this aggregate exists to prevent.
+if(TARGET CcmpSwBench)
+    add_dependencies(selftests CcmpSwBench)
+endif()
+# UdpBlast likewise: a tool named for what it is, whose ctest mode is one
+# flag (udp_blast_selftest).
+if(TARGET UdpBlast)
+    add_dependencies(selftests UdpBlast)
+endif()

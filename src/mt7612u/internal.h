@@ -20,6 +20,7 @@
  * because MSVC has no <pthread.h> and devourer builds Windows first-class.
  * Nothing outside this subtree includes this header; the public C ABI in
  * include/mt7612u/mt7612u.h is unaffected and stays C-includable. */
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
@@ -27,7 +28,9 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdio.h>
+#include "StationIdentity.h"
 #include "regs.h"
+#include "Mt7612uRxCorr.h"
 #include "include/mt7612u/mt7612u.h"
 
 /* Per-rate TX power, 0.5 dB units, exactly mt76x02_rate_power's layout. */
@@ -46,8 +49,18 @@ struct mt_tx_power_info {
 
 /* EEPROM-derived values the host computes with (firmware does the rest). */
 struct mt7612u_cal {
-	int8_t  rssi_offset[2];
-	int8_t  lna_gain;
+	/* The per-channel RSSI correction (mt76x02_mac_get_rssi's two chain
+	 * offsets and the LNA gain), packed into one word so that a retune
+	 * publishes all three at once. mt_read_rx_gain() rewrites them on every
+	 * tune from the caller's thread while mt_rx_parse() reads them on the
+	 * libusb event thread for every frame; as three separate bytes a frame
+	 * parsed mid-retune got the new offset with the old LNA gain - a wrong
+	 * RSSI, which ThreadSanitizer reported against real hardware. One
+	 * relaxed atomic word is the whole fix: the reader sees either the old
+	 * triple or the new, never a mix, and the hot path pays one load.
+	 * Encode/decode with mt_rx_corr_pack()/mt_rx_corr_unpack()
+	 * (Mt7612uRxCorr.h). */
+	std::atomic<uint32_t> rx_corr;
 	int8_t  high_gain[2];
 	uint8_t init_cal_done;
 	uint8_t channel_cal_done;
@@ -69,6 +82,7 @@ struct mt7612u_cal {
 	 * RX hot path does no cross-thread write at all. */
 };
 
+#define MT_SYNC_POOL 4   /* pooled transfers for the sync helpers */
 #define MT_RX_RING  16
 /* 16 slots, not 32: the slots now carry a full aggregate, so this is the
  * difference between 256 KB and 512 KB of ring. Depth is not what buys
@@ -208,6 +222,16 @@ struct mt7612u_dev {
 
 	unsigned io_err;          /* EP0 transfers that exhausted their retries */
 	int      transfers_stranded; /* libusb still owns a cancelled ring */
+	/* libusb_transfer objects for the synchronous helpers (usb.cpp), taken
+	 * from here rather than allocated per call. Allocated in
+	 * mt_dev_state_init(), i.e. before any event thread exists, so the
+	 * thread's first lock of a transfer's mutex is ordered after its
+	 * initialisation by thread creation - a per-call allocation is ordered
+	 * only through the kernel's URB handoff, which ThreadSanitizer cannot
+	 * see and reports. Empty pool = allocate fresh (correct, just noisier). */
+	std::mutex sync_pool_mu;
+	struct libusb_transfer *sync_pool[MT_SYNC_POOL];
+	int      sync_pool_n;
 	uint16_t max_mpdu_rx;     /* from MT_MAX_LEN_CFG at init, less the FCS */
 	uint64_t stats_last_us;   /* previous mt7612u_link_stats() mark */
 	int      ch_time_armed;   /* channel timers configured and zeroed */
@@ -230,6 +254,13 @@ struct mt7612u_dev {
 	 * caller had already armed an ACK responder, because then the identity is
 	 * theirs and restoring would silently disarm it. */
 	int      beacon_took_identity;
+
+	/* Station identity (src/mt7612u/station.cpp). The BSSID is RECORDED,
+	 * not programmed: measurement showed the hardware BSSID registers make
+	 * no difference to what a managed station receives, and MT_MAC_BSSID
+	 * already has two owners. The host still needs the value - it is addr3
+	 * on every frame a station transmits. docs/mt7612u-station-identity.md */
+	struct mt7612u_sta_state sta;
 	/* The addr2 AND addr3 mt7612u_beacon_start() programmed, so an in-place
 	 * update can refuse a beacon that would change either. Both, because they
 	 * land in different registers: addr2 in MT_MAC_ADDR and the MBSS base,
@@ -279,6 +310,13 @@ void     mt_wr(struct mt7612u_dev *d, uint32_t addr, uint32_t val);
 /* Returns -1 without writing when the read half fails. */
 int      mt_rmw(struct mt7612u_dev *d, uint32_t addr, uint32_t mask, uint32_t val);
 int      mt_wr_chk(struct mt7612u_dev *d, uint32_t addr, uint32_t val);
+/* Announce that MT_MAC_ADDR is about to move, so a live station identity does
+ * not silently survive as a lie. src/mt7612u/station.cpp. */
+void     mt7612u_station_identity_lost(struct mt7612u_dev *d, const char *who);
+/* mt7612u_set_ack_responder() naming its caller in that announcement - the
+ * beacon path takes MT_MAC_ADDR through here too. src/mt7612u/caps.cpp. */
+int      mt7612u_set_ack_responder_as(struct mt7612u_dev *d,
+                                      const uint8_t mac[6], const char *who);
 /* Register-I/O failure accumulator; see the comment above mt_io_clear(). */
 void     mt_io_clear(struct mt7612u_dev *d);
 /* Restore a previously sampled accumulator; see the note in usb.c. */
@@ -351,6 +389,7 @@ int mt_hdrlen_from_fc(const uint8_t *frame);
 #define MT_TXOPT_AMPDU     0x02  /* AMPDU flag + density + BA window */
 #define MT_TXOPT_QSEL_MGMT 0x04  /* mt76 uses MT_QSEL_MGMT for aggregated TX */
 #define MT_TXOPT_BEACON    0x08  /* HW timestamp (FLAGS_TS) + HW sequence (ACK_CTL_NSEQ) */
+#define MT_TXOPT_TXS       0x10  /* non-zero txwi pktid: file a MT_TX_STAT_FIFO entry */
 int mt_tx_build(struct mt7612u_dev *d, uint8_t *buf, size_t bufsz,
                 const void *frame, size_t len,
                 const struct mt7612u_tx_rate *rate, uint8_t wcid, unsigned opts,
