@@ -240,6 +240,41 @@ public:
   bool should_stop = false;
 
 private:
+  /* This generation's CCX map and register access, under its locks — see
+   * IRtlRadio::with_ccx. Private: the base class calls it, nobody else. */
+  bool with_ccx(const CcxFn &fn) override {
+    /* Nothing to lend before bring-up: the BB is not programmed, and a
+     * window armed against it would be forgotten by Init/InitWrite's reset. */
+    if (!_brought_up)
+      return false;
+    std::lock_guard<std::mutex> reg(_reg_mu);
+    std::lock_guard<std::mutex> ccx(busy_window_mutex());
+    const Read32 rd = [this](uint16_t a) {
+      return _device.rtw_read<uint32_t>(a);
+    };
+    const SetBb wr = [this](uint16_t a, uint32_t m, uint32_t v) {
+      _device.phy_set_bb_reg(a, m, v);
+    };
+    fn(devourer::nhm_regs_jgr3(), rd, wr);
+    return true;
+  }
+
+  /* Maps ChannelWidth_t to the devourer RX bw code (0/1/2 = 20/40/80 MHz),
+   * for _rx_bw_code below. Explicit switch rather than a cast: the enum's
+   * numeric values happen to line up today (CHANNEL_WIDTH_20/40/80 = 0/1/2)
+   * but that is not a contract this code should rely on, and the narrowband
+   * 5/10 MHz widths have no RX-bw-code equivalent (fold to 20). */
+  static uint8_t channel_width_to_bw_code(ChannelWidth_t w) {
+    switch (w) {
+    case CHANNEL_WIDTH_40:
+      return 1;
+    case CHANNEL_WIDTH_80:
+      return 2;
+    default:
+      return 0;
+    }
+  }
+
   /* Parse one send_packet-contract buffer (radiotap + 802.11) and build its
    * TXDMA block — 48-byte descriptor, pkt_offset×8 pad, frame — at `out`
    * (zeroed, sized desc + pad + frame by the caller). Performs the per-packet
@@ -262,6 +297,14 @@ private:
    * thread every ~2 s like the vendor watchdog. */
   jaguar3::PhydmRuntimeJaguar3 _phydm;
   SelectedChannel _channel{};
+  /* Mirrors _channel.ChannelWidth as a devourer bw code (0/1/2 = 20/40/80 MHz)
+   * so the RX completion handler can read the currently-tuned width without
+   * taking _reg_mu — same relaxed-atomic-mirror pattern as _txpkt_img below.
+   * parse_phy_sts_jgr3 needs it on every frame to resolve rxsc 0 ("full
+   * configured bandwidth", phydm_rxsc_2_bw) to an actual width. Written
+   * wherever _channel.ChannelWidth is set (Init, InitWrite, SetMonitorChannel,
+   * FastSetBandwidth); FastRetune never changes width. */
+  std::atomic<uint8_t> _rx_bw_code{0};
   Action_ParsedRadioPacket _packetProcessor = nullptr;
   /* Runtime TX-power knobs (atomic so GetTxPowerState's cached snapshot is
    * readable cross-thread). Flat override -1 = the chip's efuse-calibrated

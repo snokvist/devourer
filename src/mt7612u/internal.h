@@ -20,6 +20,7 @@
  * because MSVC has no <pthread.h> and devourer builds Windows first-class.
  * Nothing outside this subtree includes this header; the public C ABI in
  * include/mt7612u/mt7612u.h is unaffected and stays C-includable. */
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
@@ -29,6 +30,7 @@
 #include <stdio.h>
 #include "StationIdentity.h"
 #include "regs.h"
+#include "Mt7612uRxCorr.h"
 #include "include/mt7612u/mt7612u.h"
 
 /* Per-rate TX power, 0.5 dB units, exactly mt76x02_rate_power's layout. */
@@ -47,8 +49,18 @@ struct mt_tx_power_info {
 
 /* EEPROM-derived values the host computes with (firmware does the rest). */
 struct mt7612u_cal {
-	int8_t  rssi_offset[2];
-	int8_t  lna_gain;
+	/* The per-channel RSSI correction (mt76x02_mac_get_rssi's two chain
+	 * offsets and the LNA gain), packed into one word so that a retune
+	 * publishes all three at once. mt_read_rx_gain() rewrites them on every
+	 * tune from the caller's thread while mt_rx_parse() reads them on the
+	 * libusb event thread for every frame; as three separate bytes a frame
+	 * parsed mid-retune got the new offset with the old LNA gain - a wrong
+	 * RSSI, which ThreadSanitizer reported against real hardware. One
+	 * relaxed atomic word is the whole fix: the reader sees either the old
+	 * triple or the new, never a mix, and the hot path pays one load.
+	 * Encode/decode with mt_rx_corr_pack()/mt_rx_corr_unpack()
+	 * (Mt7612uRxCorr.h). */
+	std::atomic<uint32_t> rx_corr;
 	int8_t  high_gain[2];
 	uint8_t init_cal_done;
 	uint8_t channel_cal_done;
@@ -70,6 +82,7 @@ struct mt7612u_cal {
 	 * RX hot path does no cross-thread write at all. */
 };
 
+#define MT_SYNC_POOL 4   /* pooled transfers for the sync helpers */
 #define MT_RX_RING  16
 /* 16 slots, not 32: the slots now carry a full aggregate, so this is the
  * difference between 256 KB and 512 KB of ring. Depth is not what buys
@@ -209,9 +222,25 @@ struct mt7612u_dev {
 
 	unsigned io_err;          /* EP0 transfers that exhausted their retries */
 	int      transfers_stranded; /* libusb still owns a cancelled ring */
+	/* libusb_transfer objects for the synchronous helpers (usb.cpp), taken
+	 * from here rather than allocated per call. Allocated in
+	 * mt_dev_state_init(), i.e. before any event thread exists, so the
+	 * thread's first lock of a transfer's mutex is ordered after its
+	 * initialisation by thread creation - a per-call allocation is ordered
+	 * only through the kernel's URB handoff, which ThreadSanitizer cannot
+	 * see and reports. Empty pool = allocate fresh (correct, just noisier). */
+	std::mutex sync_pool_mu;
+	struct libusb_transfer *sync_pool[MT_SYNC_POOL];
+	int      sync_pool_n;
 	uint16_t max_mpdu_rx;     /* from MT_MAX_LEN_CFG at init, less the FCS */
 	uint64_t stats_last_us;   /* previous mt7612u_link_stats() mark */
 	int      ch_time_armed;   /* channel timers configured and zeroed */
+	/* Set when mt7612u_link_stats() cleared the channel timers while a
+	 * ch_time window was armed: the two share MT_CH_BUSY/MT_CH_IDLE, which
+	 * are read-and-clear, so the telemetry poll takes the counts the window
+	 * was accumulating. Without this the later read covers only the
+	 * remainder while still claiming the full interval. */
+	int      ch_time_disturbed;
 	uint64_t ch_time_last_us; /* previous mt7612u_ch_time() mark — separate
 	                           * from stats_last_us for the same reason it
 	                           * is per-device: two readers sharing one mark

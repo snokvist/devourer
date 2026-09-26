@@ -280,6 +280,12 @@ those are the ones listed below.
   degradation predictor — `docs/warm-tx-degradation.md` has delivery scattered
   63–83% with no relation to the meter, and inside one uninterrupted session
   the meter stays pinned while delivery drifts.
+- `DEVOURER_RX_BUSY_MS=N` (rxdemo) — the vendor-neutral busy-airtime window
+  at a fixed cadence: arm, wait N ms, read, one `rx.busy` event per window
+  (`IRadio::ArmChannelBusy`/`GetChannelBusy`, so it runs on the MT7612U where
+  `DEVOURER_RX_ENERGY_MS` cannot). It is the survey executor's dwell shape,
+  which makes it the harness for "does polling at dwell cadence cost the
+  receiver anything".
 - `DEVOURER_LINKHEALTH=1` (rxdemo, needs `DEVOURER_RX_ENERGY_MS=N`) — classify
   the RX sensor tuple via `src/LinkHealth.h`. **EVM, not SNR, is the
   saturation tell**: strong RSSI + poor EVM means back power OFF, which is the
@@ -461,7 +467,14 @@ measured, so this buys an airtime unit and a non-railing ratio rather than a new
 detection; `nhm_env` is referenced to the live IGI, so it is only dependable
 where DIG is not free to walk the gain out from under it (the per-generation
 windows are in each `src/<gen>/CLAUDE.md`); and the ~2 ms window makes one dwell
-a sample, not a measurement — average ~20, which `chanscout` does not do today.
+a sample, not a measurement.
+
+That last one is what `IRadio::ArmChannelBusy(window_us)` addresses: a busy
+figure over the caller's own window instead of a 2 ms slice of it. The contract
+— what arming promises, what invalidates a window, and what own transmission
+does to the reading — is documented once, on the declaration in `src/IRadio.h`.
+The per-generation behaviour and every measured number live in each
+`src/<gen>/CLAUDE.md` and `docs/rx-spectrum-sensing.md`.
 Both are **emitted, not scored**: neither `ChannelScore` nor the hopset
 occupancy law reads them. Measured numbers, the generation matrix and the
 harness: `docs/rx-spectrum-sensing.md`.
@@ -683,7 +696,11 @@ USB3 round-trip saturates on one blocking thread, and sync gives the HalMAC
 bring-up a clean per-send NAK backoff); the RTL8733B is synchronous too, so
 every submission has a bounded result and no buffer outlives the `send_packet`
 call. Don't unify the modes — either direction regresses throughput or
-bring-up safety.
+bring-up safety. The one opt-in exception is
+`DeviceConfig::Tx::no_cancel_multipkt`: Jaguar2/3 and Kestrel DATA sends
+longer than one USB packet then wait without a timeout (a cancelled
+multi-packet transfer can wedge the TXDMA); firmware download and every
+default stay bounded — the trade-off is at the declaration.
 
 **Nothing reads a register per frame on the send path.** Measured on one
 RTL8733B unit during bring-up: a single thermal read (3 RF writes + a 15 µs

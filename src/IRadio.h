@@ -662,6 +662,58 @@ public:
    * was never a correct discriminator. */
   virtual devourer::ChannelBusy GetChannelBusy() { return {}; }
 
+  /* Arm a busy-airtime window of `window_us` and read it later with
+   * GetChannelBusy(), instead of taking whatever window the backend samples
+   * on its own. Returns the window ACTUALLY armed in microseconds (the
+   * hardware's granularity and limits clamp it, so a caller that needs to
+   * know its own denominator reads the return value, not its request);
+   * 0 means this backend cannot arm one and the caller should keep using the
+   * sampled GetChannelBusy() path.
+   *
+   * Why it exists: the sampled path is a ~2 ms hardware window on Realtek,
+   * which is a sample rather than a measurement of the caller's dwell. On a
+   * 50 ms-on/450 ms-off interferer, one such read per 300 ms measured ZERO in
+   * 55 of 71 windows and ~63% in the rest while frames were decoded in nearly
+   * every window; the same load read 8.1-9.5% per second on the MediaTek
+   * timers, which integrate. An armed window makes both families report busy
+   * airtime over the CALLER's window instead of over whatever each backend
+   * samples on its own — not an identical measurement: the Realtek window is
+   * hardware-timed and counts receive-side deferral, the MediaTek one is the
+   * host-measured arm-to-read gap and counts own TX. ChannelBusy::source,
+   * ::window_us and ::own_tx_in_window carry those differences.
+   *
+   * Contract: arm where the caller resets its own counters, read at the end
+   * of the dwell. A window is spoiled by an NHM read (IRtlRadio::GetRxEnergy
+   * with with_nhm, which re-arms the shared CCX engine), by a retune, and by
+   * reading before it has elapsed; the reading then comes back INVALID rather
+   * than plausible-but-wrong.
+   *
+   * A window also does not outlive its hardware session: Stop() forgets it.
+   * Without that a window armed before a teardown stays reachable afterwards
+   * — by different mechanisms on different backends, so clearing whatever
+   * flag guards the engine is not a substitute — and the next retune's note
+   * stamps it Retuned, a reason earned by a session that no longer exists.
+   * Measured on all four Realtek backends. The reading is invalid either
+   * way, so what a missing reset costs is the REASON, which is the whole
+   * point of the spoil field. A backend implementing this owes the reset;
+   * the per-generation guides record how far each teardown goes.
+   *
+   * What the reset does NOT close: it forgets a window armed BEFORE the
+   * teardown. Where nothing clears the flag the engine's own accessor gates
+   * on, an arm issued AFTER Stop() still succeeds against a chip that has
+   * been torn down — true of Jaguar1/2/3, whose gate is never cleared, and
+   * not of the RTL8733B, whose Stop() clears it. Closing it everywhere is a
+   * behaviour change on paths that flag also guards.
+   *
+   * A spoiled or completed window is consumed by
+   * the read; a not-yet-elapsed one stays armed, so the caller reads again
+   * at the end of its dwell instead of re-arming. Single control thread, like
+   * every other control-plane entry point. */
+  virtual uint32_t ArmChannelBusy(uint32_t window_us) {
+    (void)window_us;
+    return 0;
+  }
+
   /* --- Adapter health (see src/AdapterHealth.h; examples/doctor is the
    * reference consumer; the EFUSE probe is on IRtlRadio) --- */
 

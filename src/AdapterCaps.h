@@ -357,15 +357,33 @@ struct AdapterCaps {
    * RTL8733B derives from IRtlRadio and implements no GetRxEnergy at all, so
    * the cast reports a sensor that returns nothing.
    *
-   * busy_airtime_ok: IRadio::GetChannelBusy returns a real busy-airtime
-   * reading — the Realtek CCX CLM engine (Jaguar1/2/3) or the MediaTek MAC
-   * channel timers. FALSE on Kestrel (its NHM rides the halbb glue, not
-   * NhmReader, so it has no CLM) and on the RTL8733B.
+   * The two flags below are also independent of each other, and the RTL8733B
+   * is where that stops being theoretical: it has a working CCX CLM engine
+   * and no phydm FA/CCA block, so busy_airtime_ok is true while rx_energy_ok
+   * is false. Do not read either from the other.
    *
-   * busy_airtime_measured: that reading has been separated arm-vs-quiet ON AIR
-   * for this family (tests/ccx_clm_probe.sh), not merely implemented. False on
-   * Jaguar1 (shares the validated Jaguar2 11AC map, unmeasured) and on the
-   * MT7612U (no adapter available). False-as-unmeasured, per the house rule.
+   * busy_airtime_ok: the backend HAS a hardware busy-airtime engine that
+   * IRadio::GetChannelBusy can report — the Realtek CCX CLM engine
+   * (Jaguar1/2/3 and the RTL8733B, which the vendor phydm puts on the JGR3
+   * map) or the MediaTek MAC channel timers. FALSE on Kestrel, whose NHM
+   * rides the halbb glue rather than NhmReader, so it has no CLM.
+   *
+   * It does NOT promise that an unarmed GetChannelBusy() answers. On the
+   * RTL8733B it does not: that backend feeds its sampled path from
+   * GetRxEnergy, which it does not implement, so an unarmed call reports no
+   * reading and IRadio::ArmChannelBusy is the only way to get a number out of
+   * it. A consumer that wants a reading from an arbitrary backend should arm
+   * rather than sample; one that samples must handle "no reading" from a
+   * backend whose flag is true.
+   *
+   * busy_airtime_measured: that reading has been separated from a quiet
+   * channel ON AIR for this family, not merely implemented. The harness is
+   * tests/busy_window_probe.sh, which pits an armed window against the quiet
+   * floor under a known load, and against each way a window can be spoiled.
+   * True today on all five backends that set busy_airtime_ok. The flag stays
+   * because the two facts are independent: a port can land the engine before
+   * anyone has run it on air, and false-as-unmeasured is the house rule for
+   * that state.
    *
    * rx_energy_ok: IRtlRadio::GetRxEnergy returns real phydm FA/CCA/IGI
    * counters. Always false on a non-Realtek radio; false on the RTL8733B and

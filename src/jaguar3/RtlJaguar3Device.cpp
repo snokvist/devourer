@@ -6,6 +6,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -79,7 +81,16 @@ struct WriteBatchScope {
 
 void RtlJaguar3Device::Init(Action_ParsedRadioPacket packetProcessor,
                             SelectedChannel channel) {
+  /* A window armed before a (re-)bring-up describes a chip state that no
+   * longer exists; leaving it armed would make the next unrelated
+   * GetChannelBusy() take the armed branch and report a stale period. */
+  {
+    std::lock_guard<std::mutex> ccx(busy_window_mutex());
+    busy_window_reset();
+  }
   _channel = channel;
+  _rx_bw_code.store(channel_width_to_bw_code(channel.ChannelWidth),
+                    std::memory_order_relaxed);
   _rx_wanted = true;
   /* No WriteBatchScope here (yet): the pipelined bring-up is validated on
    * the TX path (InitWrite, cold + warm); the RX-only
@@ -369,7 +380,7 @@ void RtlJaguar3Device::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
         if (!is_c2h && f.physt && f.drvinfo_size >= 28)
           phy = jaguar3::parse_phy_sts_jgr3(
               data + off + jaguar3::RXDESC_SIZE_8822C, f.drvinfo_size,
-              p.RxAtrib);
+              _rx_bw_code.load(std::memory_order_relaxed), p.RxAtrib);
         /* The RAW descriptor bit, not the parse outcome — that is the meaning
          * the shared field carries on Jaguar1 and the RTL8733B too, and what
          * a caller needs to tell which A-MPDU subframe the report belonged to.
@@ -464,6 +475,7 @@ RtlJaguar3Device::~RtlJaguar3Device() {
 void RtlJaguar3Device::coex_runtime_loop() {
   std::vector<uint8_t> buf(16 * 1024);
   uint64_t tick = 0, c2h = 0, rx = 0;
+  uint64_t fail_streak = 0;
   /* The coex decision + FW heartbeats run on a fixed ~2 s WALL-CLOCK cadence
    * (steady_clock), independent of how fast bulk-IN completes — a busy bulk-IN
    * pipe must not turn the keepalive into an H2C storm that floods the HMEBOX. */
@@ -507,6 +519,7 @@ void RtlJaguar3Device::coex_runtime_loop() {
     if (std::chrono::steady_clock::now() < next_tick)
       continue;
     next_tick += period;
+    std::string fail_what; /* copied: e.what() dies with the exception */
     try {
       std::lock_guard<std::mutex> lk(_reg_mu);
       _hal.coex_run_5g();
@@ -522,7 +535,31 @@ void RtlJaguar3Device::coex_runtime_loop() {
       _hal.fw_update_wl_phy_info();
       _hal.fw_set_pwr_mode_active();
       _hal.fw_coex_query_bt_info();
-    } catch (...) { break; }
+    } catch (const std::exception &e) {
+      fail_what = e.what()[0] ? e.what() : "exception";
+    } catch (...) {
+      fail_what = "unknown exception";
+    }
+    /* A failed tick is retried at the next period, never abandoned. On a USB2
+     * host a sustained TX flood starves these control transfers behind the
+     * saturated bulk-OUT pipe for many ticks in a row (bench 8812EU, ch36,
+     * ~380 fps: 5-11 consecutive failures in 30 s; at 50 fps it recovers
+     * after one), and the thread has to be alive when the pipe gets slack to
+     * resume the FW heartbeats. The retry is cheap: a tick stops at its first
+     * throwing read, so it holds _reg_mu for at most one USB_TIMEOUT (500 ms),
+     * which a concurrent retune waits out. Logging is rate-limited instead. */
+    if (!fail_what.empty()) {
+      ++fail_streak;
+      if (fail_streak <= 3 || fail_streak % 15 == 0)
+        _logger->error("Jaguar3 coex: tick {} failed ({}) — {} consecutive",
+                       tick + 1, fail_what, fail_streak);
+      continue;
+    }
+    if (fail_streak > 0) {
+      _logger->info("Jaguar3 coex: tick {} recovered after {} consecutive "
+                    "failures", tick + 1, fail_streak);
+      fail_streak = 0;
+    }
     if (++tick <= 3 || tick % 15 == 0)
       _logger->info("Jaguar3 coex: tick {} (bulk-IN reads={}, C2H={})", tick, rx,
                     c2h);
@@ -752,6 +789,28 @@ void RtlJaguar3Device::apply_replay_wseq() {
 /* Clean shutdown — see IRadio::Stop. Best-effort: a chip that already
  * dropped off the bus will make the de-init writes fail, which is fine. */
 void RtlJaguar3Device::Stop() {
+  /* The armed window dies with the session. Nothing else forgets it:
+   * with_ccx gates on _brought_up, which Stop() does not clear, so a window
+   * armed before a Stop stays visible afterwards and the next retune's note
+   * hands the caller a spoil reason earned by a session that no longer
+   * exists. Measured on an RTL8812CU with this reset removed: an
+   * arm/Stop/retune/read sequence reports spoil=retuned; with it, none.
+   * Scoped, and deliberately NOT under _reg_mu: Stop() joins the coex thread
+   * below, that thread takes _reg_mu, and holding it across the join would
+   * deadlock. Taking the CCX lock alone is safe here because the coex loop
+   * never takes it.
+   *
+   * What this does NOT close: no lock spans this Stop(), so a concurrent
+   * ArmChannelBusy can still land after the reset and during teardown, and
+   * with_ccx gates on _brought_up, which nothing here clears — so an arm
+   * issued AFTER a Stop still succeeds against a torn-down chip.
+   * ArmChannelBusy is single-control-thread by contract (IRadio.h); closing
+   * the rest means clearing _brought_up, which gates other paths. The
+   * contract and this residual are both at IRadio::ArmChannelBusy. */
+  {
+    std::lock_guard<std::mutex> ccx(busy_window_mutex());
+    busy_window_reset();
+  }
   _coex_stop = true;
   if (_coex_thread.joinable())
     _coex_thread.join();
@@ -763,7 +822,16 @@ void RtlJaguar3Device::Stop() {
 }
 
 void RtlJaguar3Device::InitWrite(SelectedChannel channel) {
+  /* A window armed before a (re-)bring-up describes a chip state that no
+   * longer exists; leaving it armed would make the next unrelated
+   * GetChannelBusy() take the armed branch and report a stale period. */
+  {
+    std::lock_guard<std::mutex> ccx(busy_window_mutex());
+    busy_window_reset();
+  }
   _channel = channel;
+  _rx_bw_code.store(channel_width_to_bw_code(channel.ChannelWidth),
+                    std::memory_order_relaxed);
   /* Concurrent TX+RX intent (DEVOURER_TX_WITH_RX / a later StartRxLoop on this
    * bring-up): enable the RX path at the same point in the sequence Init does
    * and keep the RX filters open. Retrofitting RX state after the TX-oriented
@@ -1242,13 +1310,20 @@ RxEnergy RtlJaguar3Device::GetRxEnergy(bool with_nhm) {
    * ~2 ms measurement window before the FA-counter reset below (0x1eb4[25] also
    * clears BB HW counters). Holds _reg_mu across the short wait — tolerable at
    * the emitter's >=100 ms cadence vs the coex thread's ~2 s tick. */
-  if (with_nhm)
+  /* Under the CCX lock together with the note, and INSIDE _reg_mu (the
+   * ordering every other CCX user takes): this read re-arms the shared engine,
+   * so it destroys an armed busy window on this map — the note must be atomic
+   * with the re-arm or a destroyed window reads back valid. */
+  if (with_nhm) {
+    std::lock_guard<std::mutex> ccx(busy_window_mutex());
+    busy_window_note_nhm_read();
     devourer::read_nhm(
       devourer::nhm_regs_jgr3(), e.igi, rd,
       [this](uint16_t a, uint32_t m, uint32_t v) {
         _device.phy_set_bb_reg(a, m, v);
       },
       e);
+  }
 
   /* Reset: CCK FA 0x1a2c[15:14] 0->2, CCK CCA 0x1a2c[13:12] 0->2, then OFDM
    * CCA/FA (phydm_reset_bb_hw_cnt jgr3: 0x1eb4[25] 1->0, wrapped by the
@@ -1360,16 +1435,35 @@ void RtlJaguar3Device::SetCcaMode(bool disabled) {
 }
 
 void RtlJaguar3Device::SetMonitorChannel(SelectedChannel channel) {
+  /* A window armed before this retune would integrate across the channel
+   * change and report the blend as one channel's occupancy. */
   _phydm.on_channel_change();
   /* Serialize against the coex thread's housekeeping tick (and any concurrent
    * FastRetune) — channel config is register RMW. Init/InitWrite call the
    * radio-management core directly (no lock needed: the coex thread isn't
    * running yet), so locking here cannot self-deadlock. */
   std::lock_guard<std::mutex> lk(_reg_mu);
+  /* The note must not be able to land before a concurrent arm that then
+   * commits while this tune runs. _reg_mu above is what spans the tune, and
+   * with_ccx takes _reg_mu BEFORE this lock, so an arm cannot interleave.
+   * Ordering is always the family's register lock first, then this one. */
+  std::lock_guard<std::mutex> ccx(busy_window_mutex());
+  busy_window_note_retune();
+
   const bool ch_changed = channel.Channel != _channel.Channel;
   _channel = channel;
   _radioManagement.set_channel_bwmode(channel.Channel, channel.ChannelOffset,
                                       channel.ChannelWidth);
+  /* Stored after the retune. rxsc 0 is resolved against the width configured
+   * when the frame is PARSED, as the vendor does (phydm_rxsc_2_bw reads the
+   * current dm->band_width): a frame delivered while the retune runs uses the
+   * old width, but one received before the change and delivered after this
+   * store uses the new one. Nothing per-frame could do better — the RX
+   * descriptor and PHY status carry no receive-time bandwidth the vendor
+   * uses (Jaguar2's type1 rf_mode bits only reach a debug print; Jaguar3's
+   * layout comments them out). */
+  _rx_bw_code.store(channel_width_to_bw_code(channel.ChannelWidth),
+                    std::memory_order_relaxed);
   /* Runtime TX-power knobs in use: re-fold them against the NEW channel
    * group's efuse refs (8822E bases are per-group). Gated on a knob being
    * active so the legacy no-knob path stays byte-identical. */
@@ -1391,7 +1485,14 @@ void RtlJaguar3Device::SetMonitorChannel(SelectedChannel channel) {
 void RtlJaguar3Device::FastRetune(uint8_t channel, bool cache_rf) {
   std::lock_guard<std::mutex> lk(_reg_mu);
   if (channel == _channel.Channel)
-    return;
+    return; /* no tune, so nothing to spoil — the note goes after this */
+  /* A window armed before this retune would integrate across the channel
+   * change and report the blend as one channel's occupancy. */
+  {
+    std::lock_guard<std::mutex> ccx(busy_window_mutex());
+    busy_window_note_retune();
+  }
+
   const bool band_change = (_channel.Channel <= 14) != (channel <= 14);
   if (_radioManagement.fast_retune(channel, _channel.ChannelOffset,
                                    _channel.ChannelWidth, cache_rf)) {
@@ -1415,7 +1516,14 @@ void RtlJaguar3Device::FastRetune(uint8_t channel, bool cache_rf) {
 void RtlJaguar3Device::FastSetBandwidth(ChannelWidth_t bw) {
   std::lock_guard<std::mutex> lk(_reg_mu);
   if (bw == _channel.ChannelWidth)
-    return;
+    return; /* no reconfiguration, so nothing to spoil */
+  /* A bandwidth change reconfigures the front end, so a window armed before
+   * it was measuring a different receiver — the same argument as a retune,
+   * and the full path below tunes the RF outright. */
+  {
+    std::lock_guard<std::mutex> ccx(busy_window_mutex());
+    busy_window_note_retune();
+  }
   auto in_set = [](ChannelWidth_t b) {
     return b == CHANNEL_WIDTH_20 || b == CHANNEL_WIDTH_5 ||
            b == CHANNEL_WIDTH_10;
@@ -1425,6 +1533,7 @@ void RtlJaguar3Device::FastSetBandwidth(ChannelWidth_t bw) {
   if (in_set(bw) && in_set(_channel.ChannelWidth) &&
       _radioManagement.fast_set_bandwidth(bw)) {
     _channel.ChannelWidth = bw;
+    _rx_bw_code.store(channel_width_to_bw_code(bw), std::memory_order_relaxed);
     return;
   }
   /* Fast path declined (40/80 endpoint, cold radio) — full channel set, under
@@ -1432,6 +1541,7 @@ void RtlJaguar3Device::FastSetBandwidth(ChannelWidth_t bw) {
   _radioManagement.set_channel_bwmode(_channel.Channel, _channel.ChannelOffset,
                                       bw);
   _channel.ChannelWidth = bw;
+  _rx_bw_code.store(channel_width_to_bw_code(bw), std::memory_order_relaxed);
 }
 
 /* Re-program TXAGC from the current knob state (see header). Both TXAGC
@@ -2121,7 +2231,7 @@ bool RtlJaguar3Device::send_packet(const uint8_t *packet, size_t length) {
   /* The endpoint IS the queue on this bus — see bulkout_id_for_descriptor. */
   const uint8_t ep = _device.nth_bulk_out_ep(
       bulkout_id_for_descriptor(usb_frame.data(), _device.bulk_out_ep_count()));
-  int rc = _device.bulk_send_sync_ep(ep ? ep : _device.first_bulk_out_ep(),
+  int rc = _device.bulk_send_data_sync_ep(ep ? ep : _device.first_bulk_out_ep(),
                                      usb_frame.data(), usb_frame.size(),
                                      /*timeout_ms=*/20);
   /* bulk_send_sync_ep returns BYTES SUBMITTED, so `rc >= 0` would also cover
@@ -2244,7 +2354,7 @@ size_t RtlJaguar3Device::send_packets(const TxPacketView *pkts, size_t count) {
     jaguar3::cal_txdesc_chksum_8822c(first);
 
     const uint8_t agg_ep = _device.nth_bulk_out_ep(agg_id);
-    const int rc = _device.bulk_send_sync_ep(
+    const int rc = _device.bulk_send_data_sync_ep(
         agg_ep ? agg_ep : _device.first_bulk_out_ep(), urb.data(), urb.size(),
         /*timeout_ms=*/50);
     /* Full write or nothing submitted: a truncated URB means the chip got a
