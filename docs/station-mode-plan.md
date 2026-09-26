@@ -2218,5 +2218,38 @@ independently of the rest.
 This phase is the proof of the structural claim: if it is only an `IRadio`
 implementation and the harness is untouched, the seam was right.
 
-**Status:** not started. Deliberately after a working MT7612U station, not
-alongside it.
+**Status (2026-09-26): ported on Jaguar1/2/3, measured on the 8822C and
+8822B.** Deliberately after a working MT7612U station, and it came in small.
+
+*What the arm is.* `src/StationArm.h` holds the per-device snapshot; the
+register recipe sits next to the ACK responder's in `src/AckResponder.h`
+(`arm_station`, `station_is`, `restore_station`): gate closed, MACID = own,
+BSSID = the AP, net_type = Infra (2), all read back; Clear restores MACID,
+BSSID and the net_type bits exactly (Jaguar1/CHIP_8812 is why every die
+restores MACID rather than closing the gate). PR #335's managed RCR is NOT
+ported: this station filters in software, like the MT7612U one, and the
+monitor RCR is what every other RX consumer sees. Port 0 now has three
+claimants - beacon, ACK responder, station - and each refuses while another
+holds it.
+
+*The structural test.* `sta_client` needed no backend branch. The harness
+needed two things, neither a backend branch: `STA_VID`/`STA_PID` (the station
+was pinned to the MT7612U's IDs) and a control, `STA_ARM=0`.
+
+*Measured* (`tests/sta_d2d_onair.sh thru`, ch36, MCS7, AP_RETRY=3, one run per
+arm): with the arm skipped the MAC does not ACK the AP's unicast, so each
+downlink frame airs four times and the station drops ~3x its deliveries as
+duplicates - 42122/14126 (8812CU station), 35117/11744 (8812BU station) -
+against 2/24111 and 13/24115 armed. The 8812CU station also read `wpa2` 8/8.
+`station_mode_ok` is set on those two dies; the declaration carries the table.
+
+*Found on the way: a deadlock in the caller.* The first armed `thru` hung:
+`sta_client` called `SetStationIdentity` holding its RX lock; the arm is
+synchronous USB I/O, which waits for the libusb event thread - the RX thread,
+blocked in the callback on that lock (gdb on the live process). The MT7612U
+arm makes almost no transfers and never opened the window. Fixed in the caller
+(decide under the lock, call after it), and IRadio's `StartRxLoop` now states
+the rule for every device call.
+
+*Open:* Jaguar1 needs an 8812AU station; the 8822E and 8821C have the code and
+no cell; no soak with a Realtek station yet.

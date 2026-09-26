@@ -248,7 +248,7 @@ struct AdapterCaps {
    * die. (The cells that exist use a raw injector and an armed ACK responder
    * as the peer, not an AP; the hostapd-based gates measured other things.)
    *
-   * TRUE on MT7612U only, and read docs/mt7612u-station-identity.md - its
+   * TRUE on MT7612U, and read docs/mt7612u-station-identity.md - its
    * retraction section first - before quoting a number from it. Both halves
    * of the bar are measured there, with controls, but note two limits the
    * measurements do NOT clear and which a caller should know:
@@ -261,7 +261,27 @@ struct AdapterCaps {
    *     successful arm leaves behind - but the literal end-to-end path
    *     "arm the seam, then measure" has not been exercised.
    *
-   * FALSE on every other backend: not ported. */
+   * TRUE ALSO on the Realtek 8822C (Jaguar3) and 8822B (Jaguar2), since
+   * 2026-09-26 (Phase 6: src/StationArm.h, MACID = own, BSSID = the AP,
+   * net_type = Infra). Unlike the MT7612U cells above, these drove the seam
+   * itself, associated, end to end: tests/sta_d2d_onair.sh `thru` against a
+   * devourer AP (ch36, MCS7, AP_RETRY=3), one run per arm, STA_ARM=1 against
+   * the single-variable control STA_ARM=0 (SetStationIdentity never called):
+   *
+   *   station (AP)       armed: dups / delivered   unarmed: dups / delivered
+   *   8812CU (8812BU)         2 / 24111                  42122 / 14126 (2.98x)
+   *   8812BU (8812CU)        13 / 24115                  35117 / 11744 (2.99x)
+   *
+   * Unarmed, the MAC does not ACK the AP's unicast, so each downlink frame
+   * airs AP_RETRY+1 = 4 times - the 3x duplicate ratio - and the wasted
+   * airtime collapsed the 14 Mbit/s rung (52%/64% loss vs 0.03%/0.00%).
+   * The uplink half (the AP ACKing the station) held in every arm: 20/3
+   * AP-side duplicates armed, 40/16 unarmed. `wpa2` read 8/8 on the 8812CU.
+   * Same limits as above for power save/TIM/key lookup; near field; no soak.
+   *
+   * FALSE on the 8822E and 8821C (ported, same code - no cell run), on
+   * Jaguar1 (ported, the CHIP_8812 exact-restore included - no cell run),
+   * and on every other backend: not ported. */
   bool station_mode_ok = false;
 
   /* --- feature flags --- */

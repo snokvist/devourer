@@ -1715,6 +1715,10 @@ devourer::AdapterCaps RtlJaguar3Device::GetAdapterCaps() {
    * measured — responder matrix + retry-knob A/B + the arq_e2e ledgers. */
   c.ack_responder_ok = true;
   c.tx_retry_limit_ok = true;
+  /* station_mode_ok: SetStationIdentity is ported on both dies (shared
+   * StationArm), but the flag's bar is an on-air cell per die - see the
+   * declaration. Set where one has run; the 8822E is unmeasured. */
+  c.station_mode_ok = _variant == jaguar3::ChipVariant::C8822C;
   /* Per-packet TX power: the TXPWR_OFSET_TYPE bank selector + programmable
    * 0x1e70 offset banks (SetTxPacketPowerOffsetQdb / radiotap DBM_TX_POWER;
    * TxPktPwrBanks.h). Continuous in step_qdb units, ±63/-64 index travel, 2
@@ -2590,6 +2594,11 @@ bool RtlJaguar3Device::SetAckResponder(const devourer::MacAddr &mac) {
    * StartBeacon/AP path programs, minus the beacon machinery. Serialized on
    * _reg_mu like every other register-touching control call. */
   std::lock_guard<std::mutex> lk(_reg_mu);
+  if (_station.armed()) {
+    _logger->error("Jaguar3: ACK responder refused: a station identity owns "
+                   "port 0 (ClearStationIdentity first)");
+    return false;
+  }
   if (!devourer::ack::enable(_device, mac.data())) {
     if (!devourer::ack::disable_verified(_device)) {
       _logger->error("Jaguar3: ACK responder arm failed and rollback did "
@@ -2604,6 +2613,21 @@ bool RtlJaguar3Device::SetAckResponder(const devourer::MacAddr &mac) {
                 mac.bytes[0], mac.bytes[1], mac.bytes[2], mac.bytes[3],
                 mac.bytes[4], mac.bytes[5]);
   return true;
+}
+
+bool RtlJaguar3Device::SetStationIdentity(const devourer::MacAddr &own,
+                                          const devourer::MacAddr &bssid) {
+  std::lock_guard<std::mutex> lk(_reg_mu);
+  if (!_brought_up) {
+    _logger->error("Jaguar3: station identity refused before bring-up");
+    return false;
+  }
+  return _station.arm(_device, own, bssid, _logger, "Jaguar3");
+}
+
+bool RtlJaguar3Device::ClearStationIdentity() {
+  std::lock_guard<std::mutex> lk(_reg_mu);
+  return _station.clear(_device, _logger, "Jaguar3");
 }
 
 void RtlJaguar3Device::ClearAckResponder() {
@@ -2647,6 +2671,11 @@ void RtlJaguar3Device::ClearAmpduMode() { SetAmpduMode(devourer::AmpduMode{}); }
 bool RtlJaguar3Device::StartBeacon(const uint8_t *beacon, size_t len,
                                       int interval_tu) {
   std::lock_guard<std::mutex> lk(_reg_mu);
+  if (_station.armed()) {
+    _logger->error("beacon-tbtt(J3): refused: a station identity owns port 0 "
+                   "(ClearStationIdentity first)");
+    return false;
+  }
   /* The caller may pass [radiotap][802.11 MPDU]; the rsvd-page beacon must be the
    * RAW 802.11 MPDU (the TX descriptor carries the PHY, not a radiotap header).
    * radiotap it_len is bytes [2:3] LE. Strip it. */

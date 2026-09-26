@@ -285,5 +285,119 @@ inline bool verify(RtlAdapter &dev, const uint8_t mac[6]) noexcept {
   }
 }
 
+/* --- the STATION half of port 0 (IRadio::SetStationIdentity) --------------
+ *
+ * The same three registers as the responder recipe above, in the kernel's
+ * station arrangement (hw_var_set_opmode STATION / Set_MSR(_HW_STATE_STATION_)
+ * in the vendor drivers; PR #335's StationMode.cpp ported it on an 8812AU):
+ * MACID = the station's OWN address, BSSID = the AP's, net_type = Infra (2).
+ * The ACK engine matches address 1 against MACID, so this is what makes the
+ * adapter answer the AP's unicast; net_type is the gate the AP-mode work found
+ * on the Jaguar generations (the RTL8733B has no gate - see retarget()).
+ *
+ * WHAT IT DELIBERATELY LEAVES ALONE: the receive filter. PR #335 also rewrote
+ * RCR to the kernel's managed value (CBSSID_DATA/BCN and friends), because its
+ * host path trusted the MAC to filter. This library's station runs a
+ * promiscuous monitor RCR and filters in software (tests/sta_client.cpp: the
+ * address filter and the BSS table), exactly as the MT7612U station does, so a
+ * managed RCR would buy nothing the host does not already do and would change
+ * what every other consumer of the RX loop sees.
+ *
+ * The rollback target is the EXACT pre-arm port state - MACID, BSSID and the
+ * net_type bits - because on Jaguar1/CHIP_8812 a gate-only clear was measured
+ * to leave the old MACID answering (see the ACK-responder section above and
+ * AdapterCaps.h). Restoring all three is correct on every die, so every
+ * backend uses it rather than a per-die subset. */
+constexpr uint8_t kNetTypeMask = 0x03u;
+constexpr uint8_t kNetTypeInfra = 0x02u;
+
+struct StationRestore {
+  PortIdentity identity;
+  uint8_t net_type = 0; /* 0x0102[1:0] before the arm */
+};
+
+inline bool snapshot_station_restore(RtlAdapter &dev,
+                                     StationRestore &out) noexcept {
+  try {
+    if (!snapshot_port_identity(dev, out.identity))
+      return false;
+    out.net_type = static_cast<uint8_t>(dev.rtw_read8(0x0102) & kNetTypeMask);
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+/* Gate closed first, as enable() does, so a failed identity write leaves the
+ * port passive rather than answering for half an address. Every write is
+ * attempted; the transfer status is reported but is not the verdict -
+ * station_is() is. */
+inline bool arm_station(RtlAdapter &dev, const uint8_t own[6],
+                        const uint8_t bssid[6]) noexcept {
+  try {
+    const uint8_t nt = dev.rtw_read8(0x0102);
+    const uint8_t closed = static_cast<uint8_t>(nt & ~kNetTypeMask);
+    if (!dev.rtw_write8(0x0102, closed))
+      return false;
+    const bool ml = dev.rtw_write<uint32_t>(0x0610, macid_lo(own));
+    const bool mh = dev.rtw_write16(0x0614, macid_hi(own));
+    const bool bl = dev.rtw_write<uint32_t>(0x0618, macid_lo(bssid));
+    const bool bh = dev.rtw_write16(0x061c, macid_hi(bssid));
+    if (!(ml && mh && bl && bh))
+      return false;
+    return dev.rtw_write8(0x0102,
+                          static_cast<uint8_t>(closed | kNetTypeInfra));
+  } catch (...) {
+    return false;
+  }
+}
+
+/* Did the station arm land? net_type, MACID and BSSID all read back. Unlike
+ * verify() above, BSSID IS checked here: it is what the caller asked for, and
+ * on the Infra path the MAC uses it (beacon TSF sync, CBSSID matching) even
+ * though the ACK decision rides on MACID. */
+inline bool station_is(RtlAdapter &dev, const uint8_t own[6],
+                       const uint8_t bssid[6]) noexcept {
+  try {
+    return (dev.rtw_read8(0x0102) & kNetTypeMask) == kNetTypeInfra &&
+           dev.rtw_read<uint32_t>(0x0610) == macid_lo(own) &&
+           dev.rtw_read16(0x0614) == macid_hi(own) &&
+           dev.rtw_read<uint32_t>(0x0618) == macid_lo(bssid) &&
+           dev.rtw_read16(0x061c) == macid_hi(bssid);
+  } catch (...) {
+    return false;
+  }
+}
+
+/* Back to the snapshot: gate closed, identity restored, then the pre-arm
+ * net_type bits. Returns the READBACK verdict, not the transfer status. */
+inline bool restore_station(RtlAdapter &dev,
+                            const StationRestore &saved) noexcept {
+  try {
+    const uint8_t nt = dev.rtw_read8(0x0102);
+    (void)dev.rtw_write8(0x0102, static_cast<uint8_t>(nt & ~kNetTypeMask));
+  } catch (...) {
+  }
+  (void)restore_port_identity(dev, saved.identity);
+  try {
+    const uint8_t nt = dev.rtw_read8(0x0102);
+    (void)dev.rtw_write8(0x0102,
+                         static_cast<uint8_t>((nt & ~kNetTypeMask) |
+                                              (saved.net_type & kNetTypeMask)));
+    return port_identity_is(dev, saved.identity) &&
+           (dev.rtw_read8(0x0102) & kNetTypeMask) ==
+               (saved.net_type & kNetTypeMask);
+  } catch (...) {
+    return false;
+  }
+}
+
+/* The seam's argument rule (IRadio.h): both unicast, and different. */
+inline bool station_args_ok(const uint8_t own[6],
+                            const uint8_t bssid[6]) noexcept {
+  return is_unicast(own) && is_unicast(bssid) &&
+         std::memcmp(own, bssid, 6) != 0;
+}
+
 } /* namespace ack */
 } /* namespace devourer */

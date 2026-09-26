@@ -208,6 +208,10 @@ std::atomic<uint64_t> g_q_in{0};
 /* The periodic counter dump - see the emission site in main(). Zero is off,
  * which is every existing caller, so no figure already recorded moves. */
 uint32_t g_tick_ms = 0;
+/* DEVOURER_STA_ARM=0: never call SetStationIdentity. A CONTROL, not a mode -
+ * it is how the harness shows what the arm itself buys (STA_ARM in
+ * tests/sta_d2d_onair.sh): everything else about the run is unchanged. */
+bool g_arm = true;
 uint32_t g_last_tick = 0;
 std::atomic<uint64_t> g_tx_enc{0}, g_tx_enc_fail{0}, g_tx_plain{0};
 std::atomic<uint64_t> g_crc_err{0}, g_amsdu_drop{0}, g_frag_drop{0};
@@ -1014,6 +1018,8 @@ int main(int argc, char** argv) {
     g_ccmp_profile = std::strcmp(p, "0") != 0;
   if (const char* t = std::getenv("DEVOURER_STA_TICK_MS"))
     g_tick_ms = (uint32_t)std::strtoul(t, nullptr, 10);
+  if (const char* a = std::getenv("DEVOURER_STA_ARM"))
+    g_arm = std::strcmp(a, "0") != 0;
 
   auto logger = std::make_shared<Logger>();
   apply_logging_env(*logger);
@@ -1120,10 +1126,10 @@ int main(int argc, char** argv) {
 
   std::fprintf(stderr,
                "sta_client up: own %02x:%02x:%02x:%02x:%02x:%02x ssid '%s' "
-               "%s ch%u station_mode_ok=%d\n",
+               "%s ch%u station_mode_ok=%d arm=%d\n",
                g_own[0], g_own[1], g_own[2], g_own[3], g_own[4], g_own[5],
                g_ssid.c_str(), g_psk.empty() ? "OPEN" : "WPA2-PSK", g_chan,
-               (int)caps.station_mode_ok);
+               (int)caps.station_mode_ok, (int)g_arm);
 
   uint8_t tuned = g_chan;
   uint8_t bssid_armed[6] = {0};
@@ -1139,34 +1145,49 @@ int main(int argc, char** argv) {
       g_dev->SetMonitorChannel(SelectedChannel{want, 0, CHANNEL_WIDTH_20});
       tuned = want;
     }
+    bool arm_now = false;
     {
       std::lock_guard<std::mutex> l(g_mu);
       g_sm.tick(now);
       /* Arm the identity for the BSS we actually joined, once, when it
        * changes. On MT7612U this writes no register and only verifies that
        * the port identity has not moved; on a backend where it does write
-       * one, this is where it belongs. */
-      if (caps.station_mode_ok && g_sm.state() != StationSm::State::Idle &&
+       * one, this is where it belongs - DECIDED here, MADE below. */
+      if (g_arm && caps.station_mode_ok &&
+          g_sm.state() != StationSm::State::Idle &&
           std::memcmp(bssid_armed, g_sm.bssid(), 6) != 0) {
         std::memcpy(bssid_armed, g_sm.bssid(), 6);
-        const devourer::MacAddr own{{g_own[0], g_own[1], g_own[2],
-                                     g_own[3], g_own[4], g_own[5]}};
-        const devourer::MacAddr bss{{bssid_armed[0], bssid_armed[1],
-                                     bssid_armed[2], bssid_armed[3],
-                                     bssid_armed[4], bssid_armed[5]}};
-        const bool ok = g_dev->SetStationIdentity(own, bss);
-        std::fprintf(stderr,
-                     "  station identity %s for BSSID "
-                     "%02x:%02x:%02x:%02x:%02x:%02x\n",
-                     ok ? "armed" : "REFUSED", bssid_armed[0], bssid_armed[1],
-                     bssid_armed[2], bssid_armed[3], bssid_armed[4],
-                     bssid_armed[5]);
+        arm_now = true;
       }
       std::vector<uint8_t> f;
       while (g_sm.pop_tx(&f)) {
         devourer::sta::assign_seq(f, g_data_seq.next());
         enqueue(std::move(f));
       }
+    }
+    /* THE ARM IS MADE OUTSIDE g_mu, and this is not tidiness: holding it
+     * here DEADLOCKED the first Realtek-station run (Phase 6, 8812CU,
+     * 2026-09-26 - gdb on the hung process). The arm is synchronous USB
+     * control I/O, and a libusb synchronous transfer waits on the thread
+     * handling libusb events - which on every backend here is the RX thread,
+     * sitting inside on_rx -> rx_frame, blocked on g_mu. The MT7612U arm
+     * makes almost no transfers, so the window never opened there; the
+     * Realtek arm makes ~15. The rule is IRadio's (StartRxLoop): no device
+     * call while holding a lock the RX callback takes. Still BEFORE the send
+     * below, so the auth that just left the state machine airs armed. */
+    if (arm_now) {
+      const devourer::MacAddr own{{g_own[0], g_own[1], g_own[2], g_own[3],
+                                   g_own[4], g_own[5]}};
+      const devourer::MacAddr bss{{bssid_armed[0], bssid_armed[1],
+                                   bssid_armed[2], bssid_armed[3],
+                                   bssid_armed[4], bssid_armed[5]}};
+      const bool ok = g_dev->SetStationIdentity(own, bss);
+      std::fprintf(stderr,
+                   "  station identity %s for BSSID "
+                   "%02x:%02x:%02x:%02x:%02x:%02x\n",
+                   ok ? "armed" : "REFUSED", bssid_armed[0], bssid_armed[1],
+                   bssid_armed[2], bssid_armed[3], bssid_armed[4],
+                   bssid_armed[5]);
     }
     std::vector<std::vector<uint8_t>> batch;
     { std::lock_guard<std::mutex> l(g_q_mu); batch.swap(g_q); }

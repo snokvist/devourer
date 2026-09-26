@@ -549,6 +549,11 @@ bool RtlJaguarDevice::StartBeacon(const uint8_t *beacon, size_t len,
                    "responder is armed; clear the responder first");
     return false;
   }
+  if (_station.armed()) {
+    _logger->error("beacon(J1): cannot claim port 0 while a station "
+                   "identity is armed; ClearStationIdentity first");
+    return false;
+  }
   /* Mirrors RtlJaguar2Device::StartBeacon on the pre-HalMAC registers, in the
    * VENDOR ORDER: port/beacon configuration first, reserved-page download
    * LAST. A download issued before the port is configured latches BCN_VALID
@@ -846,6 +851,11 @@ bool RtlJaguarDevice::SetAckResponder(const devourer::MacAddr &mac) {
                    "beacon owns MACID/BSSID/net_type");
     return false;
   }
+  if (_station.armed()) {
+    _logger->error("Jaguar1: ACK responder cannot be armed while a station "
+                   "identity owns port 0; ClearStationIdentity first");
+    return false;
+  }
   if (_eepromManager->version_id.ICType == CHIP_8812) {
     const bool had_restore_identity = _ack_restore_identity.has_value();
     if (!_ack_restore_identity) {
@@ -979,6 +989,27 @@ bool RtlJaguarDevice::disarm_ack_responder() {
                 "(MACID/BSSID back to the pre-arm identity; "
                 "net_type=NoLink)");
   return true;
+}
+
+bool RtlJaguarDevice::SetStationIdentity(const devourer::MacAddr &own,
+                                         const devourer::MacAddr &bssid) {
+  std::lock_guard<std::recursive_mutex> lock(_port0_mu);
+  if (!_brought_up) {
+    _logger->error("Jaguar1: station identity refused before bring-up");
+    return false;
+  }
+  if (_port0_beacon_claimed || _port0_ack_claimed) {
+    _logger->error("Jaguar1: station identity refused: port 0 is claimed "
+                   "by the {}",
+                   _port0_beacon_claimed ? "beacon" : "ACK responder");
+    return false;
+  }
+  return _station.arm(_device, own, bssid, _logger, "Jaguar1");
+}
+
+bool RtlJaguarDevice::ClearStationIdentity() {
+  std::lock_guard<std::recursive_mutex> lock(_port0_mu);
+  return _station.clear(_device, _logger, "Jaguar1");
 }
 
 void RtlJaguarDevice::ClearAckResponder() {
@@ -2152,6 +2183,9 @@ devourer::AdapterCaps RtlJaguarDevice::GetAdapterCaps() {
    * the vendor retry carve-out (knob inert). */
   c.ack_responder_ok = true;
   c.tx_retry_limit_ok = _eepromManager->version_id.ICType != CHIP_8814A;
+  /* station_mode_ok stays false: SetStationIdentity is ported (shared
+   * StationArm), but no Jaguar1 die has run the on-air cell the flag's
+   * declaration requires. */
   /* Per-packet TX power: 8814A only — its dword5 [30:28] descriptor LUT (the
    * 8822B TXPWR_OFSET position; vendor-defined, vendor-unused). measured
    * stays false until tests/txpkt_pwr_ofset_onair.sh proves it moves on-air

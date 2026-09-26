@@ -384,6 +384,14 @@ bool RtlJaguar2Device::SetAckResponder(const devourer::MacAddr &mac) {
                    "Jaguar2", mac.bytes[0]);
     return false;
   }
+  {
+    std::lock_guard<std::mutex> lk(_reg_mu);
+    if (_station.armed()) {
+      _logger->error("Jaguar2: ACK responder refused: a station identity "
+                     "owns port 0 (ClearStationIdentity first)");
+      return false;
+    }
+  }
   /* Hardware ACK responder (src/AckResponder.h): port identity + net_type so
    * the MAC auto-ACKs unicast frames to `mac`. Same registers the proven
    * StartBeacon/AP path programs, minus the beacon machinery. */
@@ -401,6 +409,21 @@ bool RtlJaguar2Device::SetAckResponder(const devourer::MacAddr &mac) {
                 mac.bytes[0], mac.bytes[1], mac.bytes[2], mac.bytes[3],
                 mac.bytes[4], mac.bytes[5]);
   return true;
+}
+
+bool RtlJaguar2Device::SetStationIdentity(const devourer::MacAddr &own,
+                                          const devourer::MacAddr &bssid) {
+  std::lock_guard<std::mutex> lk(_reg_mu);
+  if (!_brought_up) {
+    _logger->error("Jaguar2: station identity refused before bring-up");
+    return false;
+  }
+  return _station.arm(_device, own, bssid, _logger, "Jaguar2");
+}
+
+bool RtlJaguar2Device::ClearStationIdentity() {
+  std::lock_guard<std::mutex> lk(_reg_mu);
+  return _station.clear(_device, _logger, "Jaguar2");
 }
 
 void RtlJaguar2Device::ClearAckResponder() {
@@ -1208,6 +1231,10 @@ devourer::AdapterCaps RtlJaguar2Device::GetAdapterCaps() {
    * bench cell yet, so its flags stay false-as-unmeasured. */
   c.ack_responder_ok = _variant == jaguar2::ChipVariant::C8822B;
   c.tx_retry_limit_ok = _variant == jaguar2::ChipVariant::C8822B;
+  /* station_mode_ok: SetStationIdentity is ported on both dies (shared
+   * StationArm); the flag waits for an on-air cell per die, like the two
+   * above - the 8821C has none. */
+  c.station_mode_ok = _variant == jaguar2::ChipVariant::C8822B;
   c.hw_rx_timestamp = true;  /* FrameParserJaguar2 fills RxAtrib.tsfl */
   c.hw_beacon_txtsf = true;  /* StartBeacon: MAC inserts the egress TSF into beacons */
   c.tsf_write_ok = true;     /* WriteTsf: REG_TSFTR (8822B readback) */
@@ -1709,6 +1736,11 @@ bool RtlJaguar2Device::GetPermanentMacAddress(uint8_t out[6]) {
 bool RtlJaguar2Device::StartBeacon(const uint8_t *beacon, size_t len,
                                    int interval_tu) {
   std::lock_guard<std::mutex> lk(_reg_mu);
+  if (_station.armed()) {
+    _logger->error("beacon-tbtt(J2): refused: a station identity owns port 0 "
+                   "(ClearStationIdentity first)");
+    return false;
+  }
   /* Mirrors the working Jaguar3 path (RtlJaguar3Device::StartBeacon) — the same
    * two bugs (beacon at page 0, radiotap-in-rsvd-page) applied here. Validated on
    * hardware: RTL8812BU (2357:012d, Jaguar2) auto-transmits the beacon at TBTT,

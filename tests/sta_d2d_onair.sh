@@ -52,8 +52,8 @@
 #   sudo tests/sta_d2d_onair.sh bench
 #   sudo tests/sta_d2d_onair.sh flood
 #
-# Env: STA_SYSFS (the MT7612U sta_client claims), AP_SYSFS (the adapter
-# ap_wpa2 claims), AP_VID/AP_PID, CH, CH5, PSK, FW_DIR, SECS, NS, APTAP,
+# Env: STA_SYSFS (the adapter sta_client claims), STA_VID/STA_PID (default
+# the MT7612U), STA_ARM, AP_SYSFS (the adapter ap_wpa2 claims), AP_VID/AP_PID, CH, CH5, PSK, FW_DIR, SECS, NS, APTAP,
 # STATAP, AIRGAP_SECS, BEACONS_MIN, PING_N, PING_MIN, BENCH_SECS,
 # BENCH_PAYLOAD, BENCH_PPS, THRU_SECS, THRU_PAYLOAD, TX_RATE, ARQ,
 # AP_RETRY, STA_ACK, STA_RETRY, THRU_LADDER, THRU_LOSS_PCT, THRU_DIR, BCN_TU, BEACON_PHASE_SECS,
@@ -68,6 +68,18 @@ CELLS="${1:-all}"
 STA_SYSFS="${STA_SYSFS:-1-1}"
 AP_SYSFS="${AP_SYSFS:-5-1}"
 AP_VID="${AP_VID:-0x0bda}"
+# THE STATION NEED NOT BE THE MT7612U. sta_client has no backend branch - it
+# gates the station arm on AdapterCaps::station_mode_ok - so any adapter whose
+# backend ports SetStationIdentity runs the same cells (Phase 6: the Realtek
+# arm; e.g. STA_VID=0x0bda STA_PID=0xc812 for an 8812CU station).
+STA_VID="${STA_VID:-0x0e8d}"
+STA_PID="${STA_PID:-0x7612}"
+# STA_ARM=0 is the CONTROL for the station's ACK half: sta_client skips
+# SetStationIdentity, everything else unchanged. On a Realtek station the MAC
+# then should not answer the AP's unicast, so with AP_RETRY=N each downlink
+# frame airs up to N+1 times and the station's "duplicates dropped" climbs
+# toward N x delivered. Default 1 (armed).
+STA_ARM="${STA_ARM:-1}"
 AP_PID="${AP_PID:-0xc812}"
 CH="${CH:-6}"
 CH5="${CH5:-36}"
@@ -374,8 +386,9 @@ trap 'cleanup; exit 130' INT TERM
 # the WRONG RADIO, opened successfully.
 sta_vid=$(cat "/sys/bus/usb/devices/$STA_SYSFS/idVendor" 2>/dev/null)
 sta_pid=$(cat "/sys/bus/usb/devices/$STA_SYSFS/idProduct" 2>/dev/null)
-[ "$sta_vid" = "0e8d" ] && [ "$sta_pid" = "7612" ] || {
-  echo "STA_SYSFS=$STA_SYSFS is not an MT7612U (found '$sta_vid:$sta_pid')"
+want_sta_vid=$(printf '%04x' "$STA_VID"); want_sta_pid=$(printf '%04x' "$STA_PID")
+[ "$sta_vid" = "$want_sta_vid" ] && [ "$sta_pid" = "$want_sta_pid" ] || {
+  echo "STA_SYSFS=$STA_SYSFS is $sta_vid:$sta_pid, not the $want_sta_vid:$want_sta_pid this run expects (STA_VID/STA_PID)"
   exit 2; }
 ap_vid=$(cat "/sys/bus/usb/devices/$AP_SYSFS/idVendor" 2>/dev/null)
 ap_pid=$(cat "/sys/bus/usb/devices/$AP_SYSFS/idProduct" 2>/dev/null)
@@ -390,7 +403,7 @@ rfkill unblock wlan 2>/dev/null || true
 say "AP  $AP_SYSFS ($ap_vid:$ap_pid, devourer/ap_wpa2, in netns '$NS')"
 say "STA $STA_SYSFS ($sta_vid:$sta_pid, devourer/sta_client, root namespace)"
 say "ssid '$SSID' bssid $BSSID  psk '$PSK'  taps '$APTAP'/'$STATAP'"
-say "tx rate '$TX_RATE'  arq $ARQ  ap-retry ${AP_RETRY:-default}  sta-ack ${STA_ACK:-off}  sta-retry ${STA_RETRY:-hw}  beacon ${BCN_TU}TU  refresh ${BCN_REFRESH_MS}ms"
+say "tx rate '$TX_RATE'  arq $ARQ  ap-retry ${AP_RETRY:-default}  sta-ack ${STA_ACK:-off}  sta-retry ${STA_RETRY:-hw}  sta-arm $STA_ARM  beacon ${BCN_TU}TU  refresh ${BCN_REFRESH_MS}ms"
 
 # --- build -----------------------------------------------------------------
 
@@ -479,7 +492,8 @@ sta_up() {   # $1 = channel, $2 = seconds, $3.. = extra env
   env DEVOURER_TX_RATE="$TX_RATE" \
       DEVOURER_STA_ACK="${STA_ACK:-0}" \
       ${STA_RETRY:+DEVOURER_TX_RETRY_LIMIT="$STA_RETRY"} \
-      DEVOURER_VID=0x0e8d DEVOURER_PID=0x7612 \
+      DEVOURER_VID="$STA_VID" DEVOURER_PID="$STA_PID" \
+      DEVOURER_STA_ARM="$STA_ARM" \
       DEVOURER_USB_BUS="${STA_SYSFS%%-*}" DEVOURER_USB_PORT="${STA_SYSFS#*-}" \
       DEVOURER_CHANNEL="$chan" DEVOURER_TX_WITH_RX=thread \
       DEVOURER_MT7612U_FW_DIR="$FW_DIR" \

@@ -211,6 +211,7 @@ the 8822B and the 8821C. Same `rsvd_boundary`, 1938.
 | as AP, MT7612U station, ch6 | `beacons` 3/3 (ours 100% of idle under downlink, 4317 aired, 0 failed) |
 | as AP, **ch36** | `thru` 2/2 - up 19.9 Mbit/s at 0.16%, down 29.6 Mbit/s at 1.34% |
 | as AP, **ch6** | `thru` FAILS its gate: downlink carries up to 28.4 Mbit/s but at a flat ~5.5-6% loss; uplink 40-47% at every rate in one run, 31% falling to 2.5% with rate in another |
+| as AP, **ch6**, re-run 2026-09-26 with `AP_RETRY=3 STA_ACK=1 STA_RETRY=5` | `thru` **PASSES** 2/2: uplink 0.00% to 20 Mbit/s; downlink 0.67-3.10% per rung (30 Mbit/s at 0.67%). Same-session control, the 8812CU as AP, same station and channel: downlink 0.12-0.34%. One run each |
 
 **The ch6 losses are UNATTRIBUTED** (corrected by the close-out review: this
 paragraph first said "the adapter or its placement, not Jaguar2"). What the

@@ -12,6 +12,7 @@
 #include "IRtlRadio.h"
 #include "TxMode.h"
 #include "RtlAdapter.h"
+#include "StationArm.h"
 #include "SelectedChannel.h"
 #include "CfoTracker.h"
 #include "HalJaguar2.h"
@@ -75,6 +76,12 @@ public:
   /* Hardware ACK responder (IRadio contract; src/AckResponder.h). */
   bool SetAckResponder(const devourer::MacAddr &mac) override;
   void ClearAckResponder() override;
+  /* Station identity (IRadio contract; src/StationArm.h): MACID = own,
+   * BSSID = the AP, net_type = Infra, under _reg_mu; refused before bring-up
+   * and while a beacon or ACK responder owns port 0. */
+  bool SetStationIdentity(const devourer::MacAddr &own,
+                          const devourer::MacAddr &bssid) override;
+  bool ClearStationIdentity() override;
   /* A-MPDU TX mode (IRadio contract; src/AmpduMode.h). Programs the
    * 8822B pacing regs (0x455 max-time, 0x4BC burst-mode) under _reg_mu and
    * records the descriptor state the TX path reads. */
@@ -315,6 +322,7 @@ private:
    * FastRetune / the TX-power setters / GetThermalStatus by _reg_mu (the RF
    * read window is a multi-transfer sequence that must not tear). */
   std::mutex _reg_mu;
+  devourer::StationArm _station; /* under _reg_mu */
   std::thread _pwrtrack_thread;
   std::atomic<bool> _pwrtrack_stop{false};
   void start_pwrtrack();

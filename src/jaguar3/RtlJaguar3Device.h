@@ -11,6 +11,7 @@
 #include "IRtlRadio.h"
 #include "TxMode.h"
 #include "RtlAdapter.h"
+#include "StationArm.h"
 #include "SelectedChannel.h"
 #include "ChipVariant.h"
 #include "HalJaguar3.h"
@@ -83,6 +84,12 @@ public:
   bool ReadPacketBuffer(int sel, uint32_t offset, uint8_t *out,
                         size_t n) override;
   void ClearAckResponder() override;
+  /* Station identity (IRadio contract; src/StationArm.h): MACID = own,
+   * BSSID = the AP, net_type = Infra, under _reg_mu; refused before bring-up
+   * and while a beacon or ACK responder owns port 0. */
+  bool SetStationIdentity(const devourer::MacAddr &own,
+                          const devourer::MacAddr &bssid) override;
+  bool ClearStationIdentity() override;
   /* A-MPDU TX mode (IRadio contract; src/AmpduMode.h). Programs the 8822C
    * aggregate-fill timer (0x455) under _reg_mu (serialized against the coex
    * thread) and records the descriptor state the TX path reads. */
@@ -411,6 +418,7 @@ private:
   /* Serializes the coex housekeeping tick against StartRxLoop's register
    * restore (the only two register writers during an active TX session). */
   std::mutex _reg_mu;
+  devourer::StationArm _station; /* under _reg_mu */
 };
 
 #endif /* RTL_JAGUAR3_DEVICE_H */

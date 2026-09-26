@@ -1180,6 +1180,18 @@ target_link_libraries(AckResponderSelftest PRIVATE devourer PkgConfig::libusb)
 
 add_test(NAME ack_responder_recipe COMMAND AckResponderSelftest)
 
+# Headless guard for the Realtek station arm (src/StationArm.h over the
+# AckResponder.h recipe): exact registers both ways, refusals that write
+# nothing, port-0 ownership, re-arm keeping the first snapshot, readback
+# catching a write that did not land. Silicon behaviour (the MAC ACKing the
+# AP's unicast once armed) is on-air only: tests/sta_d2d_onair.sh STA_ARM.
+add_executable(StationArmSelftest
+    tests/station_arm_selftest.cpp
+)
+target_link_libraries(StationArmSelftest PRIVATE devourer PkgConfig::libusb)
+
+add_test(NAME station_arm COMMAND StationArmSelftest)
+
 # Headless guard for the windowed RX-receipt primitives (src/cell/RxReceipt.h):
 # TLV round-trip, ring eviction, late accounting, ledger merge idempotence,
 # strict-parse rejections. The on-air halves are tests/receipt_verify.py over
