@@ -66,6 +66,37 @@ void mt7612u_get_caps(const struct mt7612u_dev *d, struct mt7612u_caps *c)
 }
 
 /*
+ * Hardware retry limit. MT_TX_RETRY_CFG is GLOBAL on this part - the TXWI has
+ * no per-frame retry field - so this sets how many times the MAC retransmits
+ * every ACK-requested frame that goes unacknowledged. Both the short and the
+ * long limit take the value, so it applies whatever the frame length. The
+ * initvals leave 15/31; docs/mt7612u-tx-retry.md measured 16 attempts (limit
+ * plus the first) on a 1400-byte frame. Frames sent NOACK never retry,
+ * whatever this says. Read back, because a value that did not land would
+ * leave the MAC retrying 15 deep while the caller believes otherwise.
+ */
+int mt7612u_set_retry_limit(struct mt7612u_dev *d, int limit)
+{
+	uint32_t v, rb;
+
+	if (limit < 0 || limit > 255) {
+		ERR("retry limit %d out of range 0..255", limit);
+		return -1;
+	}
+	v = mt_rr(d, MT_TX_RETRY_CFG);
+	v &= ~(MT_TX_RETRY_CFG_SHORT | MT_TX_RETRY_CFG_LONG);
+	v |= FIELD_PREP(MT_TX_RETRY_CFG_SHORT, (uint32_t)limit) |
+	     FIELD_PREP(MT_TX_RETRY_CFG_LONG, (uint32_t)limit);
+	mt_wr(d, MT_TX_RETRY_CFG, v);
+	rb = mt_rr(d, MT_TX_RETRY_CFG);
+	if (rb != v) {
+		ERR("retry limit not verified: MT_TX_RETRY_CFG %08x != %08x", rb, v);
+		return -1;
+	}
+	return 0;
+}
+
+/*
  * Hardware ACK responder.
  *
  * On this MAC the immediate-response engine answers frames whose address 1

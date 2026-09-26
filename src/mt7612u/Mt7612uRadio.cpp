@@ -220,6 +220,17 @@ void Mt7612uRadio::apply_config() {
                   "budget this knob implies does not apply here",
                   _cfg.tx.ack_timeout_us);
 
+  /* tx.retry_limit, only when the caller chose it: this part's limit is a
+   * GLOBAL register (every ACK-requested frame), and its hardware default of
+   * 15 is what a station relies on. Refusal is fatal like the responder's -
+   * a caller that asked for 5 must not get 15 silently. */
+  if (_cfg.tx.retry_limit_set) {
+    if (mt7612u_set_retry_limit(_dev, _cfg.tx.retry_limit) != 0)
+      throw std::runtime_error("MT7612U retry limit could not be set");
+    _logger->info("MT7612U: hardware retry limit {} (global, ACK-requested "
+                  "frames only)", _cfg.tx.retry_limit);
+  }
+
   if (_cfg.tuning.disable_cca)
     _logger->warn("MT7612U: DEVOURER_DIS_CCA / tuning.disable_cca is not "
                   "implemented by this backend - carrier-sense stays ENABLED "
@@ -1205,9 +1216,10 @@ devourer::AdapterCaps Mt7612uRadio::GetAdapterCaps() {
    *   - one DUT, one peer, one channel, near field, no soak.
    */
   c.station_mode_ok = true;
-  /* Unmeasured, so false rather than optimistic - nothing here drives the
-   * hardware retry counter. */
-  c.tx_retry_limit_ok = false;
+  /* tx.retry_limit reaches MT_TX_RETRY_CFG (global, not per frame; only
+   * when tx.retry_limit_set) and is read back. On air: see
+   * docs/jaguar3-tx-ring.md item 6. */
+  c.tx_retry_limit_ok = true;
   c.narrowband_ok = false;
   /* Measured 526 ms full / 48 ms with calibration skipped, against 0.5-2.5 ms
    * on the Realtek parts: the RF plane lives behind the MCU. Not "fast". */

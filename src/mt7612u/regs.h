@@ -222,6 +222,11 @@ enum mt_mcu_cr_mode { MT_RF_CR, MT_BBP_CR, MT_RF_BBP_CR, MT_HL_TEMP_CR_UPDATE };
 #define MT_TX_RTS_CFG        0x1344
 #define MT_TX_RTS_CFG_RETRY_LIMIT GENMASK(7, 0)
 #define MT_TX_RETRY_CFG      0x134c
+/* rt2800 TX_RTY_CFG layout (initvals 0x47f01f0f = short 15, long 31, long
+ * threshold 2032 bytes): a frame longer than the threshold uses the long
+ * limit, anything else the short one. */
+#define MT_TX_RETRY_CFG_SHORT GENMASK(7, 0)
+#define MT_TX_RETRY_CFG_LONG  GENMASK(15, 8)
 #define MT_TX_LINK_CFG       0x1350
 #define MT_TX_CFACK_EN       BIT(12)
 #define MT_TX_PWR_CFG_0      0x1314

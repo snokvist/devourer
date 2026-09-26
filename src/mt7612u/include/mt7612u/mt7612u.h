@@ -277,6 +277,13 @@ size_t mt7612u_send_packets(struct mt7612u_dev *dev,
  * verified. Clear is best effort.
  */
 int  mt7612u_set_ack_responder(struct mt7612u_dev *dev, const uint8_t mac[6]);
+
+/*
+ * The MAC's hardware retry limit for ACK-requested frames (0..255). GLOBAL
+ * on this part, not per frame; sets the short and the long limit alike.
+ * Returns 0 once read back, negative otherwise.
+ */
+int  mt7612u_set_retry_limit(struct mt7612u_dev *dev, int limit);
 void mt7612u_clear_ack_responder(struct mt7612u_dev *dev);
 
 /*

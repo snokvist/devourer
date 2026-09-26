@@ -127,6 +127,7 @@ devourer::DeviceConfig devourer_config_from_env() {
     cfg.tx.ack_timeout_us = static_cast<int>(v > 255 ? 255 : v);
   if (env_long("DEVOURER_TX_RETRY_LIMIT", &v))
     cfg.tx.retry_limit = static_cast<int>(v < 0 ? 0 : (v > 63 ? 63 : v));
+    cfg.tx.retry_limit_set = true;
   if (const char *e = env_str("DEVOURER_TX_RETRY_FALLBACK")) {
     if (str_ieq(e, "off")) {
       cfg.tx.retry_fallback = devourer::RetryFallback::Off;

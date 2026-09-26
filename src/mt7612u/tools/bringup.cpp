@@ -3284,6 +3284,17 @@ static int gate_txs(uint8_t chan, int frames, const char *peer_str)
 	if (mt_eeprom_init(&dev)) return 1;
 	if (mt_init_hardware(&dev, NULL)) return 1;
 	if (mt_set_channel(&dev, chan, MT7612U_BW_20)) return 1;
+	/* DEVOURER_TX_RETRY_LIMIT=N: the knob Mt7612uRadio applies, so this gate
+	 * can verify it - an unacknowledged Normal arm must then report a mean
+	 * retry of N+1 (the limit plus the first attempt) instead of 16. */
+	if (const char *rl = getenv("DEVOURER_TX_RETRY_LIMIT")) {
+		if (mt7612u_set_retry_limit(&dev, atoi(rl))) {
+			printf("GATE TXS: FAIL - retry limit %s not set\n", rl);
+			return 2;
+		}
+		printf("retry limit set to %d (MT_TX_RETRY_CFG %08x)\n", atoi(rl),
+		       mt_rr(&dev, MT_TX_RETRY_CFG));
+	}
 
 	printf("chan %u, HT MCS7 BW20, %zu-byte QoS data, wcid 0xff, %d frames/arm\n",
 	       chan, flen, frames);

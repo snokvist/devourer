@@ -366,6 +366,14 @@ with every ping cell 20/20 (the flaky `wpa2`-at-6M cell included, one run),
 and a 4-minute bidirectional soak 0.00% both ways (one downlink chunk
 0.01%).
 
+**The station's retry limit** is the same knob on the other end
+(`DEVOURER_TX_RETRY_LIMIT`, harness `STA_RETRY`, default 5). On the MT7612U
+it is a global MAC register the initvals leave at 15; the backend now writes
+it (only when the caller chose a value) and reads it back. Verified on the
+chip's own TX status (`mt7612uprobe txs`, ch36): an unacknowledged frame
+settles at 6 attempts with 5, 16 with the default. With it, the MCS7
+uplink ladder read 0.00% to 20 Mbit/s and `all` 21/21.
+
 **Duplicate detection** came with it. With both ends retrying, a lost ACK
 delivers a frame twice, and the second copy reached the CCMP replay check -
 the `wpa2` cell's `replays=0` ledger check failed on it (2 on the AP). Both
