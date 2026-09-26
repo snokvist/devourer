@@ -411,6 +411,33 @@ works on Jaguar2 and Jaguar3, the backends with `ReadPacketBuffer`. And
 `txdemo` with `DEVOURER_TX_FRAMES=8000 DEVOURER_TX_GAP_US=0`: `tx.stats`
 carries `txdma_status`, which must stay 0.
 
+### What the fix may cost the plain injector - measured, near the noise floor
+
+The fix changes the monitor/injection path too (every Jaguar2/3 bring-up
+now enables the MAC protocol engine), so it was A/B'd against upstream
+master on that path (2026-09-26): an 8812CU injecting 8000 canonical beacons
+at MCS7, full duty, ch36 (a busy neighbour BSS on the channel), counted
+frame-exactly by an 8812EU `rxdemo` witness (`DEVOURER_STREAM_OUT=1`, the
+same witness binary for every arm):
+
+| arm | witness-decoded of 8050 submitted | mean |
+|---|---|---|
+| upstream master | 7493 7546 7682 7565 7550 7383 7659 | 7554 (93.8%) |
+| this branch | 7194 7373 7398 7437 7451 7487 7483 | 7403 (92.0%) |
+| branch, `MAC_TRX_ENABLE` back to `0x0F` | 7471 7601 7664 | 7579 (94.1%) |
+| branch, sends forced to the first endpoint | 7385 7446 7499 | 7443 (92.5%) |
+
+Submission was identical in every run (8050, 0 failed, ~6.31 s). The branch
+decodes ~1.9 points fewer, and reverting the `REG_CR` enable alone restores
+master's figure while reverting the endpoint selection does not - so the
+cost, if real, is the protocol engine the fix needs. Read it for what it is:
+seven runs per main arm and three per variant, one TX, one witness, one
+channel, inside the ~3-point single-probe band this bench measures
+(`tests/probe_repeatability.sh`) though consistent in sign. The mechanism is
+not known (deferral to the neighbour BSS is the obvious candidate and was
+not measured). An SDR duty read (`tests/bench_onair.py`) on a quiet channel
+is the measurement that would settle it.
+
 ## The answer-key technique
 
 What broke this open was running the **vendor driver on the same adapter** and
