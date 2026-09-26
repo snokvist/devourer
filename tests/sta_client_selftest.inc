@@ -333,7 +333,8 @@ struct Ap {
 
   /* A group rekey: message 1 of the group key handshake, carrying a NEW GTK.
    * Not pairwise, not install; ack + MIC + secure + encrypted. */
-  std::vector<uint8_t> group_msg1(const uint8_t new_gtk[16], uint8_t key_id) {
+  std::vector<uint8_t> group_msg1(const uint8_t new_gtk[16], uint8_t key_id,
+                                  const uint8_t* rsc = nullptr) {
     std::memcpy(gtk, new_gtk, 16);
     gtk_id = key_id;
     group_pn = 1;                     /* a new key means a new PN space */
@@ -350,7 +351,7 @@ struct Ap {
         devourer::sta::kKeyDescVersionCcmp | devourer::sta::kKiAck |
             devourer::sta::kKiMic | devourer::sta::kKiSecure |
             devourer::sta::kKiEncrypted,
-        16, replay, anonce, nullptr, w.data(), w.size(), &crypto, ptk);
+        16, replay, anonce, rsc, w.data(), w.size(), &crypto, ptk);
   }
 
   /* The same QoS downlink with an HT CONTROL field, which is what an HT AP
@@ -1117,6 +1118,67 @@ void test_group_rekey() {
   check(g_replays.load() == 0, "...and is not rejected as a replay");
 }
 
+/* KRACK, END TO END THROUGH THIS HARNESS (CVE-2017-13077/13078). Our message
+ * 4 is lost, so the AP retransmits message 3 - in the clear, it has not
+ * installed its key yet - at a GREATER replay counter, as hostapd does. The
+ * station must answer it and must NOT restart its transmit PN, its receive
+ * windows or its group window: every one of those restarts under an
+ * unchanged key is nonce reuse or a reopened replay window. And a new GTK's
+ * window starts at the Key RSC the AP quoted, not at whatever arrives. */
+void test_msg3_retransmit_keeps_the_pn() {
+  reset_all();
+  {
+    std::lock_guard<std::mutex> l(g_mu);
+    g_sm.configure(g_crypto, kSsid, kPsk, g_own);
+  }
+  Ap ap;
+  associate(ap, /*rsn=*/true);
+
+  uint8_t e[60] = {0};
+  std::memcpy(e, kPeer, 6);
+  std::memcpy(e + 6, kStaMac, 6);
+  e[12] = 0x08;
+  for (int i = 0; i < 3; i++) tap_down_one(e, sizeof e);
+  (void)drain_tx();
+  const uint8_t arp[28] = {0, 1};
+  const std::vector<uint8_t> g1 = ap.group_to_bss(arp, sizeof arp);
+  rx_frame(g1.data(), g1.size(), -40, 0);
+  (void)tap_read();
+  const uint64_t pn_before = g_tx_pn;
+  check(pn_before > 1, "the transmit PN has moved past 1");
+
+  const std::vector<uint8_t> m3 = ap.eapol_frame(ap.msg3());
+  rx_frame(m3.data(), m3.size(), -40, 0);
+  pump_tx();
+  check(drain_tx().size() == 1, "the retransmitted message 3 is answered");
+  check(g_ptk_installs.load() == 1 && g_gtk_installs.load() == 1,
+        "...AND NOTHING IS REINSTALLED");
+  check(g_tx_pn == pn_before, "...THE TRANSMIT PN IS NOT RESET");
+  rx_frame(g1.data(), g1.size(), -40, 0);
+  check(tap_read().empty() && g_replays.load() == 1,
+        "...and the group window was not reopened: a replayed group frame "
+        "is still refused");
+
+  /* A real group rekey, quoting RSC 100: its window starts THERE. */
+  uint8_t gtk2[16];
+  const uint8_t rsc[8] = {100, 0, 0, 0, 0, 0, 0, 0};
+  std::memset(gtk2, 0xa7, sizeof gtk2);
+  const std::vector<uint8_t> rk =
+      ap.eapol_protected(ap.group_msg1(gtk2, 2, rsc));
+  rx_frame(rk.data(), rk.size(), -40, 0);
+  (void)drain_tx();
+  check(g_gtk_installs.load() == 2, "a new GTK is installed");
+  ap.group_pn = 50;
+  const std::vector<uint8_t> old = ap.group_to_bss(arp, sizeof arp);
+  rx_frame(old.data(), old.size(), -40, 0);
+  check(tap_read().empty(), "a group frame BELOW the Key RSC is refused");
+  ap.group_pn = 101;
+  const std::vector<uint8_t> fresh = ap.group_to_bss(arp, sizeof arp);
+  rx_frame(fresh.data(), fresh.size(), -40, 0);
+  check(tap_read().size() == devourer::sta::kEthHdrLen + sizeof arp,
+        "...and one above it gets through");
+}
+
 /* A BSS heard once and never again must not be joined minutes later. A
  * station that keeps them forever reports "no response" as though the AP were
  * broken, when what it actually did was try to talk to one that left. */
@@ -1511,6 +1573,16 @@ void test_the_books_close() {
    * `from host` was incremented, so it was a loss no total contained. */
   tap_down_one(e, 6);
 
+  /* AND A REKEY. Its encrypted EAPOL answer goes through the same cipher
+   * path as host traffic, and used to be counted as `encrypted` with no
+   * `from host` to match - any rekeying AP (hostapd's wpa_group_rekey)
+   * broke the identity. */
+  uint8_t gtk2[16];
+  std::memset(gtk2, 0xa7, sizeof gtk2);
+  const std::vector<uint8_t> rk = ap.eapol_protected(ap.group_msg1(gtk2, 2));
+  rx_frame(rk.data(), rk.size(), -40, 0);
+  check(g_eapol_enc_tx.load() == 1, "the rekey in this cell is answered");
+
   const uint64_t from = g_tap_rx.load();
   const uint64_t down = g_tap_down_drop.load();
   check(from == 7, "every frame the host handed us is counted, malformed included");
@@ -1583,6 +1655,7 @@ int self_test() {
   selftest::test_ptk_rekey();
   selftest::test_the_channel_sweep_rotates();
   selftest::test_group_rekey();
+  selftest::test_msg3_retransmit_keeps_the_pn();
   selftest::test_a_stale_bss_is_not_joined();
   selftest::test_rssi_conversion();
   selftest::test_reconnect_after_beacon_loss();

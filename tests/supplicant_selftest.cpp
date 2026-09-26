@@ -117,6 +117,38 @@ void test_psk_known_answers() {
         "an empty SSID is refused");
   check(!devourer::sta::pmk_from_psk(c, "password", std::string(33, 'x'), a),
         "a 33-octet SSID is refused");
+
+  /* THE OTHER SPELLING: exactly 64 hex digits ARE the PMK (802.11-2016
+   * J.4.1; hostapd wpa_psk=, wpa_supplicant psk=). Known answer: the first
+   * Annex H vector's PMK, given raw, must come back byte for byte and must
+   * NOT be the PBKDF2 of those 64 characters. */
+  const char* hex = kPskVectors[0].pmk_hex;
+  const std::vector<uint8_t> want = unhex(hex);
+  std::memset(a, 0, sizeof a);
+  check(devourer::sta::pmk_from_psk(c, hex, "IEEE", a) &&
+            std::memcmp(a, want.data(), 32) == 0,
+        "a 64-hex-digit PSK is decoded as the raw PMK");
+  std::string upper(hex);
+  for (char& ch : upper)
+    if (ch >= 'a' && ch <= 'f') ch = (char)(ch - 'a' + 'A');
+  std::memset(b, 0, sizeof b);
+  check(devourer::sta::pmk_from_psk(c, upper.c_str(), "other", b) &&
+            std::memcmp(b, want.data(), 32) == 0,
+        "...in either case, and independent of the SSID");
+  std::string bad(hex);
+  bad[10] = 'g';
+  check(!devourer::sta::pmk_from_psk(c, bad.c_str(), "IEEE", a),
+        "64 characters that are not all hex are refused");
+
+  /* And a passphrase must be 8..63 characters. */
+  check(!devourer::sta::pmk_from_psk(c, "1234567", "IEEE", a),
+        "a 7-character passphrase is refused");
+  check(devourer::sta::pmk_from_psk(c, std::string(63, 'p').c_str(), "IEEE",
+                                    a),
+        "a 63-character passphrase is accepted");
+  check(!devourer::sta::pmk_from_psk(c, std::string(65, 'a').c_str(), "IEEE",
+                                     a),
+        "a 65-character passphrase is refused");
 }
 
 /* The PTK derivation's address and nonce sorting, asserted directly. Both
@@ -233,19 +265,21 @@ struct Authenticator {
   /* Group key handshake message 1, at a chosen replay counter so a test can
    * hand the supplicant one it has already seen. */
   std::vector<uint8_t> group1(const uint8_t* key, uint8_t keyid,
-                              uint64_t at_replay) {
+                              uint64_t at_replay,
+                              const uint8_t* rsc = nullptr) {
     const std::vector<uint8_t> w = wrapped_gtk(key, keyid);
 
     return devourer::sta::build_eapol_key(
         devourer::sta::kKeyDescVersionCcmp | devourer::sta::kKiAck |
             devourer::sta::kKiMic | devourer::sta::kKiSecure |
             devourer::sta::kKiEncrypted,
-        16, at_replay, nullptr, nullptr, w.data(), w.size(), &crypto, ptk);
+        16, at_replay, nullptr, rsc, w.data(), w.size(), &crypto, ptk);
   }
 
-  std::vector<uint8_t> group1_next(const uint8_t* key, uint8_t keyid) {
+  std::vector<uint8_t> group1_next(const uint8_t* key, uint8_t keyid,
+                                   const uint8_t* rsc = nullptr) {
     replay++;
-    return group1(key, keyid, replay);
+    return group1(key, keyid, replay, rsc);
   }
 };
 
@@ -855,6 +889,162 @@ void test_msg1_on_a_live_association() {
   check(sup.ptk_valid(), "...and the station stays keyed");
 }
 
+/* KEY REINSTALLATION (KRACK, CVE-2017-13077). The AP retransmits message 3
+ * whenever our message 4 is lost, and hostapd increments the replay counter
+ * on every retransmission - so a STRICTLY GREATER counter carrying the key
+ * already installed is routine, not an attack. It must be answered (the AP
+ * is owed a message 4) and must install nothing: the caller restarts its TX
+ * PN when ptk_generation() moves, and doing that under the unchanged TK
+ * reuses CCMP nonces. The equal- and lower-counter cells elsewhere in this
+ * file pass with this defect present; this one does not. */
+void test_msg3_retransmit_does_not_reinstall() {
+  Authenticator ap;
+  Supplicant sup;
+  OpenSslCryptoOps crypto;
+  std::vector<uint8_t> out;
+  uint8_t ptk_before[48];
+
+  check(handshake(ap, sup, crypto), "the four-way completes");
+  std::memcpy(ptk_before, sup.ptk(), 48);
+  const uint32_t pg = sup.ptk_generation(), gg = sup.gtk_generation();
+  const uint64_t authed = sup.replay_counter();
+
+  const std::vector<uint8_t> m3 = ap.msg3();   /* counter + 1 */
+  out.clear();
+  check(sup.on_eapol(m3.data(), m3.size(), &out) ==
+            Supplicant::Verdict::Reply,
+        "a msg3 retransmitted at a GREATER counter is answered");
+  check(ap.on_msg4(out), "...with a message 4 that verifies at the AP");
+  check(sup.ptk_generation() == pg,
+        "...AND THE PTK IS NOT REINSTALLED (ptk_generation unchanged)");
+  check(sup.gtk_generation() == gg,
+        "...NOR THE GTK (gtk_generation unchanged)");
+  check(std::memcmp(sup.ptk(), ptk_before, 48) == 0, "...the PTK is the same");
+  check(sup.replay_counter() == authed + 1,
+        "...and the authenticated counter advances past it");
+
+  /* Retransmitted again at the counter just answered: the cached reply. */
+  out.clear();
+  check(sup.on_eapol(m3.data(), m3.size(), &out) ==
+            Supplicant::Verdict::Retransmit,
+        "the same msg3 again is a retransmission");
+  check(sup.ptk_generation() == pg && sup.gtk_generation() == gg,
+        "...still installing nothing");
+
+  /* A message 1 re-quoting the INSTALLED ANonce re-derives the identical PTK
+   * into the candidate. Its message 3 must not count as a new key either. */
+  const std::vector<uint8_t> m1 = ap.msg1();
+  out.clear();
+  check(sup.on_eapol(m1.data(), m1.size(), &out) == Supplicant::Verdict::Reply,
+        "a msg1 re-quoting the installed ANonce is answered");
+  const std::vector<uint8_t> m3b = ap.msg3();
+  out.clear();
+  check(sup.on_eapol(m3b.data(), m3b.size(), &out) ==
+            Supplicant::Verdict::Reply,
+        "...and its msg3 is answered");
+  check(sup.ptk_generation() == pg && sup.gtk_generation() == gg,
+        "...WITHOUT reinstalling the identical PTK or GTK");
+}
+
+/* The group half of the same rule (CVE-2017-13078/13080). A group message 1
+ * at a greater counter carrying the GTK already installed, and a PTK rekey
+ * whose message 3 re-delivers the current GTK - which EVERY PTK rekey does -
+ * must not move gtk_generation(), or the caller reopens its group replay
+ * window each time. A genuinely new PTK must still move ptk_generation(). */
+void test_group1_same_gtk_does_not_reinstall() {
+  Authenticator ap;
+  Supplicant sup;
+  OpenSslCryptoOps crypto;
+  std::vector<uint8_t> out;
+  const uint8_t rsc[8] = {0x10, 0x27, 0, 0, 0, 0, 0xaa, 0xbb};
+  const uint8_t rsc2[8] = {0xff, 0xff, 0, 0, 0, 0, 0, 0};
+  uint8_t gtk2[16];
+
+  check(handshake(ap, sup, crypto), "the four-way completes");
+  check(sup.gtk_rsc() == 0, "the four-way's message 3 quoted RSC 0");
+  const uint32_t pg = sup.ptk_generation(), gg = sup.gtk_generation();
+
+  const std::vector<uint8_t> same = ap.group1_next(ap.gtk, ap.gtk_keyid, rsc2);
+  out.clear();
+  check(sup.on_eapol(same.data(), same.size(), &out) ==
+            Supplicant::Verdict::Reply,
+        "a group msg1 re-delivering the installed GTK is answered");
+  check(sup.gtk_generation() == gg,
+        "...AND THE GTK IS NOT REINSTALLED (gtk_generation unchanged)");
+  check(sup.gtk_rsc() == 0, "...nor its RSC re-read");
+
+  /* A genuinely new GTK installs, with its RSC: 48 bits, little-endian. */
+  std::memset(gtk2, 0x62, 16);
+  const std::vector<uint8_t> g2 = ap.group1_next(gtk2, 2, rsc);
+  out.clear();
+  check(sup.on_eapol(g2.data(), g2.size(), &out) == Supplicant::Verdict::Reply,
+        "a new GTK is accepted");
+  check(sup.gtk_generation() == gg + 1, "...and counted as one install");
+  check(sup.gtk_rsc() == 0x2710,
+        "...with the Key RSC it arrived with (48-bit LE, octets 6-7 ignored)");
+
+  /* A PTK rekey: fresh ANonce, new PTK, the same (now current) GTK. */
+  ap.gtk_keyid = 2;
+  std::memcpy(ap.gtk, gtk2, 16);
+  std::memset(ap.anonce, 0x6f, 32);
+  const std::vector<uint8_t> m1 = ap.msg1();
+  out.clear();
+  check(sup.on_eapol(m1.data(), m1.size(), &out) == Supplicant::Verdict::Reply,
+        "a PTK rekey's msg1 is answered");
+  check(ap.on_msg2(out), "...and its msg2 verifies");
+  const std::vector<uint8_t> m3 = ap.msg3();
+  out.clear();
+  check(sup.on_eapol(m3.data(), m3.size(), &out) ==
+            Supplicant::Verdict::Reply,
+        "the rekey's msg3 is accepted");
+  check(ap.on_msg4(out), "...and its msg4 verifies under the NEW PTK");
+  check(sup.ptk_generation() == pg + 1, "...a new PTK IS a new install");
+  check(sup.gtk_generation() == gg + 1,
+        "...but the GTK it re-delivers is NOT reinstalled");
+}
+
+/* The low-severity half of the same review: an UNAUTHENTICATED message 1 on
+ * a live association replaces the in-flight candidate, and must not stop the
+ * AP's own retransmitted message 3 - at an equal OR a greater counter - from
+ * being answered. Before the installed handshake was kept apart from the
+ * candidate, this refused the retransmission as Malformed and the AP
+ * deauthenticated after its retries. */
+void test_forged_msg1_does_not_orphan_msg3_retransmit() {
+  Authenticator ap;
+  Supplicant sup;
+  OpenSslCryptoOps crypto;
+  std::vector<uint8_t> out;
+
+  check(handshake(ap, sup, crypto), "the four-way completes");
+  const uint32_t pg = sup.ptk_generation();
+  const uint64_t at = sup.replay_counter();
+
+  std::vector<uint8_t> forged = ap.msg1();
+  forged[devourer::sta::kEapolNonceOff] ^= 0xff;
+  devourer::sta::eapol_put_be64(forged.data() + devourer::sta::kEapolReplayOff,
+                                at + 5);
+  out.clear();
+  sup.on_eapol(forged.data(), forged.size(), &out);
+
+  /* Equal counter: the handshake's own msg3, rebuilt at its own counter. */
+  ap.replay = at - 1;
+  const std::vector<uint8_t> same = ap.msg3();   /* counter == at */
+  out.clear();
+  check(sup.on_eapol(same.data(), same.size(), &out) ==
+            Supplicant::Verdict::Retransmit,
+        "after a forged msg1, an EQUAL-counter msg3 still collects its msg4");
+  check(ap.on_msg4(out), "...and it is a real message 4");
+
+  const std::vector<uint8_t> next = ap.msg3();   /* counter == at + 1 */
+  out.clear();
+  check(sup.on_eapol(next.data(), next.size(), &out) ==
+            Supplicant::Verdict::Reply,
+        "after a forged msg1, a GREATER-counter msg3 is still answered");
+  check(ap.on_msg4(out), "...with a message 4 the AP accepts");
+  check(sup.malformed == 0, "...and nothing was refused as malformed");
+  check(sup.ptk_generation() == pg, "...and nothing was reinstalled");
+}
+
 /* A REAL FOUR-WAY, FROM HOSTAPD AND WPA_SUPPLICANT.
  *
  * Everything else in this file is this repository talking to itself. These
@@ -1083,6 +1273,9 @@ int main() {
   test_replay_counter_rules();
   test_forged_msg1_cannot_poison_the_counter();
   test_msg1_on_a_live_association();
+  test_msg3_retransmit_does_not_reinstall();
+  test_group1_same_gtk_does_not_reinstall();
+  test_forged_msg1_does_not_orphan_msg3_retransmit();
 
   if (g_fail) {
     std::printf("supplicant_selftest: %d failure(s)\n", g_fail);

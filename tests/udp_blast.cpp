@@ -111,7 +111,7 @@ RecvResult receive_for(int fd, double secs, double grace) {
   constexpr size_t kWin = 1024;
   static bool seen[kWin];
   std::memset(seen, 0, sizeof seen);
-  uint64_t high = 0;
+  uint64_t high = 0, low = 0;
   bool started = false;
   const double deadline_idle = now_s() + secs + grace;
 
@@ -137,6 +137,7 @@ RecvResult receive_for(int fd, double secs, double grace) {
       started = true;
       r.first_s = at;
       high = seq;
+      low = seq;
       /* The first datagram is not evidence that everything before it was
        * lost: the sender may have started before the receiver was listening,
        * and on a link with no retransmission the first few can simply be
@@ -146,8 +147,15 @@ RecvResult receive_for(int fd, double secs, double grace) {
     r.datagrams++;
     r.bytes += (uint64_t)n;
 
+    if (seq < low) low = seq;
     if (seq > high) {
-      for (uint64_t s = high + 1; s < seq; s++) seen[s % kWin] = false;
+      /* BOUNDED: one stray datagram whose first 8 bytes read as a sequence
+       * near 2^63 made this loop run effectively forever. A jump of a whole
+       * window or more leaves nothing in it reachable - clear it at once. */
+      if (seq - high >= kWin)
+        for (size_t s = 0; s < kWin; s++) seen[s] = false;
+      else
+        for (uint64_t s = high + 1; s < seq; s++) seen[s % kWin] = false;
       high = seq;
       seen[seq % kWin] = true;
     } else if (seq == high) {
@@ -165,8 +173,11 @@ RecvResult receive_for(int fd, double secs, double grace) {
     uint64_t arrived = r.datagrams - r.duplicated;
     uint64_t span = high - (r.datagrams ? 0 : 0);
     (void)span;
-    /* Loss is the span the sequence covered minus what actually arrived. */
-    const uint64_t expected = high + 1;
+    /* Loss is the span the sequence covered minus what actually arrived -
+     * from the LOWEST sequence seen, not from 0: the sequences before the
+     * first arrival are not evidence of loss (see the note at `started`),
+     * and counting them made a receiver started late report phantom loss. */
+    const uint64_t expected = high - low + 1;
     r.lost = expected > arrived ? expected - arrived : 0;
   }
   return r;
@@ -392,7 +403,23 @@ int self_test() {
     check(r.datagrams == 3, "three arrive across a window-wide jump");
     check(r.reordered == 1, "...the late one is reordering");
     check(r.duplicated == 0, "...and NOT a duplicate of a stale window slot");
-    check(r.lost == 1198, "...and the gap between them is counted in full");
+    check(r.lost == 1098,
+          "...and the gap between them is counted in full - from the first "
+          "arrival (100), not from sequence 0");
+  }
+  {   /* A HUGE FORWARD JUMP must not spin the window-clearing loop once per
+       * skipped sequence number: one stray datagram near 2^63 hung the
+       * receiver. 2^40 would take hours unbounded; bounded it is instant. */
+    const uint64_t s[] = {0, 1ull << 40};
+    RecvResult r = drive(s, 2);
+    check(r.datagrams == 2, "a 2^40 jump arrives and the run ENDS");
+    check(r.lost == (1ull << 40) - 1, "...with the gap counted as lost");
+  }
+  {   /* A receiver started late: loss is counted from the first arrival, and
+       * an earlier sequence arriving after it extends the span down. */
+    const uint64_t s[] = {50, 51, 48};
+    RecvResult r = drive(s, 3);
+    check(r.lost == 1, "loss counts from the lowest sequence seen (49 only)");
   }
   {   /* THE RATE IS OVER THE WINDOW, NOT THE BURST. Ten datagrams delivered
        * in a millisecond, then silence for the rest of a quarter second, is

@@ -498,6 +498,12 @@ void RtlJaguar2Device::Init(Action_ParsedRadioPacket packetProcessor,
     std::lock_guard<std::mutex> ccx(busy_window_mutex());
     busy_window_reset();
   }
+  /* Likewise a station arm: the bring-up below power-cycles the MAC, so the
+   * snapshot StationArm holds describes nothing (StationArm::forget). */
+  {
+    std::lock_guard<std::mutex> lk(_reg_mu);
+    _station.forget();
+  }
   _channel = channel;
   bring_up(channel);
   _rx_bw_code.store(channel_width_to_bw_code(channel.ChannelWidth),
@@ -750,6 +756,12 @@ void RtlJaguar2Device::InitWrite(SelectedChannel channel) {
   {
     std::lock_guard<std::mutex> ccx(busy_window_mutex());
     busy_window_reset();
+  }
+  /* Likewise a station arm: the bring-up below power-cycles the MAC, so the
+   * snapshot StationArm holds describes nothing (StationArm::forget). */
+  {
+    std::lock_guard<std::mutex> lk(_reg_mu);
+    _station.forget();
   }
   _channel = channel;
   /* TX shares the full cold bring-up (config_trx_mode enables the TX antenna
@@ -1900,7 +1912,11 @@ bool RtlJaguar2Device::ReadPacketBuffer(int sel, uint32_t offset,
     base = 0x650; /* LLT */
   else
     return false;
-  if (n % 4)
+  /* Dword-aligned, and inside a window index that fits the 12-bit field -
+   * the same preconditions as the Jaguar3 copy (see the declaration). */
+  if (n % 4 || offset % 4)
+    return false;
+  if (((static_cast<uint64_t>(offset) + n + 0xFFF) >> 12) + base > 0x1000)
     return false;
   uint32_t win = (offset >> 12) + base;
   uint32_t residue = offset & 0xFFF;

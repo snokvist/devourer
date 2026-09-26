@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # mt7612u_sta_identity.sh - Phase 2's two measurements, end to end.
 #
 # Answers the two risks docs/station-mode-scope.md raised against the backend
@@ -45,10 +45,24 @@ mkdir -p "$OUT"
 
 # mt7612uprobe takes no firmware-directory argument and looks for ./firmware,
 # so give it one rather than requiring the caller to cd somewhere specific.
-[ -e "$ROOT/firmware" ] || ln -sfn "$FW_DIR" "$ROOT/firmware" 2>/dev/null
+# FW_LINK_OURS: only a link THIS run created is removed afterwards - a
+# pre-existing $ROOT/firmware is the operator's.
+FW_LINK_OURS=no
+if [ ! -e "$ROOT/firmware" ] && ln -sfn "$FW_DIR" "$ROOT/firmware" 2>/dev/null; then
+  FW_LINK_OURS=yes
+fi
 
 AP_IF=""
+# Set only once hostapd is up on a verified AP-capable interface: before
+# that, the trap has no business re-enumerating anything (a wrong or default
+# AP_SYSFS naming a hub would power-cycle every device under it).
+AP_REENUM=no
+CLEANED=no
 cleanup() {
+  [ "$CLEANED" = yes ] && return 0
+  CLEANED=yes
+  [ "$FW_LINK_OURS" = yes ] && rm -f "$ROOT/firmware"
+  [ "$AP_REENUM" = yes ] || return 0
   pkill -f "hostapd.*$OUT/hostapd.conf" 2>/dev/null
   sleep 1
   iw dev staid_mon del 2>/dev/null
@@ -73,7 +87,11 @@ cleanup() {
     nmcli device set "$AP_IF" managed yes >/dev/null 2>&1
   }
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+# AND IT MUST STOP: with INT/TERM on the EXIT trap the shell runs cleanup
+# and then CARRIES ON into the next arm (tests/sta_d2d_onair.sh found and
+# fixed this). cleanup is idempotent, so the EXIT pass after it is harmless.
+trap 'cleanup; exit 130' INT TERM
 
 # --- the AP ----------------------------------------------------------------
 AP_IF=$(ls "/sys/bus/usb/devices/$AP_SYSFS:1.0/net/" 2>/dev/null | head -1)
@@ -83,6 +101,15 @@ if [ -z "$AP_IF" ]; then
   AP_IF=$(ls "/sys/bus/usb/devices/$AP_SYSFS:1.0/net/" 2>/dev/null | head -1)
 fi
 [ -n "$AP_IF" ] || { echo "no AP interface at $AP_SYSFS"; exit 2; }
+# The same guards tests/mt7612u_sta_onair.sh applies before it re-enumerates:
+# a plausible device, not a hub, not the DUT's own path.
+ap_cls=$(cat "/sys/bus/usb/devices/$AP_SYSFS/bDeviceClass" 2>/dev/null)
+ap_vid=$(cat "/sys/bus/usb/devices/$AP_SYSFS/idVendor" 2>/dev/null)
+if [ -z "$ap_vid" ] || [ "$AP_SYSFS" = "$DUT_SYSFS" ] || [ "$ap_cls" = "09" ]; then
+  echo "refusing AP_SYSFS=$AP_SYSFS (vid='$ap_vid' class='$ap_cls') - not a"
+  echo "plausible AP device, and cleanup would re-enumerate it. Check AP_SYSFS."
+  exit 2
+fi
 PHY=$(basename "$(readlink -f "/sys/class/net/$AP_IF/phy80211")")
 iw phy "$PHY" info 2>/dev/null | grep -q '\* AP$' || {
   echo "$AP_IF ($PHY) does not support AP mode - this harness needs a"
@@ -113,7 +140,9 @@ EOF
 hostapd -B -f "$OUT/hostapd.log" "$OUT/hostapd.conf" >/dev/null 2>&1
 sleep 5
 grep -q "AP-ENABLED" "$OUT/hostapd.log" 2>/dev/null || {
+  AP_REENUM=yes   # hostapd may have run and left its bssid behind
   echo "hostapd did not come up:"; tail -12 "$OUT/hostapd.log"; exit 1; }
+AP_REENUM=yes
 
 # --- free the DUT ----------------------------------------------------------
 echo "$DUT_SYSFS:1.0" > /sys/bus/usb/drivers/mt76x2u/unbind 2>/dev/null
@@ -125,8 +154,11 @@ sleep 2
 # work for this: it never calls mt_eeprom_init, so it prints no MAC.)
 echo
 echo "########## the SetStationIdentity contract (no AP needed) ##########"
+# PIPESTATUS[0], captured straight after each pipeline: `$?` is tee's
+# status, and under the old #!/bin/sh (dash) PIPESTATUS did not exist at all,
+# so a failing probe scored as a pass.
 "$BUILD/mt7612uprobe" staid 2>&1 | tee "$OUT/staid.txt"
-staid=${PIPESTATUS:-0}
+staid=${PIPESTATUS[0]}
 DUT_MAC=$(sed -n 's/^own \([0-9a-f:]\{17\}\).*/\1/p' "$OUT/staid.txt" | head -1)
 [ -n "$DUT_MAC" ] || { echo "could not read the DUT's MAC from the staid gate"; exit 1; }
 echo "DUT MAC $DUT_MAC"
@@ -135,7 +167,7 @@ echo "DUT MAC $DUT_MAC"
 echo
 echo "########## R6: does the DUT auto-ACK with nothing armed? ##########"
 "$BUILD/mt7612uprobe" staack "$CH" "$SECS" "$BSSID" 2>&1 | tee "$OUT/r6.txt"
-r6=$?
+r6=${PIPESTATUS[0]}
 
 # --- R5: needs unicast aimed at the DUT for the whole run ------------------
 echo
@@ -155,10 +187,11 @@ else
   echo "         which is not the question. Treat its to_us column as void."
 fi
 "$BUILD/mt7612uprobe" sta "$CH" "$SECS" "$BSSID" 2>&1 | tee "$OUT/r5.txt"
-r5=$?
+r5=${PIPESTATUS[0]}
 
 echo
 echo "=== logs: $OUT ==="
 [ "${staid:-0}" = 0 ] || echo "the contract gate FAILED - see $OUT/staid.txt"
 [ "$r6" = 0 ] || echo "R6 did not pass - see $OUT/r6.txt"
+[ "$r5" = 0 ] || echo "R5 did not pass - see $OUT/r5.txt"
 exit $(( r5 != 0 || r6 != 0 || ${staid:-0} != 0 ))

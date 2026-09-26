@@ -1038,6 +1038,99 @@ void test_wpa2_join_needs_an_snonce() {
   check(sm.pending_tx() == 0, "...without airing anything");
 }
 
+/* A GROUP-ADDRESSED EAPOL-Key is part of no handshake with this station, and
+ * the decrypted path in sta_client already refuses one. This layer used to
+ * feed it to the supplicant, so a broadcast forged message 1 drove on_msg1. */
+void test_broadcast_eapol_is_not_fed_to_the_supplicant() {
+  OpenSslCryptoOps crypto;
+  BssTable table;
+  StationSm sm;
+  FixtureAp ap;
+  uint8_t snonce[32];
+  std::vector<uint8_t> f;
+  static const uint8_t bcast[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+
+  std::memset(snonce, 0x7a, 32);
+  sm.configure(crypto, kSsid, kPsk, kOwn);
+  const BssEntry* bss = discovered(table);
+  if (!bss) { check(false, "beacon"); return; }
+  sm.join(*bss, snonce, 0);
+  while (sm.pop_tx(&f)) {
+    const std::vector<uint8_t> r = ap.respond(f);
+    if (!r.empty()) sm.on_rx(r.data(), r.size(), 0);
+    if (f[0] == devourer::sta::kFcAssocReq) break;
+  }
+
+  std::vector<uint8_t> m1 = ap.eapol_frame(ap.msg1());
+  std::memcpy(m1.data() + 4, bcast, 6);            /* addr1 = broadcast */
+  sm.on_rx(m1.data(), m1.size(), 0);
+  check(sm.eapol_rx == 0, "a BROADCAST EAPOL-Key is not fed to the supplicant");
+  check(sm.pending_tx() == 0, "...and nothing is answered");
+
+  /* The control: the same frame to us is accepted. */
+  std::memcpy(m1.data() + 4, kOwn, 6);
+  sm.on_rx(m1.data(), m1.size(), 0);
+  check(sm.eapol_rx == 1, "the same frame unicast to us is accepted");
+}
+
+/* Beacon supervision follows the BSS's OWN interval: an AP beaconing at
+ * 1000 TU (1.024 s) must not be declared lost after one late beacon. */
+void test_beacon_loss_follows_the_interval() {
+  OpenSslCryptoOps crypto;
+  BssTable table;
+  StationSm sm;
+  FixtureAp ap;
+  uint8_t snonce[32];
+
+  std::memset(snonce, 0x7a, 32);
+  sm.configure(crypto, kSsid, kPsk, kOwn);
+  std::vector<uint8_t> b = beacon(kBssid, 6);
+  b[32] = (uint8_t)(1000 & 0xff);                  /* beacon interval, TU */
+  b[33] = (uint8_t)(1000 >> 8);
+  const BssEntry* bss = table.observe(b.data(), b.size(), -40, 0);
+  if (!bss) { check(false, "beacon"); return; }
+  sm.join(*bss, snonce, 0);
+  pump(sm, ap, 0);
+  check(sm.state() == StationSm::State::Connected, "the station connects");
+  check(sm.beacon_loss_ms() == 10240,
+        "the loss window is ten of the BSS's own intervals");
+
+  sm.tick(StationSm::kBeaconLossMs * 2);
+  check(sm.state() == StationSm::State::Connected,
+        "two 100-TU windows of silence do not end a 1000-TU link");
+  sm.tick(10240);
+  check(sm.state() == StationSm::State::Failed &&
+            sm.fail_reason() == StationSm::Failure::BeaconLost,
+        "...ten of its own intervals do");
+}
+
+/* Reconfiguring drops the Supplicant's keys too, not just this object's PMK:
+ * configure(WPA2) -> join -> configure_open() must not leave the PTK and GTK
+ * resident, nor a station claiming keyed() under the new configuration. */
+void test_reconfigure_forgets_the_keys() {
+  OpenSslCryptoOps crypto;
+  BssTable table;
+  StationSm sm;
+  FixtureAp ap;
+  uint8_t snonce[32], zero[48] = {0};
+
+  std::memset(snonce, 0x7a, 32);
+  sm.configure(crypto, kSsid, kPsk, kOwn);
+  const BssEntry* bss = discovered(table);
+  if (!bss) { check(false, "beacon"); return; }
+  sm.join(*bss, snonce, 0);
+  pump(sm, ap, 0);
+  check(sm.keyed() && sm.supplicant().ptk_valid(), "keyed");
+
+  sm.configure_open(kSsid, kOwn);
+  check(!sm.supplicant().ptk_valid() && !sm.supplicant().gtk_valid(),
+        "configure_open() drops the supplicant's keys");
+  check(std::memcmp(sm.supplicant().ptk(), zero, 48) == 0,
+        "...and wipes the PTK bytes");
+  check(!sm.keyed() && sm.state() == StationSm::State::Idle,
+        "...and the station no longer claims a keyed link");
+}
+
 }  // namespace
 
 int main() {
@@ -1065,6 +1158,9 @@ int main() {
   test_open_station_refuses_a_protected_bss();
   test_open_station_ignores_eapol();
   test_wpa2_join_needs_an_snonce();
+  test_broadcast_eapol_is_not_fed_to_the_supplicant();
+  test_beacon_loss_follows_the_interval();
+  test_reconfigure_forgets_the_keys();
 
   if (g_fail) {
     std::printf("station_sm_selftest: %d failure(s)\n", g_fail);

@@ -272,10 +272,38 @@ inline bool prf_sha1(CryptoOps& crypto, const uint8_t* key, size_t key_len,
 
 /* PMK = PBKDF2(passphrase, SSID, 4096, 32). The SSID is the salt, which is
  * why two networks with the same passphrase and different names do not share
- * a PMK. */
+ * a PMK.
+ *
+ * THE PSK HAS TWO SPELLINGS (802.11-2016 J.4.1), as hostapd's wpa_psk= and
+ * wpa_supplicant's psk= both accept: a passphrase of 8..63 characters, run
+ * through PBKDF2, or EXACTLY 64 hex digits, which ARE the PMK and are
+ * decoded, not hashed. Anything else is refused here. Hashing a 64-hex PSK
+ * as though it were a passphrase used to produce a PMK nothing else derives,
+ * and the only symptom was MIC failures and a handshake timeout; refusing
+ * here turns a malformed PSK into a configuration failure at the point it
+ * was given. */
+inline void secure_wipe(void* p, size_t n);   /* defined below */
 inline bool pmk_from_psk(CryptoOps& crypto, const char* passphrase,
                          const std::string& ssid, uint8_t pmk[32]) {
   if (!passphrase || ssid.empty() || ssid.size() > 32) return false;
+  const size_t n = std::strlen(passphrase);
+  if (n == 64) {
+    uint8_t raw[32];
+    for (size_t i = 0; i < 64; i++) {
+      const char c = passphrase[i];
+      int v;
+      if (c >= '0' && c <= '9') v = c - '0';
+      else if (c >= 'a' && c <= 'f') v = c - 'a' + 10;
+      else if (c >= 'A' && c <= 'F') v = c - 'A' + 10;
+      else { secure_wipe(raw, sizeof raw); return false; }
+      if (i % 2 == 0) raw[i / 2] = (uint8_t)(v << 4);
+      else raw[i / 2] = (uint8_t)(raw[i / 2] | v);
+    }
+    std::memcpy(pmk, raw, 32);
+    secure_wipe(raw, sizeof raw);
+    return true;
+  }
+  if (n < 8 || n > 63) return false;
   return crypto.pbkdf2_sha1(passphrase, (const uint8_t*)ssid.data(),
                             ssid.size(), 4096, pmk, 32);
 }

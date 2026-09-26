@@ -66,7 +66,12 @@ TX_SA="${TX_SA:-02:aa:bb:cc:dd:07}"
 
 [ "$(id -u)" = 0 ] || { echo "must run as root"; exit 2; }
 mkdir -p "$OUT"
-[ -e "$ROOT/firmware" ] || ln -sfn "$FW_DIR" "$ROOT/firmware" 2>/dev/null
+# FW_LINK_OURS: only a link THIS run created is removed afterwards - a
+# pre-existing $ROOT/firmware is the operator's.
+FW_LINK_OURS=no
+if [ ! -e "$ROOT/firmware" ] && ln -sfn "$FW_DIR" "$ROOT/firmware" 2>/dev/null; then
+  FW_LINK_OURS=yes
+fi
 
 pass=0; fail=0
 ok()  { pass=$((pass+1)); printf '  PASS  %s\n' "$*"; }
@@ -84,8 +89,13 @@ cleanup() {
   # -g $$ keeps the sweep inside this run's process group, so a concurrent
   # session's txdemo is not collateral.
   pkill -INT -g $$ -f "$BUILD/txdemo" 2>/dev/null
+  [ "$FW_LINK_OURS" = yes ] && rm -f "$ROOT/firmware" && FW_LINK_OURS=no
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+# AND IT MUST STOP: with INT/TERM on the EXIT trap the shell runs cleanup
+# and then CARRIES ON into the next arm (tests/sta_d2d_onair.sh found and
+# fixed this). cleanup is idempotent, so the EXIT pass after it is harmless.
+trap 'cleanup; exit 130' INT TERM
 
 echo "$DUT_SYSFS:1.0" > /sys/bus/usb/drivers/mt76x2u/unbind 2>/dev/null
 sleep 2
@@ -235,7 +245,7 @@ echo "     (R5's last caveat: does an enabled slot gate a station?)"
 e=$(arm E "$DUT_MAC" 3); echo "  $e"
 echo
 
-rm -f "$ROOT/firmware"
+[ "$FW_LINK_OURS" = yes ] && rm -f "$ROOT/firmware" && FW_LINK_OURS=no
 
 # Verdicts. A must differ from BOTH controls, or the instrument is not
 # measuring the DUT.

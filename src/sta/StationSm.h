@@ -85,7 +85,10 @@ class StationSm {
   static constexpr uint32_t kHandshakeTimeoutMs = 3000;
   /* Ten beacon intervals at the usual 100 TU. Long enough that a few lost
    * beacons mean nothing, short enough that a station does not sit Connected
-   * to an AP that has been switched off. */
+   * to an AP that has been switched off. This is the FLOOR: join() widens it
+   * to ten of the BSS's own advertised intervals, so an AP beaconing at
+   * 500-1000 TU is not declared lost after one or two late beacons -
+   * beacon_loss_ms() is the window actually in force. */
   static constexpr uint32_t kBeaconLossMs = 1024;
   /* THE TRANSMIT QUEUE IS BOUNDED. Three authentication retries plus one
    * in-flight EAPOL reply is the most this machine legitimately owes, and
@@ -113,6 +116,7 @@ class StationSm {
      * alone. It is an argument to join(). */
     have_pmk_ = pmk_from_psk(crypto, psk, ssid, pmk_);
     security_ = Security::Wpa2Psk;
+    drop_association_keys();
     /* CONFIGURED EVEN WHEN THE PMK DERIVATION FAILED, on purpose. Gating this
      * on have_pmk_ would make the NoPmk branch in join() unreachable - the
      * caller would get NotConfigured, which names the wrong thing - and a
@@ -135,17 +139,29 @@ class StationSm {
     ssid_ = ssid;
     std::memcpy(own_, own, 6);
     /* A station reconfigured from WPA2 to open must not keep the old PMK
-     * sitting in memory for the rest of the process's life.
+     * sitting in memory for the rest of the process's life - and that means
+     * the Supplicant's copy too, with the PTK and GTK it derived, not only
+     * this object's. drop_association_keys() does that half.
      *
-     * NO TEST PINS THIS, AND NONE CAN. have_pmk_ is cleared either way, so
-     * every observable behaviour is identical with the wipe deleted - a
-     * mutation removing it survives the whole suite, which is recorded here
+     * NO TEST PINS THE WIPE BELOW, AND NONE CAN. have_pmk_ is cleared either
+     * way, so every observable behaviour is identical with the wipe deleted -
+     * a mutation removing it survives the whole suite, which is recorded here
      * rather than hidden. It is the same defence-in-depth rule the destructor
      * follows, and its value is against a core dump, not against a caller. */
     secure_wipe(pmk_, sizeof pmk_);
     have_pmk_ = false;
+    drop_association_keys();
     configured_ = true;
     return true;
+  }
+
+  /* A reconfigured station is associated to nothing: the Supplicant forgets
+   * its PMK, PTK and GTK, and a live association drops back to Idle rather
+   * than claiming keyed() under a configuration that no longer matches it.
+   * A Failed state keeps its reason for the caller to read. */
+  void drop_association_keys() {
+    sup_.forget();
+    if (state_ != State::Failed) state_ = State::Idle;
   }
 
   /* Begin an association with this BSS.
@@ -186,6 +202,13 @@ class StationSm {
     std::memcpy(bssid_, bss.info.bssid, 6);
     if (security_ == Security::Wpa2Psk) std::memcpy(snonce_, snonce, 32);
     channel_ = bss.info.channel;
+    {
+      /* Ten of THIS BSS's beacon intervals (1 TU = 1.024 ms), never less
+       * than the kBeaconLossMs floor. */
+      const uint32_t ten =
+          (uint32_t)bss.info.beacon_interval_tu * 1024u * 10u / 1000u;
+      beacon_loss_ms_ = ten > kBeaconLossMs ? ten : kBeaconLossMs;
+    }
     aid_ = 0;
     fail_ = Failure::None;
     status_ = 0;
@@ -312,6 +335,12 @@ class StationSm {
       return;
     }
     if (!(llc[6] == 0x88 && llc[7] == 0x8e)) { rx_ignored++; return; }
+    /* A GROUP-ADDRESSED EAPOL-Key is part of no handshake with this station:
+     * every message of the four-way and the group key handshake is unicast
+     * to the supplicant. The decrypted path (on_decrypted_msdu's caller)
+     * already refuses one; this layer refuses it too, so the two receive
+     * paths agree and a broadcast forgery cannot reach the supplicant. */
+    if (!to_us) { rx_ignored++; return; }
     on_eapol(llc + kLlcSnapLen, len - hlen - kLlcSnapLen, now_ms);
   }
 
@@ -380,7 +409,7 @@ class StationSm {
          * that does not exist - the caller sees keyed() forever and has no
          * hook to notice. A beacon is the cheapest liveness signal there is;
          * the station is already receiving them. */
-        if ((uint32_t)(now_ms - last_beacon_ms_) >= kBeaconLossMs)
+        if ((uint32_t)(now_ms - last_beacon_ms_) >= beacon_loss_ms_)
           fail(Failure::BeaconLost, 0);
         return;
       default:
@@ -397,6 +426,8 @@ class StationSm {
   }
 
   size_t pending_tx() const { return tx_.size(); }
+  /* The Connected-state beacon-loss window in force - see kBeaconLossMs. */
+  uint32_t beacon_loss_ms() const { return beacon_loss_ms_; }
   static constexpr size_t tx_capacity() { return kMaxTxQueue; }
   State state() const { return state_; }
   Failure fail_reason() const { return fail_; }
@@ -575,6 +606,7 @@ class StationSm {
   int tries_ = 0;
   uint32_t last_tx_ms_ = 0;
   uint32_t last_beacon_ms_ = 0;
+  uint32_t beacon_loss_ms_ = kBeaconLossMs;
   SeqCounter seq_;
   Supplicant sup_;
   std::vector<std::vector<uint8_t>> tx_;

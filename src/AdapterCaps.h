@@ -250,16 +250,22 @@ struct AdapterCaps {
    *
    * TRUE on MT7612U, and read docs/mt7612u-station-identity.md - its
    * retraction section first - before quoting a number from it. Both halves
-   * of the bar are measured there, with controls, but note two limits the
+   * of the bar are measured there, with controls, but note the limits the
    * measurements do NOT clear and which a caller should know:
    *
    *   - every cell ran an UNASSOCIATED station receiving traffic it had not
    *     negotiated, so power save, TIM parsing, cross-BSS duplicate detection
    *     and hardware key lookup are untested;
-   *   - no cell drove SetStationIdentity itself. The seam writes no register
-   *     on that part, so the hardware state measured is the state a
-   *     successful arm leaves behind - but the literal end-to-end path
-   *     "arm the seam, then measure" has not been exercised.
+   *   - those cells did not drive SetStationIdentity. The associated
+   *     end-to-end runs that do - tests/sta_client.cpp arming through
+   *     IRadio, against hostapd (tests/mt7612u_sta_onair.sh) and a devourer
+   *     AP (tests/sta_d2d_onair.sh) - run the library's own station RX
+   *     path, which is PROMISCUOUS: Mt7612uRadio::StartRxLoop calls
+   *     mt7612u_set_monitor_rx() unconditionally, so they do not run the
+   *     managed filter the cells above describe (the managed filter as a
+   *     role-selected value is recorded as open work in
+   *     docs/station-mode-scope.md, "The target").
+   *   - one DUT, one peer, one channel, near field, no soak.
    *
    * TRUE ALSO on the Realtek 8822C and 8822E (Jaguar3), the 8822B (Jaguar2)
    * and the Jaguar1 8812 die, since
@@ -307,6 +313,9 @@ struct AdapterCaps {
    * The arm also reads BSSID back, so a die whose 0x0618 does not read back
    * would refuse - one more reason the flag stays per measured die.
    * Same limits as above for power save/TIM/key lookup; near field; no soak.
+   *
+   * The Jaguar1 flag keys on CHIP_8812, so the 1T1R RTL8811AU cut, which
+   * rides the 8812 path, INHERITS it UNMEASURED - no 8811AU cell was run.
    *
    * FALSE on the 8821C (ported, same code - no cell run), on the Jaguar1
    * 8814A and 8821A (ported - no cell run), and on every other backend:

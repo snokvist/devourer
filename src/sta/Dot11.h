@@ -142,8 +142,14 @@ inline void assign_seq(std::vector<uint8_t>& frame, uint16_t seq) {
  * from an attack. Pure, per peer; keep one per transmitter.
  *
  * It runs before decryption, as it does in real stacks, so a forged frame can
- * move the cache. The worst that buys is one legitimate retransmission being
- * processed instead of dropped - and the replay window still refuses it. */
+ * move the cache, and that cuts BOTH ways. A forgery that moves it off a
+ * sequence number costs one legitimate retransmission being processed
+ * instead of dropped - and the replay window still refuses it. A forgery
+ * that moves it ONTO one (Retry=0 at the peer's next sequence number) makes
+ * the peer's genuine Retry=1 copy of that frame match and be DROPPED as a
+ * duplicate, if the original was lost on air - one lost frame per forgery,
+ * counted in the dup-drop counter rather than as a replay. mac80211 has the
+ * same exposure; the cache is not an integrity mechanism. */
 class DupDetector {
 public:
   static constexpr int kNonQosTid = 16;

@@ -88,6 +88,7 @@
 #include <libusb.h>
 #include <openssl/rand.h>
 
+#include "DeviceSession.h"
 #include "RadiotapBuilder.h"
 #include "RxPacket.h"
 #include "SelectedChannel.h"
@@ -370,7 +371,10 @@ void note_keys() {
   if (sup.gtk_valid() && sup.gtk_len() == 16 &&
       sup.gtk_generation() != g_gtk_gen_seen) {
     g_gtk_gen_seen = sup.gtk_generation();
-    g_group_replay.reset();
+    /* Seeded from the AUTHENTICATED Key RSC, not reset: a window opened at
+     * whichever group frame arrives first would accept a replayed capture
+     * from earlier in this GTK's life as that first frame. */
+    g_group_replay.seed(sup.gtk_rsc());
     g_gtk_installs.fetch_add(1);
   }
 }
@@ -378,8 +382,12 @@ void note_keys() {
 /* Declared here and defined below with the rest of the transmit path: the
  * receive path needs it for the group rekey's answer, which is encrypted
  * exactly as a data frame is. */
+/* `from_host` false for an MSDU this harness originates itself - a rekey's
+ * EAPOL answer - so it stays out of g_tx_enc / g_tx_plain, whose sum is one
+ * side of the `from host` identity in the ledger; it is counted in
+ * g_eapol_enc_tx instead. */
 bool air_msdu(const uint8_t* msdu, size_t len, const uint8_t da[6],
-              const uint8_t* tk = nullptr);
+              const uint8_t* tk = nullptr, bool from_host = true);
 
 /* ---- UP: one received MPDU --------------------------------------------- */
 
@@ -624,7 +632,8 @@ void rx_frame(const uint8_t* mpdu, size_t len, int8_t rssi, uint32_t now) {
       /* Addressed to the BSSID: the AP is both the receiver and the
        * destination of an EAPOL-Key frame. A non-pairwise EAPOL-Key is
        * already refused above, so tk_in is always the one that was set. */
-      if (air_msdu(out.data(), out.size(), g_sm.bssid(), tk_in))
+      if (air_msdu(out.data(), out.size(), g_sm.bssid(), tk_in,
+                   /*from_host=*/false))
         g_eapol_enc_tx.fetch_add(1);
     }
     /* Only now: a rekey has installed a new key and the PN spaces restart
@@ -647,7 +656,7 @@ void rx_frame(const uint8_t* mpdu, size_t len, int8_t rssi, uint32_t now) {
  * a data frame is, and a second copy of this would be a second chance to get
  * the PN space wrong. */
 bool air_msdu(const uint8_t* msdu, size_t len, const uint8_t da[6],
-              const uint8_t* tk) {
+              const uint8_t* tk, bool from_host) {
   const bool protect = g_sm.security() != StationSm::Security::Open;
   /* Null means "whatever is installed now", which is what ordinary traffic
    * wants. A rekey's answer passes the key its request arrived under - see
@@ -658,7 +667,7 @@ bool air_msdu(const uint8_t* msdu, size_t len, const uint8_t da[6],
 
   if (!protect) {
     hdr.insert(hdr.end(), msdu, msdu + len);
-    g_tx_plain.fetch_add(1);
+    if (from_host) g_tx_plain.fetch_add(1);
     enqueue(std::move(hdr));
     return true;
   }
@@ -672,7 +681,7 @@ bool air_msdu(const uint8_t* msdu, size_t len, const uint8_t da[6],
    * increment is not. */
   g_tx_pn++;
   f.resize(n);
-  g_tx_enc.fetch_add(1);
+  if (from_host) g_tx_enc.fetch_add(1);
   enqueue(std::move(f));
   return true;
 }
@@ -954,7 +963,9 @@ void report() {
    *   from host == encrypted + plaintext + dropped down
    *   queued    == aired + queue dropped + send failed
    * Both hold exactly, because the TAP reader is stopped and the queue
-   * drained before this runs. */
+   * drained before this runs. `encrypted` and `plaintext` count HOST frames
+   * only: a rekey's encrypted EAPOL answer is ours, not the host's, and is
+   * the `answered` count on the rekeys line (it is still in `queued`). */
   std::fprintf(stderr,
                "  TAP: to host=%llu, from host=%llu, dropped up=%llu,"
                " dropped down=%llu\n",
@@ -972,15 +983,17 @@ void report() {
                (unsigned long long)g_sent.load(),
                (unsigned long long)g_send_fail.load(),
                (unsigned long long)g_q_drop.load());
-  if (g_ccmp_profile)
-    std::fprintf(stderr,
-                 "{\"ev\":\"ccmp.profile\",\"path\":\"software\","
-                 "\"tx_frames\":%llu,\"tx_ns\":%llu,"
-                 "\"rx_frames\":%llu,\"rx_ns\":%llu}\n",
-                 (unsigned long long)g_ccmp_tx_frames.load(),
-                 (unsigned long long)g_ccmp_tx_ns.load(),
-                 (unsigned long long)g_ccmp_rx_frames.load(),
-                 (unsigned long long)g_ccmp_rx_ns.load());
+  if (g_ccmp_profile) {
+    /* A machine event, so stdout - the event plane, where sta.tick goes. */
+    std::printf("{\"ev\":\"ccmp.profile\",\"path\":\"software\","
+                "\"tx_frames\":%llu,\"tx_ns\":%llu,"
+                "\"rx_frames\":%llu,\"rx_ns\":%llu}\n",
+                (unsigned long long)g_ccmp_tx_frames.load(),
+                (unsigned long long)g_ccmp_tx_ns.load(),
+                (unsigned long long)g_ccmp_rx_frames.load(),
+                (unsigned long long)g_ccmp_rx_ns.load());
+    std::fflush(stdout);
+  }
 }
 
 std::vector<uint8_t> parse_chan_list(const char* s) {
@@ -1026,19 +1039,28 @@ int main(int argc, char** argv) {
 
   auto logger = std::make_shared<Logger>();
   apply_logging_env(*logger);
+  /* THE TEARDOWN ORDER root CLAUDE.md requires - the radio first, then
+   * the interface, the handle, and only then libusb_exit - held by the
+   * demos' RAII session, so every return below unwinds it. Declared before
+   * the RX thread, so it outlives that thread's join. */
+  devourer::DeviceSession session{logger};
   libusb_context* ctx = nullptr;
   libusb_init(&ctx);
+  session.adopt_context(ctx);
   libusb_set_option(ctx, LIBUSB_OPTION_LOG_LEVEL, LIBUSB_LOG_LEVEL_WARNING);
   static const uint16_t pids[] = {0x7612};
   auto* h = open_selected_usb(ctx, logger, pids, 1);
   if (!h) return 1;
+  session.adopt_handle(h);
   std::shared_ptr<devourer::UsbDeviceLock> lk;
   if (devourer::claim_interface_then_reset(
           h, devourer::find_wifi_interface(h), logger, true, lk) != 0)
     return 1;
+  session.adopt_lock(lk);
   WiFiDriver wifi(logger);
-  auto dev = wifi.CreateRadio(h, ctx, lk, devourer_config_from_env());
-  g_dev = dev.get();
+  session.adopt_device(
+      wifi.CreateRadio(h, ctx, lk, devourer_config_from_env()));
+  g_dev = session.device();
   if (!g_dev) return 1;
 
   /* THE RATE EVERY FRAME AIRS AT, and until now it was 6M legacy, hardcoded,
@@ -1107,8 +1129,18 @@ int main(int argc, char** argv) {
     }
   }
 
-  if (const char* t = std::getenv("DEVOURER_STA_TAP"))
+  /* A TAP that was asked for and could not be opened is a refusal, not a
+   * TAP-less run: the harness around this checks only that the NAME exists,
+   * so a pre-existing foreign interface of that name would otherwise be
+   * addressed, used and then deleted by its cleanup. */
+  if (const char* t = std::getenv("DEVOURER_STA_TAP")) {
     g_tap_fd = tap_open(t, g_own);
+    if (g_tap_fd < 0) {
+      std::fprintf(stderr, "sta_client: DEVOURER_STA_TAP=%s could not be "
+                           "opened - refusing to run without it\n", t);
+      return 1;
+    }
+  }
 
   std::thread rx([&] { g_dev->StartRxLoop(on_rx); });
 
@@ -1154,6 +1186,11 @@ int main(int argc, char** argv) {
 
   uint8_t tuned = g_chan;
   uint8_t bssid_armed[6] = {0};
+  /* The BSS the machine is joining, printed once per change and INDEPENDENT
+   * of the identity arm - so a harness can see an association attempt with
+   * the arm off (DEVOURER_STA_ARM=0, the control) or on a backend whose
+   * station_mode_ok is false, where no "armed" line is ever printed. */
+  uint8_t bssid_joined[6] = {0};
   /* A REFUSED arm is retried, a few times, a second apart. It used to be
    * recorded as done before the call, so one transient failure - a Jaguar2
    * control read fails about once a minute under RX load - left the whole
@@ -1175,9 +1212,15 @@ int main(int argc, char** argv) {
       tuned = want;
     }
     bool arm_now = false;
+    bool join_now = false;
     {
       std::lock_guard<std::mutex> l(g_mu);
       g_sm.tick(now);
+      if (g_sm.state() != StationSm::State::Idle &&
+          std::memcmp(bssid_joined, g_sm.bssid(), 6) != 0) {
+        std::memcpy(bssid_joined, g_sm.bssid(), 6);
+        join_now = true;
+      }
       /* Arm the identity for the BSS we actually joined, once, when it
        * changes. On MT7612U this writes no register and only verifies that
        * the port identity has not moved; on a backend where it does write
@@ -1213,6 +1256,11 @@ int main(int argc, char** argv) {
      * Realtek arm makes ~15. The rule is IRadio's (StartRxLoop): no device
      * call while holding a lock the RX callback takes. Still BEFORE the send
      * below, so the auth that just left the state machine airs armed. */
+    if (join_now)
+      std::fprintf(stderr,
+                   "  station joining BSSID %02x:%02x:%02x:%02x:%02x:%02x\n",
+                   bssid_joined[0], bssid_joined[1], bssid_joined[2],
+                   bssid_joined[3], bssid_joined[4], bssid_joined[5]);
     if (arm_now) {
       const devourer::MacAddr own{{g_own[0], g_own[1], g_own[2], g_own[3],
                                    g_own[4], g_own[5]}};

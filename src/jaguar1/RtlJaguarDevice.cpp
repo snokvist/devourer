@@ -104,6 +104,12 @@ void RtlJaguarDevice::InitWrite(SelectedChannel channel) {
     std::lock_guard<std::mutex> ccx(busy_window_mutex());
     busy_window_reset();
   }
+  /* Likewise a station arm: the bring-up below rewrites port 0, so the
+   * snapshot StationArm holds describes nothing (StationArm::forget). */
+  {
+    std::lock_guard<std::recursive_mutex> lock(_port0_mu);
+    _station.forget();
+  }
   std::optional<uint64_t> configured_arm_generation;
   JaguarScopeExit rollback([&] {
     if (!configured_arm_generation)
@@ -1655,6 +1661,12 @@ void RtlJaguarDevice::Init(Action_ParsedRadioPacket packetProcessor,
     std::lock_guard<std::mutex> ccx(busy_window_mutex());
     busy_window_reset();
   }
+  /* Likewise a station arm: the bring-up below rewrites port 0, so the
+   * snapshot StationArm holds describes nothing (StationArm::forget). */
+  {
+    std::lock_guard<std::recursive_mutex> lock(_port0_mu);
+    _station.forget();
+  }
   std::optional<uint64_t> configured_arm_generation;
   JaguarScopeExit rollback([&] {
     if (!configured_arm_generation)
@@ -2268,7 +2280,8 @@ devourer::AdapterCaps RtlJaguarDevice::GetAdapterCaps() {
    * STA_ARM=0 control ACKed too (27 duplicates vs 38 armed, where a port
    * that does not answer shows ~3x delivered). The arm is harmless and
    * verified; Clear (MACID back to `own`) cannot silence the port. The
-   * 8814A/8821A dies are unmeasured and stay false. */
+   * 8814A/8821A dies are unmeasured and stay false. The 1T1R 8811AU cut is
+   * CHIP_8812 too, so it inherits TRUE UNMEASURED - no 8811AU cell ran. */
   c.station_mode_ok = _eepromManager->version_id.ICType == CHIP_8812;
   /* Per-packet TX power: 8814A only — its dword5 [30:28] descriptor LUT (the
    * 8822B TXPWR_OFSET position; vendor-defined, vendor-unused). measured

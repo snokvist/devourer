@@ -62,9 +62,16 @@ public:
    * (InitWrite) and then run TX and RX concurrently on the same claimed handle
    * — Init is the RX-only convenience wrapper (bring-up + StartRxLoop).
    *
-   * ON THE USB TRANSPORT (every backend but the PCIe one), THE CALLBACK RUNS
-   * ON THE THREAD THAT DRIVES libusb's EVENT HANDLING, and
-   * a synchronous USB transfer made from any other thread (every register
+   * WHICH THREAD THE CALLBACK RUNS ON IS BACKEND- AND MODE-SPECIFIC. In the
+   * Realtek USB backends' default RxMode::Async ring it runs on the thread
+   * that drives libusb's event handling; under RxMode::SpscFat it runs on the
+   * ring's consumer thread; on the MT7612U it runs on the thread that called
+   * StartRxLoop while a C-layer thread pumps libusb. Keep to the lock rule
+   * below on every backend regardless: where the callback is not on the
+   * event thread the deadlock does not form, but a callback parked on the
+   * caller's lock still stalls the receive path behind it, and the mode is a
+   * configuration detail a caller should not have to track. In the Async
+   * case a synchronous USB transfer made from any other thread (every register
    * read or write behind a control call - SetStationIdentity, the TX-power
    * setters, SetMonitorChannel, ...) waits for that thread to come back out
    * of it. So never make a device call while holding a lock the callback
@@ -269,6 +276,16 @@ public:
    * and does not promise the MAC stops responding - a die that matches on an
    * address alone will answer for whatever address is left programmed.
    *
+   * A LATER PORT-0 CLAIMANT IS BACKEND-SPECIFIC, and a caller must not assume
+   * either rule. While a station is armed, the Jaguar1/2/3 backends REFUSE
+   * SetAckResponder, ClearAckResponder and StartBeacon (they return false and
+   * the station stays armed). The MT7612U lets them proceed: moving the port
+   * identity drops the station arm with a WARN, SetAckResponder returns true,
+   * and the station is deaf until it is re-armed (measured there - reception
+   * goes to zero). So after any of those calls on a live station, re-check
+   * the station arm (re-arm, or ClearStationIdentity) rather than inferring
+   * it from the call's return value.
+   *
    * Gate this on AdapterCaps::station_mode_ok rather than on a nullptr check;
    * the default here returns false for every backend that has not ported it,
    * which is all of them until a backend says otherwise. */
@@ -285,8 +302,13 @@ public:
    * the same contract SetAckResponder's clear half spends a paragraph on, and
    * an earlier draft of this seam dropped it to `void` - which would have
    * made an unverifiable rollback unreportable on exactly the backends where
-   * rollback is real. */
-  virtual bool ClearStationIdentity() { return false; }
+   * rollback is real.
+   *
+   * The not-ported default returns TRUE: its SetStationIdentity arms nothing,
+   * so there is nothing to undo - the "trivially true" case above, and the
+   * same answer StationArm::clear gives when no snapshot exists. A false here
+   * would report an unverified rollback for a port nothing touched. */
+  virtual bool ClearStationIdentity() { return true; }
 
   /* 802.11 A-MPDU TX mode (src/AmpduMode.h): the first-class bundle of the
    * recipe the spike + pacing sweep proved on-air. When enabled, every data

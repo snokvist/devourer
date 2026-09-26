@@ -713,6 +713,94 @@ void test_kernel_vectors() {
         "kernel vectors: eight TIDs in each direction");
 }
 
+/* A NULL OUTPUT MUST NEVER REACH THE CIPHER. OpenSSL's CCM reads a NULL
+ * output pointer as "this is AAD" and returns success with NO TAG CHECK, and
+ * `std::vector<uint8_t> plain(ccmp_decrypted_len(...))` hands exactly that
+ * over (`data()` of an empty vector) for a ZERO-BODY frame. A forged one
+ * then decrypts "successfully" with an attacker-chosen PN, which moves the
+ * replay window to wherever the attacker likes. Both layers are pinned: the
+ * module never passes NULL, and the software primitive refuses it anyway. */
+struct NullSpy : OpenSslCcm {
+  bool saw_null = false;
+  bool aes_ccm(bool encrypt, const uint8_t key[16], const uint8_t nonce[13],
+               const uint8_t* aad, size_t aad_len, const uint8_t* in,
+               size_t in_len, uint8_t* out, uint8_t* tag) override {
+    if (!out) saw_null = true;
+    return OpenSslCcm::aes_ccm(encrypt, key, nonce, aad, aad_len, in, in_len,
+                               out, tag);
+  }
+};
+
+void test_null_output_and_zero_body() {
+  NullSpy crypto;
+  const CcmpVector& v = kCcmpVectors[0];
+  const uint64_t pn = 0x7fffffffffffULL;
+
+  /* Forged: header, CCMP header at a huge PN, and eight bytes of made-up
+   * MIC. No body. */
+  std::vector<uint8_t> forged(v.hdr, v.hdr + v.hdr_len);
+  forged[1] |= 0x40;
+  forged.resize(v.hdr_len + devourer::sta::kCcmpHdrLen);
+  devourer::sta::ccmp_header(pn, 0, forged.data() + v.hdr_len);
+  forged.insert(forged.end(), devourer::sta::kCcmpMicLen, 0x5a);
+
+  std::vector<uint8_t> plain(
+      devourer::sta::ccmp_decrypted_len(forged.size(), v.hdr_len));
+  size_t plen = 99;
+  uint64_t got = 0;
+  check(plain.empty(), "a zero-body frame sizes an EMPTY output vector");
+  check(!devourer::sta::ccmp_decrypt(crypto, v.tk, forged.data(),
+                                     forged.size(), v.hdr_len, v.a2,
+                                     plain.data(), plain.size(), &plen, &got),
+        "A FORGED ZERO-BODY FRAME IS REFUSED with a NULL output buffer");
+  check(got == 0, "...and reports no PN");
+  check(!crypto.saw_null, "...and the cipher was never handed NULL");
+
+  /* The primitive on its own, the layer an integrator's CryptoOps sits at. */
+  uint8_t nonce[13] = {0}, aad[32] = {0}, tag[8];
+  std::memset(tag, 0x5a, sizeof tag);
+  check(!devourer::test::ccmp_software(false, v.tk, nonce, aad, 22,
+                                       forged.data(), 0, nullptr, tag),
+        "ccmp_software refuses a forged tag with a NULL output");
+
+  /* THE POSITIVE ARM: a genuine zero-body frame still decrypts, with the
+   * same empty output vector, and its tag IS checked. */
+  std::vector<uint8_t> real(
+      devourer::sta::ccmp_encrypted_len(v.hdr_len, 0));
+  const size_t n = devourer::sta::ccmp_encrypt(
+      crypto, v.tk, v.hdr, v.hdr_len, v.a2, 7, 0, nullptr, 0, real.data(),
+      real.size());
+  check(n == real.size(), "a zero-body frame encrypts");
+  got = 0;
+  check(devourer::sta::ccmp_decrypt(crypto, v.tk, real.data(), real.size(),
+                                    v.hdr_len, v.a2, plain.data(),
+                                    plain.size(), &plen, &got),
+        "...and a GENUINE zero-body frame decrypts into an empty vector");
+  check(plen == 0 && got == 7, "...with no bytes and its own PN");
+  real[real.size() - 1] ^= 0x01;
+  check(!devourer::sta::ccmp_decrypt(crypto, v.tk, real.data(), real.size(),
+                                     v.hdr_len, v.a2, plain.data(),
+                                     plain.size(), nullptr, nullptr),
+        "...whose tag is still verified");
+  check(!crypto.saw_null, "the cipher was never handed NULL");
+}
+
+/* seed(): the group window starts at the Key RSC the AP quoted. */
+void test_replay_seed() {
+  devourer::sta::CcmpReplay s;
+
+  s.seed(1000);
+  check(!s.accept(1000), "seed: the RSC itself is refused");
+  check(!s.accept(999), "seed: one below it is refused");
+  check(!s.accept(1000 - 40), "seed: inside the window below it is refused");
+  check(!s.accept(3), "seed: far below it is refused");
+  check(s.accept(1001, 3), "seed: above it is accepted, on any TID");
+  check(s.accept(1001), "seed: ...and on the non-QoS window too");
+
+  s.seed(0);
+  check(s.accept(1), "seed(0) is reset(): PN 1 is accepted");
+}
+
 }  // namespace
 
 int main() {
@@ -726,6 +814,8 @@ int main() {
   test_aad_masking();
   test_header_pn();
   test_replay();
+  test_null_output_and_zero_body();
+  test_replay_seed();
 
   if (g_fail) {
     std::printf("ccmp_selftest: %d failure(s)\n", g_fail);

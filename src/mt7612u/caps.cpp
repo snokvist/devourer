@@ -83,12 +83,22 @@ int mt7612u_set_retry_limit(struct mt7612u_dev *d, int limit)
 		ERR("retry limit %d out of range 0..255", limit);
 		return -1;
 	}
-	v = mt_rr(d, MT_TX_RETRY_CFG);
+	/* Checked reads, both of them. mt_rr() returns ~0u on a failed transfer,
+	 * and a failed read here written back would set every OTHER field of
+	 * MT_TX_RETRY_CFG to all-ones - and the readback would then "verify" the
+	 * corrupted word, because it is exactly what was written. */
+	if (mt_rr_chk(d, MT_TX_RETRY_CFG, &v)) {
+		ERR("retry limit not set: MT_TX_RETRY_CFG read failed");
+		return -1;
+	}
 	v &= ~(MT_TX_RETRY_CFG_SHORT | MT_TX_RETRY_CFG_LONG);
 	v |= FIELD_PREP(MT_TX_RETRY_CFG_SHORT, (uint32_t)limit) |
 	     FIELD_PREP(MT_TX_RETRY_CFG_LONG, (uint32_t)limit);
 	mt_wr(d, MT_TX_RETRY_CFG, v);
-	rb = mt_rr(d, MT_TX_RETRY_CFG);
+	if (mt_rr_chk(d, MT_TX_RETRY_CFG, &rb)) {
+		ERR("retry limit not verified: MT_TX_RETRY_CFG readback failed");
+		return -1;
+	}
 	if (rb != v) {
 		ERR("retry limit not verified: MT_TX_RETRY_CFG %08x != %08x", rb, v);
 		return -1;
@@ -106,7 +116,35 @@ int mt7612u_set_retry_limit(struct mt7612u_dev *d, int limit)
  * closing the gate alone does not stop a die that matches on identity, the
  * clear path moves the identity back rather than only clearing the gate.
  */
+/* Whether MT_MAC_ADDR already holds `mac`. A failed read answers "no", which
+ * is the conservative direction for the one caller: it only decides whether
+ * the station-identity warning fires. The I/O-error accumulator is restored,
+ * so these extra reads cannot fail an arm the beacon path would otherwise
+ * have kept (the same reasoning as the mt_set() below). */
+static int port_identity_is(struct mt7612u_dev *d, const uint8_t mac[6])
+{
+	uint32_t dw0 = 0, dw1 = 0;
+	const unsigned io = mt_io_errors(d);
+	int same = 0;
+
+	if (mt_rr_chk(d, MT_MAC_ADDR_DW0, &dw0) == 0 &&
+	    mt_rr_chk(d, MT_MAC_ADDR_DW1, &dw1) == 0)
+		same = dw0 == ((uint32_t)mac[0] | ((uint32_t)mac[1] << 8) |
+		               ((uint32_t)mac[2] << 16) |
+		               ((uint32_t)mac[3] << 24)) &&
+		       (dw1 & 0xffff) == ((uint32_t)mac[4] |
+		                          ((uint32_t)mac[5] << 8));
+	mt_io_restore(d, io);
+	return same;
+}
+
 int mt7612u_set_ack_responder(struct mt7612u_dev *d, const uint8_t mac[6])
+{
+	return mt7612u_set_ack_responder_as(d, mac, "an ACK responder");
+}
+
+int mt7612u_set_ack_responder_as(struct mt7612u_dev *d, const uint8_t mac[6],
+                                  const char *who)
 {
 	uint32_t dw0, rb;
 
@@ -116,8 +154,13 @@ int mt7612u_set_ack_responder(struct mt7612u_dev *d, const uint8_t mac[6])
 	}
 	/* Arming a responder retargets MT_MAC_ADDR, which is the register a
 	 * station identity depends on. Say so before it happens rather than
-	 * leaving a live station silently unacknowledged. */
-	mt7612u_station_identity_lost(d, "an ACK responder");
+	 * leaving a live station silently unacknowledged - but only when it
+	 * really MOVES: re-arming the address already there (a responder or a
+	 * beacon on the station's own address) leaves the station hearing
+	 * exactly what it heard, and dropping its arm then would report a deaf
+	 * station that is not. */
+	if (!port_identity_is(d, mac))
+		mt7612u_station_identity_lost(d, who);
 
 	if (!d->ack_saved) {
 		memcpy(d->ack_saved_mac, d->macaddr, 6);

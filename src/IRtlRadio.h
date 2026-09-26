@@ -194,6 +194,11 @@ public:
    * dump_fifo gates the RX clock around the same read; this does not, so a
    * FIFO read with RX running is a snapshot of moving memory.
    * Throws on a failed USB transfer, like GetTxDmaStatus - catch it.
+   * PRECONDITIONS, refused with false: `offset` and `n` both multiples of 4,
+   * and the last window the read touches still inside the 12-bit window
+   * field of 0x0140. The size of the selected memory itself is NOT checked -
+   * reading past the end of the TX FIFO or LLT returns whatever the window
+   * maps there, so bound `offset + n` by the part's own sizes.
    * Returns false where unsupported. */
   virtual bool ReadPacketBuffer(int sel, uint32_t offset, uint8_t *out,
                                 size_t n) {

@@ -392,6 +392,36 @@ void test_a_flood_of_the_wanted_ssid_cannot_lock_the_table() {
           "...and it is the genuine AP, which has the strongest signal");
 }
 
+/* A HIDDEN BSS: its beacons carry an empty (or all-zero) SSID and only a
+ * directed probe response names it. The beacons that follow must not wipe
+ * the name, or select() never finds the network the probe was sent for. */
+void test_hidden_ssid_survives_its_beacons() {
+  BssTable t;
+  const uint8_t a[6] = {0x02, 0, 0, 0, 0, 0x0a};
+
+  std::vector<uint8_t> pr = beacon(a, "net", 6, true);
+  pr[0] = devourer::sta::kFcProbeResp;
+  t.observe(pr.data(), pr.size(), -40, 1000);
+  check(t.select("net") != nullptr, "the probe response names the BSS");
+
+  std::vector<uint8_t> empty = beacon(a, "", 6, true);
+  t.observe(empty.data(), empty.size(), -41, 1100);
+  check(t.select("net") != nullptr,
+        "AN EMPTY-SSID BEACON DOES NOT WIPE THE NAME");
+  std::vector<uint8_t> zeros = beacon(a, std::string(3, '\0'), 6, true);
+  t.observe(zeros.data(), zeros.size(), -42, 1200);
+  const BssEntry* e = t.select("net");
+  check(e != nullptr, "...nor does an all-zero SSID");
+  check(e && e->rssi == -42 && e->frames == 3,
+        "...while the rest of the entry still refreshes");
+
+  /* A BSS that genuinely renames itself is believed. */
+  std::vector<uint8_t> other = beacon(a, "renamed", 6, true);
+  t.observe(other.data(), other.size(), -40, 1300);
+  check(t.select("net") == nullptr && t.select("renamed") != nullptr,
+        "a non-empty new SSID replaces the old one");
+}
+
 }  // namespace
 
 int main() {
@@ -404,6 +434,7 @@ int main() {
   test_eviction_when_full();
   test_wanted_ssid_survives_a_flood();
   test_a_flood_of_the_wanted_ssid_cannot_lock_the_table();
+  test_hidden_ssid_survives_its_beacons();
 
   if (g_fail) {
     std::printf("bss_table_selftest: %d failure(s)\n", g_fail);

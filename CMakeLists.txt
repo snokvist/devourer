@@ -687,6 +687,16 @@ add_executable(txdemo
 target_link_libraries(txdemo PUBLIC devourer PRIVATE PkgConfig::libusb)
 target_include_directories(txdemo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
 
+# examples/common/env_config.cpp headless: the env-var -> DeviceConfig map
+# every demo shares. No device, no libusb calls.
+add_executable(EnvConfigSelftest
+    tests/env_config_selftest.cpp
+    examples/common/env_config.cpp
+)
+target_link_libraries(EnvConfigSelftest PUBLIC devourer)
+target_include_directories(EnvConfigSelftest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
+add_test(NAME env_config COMMAND EnvConfigSelftest)
+
 # dwell-1 A/B injection over the firmware channel switch (issue #272 data
 # plane): one admitted data-frame opportunity per wall-clock slot, with
 # bounded admission so a frame for context A can never air on B.
@@ -1053,6 +1063,12 @@ target_compile_features(StationSmSelftest PRIVATE cxx_std_20)
 # inline variables and nested namespaces, which MSVC rejects below C++17.
 target_compile_features(CcmpSelftest PRIVATE cxx_std_20)
     add_test(NAME ccmp_framing COMMAND CcmpSelftest)
+else()
+    # Said out loud: without OpenSSL the station's crypto ACCEPTANCE cells are
+    # not built, and a green ctest here has run none of them.
+    message(WARNING "OpenSSL not found: the station crypto selftests "
+                    "(supplicant, station_sm, ccmp_framing, "
+                    "ccmp_software_roundtrip) are NOT built on this host")
 endif()
 
 # tests/ap_wpa2.cpp itself, headless.
@@ -1831,4 +1847,9 @@ endforeach()
 # failure this aggregate exists to prevent.
 if(TARGET CcmpSwBench)
     add_dependencies(selftests CcmpSwBench)
+endif()
+# UdpBlast likewise: a tool named for what it is, whose ctest mode is one
+# flag (udp_blast_selftest).
+if(TARGET UdpBlast)
+    add_dependencies(selftests UdpBlast)
 endif()

@@ -283,6 +283,12 @@ private:
    * send_packet (pkt_offset=0) and the send_packets URB packer. */
   size_t build_tx_block(const uint8_t *packet, size_t length, uint8_t *out,
                         uint8_t pkt_offset);
+  /* The QSEL build_tx_block will stamp on this buffer, WITHOUT building it,
+   * so send_packets can end a URB run at a queue change before anything is
+   * built - build_tx_block has side effects (the CCX report tag, a TX-power
+   * bank, a retune) that must run once per frame. Mirrors build_tx_block's
+   * QSEL writes; change the two together. */
+  uint8_t peek_tx_qsel(const uint8_t *packet, size_t length) const;
 
   RtlAdapter _device;
   const devourer::DeviceConfig _cfg;

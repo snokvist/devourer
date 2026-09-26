@@ -49,7 +49,12 @@ OTHER="${OTHER:-02:aa:bb:cc:dd:12}"
 
 [ "$(id -u)" = 0 ] || { echo "must run as root"; exit 2; }
 mkdir -p "$OUT"
-[ -e "$ROOT/firmware" ] || ln -sfn "$FW_DIR" "$ROOT/firmware" 2>/dev/null
+# FW_LINK_OURS: only a link THIS run created is removed afterwards - a
+# pre-existing $ROOT/firmware is the operator's.
+FW_LINK_OURS=no
+if [ ! -e "$ROOT/firmware" ] && ln -sfn "$FW_DIR" "$ROOT/firmware" 2>/dev/null; then
+  FW_LINK_OURS=yes
+fi
 
 pass=0; fail=0
 ok()  { pass=$((pass+1)); printf '  PASS  %s\n' "$*"; }
@@ -59,9 +64,14 @@ RESP=""
 cleanup() {
   [ -n "$RESP" ] && kill "$RESP" 2>/dev/null
   [ -f "$OUT/.resppid" ] && kill "$(cat "$OUT/.resppid")" 2>/dev/null
-  rm -f "$OUT/.resppid" "$ROOT/firmware"
+  rm -f "$OUT/.resppid"
+  [ "$FW_LINK_OURS" = yes ] && rm -f "$ROOT/firmware" && FW_LINK_OURS=no
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+# AND IT MUST STOP: with INT/TERM on the EXIT trap the shell runs cleanup
+# and then CARRIES ON into the next arm (tests/sta_d2d_onair.sh found and
+# fixed this). cleanup is idempotent, so the EXIT pass after it is harmless.
+trap 'cleanup; exit 130' INT TERM
 
 echo "$DUT_SYSFS:1.0" > /sys/bus/usb/drivers/mt76x2u/unbind 2>/dev/null
 sleep 2
@@ -89,7 +99,9 @@ arm() {
   # The arm must be VERIFIED, not assumed: an unarmed responder and a
   # responder armed on the wrong address look identical from here, and that is
   # exactly what arm B is supposed to be.
-  if ! grep -qi "ack responder" "$OUT/resp_$tag.err"; then
+  # The SUCCESS line only: "ack responder" alone also matches the
+  # backends' refusal and write-failure lines, which would pass as armed.
+  if ! grep -q "ACK responder armed for" "$OUT/resp_$tag.err"; then
     printf '%s ABORTED the peer never reported arming a responder' "$tag"
     kill "$RESP" 2>/dev/null; RESP=""; return 1
   fi

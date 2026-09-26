@@ -102,6 +102,11 @@ reap() {
   KIDS=""
 }
 
+# EXACT name match: `grep "^$NS"` also matched any namespace whose name
+# merely STARTS with $NS.
+ns_exists() { ip netns list 2>/dev/null | awk '{print $1}' | grep -qx "$NS"; }
+NS_OURS=no
+
 cleanup() {
   reap
   [ -f "$OUT/hostapd.pid" ] && { kill "$(cat "$OUT/hostapd.pid")" 2>/dev/null
@@ -118,7 +123,7 @@ cleanup() {
   # re-enumeration brought it back. So the delete is CONDITIONAL on the move
   # having worked, and if it did not, this says so and leaves the namespace
   # alone rather than turning a recoverable mess into a lost adapter.
-  if ip netns list 2>/dev/null | grep -q "^$NS"; then
+  if [ "$NS_OURS" = yes ] && ns_exists; then
     if [ -n "${AP_PHY:-}" ]; then
       ip netns exec "$NS" iw phy "$AP_PHY" set netns 1 2>/dev/null
       sleep 1
@@ -130,26 +135,45 @@ cleanup() {
       say "           sudo ip netns del $NS"
     else
       ip netns del "$NS" 2>/dev/null
+      NS_OURS=no
     fi
   fi
   # The TAP is sta_client's and dies with it; this only catches a leak.
   ip link del "$TAP" 2>/dev/null
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+# AND IT MUST STOP: with INT/TERM on the EXIT trap, bash runs cleanup and then
+# CARRIES ON into the next cell (tests/sta_d2d_onair.sh found and fixed this).
+trap 'cleanup; exit 130' INT TERM
 
 # --- preflight -------------------------------------------------------------
 
 # A phy left in our namespace by a run that died. Recover it before doing
 # anything else, or the AP interface below is simply "not found".
-if ip netns list 2>/dev/null | grep -q "^$NS"; then
+#
+# ONLY A NAMESPACE THAT LOOKS LIKE OURS. A leftover of this harness holds a
+# wireless phy and its netdev, nothing else; a namespace with any other
+# interface in it (a veth, a bridge) is the operator's, and moving its phys
+# out and deleting it would destroy their setup. Refused instead.
+if ns_exists; then
+  foreign=$(ip netns exec "$NS" sh -c 'for d in /sys/class/net/*; do
+              n=${d##*/}; [ "$n" = lo ] && continue
+              [ -e "$d/phy80211" ] || echo "$n"; done' 2>/dev/null)
+  if [ -n "$foreign" ]; then
+    echo "netns $NS exists and holds non-wireless interfaces ($foreign) -"
+    echo "not a leftover of this harness. Refusing to use or delete it (set NS=)."
+    exit 2
+  fi
+  NS_OURS=yes
   say "a previous run left the namespace $NS - recovering"
   for p in $(ip netns exec "$NS" ls /sys/class/ieee80211/ 2>/dev/null); do
     ip netns exec "$NS" iw phy "$p" set netns 1 2>/dev/null
   done
   sleep 2
   # Only once it is empty - see cleanup() for what deleting it otherwise does.
-  ip netns exec "$NS" ls /sys/class/ieee80211/ 2>/dev/null | grep -q . ||
-    ip netns del "$NS" 2>/dev/null
+  if ! ip netns exec "$NS" ls /sys/class/ieee80211/ 2>/dev/null | grep -q .; then
+    ip netns del "$NS" 2>/dev/null && NS_OURS=no
+  fi
 fi
 
 rfkill unblock wlan 2>/dev/null || true
@@ -262,8 +286,11 @@ ap_conf() {   # $1 = "open" | "wpa2"
 }
 
 ns_up() {
-  ip netns list 2>/dev/null | grep -q "^$NS" && return 0
+  # Ours by now if it exists (preflight refused anything else, and cleanup
+  # removes our own between cells), so re-entry is a no-op.
+  if ns_exists; then [ "$NS_OURS" = yes ] && return 0; return 1; fi
   ip netns add "$NS" || return 1
+  NS_OURS=yes
   iw phy "$AP_PHY" set netns name "$NS" || return 1
   sleep 2
   ip netns exec "$NS" ip link set "$AP_IF" up || return 1
@@ -296,7 +323,11 @@ ap_down() {
 sta_up() {   # $1 = seconds, $2.. = extra env
   local secs="$1"; shift
   rm -f "$OUT/sta.log"
-  env $(staenv "$@") timeout $((secs + 20)) "$OUT/sta_client" "$secs" \
+  # An ARRAY, not `env $(staenv ...)`: the unquoted form word-split every
+  # NAME=value, so an SSID or FW_DIR with a space became stray arguments.
+  local -a e
+  mapfile -t e < <(staenv "$@")
+  env "${e[@]}" timeout $((secs + 20)) "$OUT/sta_client" "$secs" \
       >"$OUT/sta.log" 2>&1 &
   STA_PID=$!
   KIDS="$KIDS $STA_PID"
@@ -659,13 +690,18 @@ cell_bench() {
   # 3365 encrypted round trips, because the profiling CryptoOps existed and
   # nothing instantiated it - the reply count was the only thing graded, and
   # replies say nothing about whether anything was timed.
-  local pf_tx pf_rx
+  # FRAMES AND NANOSECONDS BOTH: frames>0 with ns=0 is a profile that
+  # counted but never timed - the hole tests/sta_d2d_onair.sh's bench closed.
+  local pf_tx pf_rx pf_txns pf_rxns
   pf_tx=$(printf '%s' "$profile" | sed -n 's/.*"tx_frames":\([0-9][0-9]*\).*/\1/p')
   pf_rx=$(printf '%s' "$profile" | sed -n 's/.*"rx_frames":\([0-9][0-9]*\).*/\1/p')
-  if [ "${pf_tx:-0}" -gt 0 ] 2>/dev/null && [ "${pf_rx:-0}" -gt 0 ] 2>/dev/null; then
-    ok "bench: the cipher was actually timed (tx_frames=$pf_tx rx_frames=$pf_rx)"
+  pf_txns=$(printf '%s' "$profile" | sed -n 's/.*"tx_ns":\([0-9][0-9]*\).*/\1/p')
+  pf_rxns=$(printf '%s' "$profile" | sed -n 's/.*"rx_ns":\([0-9][0-9]*\).*/\1/p')
+  if [ "${pf_tx:-0}" -gt 0 ] 2>/dev/null && [ "${pf_rx:-0}" -gt 0 ] 2>/dev/null &&
+     [ "${pf_txns:-0}" -gt 0 ] 2>/dev/null && [ "${pf_rxns:-0}" -gt 0 ] 2>/dev/null; then
+    ok "bench: the cipher was actually timed (tx_frames=$pf_tx rx_frames=$pf_rx tx_ns=$pf_txns rx_ns=$pf_rxns)"
   else
-    bad "bench: ccmp.profile counted tx_frames=$pf_tx rx_frames=$pf_rx - nothing was timed, so the ns/frame figures below are meaningless"
+    bad "bench: ccmp.profile counted tx_frames=$pf_tx rx_frames=$pf_rx tx_ns=$pf_txns rx_ns=$pf_rxns - nothing was timed, so the ns/frame figures below are meaningless"
   fi
   python3 - "$profile" "$BENCH_PAYLOAD" "$BENCH_SECS" "$tx" "$rx" "$sta_core" "$sys_cores" <<'PYEOF'
 import json, sys

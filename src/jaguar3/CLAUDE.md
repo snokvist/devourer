@@ -63,8 +63,9 @@ narrowband dividers, RF18 encoding), strategy interfaces `Jaguar3Calibration`
   LOW 0x08). QSEL and endpoint must agree: QSEL alone was measured to change
   nothing; the endpoint alone was not run (a reviewer predicted it would set
   `TXDMA_STATUS`'s `EP_QSEL_DIFF` bit). The aggregated-URB path
-  (`send_packets`) follows the same rule, falling back to per-frame sends
-  when packed frames disagree on queue. Management and beacons stay on HIGH.
+  (`send_packets`) follows the same rule, ending a URB run at a queue change
+  decided before the build (`peek_tx_qsel`), so no frame is built twice.
+  Management and beacons stay on HIGH.
 
 ## Bring-up cost and the pipelined register writes
 

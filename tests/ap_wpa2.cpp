@@ -46,6 +46,7 @@
 #include <unistd.h>
 #include <libusb.h>
 #include <openssl/evp.h>
+#include <openssl/crypto.h>
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
 #include "RadiotapBuilder.h"
@@ -257,6 +258,20 @@ static bool env_on(const char* name) {
   return v && *v && std::strcmp(v, "0") != 0;
 }
 
+/* DumpChipState on the FAULT paths - the breaker trip, a TXDMA transition, a
+ * beacon that will not load - which run exactly when the USB path is least
+ * healthy. It is ~20 register reads, and any of them can throw; uncaught,
+ * that terminates the AP past joinable threads, with no ledger, no
+ * StopBeacon and no destructor power-down. Same rule as the TX-DMA watchdog
+ * and the end-of-run dump. */
+static void dump_chip_state_safe(IRtlRadio* rtl) {
+  try {
+    rtl->DumpChipState();
+  } catch (const std::exception& e) {
+    fprintf(stderr, "  chip-state read failed (%s)\n", e.what());
+  }
+}
+
 static void probe_pktbuf_body(const char* when);
 static void probe_pktbuf(const char* when) {
   /* A diagnostic must not take the AP down: its reads can throw under load
@@ -449,7 +464,9 @@ static bool check_mic_kck(const uint8_t* e, int len, const uint8_t kck[16]) {
   memset(t.data()+81, 0, 16);
   unsigned int l; uint8_t d[20];
   HMAC(EVP_sha1(), kck, 16, t.data(), t.size(), d, &l);
-  return memcmp(got, d, 16) == 0;
+  /* Constant-time, as src/sta/Eapol.h's eapol_mic_ok is: an early-exit
+   * memcmp over a MAC on attacker-supplied input is a forgery oracle. */
+  return CRYPTO_memcmp(got, d, 16) == 0;
 }
 static bool check_mic(const uint8_t* e, int len,
                       const devourer::sta::Station& st) {
@@ -961,7 +978,10 @@ static void handle_plain(const uint8_t* sta, const uint8_t* d, int len) {
         uint8_t a[28]={0,1,8,0,6,4,0,2, rmac[0],rmac[1],rmac[2],rmac[3],rmac[4],rmac[5],
           tip[0],tip[1],tip[2],tip[3], pl[8],pl[9],pl[10],pl[11],pl[12],pl[13],
           pl[14],pl[15],pl[16],pl[17]};
-        enqueue(ccmp_tx(sta,0x0806,a,28));
+        /* ccmp_tx returns an EMPTY vector on an unkeyed station or a
+         * cipher refusal; enqueue() would air that as a radiotap-only
+         * frame. Same at the two sites below. */
+        if (auto f = ccmp_tx(sta,0x0806,a,28); !f.empty()) enqueue(std::move(f));
       }
     }
   } else if (eth==0x0800 && pllen>=28) {                 // IPv4/ICMP
@@ -972,7 +992,8 @@ static void handle_plain(const uint8_t* sta, const uint8_t* d, int len) {
       r[10]=r[11]=0; uint16_t ic=csum16(r.data(),ihl); r[10]=ic>>8; r[11]=ic&0xff;
       r[ihl]=0; r[ihl+2]=r[ihl+3]=0;
       uint16_t cc=csum16(r.data()+ihl,pllen-ihl); r[ihl+2]=cc>>8; r[ihl+3]=cc&0xff;
-      enqueue(ccmp_tx(sta,0x0800,r.data(),pllen));
+      if (auto f = ccmp_tx(sta,0x0800,r.data(),pllen); !f.empty())
+        enqueue(std::move(f));
     } else if (ip[9]==17 && pllen>=ihl+8+240) {          // UDP -> DHCP
       const uint8_t* udp=ip+ihl;
       if (((udp[2]<<8)|udp[3])==67) {
@@ -987,7 +1008,9 @@ static void handle_plain(const uint8_t* sta, const uint8_t* d, int len) {
           uint8_t lease[4];
           sta_ip(*me, lease);
           auto dp = dhcp_payload(sta, dh+4, reply, lease);
-          enqueue(ccmp_tx(sta,0x0800,dp.data(),(int)dp.size()));
+          if (auto f = ccmp_tx(sta,0x0800,dp.data(),(int)dp.size());
+              !f.empty())
+            enqueue(std::move(f));
           fprintf(stderr, "  DHCP: %s %u.%u.%u.%u to aid=%u\n",
                   reply == 2 ? "OFFER" : "ACK",
                   lease[0], lease[1], lease[2], lease[3], me->aid);
@@ -1583,12 +1606,16 @@ int main(int argc, char** argv) {
      * A cap costs nothing here - the loop runs every millisecond, so 16
      * frames an iteration is 16000 a second, far above anything this AP
      * sustains - and it leaves the chip room to breathe between bursts. */
-    const size_t burst = batch.size() < kTxBurst ? batch.size() : kTxBurst;
+    size_t burst = batch.size() < kTxBurst ? batch.size() : kTxBurst;
     size_t i = 0;
+    bool refused = false;
     if (g_tx_circuit_open) {
-      /* Tripped: drop the batch, counted, and do not touch the device. */
+      /* Tripped: drop the batch, counted, and do not touch the device -
+       * and send NOTHING below: `burst` was sized from the batch just
+       * cleared, and indexing it would read destroyed frames. */
       g_tx_broken.fetch_add(batch.size());
       batch.clear();
+      burst = 0;
     }
     for (; i < burst; i++) {
       if (g_dev->send_packet(batch[i].data(), batch[i].size())) {
@@ -1608,7 +1635,7 @@ int main(int argc, char** argv) {
            * backend. */
           if (auto* rtl = dynamic_cast<IRtlRadio*>(g_dev)) {
             fprintf(stderr, "  --- chip state WHEN TX STOPPED ---\n");
-            rtl->DumpChipState();
+            dump_chip_state_safe(rtl);
           }
           fprintf(stderr,
                   "\n  *** TX PATH NOT DRAINING: %llu consecutive refusals.\n"
@@ -1619,6 +1646,7 @@ int main(int argc, char** argv) {
                   "  *** The ledger below is still valid; the link is not.\n\n",
                   (unsigned long long)consecutive_fail);
         }
+        refused = true;
         break;
       }
     }
@@ -1627,9 +1655,15 @@ int main(int argc, char** argv) {
        * sending. Not through enqueue(): these were counted in g_q_in when
        * they were first offered, and counting them twice would break the
        * ledger identity the on-air cells check. The cap still applies -
-       * anything beyond it is a queue drop like any other. */
+       * anything beyond it is a queue drop like any other.
+       *
+       * THE REFUSED FRAME ITSELF IS NOT REQUEUED: it is already booked in
+       * g_send_fail, and requeueing it let it be booked AGAIN in g_sent
+       * when it later aired, so `queued == sent + qdrop + sfail` stopped
+       * closing exactly when the backoff path ran. */
+      const size_t from = refused ? i + 1 : i;
       std::lock_guard<std::mutex> l(g_q_mu);
-      for (size_t k = batch.size(); k-- > i;) {
+      for (size_t k = batch.size(); k-- > from;) {
         if (g_q.size() < 128) g_q.insert(g_q.begin(), std::move(batch[k]));
         else g_q_drop.fetch_add(1);
       }
@@ -1667,7 +1701,7 @@ int main(int argc, char** argv) {
           if (st != txdma_seen && g_dev) {
             if (auto* r2 = dynamic_cast<IRtlRadio*>(g_dev)) {
               fprintf(stderr, "  pages at the transition:\n");
-              r2->DumpChipState();
+              dump_chip_state_safe(r2);
             }
           }
           if (st != txdma_seen && env_on("DEVOURER_AP_PKTBUF"))
@@ -1716,7 +1750,7 @@ int main(int argc, char** argv) {
             dumped = true;
             if (auto* rtl = dynamic_cast<IRtlRadio*>(g_dev)) {
               fprintf(stderr, "  --- chip state WHEN THE BEACON WOULD NOT LOAD ---\n");
-              rtl->DumpChipState();
+              dump_chip_state_safe(rtl);
             }
           }
         }
@@ -1743,6 +1777,12 @@ int main(int argc, char** argv) {
   {
     std::vector<std::vector<uint8_t>> batch;
     { std::lock_guard<std::mutex> l(g_q_mu); batch.swap(g_q); }
+    /* The breaker holds at shutdown too: a tripped TX path gets the batch
+     * booked as broken, not hammered once more at ~20 ms a refusal. */
+    if (g_tx_circuit_open) {
+      g_tx_broken.fetch_add(batch.size());
+      batch.clear();
+    }
     for (auto& f : batch) {
       if (g_dev->send_packet(f.data(), f.size())) g_sent.fetch_add(1);
       else g_send_fail.fetch_add(1);
@@ -1775,7 +1815,8 @@ int main(int argc, char** argv) {
     fprintf(stderr, "\n");
   }
   if (g_ccmp_profile) {
-    fprintf(stderr,
+    /* A machine event, so stdout - the event plane (root CLAUDE.md). */
+    fprintf(stdout,
             "{\"ev\":\"ccmp.profile\",\"path\":\"software\","
             "\"tx_frames\":%llu,\"tx_bytes\":%llu,\"tx_ns\":%llu,"
             "\"rx_frames\":%llu,\"rx_bytes\":%llu,\"rx_ns\":%llu}\n",
@@ -1785,6 +1826,7 @@ int main(int argc, char** argv) {
             (unsigned long long)g_ccmp_rx_frames.load(),
             (unsigned long long)g_ccmp_rx_bytes.load(),
             (unsigned long long)g_ccmp_rx_ns.load());
+    fflush(stdout);
   }
   /* The data-plane ledger. The on-air runs could not tell an AP that never
    * RECEIVED an encrypted frame from one that received and failed to decrypt

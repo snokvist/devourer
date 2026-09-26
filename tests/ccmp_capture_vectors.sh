@@ -36,18 +36,37 @@ cleanup() {
     # which on a machine that is also a radio bench is somebody else's run.
     [ -n "${CAP_PID:-}" ] && kill "$CAP_PID" 2>/dev/null || true
     pkill -f "hostapd .*$WORK" 2>/dev/null || true
-    ip netns exec "$NS" pkill -f wpa_supplicant 2>/dev/null || true
-    ip netns del "$NS" 2>/dev/null || true
-    rmmod mac80211_hwsim 2>/dev/null || true
+    # OUR wpa_supplicant only, matched by this run's unique $WORK config
+    # path. `ip netns exec` does not change the PID namespace, so the old
+    # `pkill -f wpa_supplicant` also killed the host's NetworkManager one.
+    pkill -f "wpa_supplicant .*$WORK/wpa.conf" 2>/dev/null || true
+    [ "${NS_OURS:-no}" = yes ] && ip netns del "$NS" 2>/dev/null || true
+    [ "${HWSIM_OURS:-no}" = yes ] && rmmod mac80211_hwsim 2>/dev/null || true
 }
 trap cleanup EXIT
 
 echo "--- two virtual radios"
-rmmod mac80211_hwsim 2>/dev/null || true
+# REFUSE, do not reuse: an already-loaded hwsim is somebody else's rig (or a
+# leftover), and if it is in use the rmmod fails, modprobe is a no-op, and
+# "the two highest phys" can then include a REAL adapter - which would be
+# moved into the namespace and destroyed with it.
+if [ -d /sys/module/mac80211_hwsim ]; then
+    echo "mac80211_hwsim is already loaded - refusing (unload it if it is yours)"
+    exit 1
+fi
+if ip netns list 2>/dev/null | awk '{print $1}' | grep -qx "$NS"; then
+    echo "netns $NS already exists - refusing to use or delete it"
+    exit 1
+fi
+PHYS_BEFORE=$(ls /sys/class/ieee80211 2>/dev/null || true)
 modprobe mac80211_hwsim radios=2
+HWSIM_OURS=yes
 sleep 2
-# The two phys hwsim just created are the two highest-numbered ones.
-PHYS=$(ls /sys/class/ieee80211 | sed 's/phy//' | sort -n | tail -2)
+# The phys hwsim just CREATED - the set difference against the listing
+# before the modprobe, not "the two highest-numbered", which is a guess that
+# can pick a real adapter - and there must be exactly two.
+PHYS=$(ls /sys/class/ieee80211 | grep -vxF "$PHYS_BEFORE" | sed 's/phy//' | sort -n)
+[ "$(echo "$PHYS" | grep -c .)" = 2 ] || { echo "expected 2 new hwsim phys, got: $PHYS"; exit 1; }
 AP_PHY=phy$(echo "$PHYS" | head -1)
 STA_PHY=phy$(echo "$PHYS" | tail -1)
 if_for_phy() {
@@ -68,6 +87,7 @@ nmcli dev set "$STA_IF" managed no 2>/dev/null || true
 
 echo "--- the station gets its own namespace"
 ip netns add "$NS"
+NS_OURS=yes
 # A cfg80211 interface cannot be moved with `ip link set netns`; the whole phy
 # moves or nothing does.
 iw phy "$STA_PHY" set netns name "$NS"

@@ -254,7 +254,7 @@ inline size_t ccmp_encrypt(CryptoOps& crypto, const uint8_t tk[16],
   uint8_t nonce[kCcmpNonceLen];
   size_t aad_len;
 
-  if (out_cap < ccmp_encrypted_len(hdr_len, plain_len)) return 0;
+  if (!out || out_cap < ccmp_encrypted_len(hdr_len, plain_len)) return 0;
   aad_len = ccmp_aad(hdr, hdr_len, aad);
   if (aad_len == 0) return 0;
   if (!ccmp_nonce(hdr, hdr_len, a2, pn, nonce)) return 0;
@@ -287,6 +287,15 @@ inline size_t ccmp_encrypt(CryptoOps& crypto, const uint8_t tk[16],
  * adversarial review found it; nothing in the tree had triggered it, because
  * every vector on hand happened to be short. ccmp_decrypted_len() computes
  * the size to allocate.
+ *
+ * A NULL `out` IS REFUSED for a non-empty body, and never reaches the cipher
+ * for an empty one. OpenSSL's CCM reads a NULL output pointer as "this is
+ * AAD", so a decrypt handed one returns success with NO TAG CHECK - and the
+ * natural idiom `std::vector<uint8_t> plain(ccmp_decrypted_len(...))` hands
+ * over exactly that (`data()` of an empty vector) for a forged zero-body
+ * frame, whose attacker-chosen PN would then move the replay window. A
+ * zero-length body is decrypted into a local scratch byte instead, so its
+ * tag is still checked.
  */
 inline bool ccmp_decrypt(CryptoOps& crypto, const uint8_t tk[16],
                          const uint8_t* mpdu, size_t mpdu_len, size_t hdr_len,
@@ -302,12 +311,15 @@ inline bool ccmp_decrypt(CryptoOps& crypto, const uint8_t tk[16],
    * vector. The old inline harness code did this memcpy; the first version of
    * this function dropped it. */
   uint8_t tag[kCcmpMicLen];
+  uint8_t scratch[1];
   size_t aad_len, body;
   uint64_t pn;
 
   if (mpdu_len < overhead) return false;
   body = mpdu_len - overhead;
   if (out_cap < body) return false;
+  if (body > 0 && !out) return false;
+  if (body == 0) out = scratch;
   pn = ccmp_header_pn(mpdu + hdr_len);
   aad_len = ccmp_aad(mpdu, hdr_len, aad);
   if (aad_len == 0) return false;
@@ -413,6 +425,22 @@ public:
     if (mask_[tid] & bit) return false;              /* already seen */
     mask_[tid] |= bit;
     return true;
+  }
+
+  /* Start every window at a KNOWN head: after seed(rsc) only a PN strictly
+   * greater than `rsc` is accepted, on every TID. This is how a group key
+   * is installed - 802.11-2016 12.7.6.4 hands the receiver the GTK's current
+   * receive sequence counter (the Key RSC field) precisely so that the first
+   * group frame it accepts is not simply whichever arrives first, which
+   * would let a capture from earlier in the key's life in. The whole mask is
+   * marked seen, so nothing at or below the seed gets in through the window
+   * either. seed(0) is reset(). */
+  void seed(uint64_t pn) {
+    for (int i = 0; i < kSlots; i++) {
+      last_[i] = pn;
+      mask_[i] = pn ? ~0ull : 0;
+      seen_[i] = pn != 0;
+    }
   }
 
   /* Every rekey resets every counter: a new key means a new PN space. */

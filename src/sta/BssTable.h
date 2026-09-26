@@ -102,13 +102,25 @@ class BssTable {
     if (!parse_beacon(frame, len, &info)) return nullptr;
 
     int i = index_of(info.bssid);
-    if (i < 0) i = allocate(now_ms, info.ssid);
-    /* allocate() evicts rather than refusing, so it only fails when every
-     * slot is protected - sixteen BSSIDs airing the wanted SSID at once. */
-    if (i < 0) return nullptr;
+    /* allocate() evicts rather than refusing - even when every slot is
+     * protected - so it always yields a slot. */
+    if (i < 0) i = allocate(now_ms);
 
     const uint32_t seen = used_[i] ? slots_[i].frames : 0;
     const bool fresh = !used_[i];
+
+    /* A HIDDEN BSS beacons an empty (or all-zero) SSID, and only a directed
+     * probe response names it. Replacing the whole entry on every beacon
+     * would wipe that name within a beacon interval or two - long before
+     * select() is next asked - so the hidden-BSS join a directed probe exists
+     * for would essentially never happen. Keep the name this BSSID has
+     * already been heard with. */
+    if (!fresh && !slots_[i].info.ssid.empty()) {
+      bool hidden = true;
+      for (char c : info.ssid)
+        if (c != 0) { hidden = false; break; }
+      if (hidden) info.ssid = slots_[i].info.ssid;
+    }
 
     if (fresh) {
       used_[i] = true;
@@ -217,7 +229,7 @@ class BssTable {
     return !wanted_.empty() && slots_[i].info.ssid == wanted_;
   }
 
-  int allocate(uint32_t now_ms, const std::string& incoming_ssid) {
+  int allocate(uint32_t now_ms) {
     for (int i = 0; i < kMaxBss; i++)
       if (!used_[i]) return i;
 
@@ -246,7 +258,6 @@ class BssTable {
      * this table cannot tell which one is real and staying fresh beats
      * staying stuck. */
     if (victim < 0) {
-      (void)incoming_ssid;
       for (int i = 0; i < kMaxBss; i++) {
         if (victim < 0) { victim = i; continue; }
         const uint32_t age_v = (uint32_t)(now_ms - slots_[victim].last_seen_ms);
@@ -257,7 +268,8 @@ class BssTable {
           victim = i;
       }
     }
-    if (victim < 0) return -1;
+    /* victim >= 0 here: the table is full and the fallback considers every
+     * slot. */
     used_[victim] = false;
     count_--;
     return victim;

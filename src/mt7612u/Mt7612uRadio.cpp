@@ -1030,14 +1030,9 @@ void Mt7612uRadio::ClearAckResponder() {
  * side documents: on this part a station identity is a check, not a
  * configuration. See docs/mt7612u-station-identity.md and station.cpp.
  *
- * Note what this does NOT do about IRadio's ordering clause. The contract
- * says call after the RX loop is running, because a backend may reprogram the
- * receive filter there; MT7612U does (StartRxLoop rewrites it after
- * mt7612u_start()). This implementation writes no filter and no identity, so
- * it is order-independent in fact - but it cannot detect being called early
- * either, and it must not pretend the ordering does not matter for the
- * interface. A future revision that starts writing registers here has to
- * revisit that. */
+ * The ordering note IRadio requires is at the declaration
+ * (Mt7612uRadio.h). A future revision that starts writing registers here has
+ * to revisit it. */
 bool Mt7612uRadio::SetStationIdentity(const devourer::MacAddr &own,
                                       const devourer::MacAddr &bssid) {
   std::lock_guard<std::recursive_mutex> lock(_mu);
@@ -1280,60 +1275,10 @@ devourer::AdapterCaps Mt7612uRadio::GetAdapterCaps() {
   c.tsf_write_ok = hw.tsf_write;
   /* Measured on air: 0 frames at the stimulus radio unarmed, 3500+ armed. */
   c.ack_responder_ok = true;
-  /*
-   * station_mode_ok: TRUE, and both halves of the bar this flag's declaration
-   * sets are measured on air against independent silicon. The record, with
-   * the arms and their controls, is docs/mt7612u-station-identity.md - read
-   * its retraction section before quoting anything from it, because two
-   * earlier attempts at the acknowledgement half produced confident-looking
-   * non-results.
-   *
-   * DOWNLINK - unicast addressed to this station is acknowledged by it, with
-   * NOTHING armed. A Realtek peer injects at the DUT and reads its own
-   * per-frame CCX reports: 1279 frames, 100% acknowledged, 0.45 mean retries,
-   * against three controls all pinned at the 12-retry descriptor limit with
-   * 0% acknowledged - a destination nobody holds, the DUT not running, and
-   * the DUT running with MT_AUTO_RSP_EN cleared. Every arm runs one code path
-   * under one receive filter, so each control differs from the claim by one
-   * variable.
-   *
-   * ONE QUALIFIER THAT BELONGS WITH THOSE NUMBERS: the peer is a raw
-   * injector, not an AP. No cell here involved an AP.
-   *
-   * An earlier revision quoted 887/0.10 from a run whose claim arm ran the
-   * MONITOR filter while its MT_AUTO_RSP_EN control ran the managed one -
-   * not single-variable, and superseded by the numbers above.
-   *
-   * UPLINK - what this station transmits is acknowledged by its peer. The
-   * DUT's own MT_TX_STAT_FIFO, receiver ON, transmitting from its own address
-   * with normal ack policy: 200/200 acknowledged at 0.0 mean retries against
-   * a control - the same peer answering for a DIFFERENT address - at 0/200
-   * and 16.0 retries.
-   *
-   * RECEIVE CONFIGURATION - the BSSID registers do not gate any of it. Six
-   * arms across MT_MAC_BSSID and the APC slot table, read back, including one
-   * with both deliberately WRONG and one with a wrong BSSID in a slot whose
-   * per-slot enable bit is SET: reception and acknowledgement are unchanged.
-   * So SetStationIdentity writing no register is a measured decision.
-   *
-   * WHAT THIS FLAG STILL DOES NOT CERTIFY:
-   *   - everything above is an UNASSOCIATED station receiving traffic it did
-   *     not negotiate. Power save, TIM parsing, cross-BSS duplicate detection
-   *     and hardware key lookup are untested.
-   *   - no cell drove SetStationIdentity itself. The seam writes no register
-   *     here, so the state measured IS the state a successful arm leaves -
-   *     but the literal end-to-end path is unexercised.
-   *   - THE LIBRARY'S OWN STATION RX PATH IS PROMISCUOUS. StartRxLoop calls
-   *     mt7612u_set_monitor_rx() unconditionally, so a station driven through
-   *     IRadio does not run the managed filter these results describe.
-   *     DECIDED 2026-09-20 (docs/station-mode-scope.md, "The target"): the
-   *     managed filter is the right one, and it belongs under the
-   *     SetStationIdentity ordering contract as a role-selected value - NOT
-   *     as an edit to this shared entry point, which would regress every
-   *     monitor consumer and the AP harnesses. That makes it Phase 2 work,
-   *     not the Phase 3 open question this comment used to call it.
-   *   - one DUT, one peer, one channel, near field, no soak.
-   */
+  /* station_mode_ok: TRUE. The evidence, its controls and its limits -
+   * the promiscuous station RX path included - are kept in ONE place, at the
+   * AdapterCaps::station_mode_ok declaration, with the full record in
+   * docs/mt7612u-station-identity.md (read its retraction section first). */
   c.station_mode_ok = true;
   /* tx.retry_limit reaches MT_TX_RETRY_CFG (global, not per frame; only
    * when tx.retry_limit_set) and is read back. On air: see

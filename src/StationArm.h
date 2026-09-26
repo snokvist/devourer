@@ -41,6 +41,14 @@ class StationArm {
 public:
   bool armed() const { return _restore.has_value(); }
 
+  /* Drop the snapshot WITHOUT touching the chip. Called at the start of a
+   * (re-)bring-up: Init/InitWrite power-cycle the MAC, which wipes the port-0
+   * state the snapshot describes, so there is nothing left to restore - and
+   * a stale snapshot would keep armed() true, refusing every later
+   * SetAckResponder/StartBeacon on a chip that holds no station arm. Caller
+   * holds the backend's station lock. */
+  void forget() { _restore.reset(); }
+
   bool arm(RtlAdapter &dev, const MacAddr &own, const MacAddr &bssid,
            const Logger_t &log, const char *tag) {
     if (!ack::station_args_ok(own.data(), bssid.data())) {

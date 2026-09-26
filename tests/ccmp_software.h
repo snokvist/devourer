@@ -14,8 +14,24 @@ inline bool ccmp_software(bool encrypt, const uint8_t* key,
                           const uint8_t* nonce, const uint8_t* aad,
                           int aad_len, const uint8_t* input, int input_len,
                           uint8_t* output, uint8_t* tag) {
+  // NEVER HAND OPENSSL A NULL OUTPUT. Its CCM reads EVP_*Update(ctx, NULL,
+  // ...) as AAD, so a decrypt with a NULL output "succeeds" with no tag
+  // check at all.  A zero-length payload gets a scratch byte instead.  A NULL
+  // INPUT is the mirror trap: with in == NULL the update is read as the
+  // finish step and no payload pass runs, so a zero-length encrypt produced
+  // no tag.  Same substitution.
+  uint8_t scratch[1] = {0};
+  if (!output) {
+    if (input_len != 0) return false;
+    output = scratch;
+  }
+  if (!input) {
+    if (input_len != 0) return false;
+    input = scratch;
+  }
   EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
   if (!ctx) return false;
+
 
   int len = 0;
   bool ok = true;

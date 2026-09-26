@@ -313,6 +313,10 @@ int      mt_wr_chk(struct mt7612u_dev *d, uint32_t addr, uint32_t val);
 /* Announce that MT_MAC_ADDR is about to move, so a live station identity does
  * not silently survive as a lie. src/mt7612u/station.cpp. */
 void     mt7612u_station_identity_lost(struct mt7612u_dev *d, const char *who);
+/* mt7612u_set_ack_responder() naming its caller in that announcement - the
+ * beacon path takes MT_MAC_ADDR through here too. src/mt7612u/caps.cpp. */
+int      mt7612u_set_ack_responder_as(struct mt7612u_dev *d,
+                                      const uint8_t mac[6], const char *who);
 /* Register-I/O failure accumulator; see the comment above mt_io_clear(). */
 void     mt_io_clear(struct mt7612u_dev *d);
 /* Restore a previously sampled accumulator; see the note in usb.c. */

@@ -160,8 +160,8 @@ MHz tuning all work, as do beacons (`StartBeacon`/`StopBeacon`, validated
 (≈50 ms fast / ≈530 ms full), no 5/10 MHz, no HE and no 160 MHz.
 **TX-only** unicast injection is a 40× cliff, but that is a property of
 injection rather than of the part: a station-shaped transmitter with its
-receiver on runs at 2084 fps with a 99.9% ACK rate
-(`docs/station-mode-phase0.md`).
+receiver on runs at 2084 fps with a 99.9% ACK rate — 71% of its matched
+broadcast control, at ~20 cm separation (`docs/station-mode-phase0.md`).
 `SetTxMode` is refused — the C library has no session-default rate, so the rate
 goes in each frame's radiotap header instead, where it always wins. [Every
 number and its counterpart](docs/mt7612u.md).

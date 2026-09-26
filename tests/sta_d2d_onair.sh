@@ -345,6 +345,7 @@ chan_freq() {   # $1 = channel -> MHz on stdout, empty if unmappable
 
 AP_PID_RUN=""; STA_PID_RUN=""
 NS_OURS=no
+STATAP_OURS=no
 
 cleanup() {
   # The AP first and with SIGTERM, not SIGKILL. ap_wpa2 beacons AUTONOMOUSLY -
@@ -354,8 +355,13 @@ cleanup() {
   [ -n "$STA_PID_RUN" ] && kill "$STA_PID_RUN" 2>/dev/null
   [ -n "$AP_PID_RUN" ]  && kill "$AP_PID_RUN"  2>/dev/null
   wait 2>/dev/null
-  ip addr flush dev "$STATAP" 2>/dev/null
-  ip link del "$STATAP" 2>/dev/null
+  # ONLY A TAP NAME THIS RUN OWNS: preflight refuses a pre-existing one, so
+  # after it the name is ours (sta_client creates it per cell and exits
+  # non-zero when it cannot).
+  if [ "$STATAP_OURS" = yes ]; then
+    ip addr flush dev "$STATAP" 2>/dev/null
+    ip link del "$STATAP" 2>/dev/null
+  fi
   # ONLY A NAMESPACE THIS RUN CREATED. Deleting it is safe in a way it is NOT
   # in mt7612u_sta_onair.sh - nothing but a TAP ever enters this one, because
   # devourer holds both radios over libusb and neither has a phy to move -
@@ -398,6 +404,16 @@ want_vid=$(printf '%04x' "$AP_VID"); want_pid=$(printf '%04x' "$AP_PID")
   echo "(tests/ap_wpa2.cpp's AP-mode path is validated on Jaguar3 - 0bda:c812)"
   exit 2; }
 
+# THE STATION'S TAP NAME MUST BE FREE. sta_client creates it per cell (non-
+# persistent), and cleanup deletes it - so a pre-existing interface of that
+# name would be addressed, used and then destroyed. Refused here, and only
+# after this does cleanup treat the name as ours.
+if [ -e "/sys/class/net/$STATAP" ]; then
+  echo "STATAP=$STATAP already exists - refusing to use or delete it (set STATAP=<other name>)"
+  exit 2
+fi
+STATAP_OURS=yes
+
 rfkill unblock wlan 2>/dev/null || true
 
 say "AP  $AP_SYSFS ($ap_vid:$ap_pid, devourer/ap_wpa2, in netns '$NS')"
@@ -430,11 +446,14 @@ build_both() {
 # remove, because nothing but a TAP ever goes in here; anything else is not
 # ours to judge.
 ns_up() {
-  if ip netns list 2>/dev/null | grep -q "^$NS"; then
+  # EXACT name, and ANY non-loopback interface means it is not ours: both
+  # TAPs are non-persistent and die with their process, so a genuine
+  # leftover of this harness holds none.
+  if ip netns list 2>/dev/null | awk '{print $1}' | grep -qx "$NS"; then
     local ifs
     ifs=$(ip netns exec "$NS" ip -br link show 2>/dev/null |
           grep -cv '^lo ') || ifs=0
-    if [ "${ifs:-0}" -gt 1 ]; then
+    if [ "${ifs:-0}" -gt 0 ]; then
       say "netns $NS already exists and is NOT empty - refusing to use or delete it."
       say "  Set NS=<other name>, or remove it yourself if it is a leftover."
       return 1
@@ -640,11 +659,24 @@ cell_link() {   # $1 = cell name, $2 = channel
   # address by hand. If ap_wpa2's kBssid ever moves, this is what says so -
   # otherwise the symptom is a downlink that silently takes the off-BSS
   # branch, which still works, so nothing else here would notice.
-  if wait_for "station identity armed for BSSID $BSSID" "$OUT/sta.log" 30; then
-    ok "$cell: the station armed its filter for $BSSID, the address the AP's TAP carries"
-  else
-    bad "$cell: the station never armed $BSSID - see $OUT/sta.log (has ap_wpa2's kBssid moved?)"
+  # KEYED ON THE JOIN, NOT THE ARM: sta_client prints the arm line only when
+  # it arms, so the STA_ARM=0 control (and a die whose station_mode_ok is
+  # false) could never pass this cell. The arm is checked separately, and
+  # only when it was asked for.
+  # One check either way, so `want` does not depend on STA_ARM.
+  if ! wait_for "station joining BSSID $BSSID" "$OUT/sta.log" 30; then
+    bad "$cell: the station never joined $BSSID - see $OUT/sta.log (has ap_wpa2's kBssid moved?)"
     stop_both; return
+  fi
+  if [ "$STA_ARM" != 0 ] &&
+     ! wait_for "station identity armed for BSSID $BSSID" "$OUT/sta.log" 10; then
+    bad "$cell: the station joined $BSSID but never armed it - see $OUT/sta.log (is the die's station_mode_ok false?)"
+    stop_both; return
+  fi
+  if [ "$STA_ARM" != 0 ]; then
+    ok "$cell: the station joined and armed its filter for $BSSID, the address the AP's TAP carries"
+  else
+    ok "$cell: the station joined $BSSID, the address the AP's TAP carries (STA_ARM=0 control: not armed)"
   fi
 
   # The AP is the authenticator, so its log is the witness that matters: it
@@ -740,7 +772,9 @@ cell_airgap() {
   sta_tap_up || { stop_both; return; }
   ok "airgap: the station's TAP is up and the route STILL leaves through it"
 
-  if wait_for "station identity armed for BSSID" "$OUT/sta.log" 25; then
+  # The JOIN line, which sta_client prints with or without the arm - keyed on
+  # the arm line this check was vacuous under STA_ARM=0.
+  if wait_for "station joining BSSID" "$OUT/sta.log" 25; then
     bad "airgap: the station associated with an AP on a different channel - one of the two is not tuned where it was told"
     stop_both; return
   fi
@@ -1116,13 +1150,14 @@ cell_throughput() {
   # A LADDER THAT NEVER DELIVERED ANYTHING IS NOT A MEASUREMENT. The bench
   # cell in this file shipped with exactly that hole one layer down - it
   # printed 0 ns/frame over three thousand round trips and passed.
-  # A DIRECTION THAT WAS NOT RUN IS NOT A DIRECTION THAT PASSED. `skipped` is
-  # not a number, so awk reads it as 0 and the check fails - which is the
-  # right way round: a diagnostic arm reports its rungs and does not get to
-  # claim the cell's acceptance.
+  # A DIRECTION THAT WAS NOT RUN IS NOT A DIRECTION THAT PASSED. A
+  # diagnostic arm reports its rungs and does NOT get to claim the cell's
+  # acceptance - so it is scored as a non-pass, not an ok(). (This used to
+  # say the awk below failed it, but the early return here made that code
+  # unreachable and the arm scored 2/2.)
   if [ "$THRU_DIR" != both ]; then
-    ok "throughput: $THRU_DIR only (diagnostic arm) - UP ${up_best}, DOWN ${dn_best}; see the rungs above"
-    say "  THIS IS NOT THE ACCEPTANCE MEASUREMENT: one direction was skipped."
+    say "  throughput: $THRU_DIR only (diagnostic arm) - UP ${up_best}, DOWN ${dn_best}; see the rungs above"
+    bad "throughput: THRU_DIR=$THRU_DIR skipped a direction - a diagnostic arm, NOT the acceptance measurement"
     return
   fi
   if awk -v u="${up_best:-0}" -v d="${dn_best:-0}" 'BEGIN{exit !(u>0 && d>0)}'; then
@@ -1356,8 +1391,10 @@ cell_soak() {
 
   local sta_pid ap_pid rss0_s rss0_a
   sta_pid=$(pgrep -P "$STA_PID_RUN" -x sta_client | head -1)
-  ap_pid=$(ip netns exec "$NS" pgrep -x ap_wpa2 2>/dev/null | head -1)
-  [ -z "$ap_pid" ] && ap_pid=$(pgrep -x ap_wpa2 | head -1)
+  # A CHILD OF THIS RUN'S AP launcher, as the station side does: `ip netns
+  # exec` does not isolate PIDs, so a namespace-wide or host-wide pgrep could
+  # sample an unrelated ap_wpa2.
+  ap_pid=$(pgrep -P "$AP_PID_RUN" -x ap_wpa2 | head -1)
   rss0_s=$(awk '/VmRSS/{print $2}' "/proc/${sta_pid:-0}/status" 2>/dev/null)
   rss0_a=$(awk '/VmRSS/{print $2}' "/proc/${ap_pid:-0}/status" 2>/dev/null)
 

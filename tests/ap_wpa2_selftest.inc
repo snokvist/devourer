@@ -737,6 +737,9 @@ static void test_local_arp(Supplicant& a) {
 static void test_tap(Supplicant& a, Supplicant& b) {
   int fds[2];
   if (::pipe(fds) != 0) { check(false, "tap: pipe()"); return; }
+  /* Non-blocking read end, as sta_client_selftest does: a regression that
+   * stops tap_up writing must FAIL the check below, not hang ctest. */
+  ::fcntl(fds[0], F_SETFL, O_NONBLOCK);
 
   const int saved = g_tap_fd;
   g_tap_fd = fds[1];

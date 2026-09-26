@@ -126,9 +126,13 @@ devourer::DeviceConfig devourer_config_from_env() {
     /* 1..255; out-of-range low keeps the library default (a 0 collapsing
      * to 1 us would write off every frame). */
     cfg.tx.ack_timeout_us = static_cast<int>(v > 255 ? 255 : v);
-  if (env_long("DEVOURER_TX_RETRY_LIMIT", &v))
+  if (env_long("DEVOURER_TX_RETRY_LIMIT", &v)) {
+    /* BOTH statements are conditional: retry_limit_set on an unset variable
+     * made every MT7612U session write MT_TX_RETRY_CFG = 0 and switch its
+     * hardware retransmission off (see the field doc in DeviceConfig.h). */
     cfg.tx.retry_limit = static_cast<int>(v < 0 ? 0 : (v > 63 ? 63 : v));
     cfg.tx.retry_limit_set = true;
+  }
   if (const char *e = env_str("DEVOURER_TX_RETRY_FALLBACK")) {
     if (str_ieq(e, "off")) {
       cfg.tx.retry_fallback = devourer::RetryFallback::Off;

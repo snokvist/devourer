@@ -715,7 +715,10 @@ cell_bench() {
   kill "$wp" 2>/dev/null
   ip addr flush dev "$STA_IF" 2>/dev/null
   wait $ap 2>/dev/null
-  local profile; profile=$(grep '"ev":"ccmp.profile"' "$OUT/bench.log" | tail -1)
+  # ccmp.profile is a machine event, so it is on stdout (bench.jsonl); the
+  # stderr log is still searched so an older binary's line is found too.
+  local profile; profile=$(cat "$OUT/bench.jsonl" "$OUT/bench.log" 2>/dev/null |
+                           grep '"ev":"ccmp.profile"' | tail -1)
   [ -n "$profile" ] || { bad "bench: missing ccmp.profile"; return; }
   printf '%s\n' "$profile"
   python3 - "$profile" "$BENCH_PAYLOAD" "$BENCH_SECS" "$tx" "$rx" "$ap_core" "$sys_cores" <<'PYEOF'

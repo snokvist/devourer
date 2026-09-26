@@ -46,7 +46,21 @@
  * counter now advances ONLY where a MIC has verified. What an unauthenticated
  * message 1 can still do is replace the candidate PTK of a handshake in
  * flight - wpa_supplicant has the same exposure, and it costs an association
- * attempt, not a working link.
+ * attempt, not a working link. The INSTALLED handshake's ANonce and its
+ * message 4 are kept apart from the candidate for exactly that reason: a
+ * forged message 1 must not stop the AP's own retransmitted message 3 from
+ * being answered.
+ *
+ * AND A FOURTH, FOUND BY REVIEW OF THE BRANCH: KEY REINSTALLATION (KRACK,
+ * CVE-2017-13077/13078/13080). The AP retransmits message 3 whenever our
+ * message 4 is lost, at a STRICTLY GREATER counter (hostapd increments on
+ * every retransmission), so the replay gate rightly lets it through. It must
+ * be answered, and it must NOT reinstall: a caller that restarts its PN when
+ * the key generation moves would then reuse CCMP nonces under the unchanged
+ * TK. So a key that is already installed is never installed again - the PTK
+ * generation moves only when the PTK bytes change, and the GTK generation
+ * only when the key id or bytes change, as wpa_supplicant's "not
+ * reinstalling already in-use" rule does.
  */
 #ifndef DEVOURER_STA_SUPPLICANT_H
 #define DEVOURER_STA_SUPPLICANT_H
@@ -114,12 +128,18 @@ class Supplicant {
     secure_wipe(pmk_, sizeof pmk_);
     secure_wipe(snonce_, sizeof snonce_);
     secure_wipe(anonce_, sizeof anonce_);
+    secure_wipe(inst_anonce_, sizeof inst_anonce_);
     secure_wipe(ptk_, sizeof ptk_);
     secure_wipe(cand_ptk_, sizeof cand_ptk_);
     secure_wipe(gtk_, sizeof gtk_);
     if (!last_reply_.empty())
       secure_wipe(last_reply_.data(), last_reply_.size());
     last_reply_.clear();
+    if (!m1_reply_.empty()) secure_wipe(m1_reply_.data(), m1_reply_.size());
+    m1_reply_.clear();
+    m1_replay_ = 0;
+    m1_answered_ = false;
+    gtk_rsc_ = 0;
     state_ = State::Idle;
     crypto_ = nullptr;
     rx_replay_ = 0;
@@ -175,11 +195,11 @@ class Supplicant {
     if (rx_replay_set_ && k.replay <= rx_replay_)
       return retransmit_or_replay(k, kind, out);
     /* A repeat of something answered but never authenticated: a retransmitted
-     * message 1. */
-    if (answered_ && k.replay == answered_replay_ && kind == answered_kind_ &&
-        !last_reply_.empty()) {
+     * message 1. It has its own cache, so it can never collect a message 4. */
+    if (kind == Kind::Msg1 && m1_answered_ && k.replay == m1_replay_ &&
+        !m1_reply_.empty()) {
       retransmits++;
-      if (out) *out = last_reply_;
+      if (out) *out = m1_reply_;
       return Verdict::Retransmit;
     }
 
@@ -200,11 +220,20 @@ class Supplicant {
   const uint8_t* gtk() const { return gtk_; }
   size_t gtk_len() const { return gtk_len_; }
   uint8_t gtk_key_id() const { return gtk_key_id_; }
+  /* The installed GTK's receive sequence counter, from the MIC-verified
+   * message that delivered it: the Key RSC field, a 48-bit little-endian PN
+   * for CCMP. 802.11-2016 12.7.6.4 has the receiver START its group replay
+   * counter here rather than at whatever group frame happens to arrive
+   * first - otherwise a capture from earlier in the GTK's life is accepted
+   * as the first frame. Updated only when the GTK itself changes. */
+  uint64_t gtk_rsc() const { return gtk_rsc_; }
   /* The last counter this station AUTHENTICATED, not the last it saw. */
   uint64_t replay_counter() const { return rx_replay_; }
 
   /* HOW MANY TIMES EACH KEY HAS BEEN INSTALLED, monotonic for the life of
-   * this object and NOT reset by forget().
+   * this object and NOT reset by forget(). A message that re-delivers the
+   * key already installed does NOT count - see the fourth defect at the top
+   * of this file.
    *
    * A caller with a cipher has per-key state - packet numbers, replay
    * windows - that must restart when the key does, and "are we connected
@@ -310,21 +339,31 @@ class Supplicant {
   /* Message 3: the GTK, and the confirmation that the authenticator holds the
    * same PTK. Everything is checked before anything is installed. */
   Verdict on_msg3(const EapolKey& k, std::vector<uint8_t>* out) {
-    /* Gated on the CANDIDATE, not on the state: a message 1 that arrived on a
-     * working association leaves the state at Done deliberately, and its
-     * message 3 still has to be processable. */
-    if (!cand_valid_) return note(Verdict::OutOfState);
-
-    /* 12.7.6.4: the ANonce in message 3 must equal the one in message 1, or
+    /* WHICH PTK THIS MESSAGE 3 BELONGS TO. Either the CANDIDATE of a
+     * handshake in flight (gated on the candidate, not on the state: a
+     * message 1 that arrived on a working association leaves the state at
+     * Done deliberately, and its message 3 still has to be processable), or
+     * the handshake ALREADY INSTALLED - the AP retransmitting message 3
+     * because our message 4 was lost, which must be answered and must not
+     * reinstall anything.
+     *
+     * 12.7.6.4: the ANonce in message 3 must equal the one in message 1, or
      * the authenticator is not the party we derived against. Checked BEFORE
      * the MIC so a mix-and-match is refused as what it is rather than as a
      * key mismatch. */
-    if (std::memcmp(k.nonce, anonce_, 32) != 0)
+    const uint8_t* kptk = nullptr;
+    if (cand_valid_ && std::memcmp(k.nonce, anonce_, 32) == 0)
+      kptk = cand_ptk_;
+    else if (ptk_valid_ && std::memcmp(k.nonce, inst_anonce_, 32) == 0)
+      kptk = ptk_;
+    else if (!cand_valid_ && !ptk_valid_)
+      return note(Verdict::OutOfState);
+    else
       return note(Verdict::Malformed);
 
-    /* THE FORGERY GATE. Verified with the CANDIDATE KCK, which exists only
-     * because message 1 named an ANonce and we hold the PMK. */
-    if (!eapol_mic_ok(*crypto_, cand_ptk_, k)) return note(Verdict::MicFailed);
+    /* THE FORGERY GATE. Verified with the KCK of the PTK chosen above, which
+     * exists only because a message 1 named an ANonce and we hold the PMK. */
+    if (!eapol_mic_ok(*crypto_, kptk, k)) return note(Verdict::MicFailed);
 
     /* Message 3's key data is AES-key-wrapped with the KEK. An unwrap is an
      * integrity check in its own right, so a failure here is not a decode
@@ -349,8 +388,8 @@ class Supplicant {
     if (k.key_data_len < 16 || (k.key_data_len % 8) != 0)
       return note(Verdict::Malformed);
     std::vector<uint8_t> plain(k.key_data_len - 8);
-    if (!crypto_->aes_key_unwrap(cand_ptk_ + 16, 16, k.key_data,
-                                 k.key_data_len, plain.data()))
+    if (!crypto_->aes_key_unwrap(kptk + 16, 16, k.key_data, k.key_data_len,
+                                 plain.data()))
       return note(Verdict::Malformed);
     /* Absent and Malformed are both refusals HERE - see the note at
      * KdeResult. A message 3 with no GTK would otherwise complete the
@@ -363,18 +402,32 @@ class Supplicant {
 
     std::vector<uint8_t> e = build_eapol_key(
         (uint16_t)(kKeyDescVersionCcmp | kKiPairwise | kKiMic | kKiSecure), 0,
-        k.replay, nullptr, nullptr, nullptr, 0, crypto_, cand_ptk_,
+        k.replay, nullptr, nullptr, nullptr, 0, crypto_, kptk,
         kEapolVersionSupplicant);
     if (e.empty()) {
       secure_wipe(plain.data(), plain.size());
       return note(Verdict::CryptoError);
     }
 
-    /* INSTALL LAST. Up to here a failure has cost nothing. */
-    std::memcpy(ptk_, cand_ptk_, 48);
-    ptk_valid_ = true;
-    ptk_gen_++;
-    install_gtk(g);
+    /* INSTALL LAST. Up to here a failure has cost nothing.
+     *
+     * AND NEVER REINSTALL (the fourth defect at the top of this file). The
+     * comparison is on the key bytes, not on which path chose `kptk`: a
+     * message 1 re-quoting the installed ANonce re-derives the identical PTK
+     * into the candidate, and its message 3 must not count as a new key
+     * either. */
+    if (!ptk_valid_ || std::memcmp(kptk, ptk_, 48) != 0) {
+      std::memcpy(ptk_, kptk, 48);
+      std::memcpy(inst_anonce_, k.nonce, 32);
+      ptk_valid_ = true;
+      ptk_gen_++;
+    }
+    /* The candidate is spent: only a fresh message 1 re-arms it. */
+    if (kptk == cand_ptk_) {
+      secure_wipe(cand_ptk_, sizeof cand_ptk_);
+      cand_valid_ = false;
+    }
+    install_gtk(g, k.rsc);
     authenticated(k.replay);
     answer(Kind::Msg3, k.replay, e);
     state_ = State::Done;
@@ -411,7 +464,7 @@ class Supplicant {
       return note(Verdict::CryptoError);
     }
 
-    install_gtk(g);
+    install_gtk(g, k.rsc);
     authenticated(k.replay);
     answer(Kind::Group1, k.replay, e);
     secure_wipe(plain.data(), plain.size());
@@ -419,10 +472,21 @@ class Supplicant {
     return Verdict::Reply;
   }
 
-  void install_gtk(const GtkKde& g) {
+  /* The GTK already in use is NOT reinstalled - not copied, not counted, and
+   * its RSC is not re-read. Every PTK rekey's message 3 re-delivers the
+   * current GTK, and a caller that reopens its group replay window on a
+   * generation change would otherwise reopen it on every rekey, with no
+   * attacker involved (CVE-2017-13078/13080 class). */
+  void install_gtk(const GtkKde& g, const uint8_t* rsc) {
+    if (gtk_valid_ && gtk_len_ == g.gtk_len && gtk_key_id_ == g.key_id &&
+        std::memcmp(gtk_, g.gtk, g.gtk_len) == 0)
+      return;
     std::memcpy(gtk_, g.gtk, g.gtk_len);
     gtk_len_ = g.gtk_len;
     gtk_key_id_ = g.key_id;
+    gtk_rsc_ = 0;
+    if (rsc)
+      for (int i = 0; i < 6; i++) gtk_rsc_ |= (uint64_t)rsc[i] << (8 * i);
     gtk_valid_ = true;
     gtk_gen_++;
   }
@@ -434,9 +498,18 @@ class Supplicant {
     rx_replay_set_ = true;
   }
 
-  /* The retransmission cache, kept with the message type it answered so a
-   * different message quoting the same counter cannot collect it. */
+  /* The retransmission caches, kept with the message type they answered so a
+   * different message quoting the same counter cannot collect them. Message
+   * 1's answer is cached APART from the authenticated one: an
+   * unauthenticated message 1 must not be able to evict the message 4 that
+   * the AP's equal-counter retransmission of message 3 is owed. */
   void answer(Kind kind, uint64_t replay, const std::vector<uint8_t>& reply) {
+    if (kind == Kind::Msg1) {
+      m1_replay_ = replay;
+      m1_answered_ = true;
+      m1_reply_ = reply;
+      return;
+    }
     answered_kind_ = kind;
     answered_replay_ = replay;
     answered_ = true;
@@ -449,12 +522,14 @@ class Supplicant {
   uint8_t own_[6] = {0};
   uint8_t bssid_[6] = {0};
   uint8_t snonce_[32] = {0};
-  uint8_t anonce_[32] = {0};
+  uint8_t anonce_[32] = {0};       /* the in-flight candidate's ANonce */
+  uint8_t inst_anonce_[32] = {0};  /* the installed PTK's ANonce */
   uint8_t ptk_[48] = {0};
   uint8_t cand_ptk_[48] = {0};
   uint8_t gtk_[32] = {0};
   size_t gtk_len_ = 0;
   uint8_t gtk_key_id_ = 0;
+  uint64_t gtk_rsc_ = 0;
   uint32_t ptk_gen_ = 0;
   uint32_t gtk_gen_ = 0;
   bool ptk_valid_ = false;
@@ -466,6 +541,9 @@ class Supplicant {
   bool answered_ = false;
   Kind answered_kind_ = Kind::None;
   std::vector<uint8_t> last_reply_;
+  uint64_t m1_replay_ = 0;
+  bool m1_answered_ = false;
+  std::vector<uint8_t> m1_reply_;
 };
 
 }  // namespace sta
