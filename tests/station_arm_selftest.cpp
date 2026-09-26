@@ -17,6 +17,7 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <utility>
 #include <stdexcept>
 
 #include "StationArm.h"
@@ -45,6 +46,9 @@ public:
   std::map<uint16_t, uint8_t> mem;
   std::set<uint16_t> deaf;
   std::set<uint16_t> latch, latched;
+  std::set<uint16_t> drop_once; /* the next write here is lost, then normal */
+  std::set<uint16_t> refuse;    /* writes here report FAILURE and store nothing */
+  std::set<std::pair<uint16_t, uint8_t>> open_writes; /* (addr, value) */
   int open_identity_writes = 0;
   bool fail_writes = false;
   bool throw_writes = false;
@@ -63,9 +67,13 @@ public:
     ++write_calls;
     if (throw_writes) throw std::runtime_error("injected write failure");
     if (fail_writes) return false;
-    if (a >= 0x0610 && a <= 0x061d && (read8(0x0102) & 0x03u) != 0)
+    if (refuse.count(a)) return false;
+    if (a >= 0x0610 && a <= 0x061d && (read8(0x0102) & 0x03u) != 0) {
       ++open_identity_writes;
+      open_writes.insert({a, v});
+    }
     if (deaf.count(a)) return true;
+    if (drop_once.erase(a)) return true;
     if (latch.count(a)) {
       if (latched.count(a)) return true;
       latched.insert(a);
@@ -196,6 +204,62 @@ int main() {
     CHECK(!s.armed());
     CHECK(at_pre_arm(*r));
   }
+  { /* a MACID write that does not land: caught by readback (the half the
+     * ACK engine matches), rolled back, not armed */
+    auto r = fresh_port();
+    r->deaf.insert(kMacId + 5);
+    RtlAdapter dev(r, log);
+    devourer::StationArm s;
+    CHECK(!s.arm(dev, mac(kOwn), mac(kAp), log, "t"));
+    CHECK(!s.armed());
+    CHECK(at_pre_arm(*r));
+  }
+  { /* every write failing outright: the gate close fails, nothing else is
+     * attempted, readback shows the untouched pre-arm port, not armed */
+    auto r = fresh_port();
+    r->fail_writes = true;
+    RtlAdapter dev(r, log);
+    devourer::StationArm s;
+    CHECK(!s.arm(dev, mac(kOwn), mac(kAp), log, "t"));
+    CHECK(!s.armed());
+    CHECK(at_pre_arm(*r));
+  }
+  { /* a FAILED re-arm tears the earlier arm down (documented): passive,
+     * verified, not armed - not a stale "armed" over half a new identity */
+    auto r = fresh_port();
+    RtlAdapter dev(r, log);
+    devourer::StationArm s;
+    CHECK(s.arm(dev, mac(kOwn), mac(kAp), log, "t"));
+    r->drop_once.insert(kBssid + 5); /* the re-arm's write is lost; the
+                                      * rollback's lands */
+    CHECK(!s.arm(dev, mac(kOwn), mac(kAp2), log, "t"));
+    CHECK(!s.armed());
+    CHECK(at_pre_arm(*r));
+  }
+  { /* a re-arm whose gate close FAILS writes none of the new identity: the
+     * port is live (Infra) at that point, and writing the new BSSID with the
+     * gate open is the half-written-address responder the close exists to
+     * prevent. (The rollback that follows may write the PRE-arm identity with
+     * the gate still open - that is the address it answered for before.) */
+    auto r = fresh_port();
+    RtlAdapter dev(r, log);
+    devourer::StationArm s;
+    CHECK(s.arm(dev, mac(kOwn), mac(kAp), log, "t"));
+    r->refuse.insert(kNetType);
+    r->open_writes.clear();
+    CHECK(!s.arm(dev, mac(kOwn), mac(kAp2), log, "t"));
+    CHECK(r->open_writes.count({static_cast<uint16_t>(kBssid + 5), kAp2[5]}) == 0);
+  }
+  { /* Clear closes the gate BEFORE it moves the identity back - otherwise the
+     * live Infra port briefly answers for a half-restored address */
+    auto r = fresh_port();
+    RtlAdapter dev(r, log);
+    devourer::StationArm s;
+    CHECK(s.arm(dev, mac(kOwn), mac(kAp), log, "t"));
+    r->open_identity_writes = 0;
+    CHECK(s.clear(dev, log, "t"));
+    CHECK(r->open_identity_writes == 0);
+  }
   { /* a net_type write that does not land: not armed, rolled back */
     auto r = fresh_port();
     r->deaf.insert(kNetType);
@@ -248,6 +312,8 @@ int main() {
       threw = true;
     }
     CHECK(!threw);
+    CHECK(!s.armed());
+    CHECK(at_pre_arm(*r));
   }
   { /* ack::restore_station on its own: it restores the snapshot's net_type
      * bits, not merely "closed". Through StationArm the snapshot is always

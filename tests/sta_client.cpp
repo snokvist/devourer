@@ -1133,6 +1133,14 @@ int main(int argc, char** argv) {
 
   uint8_t tuned = g_chan;
   uint8_t bssid_armed[6] = {0};
+  /* A REFUSED arm is retried, a few times, a second apart. It used to be
+   * recorded as done before the call, so one transient failure - a Jaguar2
+   * control read fails about once a minute under RX load - left the whole
+   * association unarmed with a single log line (review, Phase 6). */
+  constexpr int kArmTries = 5;
+  int arm_tries = 0;
+  bool arm_ok = false;
+  uint32_t next_arm_ms = 0;
   std::signal(SIGINT, on_signal);
   std::signal(SIGTERM, on_signal);
   const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(sec);
@@ -1154,10 +1162,19 @@ int main(int argc, char** argv) {
        * the port identity has not moved; on a backend where it does write
        * one, this is where it belongs - DECIDED here, MADE below. */
       if (g_arm && caps.station_mode_ok &&
-          g_sm.state() != StationSm::State::Idle &&
-          std::memcmp(bssid_armed, g_sm.bssid(), 6) != 0) {
-        std::memcpy(bssid_armed, g_sm.bssid(), 6);
-        arm_now = true;
+          g_sm.state() != StationSm::State::Idle) {
+        if (std::memcmp(bssid_armed, g_sm.bssid(), 6) != 0) {
+          std::memcpy(bssid_armed, g_sm.bssid(), 6);
+          arm_tries = 0;
+          arm_ok = false;
+          next_arm_ms = now;
+        }
+        if (!arm_ok && arm_tries < kArmTries &&
+            (int32_t)(now - next_arm_ms) >= 0) {
+          ++arm_tries;
+          next_arm_ms = now + 1000;
+          arm_now = true;
+        }
       }
       std::vector<uint8_t> f;
       while (g_sm.pop_tx(&f)) {
@@ -1181,13 +1198,13 @@ int main(int argc, char** argv) {
       const devourer::MacAddr bss{{bssid_armed[0], bssid_armed[1],
                                    bssid_armed[2], bssid_armed[3],
                                    bssid_armed[4], bssid_armed[5]}};
-      const bool ok = g_dev->SetStationIdentity(own, bss);
+      arm_ok = g_dev->SetStationIdentity(own, bss);
       std::fprintf(stderr,
                    "  station identity %s for BSSID "
-                   "%02x:%02x:%02x:%02x:%02x:%02x\n",
-                   ok ? "armed" : "REFUSED", bssid_armed[0], bssid_armed[1],
-                   bssid_armed[2], bssid_armed[3], bssid_armed[4],
-                   bssid_armed[5]);
+                   "%02x:%02x:%02x:%02x:%02x:%02x (attempt %d/%d)\n",
+                   arm_ok ? "armed" : "REFUSED", bssid_armed[0],
+                   bssid_armed[1], bssid_armed[2], bssid_armed[3],
+                   bssid_armed[4], bssid_armed[5], arm_tries, kArmTries);
     }
     std::vector<std::vector<uint8_t>> batch;
     { std::lock_guard<std::mutex> l(g_q_mu); batch.swap(g_q); }
@@ -1274,7 +1291,12 @@ int main(int argc, char** argv) {
       else g_send_fail.fetch_add(1);
     }
   }
-  if (caps.station_mode_ok) g_dev->ClearStationIdentity();
+  /* The clear's result is the only way to learn the rollback did not land
+   * (IRadio: the port may keep answering for `own`), so it is printed. */
+  if (caps.station_mode_ok)
+    std::fprintf(stderr, "  station identity clear: %s\n",
+                 g_dev->ClearStationIdentity() ? "restored (verified)"
+                                               : "NOT VERIFIED");
 
   report();
   g_dev->StopRxLoop();

@@ -62,7 +62,8 @@ public:
    * (InitWrite) and then run TX and RX concurrently on the same claimed handle
    * — Init is the RX-only convenience wrapper (bring-up + StartRxLoop).
    *
-   * THE CALLBACK RUNS ON THE THREAD THAT DRIVES libusb's EVENT HANDLING, and
+   * ON THE USB TRANSPORT (every backend but the PCIe one), THE CALLBACK RUNS
+   * ON THE THREAD THAT DRIVES libusb's EVENT HANDLING, and
    * a synchronous USB transfer made from any other thread (every register
    * read or write behind a control call - SetStationIdentity, the TX-power
    * setters, SetMonitorChannel, ...) waits for that thread to come back out
@@ -71,7 +72,10 @@ public:
    * and neither returns. Measured, not theoretical - tests/sta_client.cpp
    * armed its station identity under its RX lock and hung (gdb: main in
    * libusb_control_transfer, RX thread in the callback on that lock); the
-   * MT7612U arm had hidden it only by making almost no transfers. */
+   * MT7612U arm had hidden it only by making almost no transfers. The same
+   * holds inside a backend: a callback path that takes a lock some other
+   * thread holds across USB I/O must try_lock (Jaguar3's CFO and BF
+   * paths do). */
   virtual void StartRxLoop(Action_ParsedRadioPacket packetProcessor) = 0;
 
   /* Ask a running StartRxLoop to exit (sets a flag; the caller then joins

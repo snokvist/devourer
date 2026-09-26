@@ -2185,7 +2185,11 @@ devourer::AdapterCaps RtlJaguarDevice::GetAdapterCaps() {
   c.tx_retry_limit_ok = _eepromManager->version_id.ICType != CHIP_8814A;
   /* station_mode_ok stays false: SetStationIdentity is ported (shared
    * StationArm), but no Jaguar1 die has run the on-air cell the flag's
-   * declaration requires. */
+   * declaration requires. Expect the CHIP_8812 cell to read differently from
+   * the Jaguar2/3 ones: bring-up programs the EFUSE MAC into MACID (the
+   * station's `own`), and on that die the MACID was measured to keep
+   * answering with net_type NoLink - so its STA_ARM=0 control may already
+   * ACK, and Clear (which restores MACID = own) does not silence it. */
   /* Per-packet TX power: 8814A only — its dword5 [30:28] descriptor LUT (the
    * 8822B TXPWR_OFSET position; vendor-defined, vendor-unused). measured
    * stays false until tests/txpkt_pwr_ofset_onair.sh proves it moves on-air

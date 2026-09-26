@@ -17,8 +17,16 @@
  *     the port away from them. A re-arm (a new BSSID while armed) is not
  *     refused - it replaces our own arm and keeps the original snapshot, so
  *     Clear still returns to the state before the FIRST arm;
- *   - any readback that does not match. A failed arm rolls back to the
- *     snapshot and reports whether that rollback verified. */
+ *   - any readback that does not match. A FAILED arm - first or re-arm -
+ *     rolls back to the pre-FIRST-arm snapshot and, once that verifies, is
+ *     no longer armed: a re-arm that fails tears down the arm before it
+ *     rather than guessing that the old identity still holds, and returns
+ *     false so the caller knows the port is passive.
+ *
+ * ORDERING (IRadio's clause): order-independent in fact on Jaguar1/2/3 - no
+ * RX-loop start writes 0x0102/0x0610/0x0618 there (only bring-up, the beacon
+ * and the ACK responder do) - so the backends require bring-up and nothing
+ * else. */
 
 #include <cstdint>
 #include <optional>
@@ -51,14 +59,15 @@ public:
       }
       if (snap.net_type != 0) {
         log->error("{}: station identity refused: port 0 already has "
-                   "net_type {} (a beacon or an ACK responder owns it)",
+                   "net_type {} (a beacon or an ACK responder owns it, or "
+                   "an earlier session left it set)",
                    tag, snap.net_type);
         return false;
       }
       _restore = snap;
     }
-    if (ack::arm_station(dev, own.data(), bssid.data()) &&
-        ack::station_is(dev, own.data(), bssid.data())) {
+    (void)ack::arm_station(dev, own.data(), bssid.data());
+    if (ack::station_is(dev, own.data(), bssid.data())) {
       log->info("{}: station identity armed: own "
                 "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} BSSID "
                 "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} (net_type=Infra)",
@@ -84,7 +93,7 @@ public:
 
   /* IRadio::ClearStationIdentity: true when nothing was armed (nothing to
    * undo) or the pre-arm state was restored AND read back. */
-  bool clear(RtlAdapter &dev, const Logger_t &log, const char *tag) noexcept {
+  bool clear(RtlAdapter &dev, const Logger_t &log, const char *tag) {
     if (!_restore)
       return true;
     if (!ack::restore_station(dev, *_restore)) {

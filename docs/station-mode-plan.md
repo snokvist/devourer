@@ -2229,8 +2229,10 @@ BSSID and the net_type bits exactly (Jaguar1/CHIP_8812 is why every die
 restores MACID rather than closing the gate). PR #335's managed RCR is NOT
 ported: this station filters in software, like the MT7612U one, and the
 monitor RCR is what every other RX consumer sees. Port 0 now has three
-claimants - beacon, ACK responder, station - and each refuses while another
-holds it.
+claimants - beacon, ACK responder, station. The STATION refuses while either
+of the others holds the port, and both refuse (arm and clear) while it does;
+on Jaguar2/3 the beacon and the ACK responder still do not check EACH OTHER
+(pre-existing, not this phase's).
 
 *The structural test.* `sta_client` needed no backend branch. The harness
 needed two things, neither a backend branch: `STA_VID`/`STA_PID` (the station
@@ -2250,6 +2252,67 @@ blocked in the callback on that lock (gdb on the live process). The MT7612U
 arm makes almost no transfers and never opened the window. Fixed in the caller
 (decide under the lock, call after it), and IRadio's `StartRxLoop` now states
 the rule for every device call.
+
+*What the measurement does and does not separate* (review): the ACK evidence is
+indirect - the station-side duplicate ratio, no witness capture or AP
+tx.report - and the control moves two registers, because Jaguar2/3 bring-up
+never programs MACID: unarmed differs in MACID and net_type both. The arm as a
+whole makes the port answer; which register gates it is not separated.
+
+### Phase 6 review round (Round 7), 2026-09-26
+
+Two independent adversarial reviews (Flash, Opus) of `05e94ff`. They converged;
+every finding resolved:
+
+- *`ClearAckResponder` on Jaguar2/3 closed the gate under an armed station*
+  (both): the station went deaf while still reading armed. It now refuses while
+  a station holds the port, and on Jaguar2 runs under `_reg_mu`.
+- *Jaguar2 `SetAckResponder` locked the station check but not the write* (both):
+  a station arm between them was overwritten while it read armed. Now under
+  `_reg_mu` end to end, as Jaguar3 was.
+- *Jaguar2/3 inferred the beacon from net_type alone* (Opus): a beacon whose
+  gate a `ClearAckResponder` had closed read as a free port. The arm now checks
+  the beacon's own record (`_bcn_mpdu` / `_bcn_interval_tu`).
+- *Jaguar3's RX path took `_reg_mu`* (Opus; pre-existing, opt-in paths): the CFO
+  tracker and the BF apply. With a `_reg_mu` holder doing USB I/O (the coex
+  tick, the station arm) that is the `sta_client` deadlock inside the library.
+  Both now `try_lock` and skip/retry. Not reproduced on hardware - fixed from
+  the code, because the shape is the one gdb caught.
+- *`sta_client`*: a refused arm was never retried (both) - now up to 5 tries a
+  second apart; the `ClearStationIdentity` result was discarded (Flash) - now
+  printed.
+- *`arm_station`'s comment contradicted its code* (Flash): comment corrected,
+  and `StationArm` now ignores the transfer status and decides on readback
+  alone. *A failed re-arm tears the earlier arm down* (both): kept, documented,
+  tested. `clear()` lost its `noexcept` (it logs).
+- *Docs overclaimed* (both): "each refuses while another holds it", the
+  two-variable control, the indirect ACK evidence, a stale AdapterCaps
+  sentence, and the Jaguar1 note (on the 8812 the MACID answers with net_type
+  NoLink, and bring-up programs `own` there - so its unarmed control may ACK).
+- *Selftest gaps* (both): an unused `fail_writes`, no MACID-not-landing case,
+  no restore-ordering check, a throw case that checked only "no exception".
+  All added.
+- *Rejected, with reason:* `_station` not reset on teardown (Flash) - no backend
+  supports re-init on one object, and Jaguar1's `_ack_restore_identity` has the
+  same shape; BSSID readback on unmeasured dies (Flash) - kept and documented,
+  since the flag is per measured die anyway.
+
+**Mutation record** (`tests/station_arm_selftest.cpp`, named sweep, each
+applied alone, rebuilt, run): M1 arm writes AP net_type; M2 arm skips BSSID lo;
+M3 station_is ignores BSSID; M4 station_is ignores net_type; M5 restore skips
+net_type; M6 restore unverified; M7 no ownership refusal; M8 re-arm
+re-snapshots; M9 failed rollback forgets the arm; M10 clear forgets on
+failure; M11 own==bssid accepted; M12 gate not closed first; M13 station_is
+ignores MACID; M14 restore moves identity before closing the gate; M15
+StationArm trusts transfer status; M16 arm ignores a failed gate close.
+**16/16 killed, 0 survivors.** How it got there: M1-M12 against the first
+selftest left M5 (equivalent through `StationArm`, whose refusal pins the
+snapshot to NoLink - now pinned on `restore_station` directly), M9 and M12; the
+review's M13-M16 left M16 (needed a gate close that FAILS on a live port). The
+strengthened throwing-transport case also caught a real bug: `restore_station`
+shared one guard between its last write and its readback, so a write that
+threw reported "not restored" for a port nothing had touched. Fixed - the
+verdict has its own guard.
 
 *Open:* Jaguar1 needs an 8812AU station; the 8822E and 8821C have the code and
 no cell; no soak with a Realtek station yet.

@@ -384,13 +384,15 @@ bool RtlJaguar2Device::SetAckResponder(const devourer::MacAddr &mac) {
                    "Jaguar2", mac.bytes[0]);
     return false;
   }
-  {
-    std::lock_guard<std::mutex> lk(_reg_mu);
-    if (_station.armed()) {
-      _logger->error("Jaguar2: ACK responder refused: a station identity "
-                     "owns port 0 (ClearStationIdentity first)");
-      return false;
-    }
+  /* Under _reg_mu END TO END, like Jaguar3: the station check and the port
+   * write must be one step, or a SetStationIdentity between them has its
+   * identity overwritten while it still reads as armed. Every caller of this
+   * (the Init/InitWrite config arms included) holds no _reg_mu. */
+  std::lock_guard<std::mutex> lk(_reg_mu);
+  if (_station.armed()) {
+    _logger->error("Jaguar2: ACK responder refused: a station identity "
+                   "owns port 0 (ClearStationIdentity first)");
+    return false;
   }
   /* Hardware ACK responder (src/AckResponder.h): port identity + net_type so
    * the MAC auto-ACKs unicast frames to `mac`. Same registers the proven
@@ -418,6 +420,13 @@ bool RtlJaguar2Device::SetStationIdentity(const devourer::MacAddr &own,
     _logger->error("Jaguar2: station identity refused before bring-up");
     return false;
   }
+  /* The beacon's own record, not net_type: a ClearAckResponder can close the
+   * gate under a live beacon, and net_type alone would then read "free". */
+  if (!_bcn_mpdu.empty()) {
+    _logger->error("Jaguar2: station identity refused: the beacon owns port "
+                   "0 (StopBeacon first)");
+    return false;
+  }
   return _station.arm(_device, own, bssid, _logger, "Jaguar2");
 }
 
@@ -427,6 +436,14 @@ bool RtlJaguar2Device::ClearStationIdentity() {
 }
 
 void RtlJaguar2Device::ClearAckResponder() {
+  std::lock_guard<std::mutex> lk(_reg_mu);
+  /* The gate this closes is the station's too: a clear here would leave the
+   * station deaf to its AP while it still reads as armed. */
+  if (_station.armed()) {
+    _logger->error("Jaguar2: ACK responder clear refused: port 0 belongs to "
+                   "a station identity (ClearStationIdentity instead)");
+    return;
+  }
   if (!devourer::ack::disable_verified(_device)) {
     _logger->error("Jaguar2: ACK responder disarm did not latch");
     return;

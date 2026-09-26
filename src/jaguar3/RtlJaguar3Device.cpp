@@ -292,7 +292,15 @@ void RtlJaguar3Device::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
       const uint32_t field = static_cast<uint32_t>(nc) |
                              (static_cast<uint32_t>(nc) << 7); /* 14-bit */
       try {
-        std::lock_guard<std::mutex> lk(_reg_mu);
+        /* NON-BLOCKING, because this runs on the RX thread - the thread that
+         * drives libusb's event handling. A _reg_mu holder doing synchronous
+         * USB I/O (the coex tick, SetStationIdentity, any setter) waits for
+         * this thread; blocking here on _reg_mu would deadlock both - the
+         * shape tests/sta_client.cpp hit (IRadio::StartRxLoop). A busy lock
+         * skips one 2 s CFO step; the next tick re-measures. */
+        std::unique_lock<std::mutex> lk(_reg_mu, std::try_to_lock);
+        if (!lk.owns_lock())
+          return;
         _device.rtw_write<uint32_t>(0x1040,
                                     reg1040_base | ((field << 10) & 0x00FFFC00u));
         _xtal_cap = nc;
@@ -390,8 +398,12 @@ void RtlJaguar3Device::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
           if (fb[24] == 0x15 && fb[25] == 0x00 &&
               std::memcmp(fb + 10, _bf_peer, 6) == 0) {
             _bf_cbr_count.fetch_add(1, std::memory_order_relaxed);
-            if (!_bf_apply_on.load(std::memory_order_relaxed)) {
-              std::lock_guard<std::mutex> lk(_reg_mu);
+            /* try_lock for the reason cfo_tick gives: this is the RX
+             * thread. Busy -> _bf_apply_on stays false, and the next CBR
+             * from the peer retries the apply. */
+            std::unique_lock<std::mutex> lk(_reg_mu, std::defer_lock);
+            if (!_bf_apply_on.load(std::memory_order_relaxed) &&
+                lk.try_lock()) {
               devourer::bf::apply_vmatrix(
                   _device, true, static_cast<uint8_t>(_channel.ChannelWidth));
               _bf_apply_on.store(true, std::memory_order_relaxed);
@@ -2622,6 +2634,13 @@ bool RtlJaguar3Device::SetStationIdentity(const devourer::MacAddr &own,
     _logger->error("Jaguar3: station identity refused before bring-up");
     return false;
   }
+  /* The beacon's own record, not net_type: a ClearAckResponder can close the
+   * gate under a live beacon, and net_type alone would then read "free". */
+  if (_bcn_interval_tu > 0) {
+    _logger->error("Jaguar3: station identity refused: the beacon owns port "
+                   "0 (StopBeacon first)");
+    return false;
+  }
   return _station.arm(_device, own, bssid, _logger, "Jaguar3");
 }
 
@@ -2632,6 +2651,13 @@ bool RtlJaguar3Device::ClearStationIdentity() {
 
 void RtlJaguar3Device::ClearAckResponder() {
   std::lock_guard<std::mutex> lk(_reg_mu);
+  /* The gate this closes is the station's too: a clear here would leave the
+   * station deaf to its AP while it still reads as armed. */
+  if (_station.armed()) {
+    _logger->error("Jaguar3: ACK responder clear refused: port 0 belongs to "
+                   "a station identity (ClearStationIdentity instead)");
+    return;
+  }
   if (!devourer::ack::disable_verified(_device)) {
     _logger->error("Jaguar3: ACK responder disarm did not latch");
     return;

@@ -245,8 +245,8 @@ struct AdapterCaps {
    * not set it from a code-reading: the bar is an on-air cell showing this
    * adapter receiving unicast addressed to it and being ACKed for what it
    * sends - the same shape of evidence ack_responder_ok carries, measured per
-   * die. (The cells that exist use a raw injector and an armed ACK responder
-   * as the peer, not an AP; the hostapd-based gates measured other things.)
+   * die. (The MT7612U cells use a raw injector and an armed ACK responder as
+   * the peer, not an AP; the Realtek cells below use a devourer AP.)
    *
    * TRUE on MT7612U, and read docs/mt7612u-station-identity.md - its
    * retraction section first - before quoting a number from it. Both halves
@@ -277,6 +277,13 @@ struct AdapterCaps {
    * airtime collapsed the 14 Mbit/s rung (52%/64% loss vs 0.03%/0.00%).
    * The uplink half (the AP ACKing the station) held in every arm: 20/3
    * AP-side duplicates armed, 40/16 unarmed. `wpa2` read 8/8 on the 8812CU.
+   * Two limits on what that shows: the ACK evidence is INDIRECT (the
+   * station-side duplicate ratio; no witness capture, no AP tx.report), and
+   * the control moves two registers at once - these dies' bring-up never
+   * programs MACID, so unarmed differs in MACID AND net_type. The arm as a
+   * whole makes the port answer; which register gates it is not separated.
+   * The arm also reads BSSID back, so a die whose 0x0618 does not read back
+   * would refuse - one more reason the flag stays per measured die.
    * Same limits as above for power save/TIM/key lookup; near field; no soak.
    *
    * FALSE on the 8822E and 8821C (ported, same code - no cell run), on

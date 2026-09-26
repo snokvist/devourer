@@ -329,9 +329,12 @@ inline bool snapshot_station_restore(RtlAdapter &dev,
 }
 
 /* Gate closed first, as enable() does, so a failed identity write leaves the
- * port passive rather than answering for half an address. Every write is
- * attempted; the transfer status is reported but is not the verdict -
- * station_is() is. */
+ * port passive rather than answering for half an address. The gate close is a
+ * PRECONDITION: if its transfer fails nothing else is written. Past it, every
+ * identity write is attempted (no short-circuit), and the gate opens only if
+ * all four reported success. The return is transfer status, NOT the verdict:
+ * a write can report failure and land, or report success and not - which is
+ * why StationArm ignores it and decides on station_is() alone. */
 inline bool arm_station(RtlAdapter &dev, const uint8_t own[6],
                         const uint8_t bssid[6]) noexcept {
   try {
@@ -384,6 +387,13 @@ inline bool restore_station(RtlAdapter &dev,
     (void)dev.rtw_write8(0x0102,
                          static_cast<uint8_t>((nt & ~kNetTypeMask) |
                                               (saved.net_type & kNetTypeMask)));
+  } catch (...) {
+  }
+  /* The verdict in its OWN guard: a write that threw may not have landed
+   * or may have, and only the readback knows. (One shared guard here once
+   * returned "not restored" for a port that had never been touched -
+   * caught by tests/station_arm_selftest.cpp's throwing transport.) */
+  try {
     return port_identity_is(dev, saved.identity) &&
            (dev.rtw_read8(0x0102) & kNetTypeMask) ==
                (saved.net_type & kNetTypeMask);

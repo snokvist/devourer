@@ -59,8 +59,8 @@ that tree up; nothing here depends on it any more.
 | 2 — the `IRadio` seam | **Implemented.** Seam + caps flag + MT7612U implementation + five bring-up gates + a headless selftest. R5 and R6 both measured; `station_mode_ok` is **true** for MT7612U. `docs/mt7612u-station-identity.md` — read its retraction section before quoting any number. The R6 table was re-taken 2026-09-20 under the corrected single-variable harness and holds. |
 | 3 — pure station logic | **DONE 2026-09-21.** BSS table, association state machine, EAPOL/4-way supplicant, all headless. Both acceptance negatives present and load-bearing. Pinned against a captured hostapd/wpa_supplicant four-way. |
 | 4 — the harness | **DONE 2026-09-21.** `tests/sta_client.cpp` (+ its `.inc`, ctest `sta_client_headless`) and `tests/mt7612u_sta_onair.sh`. **16/16 on ch6** against hostapd on an RTL8812AU; `bench` 2/2 separately. No backend branch anywhere in it, which is the phase's acceptance property. |
-| 5 — validation | **DONE 2026-09-26 on 5 GHz; two 2.4 GHz gates open.** Close-out review done (Round 6 + its addendum; every finding resolved). The d2d link now runs with retransmission at both ends by default - `AP_RETRY=3` (Realtek descriptor retry limit), `STA_ACK=1` (the station had sent every frame NOACK and never retried), `STA_RETRY=5` (MT7612U MAC retry limit) - plus 802.11 duplicate detection at both ends. With them, ch36 MCS7: 0.00% loss both ways to 20 up / 30 down Mbit/s; 6M 0.00%; `all` 21/21 (every ping cell 20/20, the old flaky 6M/ch6 cell included); a 4-min bidirectional soak 0.00% with `replays rejected` 0. The 30-min soak (8812CU) and 15-min soak (8812BU) ran BEFORE the defaults and passed 5/5 with ~3% downlink loss; not yet re-run with them. 2.4 GHz, re-run with the defaults 2026-09-26: the 8812BU as AP on ch6 now PASSES `thru` (it failed before retries) - uplink 0.00% to 20 Mbit/s, downlink 0.67-3.10% per rung against 0.12-0.34% for the 8812CU AP on the same channel, same station, back to back (one run each: the 8812BU's excess is the AP adapter or Jaguar2, not the channel). The 8812AU uplink is still to re-run (adapter not on the bench). The Jaguar3 AP TX wedge (REG_CR PROTOCOL_EN at the LLT init) is fixed on 8822C/8822E and the same defect on Jaguar2 (8822B): `docs/jaguar3-tx-ring.md`. |
-| 6 — the Realtek arm | **Ported on Jaguar1/2/3, MEASURED on the 8822C and 8822B, 2026-09-26.** `src/StationArm.h` over `AckResponder.h`: MACID = own, BSSID = the AP, net_type = Infra, exact pre-arm restore, refused while a beacon or ACK responder owns port 0 (and they refuse while it is armed). `station_mode_ok` true on those two dies only. The structural test held: `sta_client` needed no backend branch - the harness gained `STA_VID/STA_PID` (the station was hardcoded MT7612U) and the `STA_ARM=0` control. 8812CU station: `wpa2` 8/8; `thru` armed vs unarmed 2 vs 42122 station duplicates (2.98x delivered = every downlink frame aired AP_RETRY+1 times unarmed); 8812BU station 13 vs 35117 (2.99x). **One caller bug found and fixed**: `sta_client` armed under its RX lock and deadlocked (sync USB I/O waits on the RX thread) - IRadio's `StartRxLoop` now states the rule. Open: Jaguar1 (needs an 8812AU), the 8822E and 8821C (no cell). |
+| 5 — validation | **DONE 2026-09-26 on 5 GHz; two 2.4 GHz gates open.** Close-out review done (Round 6 + its addendum; every finding resolved). The d2d link now runs with retransmission at both ends by default - `AP_RETRY=3` (Realtek descriptor retry limit), `STA_ACK=1` (the station had sent every frame NOACK and never retried), `STA_RETRY=5` (MT7612U MAC retry limit) - plus 802.11 duplicate detection at both ends. With them, ch36 MCS7: 0.00% loss both ways to 20 up / 30 down Mbit/s; 6M 0.00%; `all` 21/21 (every ping cell 20/20, the old flaky 6M/ch6 cell included); a 4-min bidirectional soak 0.00% with `replays rejected` 0. The 30-min soak (8812CU) and 15-min soak (8812BU) ran BEFORE the defaults and passed 5/5 with ~3% downlink loss; the 8812CU one was RE-RUN with the defaults 2026-09-26: 5/5, uplink 0.00% in all 30 chunks, downlink 0.00-0.02%, one association, 643k frames each way with both ledgers closed, replays 0, AP RSS flat (11928 -> 11940 kB, sampled every 30 s) - one run. 2.4 GHz, re-run with the defaults 2026-09-26: the 8812BU as AP on ch6 now PASSES `thru` (it failed before retries) - uplink 0.00% to 20 Mbit/s, downlink 0.67-3.10% per rung against 0.12-0.34% for the 8812CU AP on the same channel, same station, back to back (one run each: the 8812BU's excess is the AP adapter or Jaguar2, not the channel). The 8812AU uplink is still to re-run (adapter not on the bench). The Jaguar3 AP TX wedge (REG_CR PROTOCOL_EN at the LLT init) is fixed on 8822C/8822E and the same defect on Jaguar2 (8822B): `docs/jaguar3-tx-ring.md`. |
+| 6 — the Realtek arm | **Ported on Jaguar1/2/3, MEASURED on the 8822C and 8822B, 2026-09-26.** `src/StationArm.h` over `AckResponder.h`: MACID = own, BSSID = the AP, net_type = Infra, exact pre-arm restore, refused while a beacon or ACK responder owns port 0 (and they refuse while it is armed). `station_mode_ok` true on those two dies only. The structural test held: `sta_client` needed no backend branch - the harness gained `STA_VID/STA_PID` (the station was hardcoded MT7612U) and the `STA_ARM=0` control. Review round 7 (two reviews, converged; `docs/station-mode-plan.md`) fixed the Jaguar2/3 port-0 ownership holes it found. 8812CU station: `wpa2` 8/8; `thru` armed vs unarmed 2 vs 42122 station duplicates (2.98x delivered = every downlink frame aired AP_RETRY+1 times unarmed); 8812BU station 13 vs 35117 (2.99x). **One caller bug found and fixed**: `sta_client` armed under its RX lock and deadlocked (sync USB I/O waits on the RX thread) - IRadio's `StartRxLoop` now states the rule. Open: Jaguar1 (needs an 8812AU), the 8822E and 8821C (no cell). |
 
 ## What exists now
 
@@ -402,12 +402,14 @@ because it was measured, not because it is understood.
     one run each, so the 8812BU's downlink excess is the adapter or Jaguar2,
     not the channel; unattributed further). The 8812AU uplink still needs
     that adapter on the bench.
-11. **Soaks with the defaults.** The 30-min (8812CU) and 15-min (8812BU)
-    bidirectional soaks predate the retransmission defaults. One 30-min run
-    with them closes Phase 5 cleanly.
+11. ~~**Soaks with the defaults.**~~ **CLOSED 2026-09-26** for the 8812CU:
+    30 min, 5/5, up 0.00% every chunk, down <= 0.02%, 643k frames each way,
+    replays 0 (one run). The 8812BU is item 12's run.
 12. **The 8812BU AP's resident memory grew 532 kB in 15 min** (the 8812CU:
-    16 kB in 30). One run; leak vs warm-up not separated. A 30-min soak with
-    RSS sampled per chunk would say.
+    16 kB in 30, and 12 kB in 30 with the defaults, flat when sampled every
+    30 s). One run; leak vs warm-up not separated. A 30-min 8812BU soak with
+    RSS sampled every 30 s would say (the external sampler used for the
+    8812CU: the harness itself reads RSS only at start and end).
 13. ~~**The station's send ceiling is ~22.7 Mbit/s**~~ **ANSWERED
     2026-09-26: the MT7612U send path, not the CCMP.** Same AP (8812CU),
     same session, uplink ladder 20-50 Mbit/s, one run each: the MT7612U
@@ -415,11 +417,6 @@ because it was measured, not because it is understood.
     `sta_client` at 28.4-29.8. Both encrypted every offered frame (187.5k);
     every loss is a send-queue drop. Why the MT7612U path stops there (USB
     submit depth, TXWI build, the chip) is not measured.
-16. **12 station MIC failures = 12 AP send failures** in the unarmed Phase 6
-    control (8812BU station, 8812CU AP, 4x retry load): possibly frames aired
-    truncated when a Jaguar3 send timed out, possibly coincidence. One run.
-17. **Phase 6 remainder:** Jaguar1 (`STA_ARM` pair on an 8812AU station),
-    the 8822E and 8821C cells; a soak with a Realtek station.
 14. **Untested silicon** sharing today's fixes: the 8821C (USB) and the PCIe
     8821CE (Jaguar2 `MAC_TRX_ENABLE`), the 8814AU (Jaguar1 auto-LLT - not
     covered by the manual-LLT argument), and 2/4-bulk-OUT Jaguar3 parts (the
@@ -430,6 +427,11 @@ because it was measured, not because it is understood.
     (the byte-exact GENERAL_INFO port) - push to the fork as a record or
     delete.
 
+16. **12 station MIC failures = 12 AP send failures** in the unarmed Phase 6
+    control (8812BU station, 8812CU AP, 4x retry load): possibly frames aired
+    truncated when a Jaguar3 send timed out, possibly coincidence. One run.
+17. **Phase 6 remainder:** Jaguar1 (`STA_ARM` pair on an 8812AU station),
+    the 8822E and 8821C cells; a soak with a Realtek station.
 ## The rule this work runs under
 
 No gate closes without **at least two adversarial reviews** with findings
