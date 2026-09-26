@@ -2183,13 +2183,16 @@ devourer::AdapterCaps RtlJaguarDevice::GetAdapterCaps() {
    * the vendor retry carve-out (knob inert). */
   c.ack_responder_ok = true;
   c.tx_retry_limit_ok = _eepromManager->version_id.ICType != CHIP_8814A;
-  /* station_mode_ok stays false: SetStationIdentity is ported (shared
-   * StationArm), but no Jaguar1 die has run the on-air cell the flag's
-   * declaration requires. Expect the CHIP_8812 cell to read differently from
-   * the Jaguar2/3 ones: bring-up programs the EFUSE MAC into MACID (the
-   * station's `own`), and on that die the MACID was measured to keep
-   * answering with net_type NoLink - so its STA_ARM=0 control may already
-   * ACK, and Clear (which restores MACID = own) does not silence it. */
+  /* station_mode_ok: TRUE on CHIP_8812 (measured on an 8812AU, 2026-09-26 -
+   * see the table at the AdapterCaps declaration), and read what the
+   * measurement is: the station behaviour holds, the ARM is not what makes
+   * it hold. Bring-up programs the EFUSE MAC into MACID (the station's
+   * `own`), and on this die the MACID answers with net_type NoLink - so the
+   * STA_ARM=0 control ACKed too (27 duplicates vs 38 armed, where a port
+   * that does not answer shows ~3x delivered). The arm is harmless and
+   * verified; Clear (MACID back to `own`) cannot silence the port. The
+   * 8814A/8821A dies are unmeasured and stay false. */
+  c.station_mode_ok = _eepromManager->version_id.ICType == CHIP_8812;
   /* Per-packet TX power: 8814A only — its dword5 [30:28] descriptor LUT (the
    * 8822B TXPWR_OFSET position; vendor-defined, vendor-unused). measured
    * stays false until tests/txpkt_pwr_ofset_onair.sh proves it moves on-air

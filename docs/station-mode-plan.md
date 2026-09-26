@@ -2314,5 +2314,11 @@ shared one guard between its last write and its readback, so a write that
 threw reported "not restored" for a port nothing had touched. Fixed - the
 verdict has its own guard.
 
-*Open:* Jaguar1 needs an 8812AU station; the 8822E and 8821C have the code and
-no cell; no soak with a Realtek station yet.
+*Jaguar1 (2026-09-26, 8812AU station, 8812CU AP, ch36):* 2/2 `thru` armed and
+unarmed alike - 38 vs 27 duplicates. The control does not discriminate on this
+die, as the review predicted: bring-up programs the EFUSE MAC (`own`) into
+MACID, and the 8812's MACID answers with net_type NoLink. The flag is TRUE
+there for the behaviour, with that stated at the declaration.
+
+*Open:* the 8822E and 8821C have the code and no cell; no soak with a Realtek
+station yet.

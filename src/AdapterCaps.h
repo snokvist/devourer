@@ -271,6 +271,13 @@ struct AdapterCaps {
    *   station (AP)       armed: dups / delivered   unarmed: dups / delivered
    *   8812CU (8812BU)         2 / 24111                  42122 / 14126 (2.98x)
    *   8812BU (8812CU)        13 / 24115                  35117 / 11744 (2.99x)
+   *   8812AU (8812CU)        38 / 24110                     27 / 24114  (!)
+   *
+   * (!) The Jaguar1 8812 row does NOT discriminate, and was predicted not
+   * to: its bring-up programs `own` into MACID and that die's MACID answers
+   * with net_type NoLink, so the port ACKs with or without the arm. TRUE
+   * there because the station behaviour is measured, not because the arm
+   * produces it (RtlJaguarDevice::GetAdapterCaps).
    *
    * Unarmed, the MAC does not ACK the AP's unicast, so each downlink frame
    * airs AP_RETRY+1 = 4 times - the 3x duplicate ratio - and the wasted
@@ -286,9 +293,9 @@ struct AdapterCaps {
    * would refuse - one more reason the flag stays per measured die.
    * Same limits as above for power save/TIM/key lookup; near field; no soak.
    *
-   * FALSE on the 8822E and 8821C (ported, same code - no cell run), on
-   * Jaguar1 (ported, the CHIP_8812 exact-restore included - no cell run),
-   * and on every other backend: not ported. */
+   * FALSE on the 8822E and 8821C (ported, same code - no cell run), on the
+   * Jaguar1 8814A and 8821A (ported - no cell run), and on every other
+   * backend: not ported. */
   bool station_mode_ok = false;
 
   /* --- feature flags --- */

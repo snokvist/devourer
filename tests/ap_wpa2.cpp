@@ -1481,6 +1481,24 @@ int main(int argc, char** argv) {
     /* The full-window diff source - see IRtlRadio::DumpMacRegisters. */
     if (env_on("DEVOURER_AP_MAC_DUMP")) rtl->DumpMacRegisters();
   }
+  /* DEVOURER_AP_CCA_GATES=primary|edcca|both - DIAGNOSTIC: clear ONE MAC
+   * carrier-sense gate after bring-up (IRtlRadio::SetCcaGates), the other left
+   * as bring-up set it. DEVOURER_DIS_CCA is both-or-neither, and on Jaguar1
+   * both-off was measured WORSE than the right one alone (CLAUDE.md). Added
+   * for the 8812AU-as-AP ch6 deferral (2026-09-26): which gate holds it off.
+   * Read back and printed; anything else is refused, loudly. */
+  if (const char* g = std::getenv("DEVOURER_AP_CCA_GATES"); g && *g) {
+    const bool both = std::strcmp(g, "both") == 0;
+    const bool pri = both || std::strcmp(g, "primary") == 0;
+    const bool ed = both || std::strcmp(g, "edcca") == 0;
+    auto* rtl = dynamic_cast<IRtlRadio*>(g_dev);
+    bool rp = false, re = false;
+    const bool ok = (pri || ed) && rtl && rtl->SetCcaGates(pri, ed) &&
+                    rtl->GetCcaGates(rp, re);
+    fprintf(stderr,
+            "  CCA gates: asked '%s' -> %s (read back: primary %s, edcca %s)\n",
+            g, ok ? "applied" : "REFUSED", rp ? "OFF" : "on", re ? "OFF" : "on");
+  }
   std::signal(SIGINT, ap_on_signal);
   std::signal(SIGTERM, ap_on_signal);
   int tx_backoff_ms = 0;
