@@ -128,6 +128,51 @@ inline void assign_seq(std::vector<uint8_t>& frame, uint16_t seq) {
   frame[23] = (uint8_t)(sc >> 8);
 }
 
+/* DUPLICATE DETECTION, 802.11-2016 10.3.2.14. A transmitter that retries -
+ * and both ends of this link do, since STA_ACK and AP_RETRY - resends the
+ * same frame with the Retry bit set whenever an ACK is lost, so the receiver
+ * sees it twice. The standard answer is a per-transmitter cache of the last
+ * Sequence Control accepted (per TID for QoS data): a frame with Retry set
+ * that matches it is a duplicate and is discarded before anything else looks
+ * at it.
+ *
+ * Without this the second copy reaches the CCMP replay check, which rejects
+ * it (same PN) - the right outcome, counted as the wrong thing: a replay
+ * counter that goes up on every lost ACK can no longer tell a retransmission
+ * from an attack. Pure, per peer; keep one per transmitter.
+ *
+ * It runs before decryption, as it does in real stacks, so a forged frame can
+ * move the cache. The worst that buys is one legitimate retransmission being
+ * processed instead of dropped - and the replay window still refuses it. */
+class DupDetector {
+public:
+  static constexpr int kNonQosTid = 16;
+  static constexpr int kSlots = 17;
+
+  /* True when this frame is a retransmission of the last one accepted on the
+   * same TID (Retry bit set, identical Sequence Control). A frame that is not
+   * a duplicate becomes the new "last". */
+  bool is_duplicate(bool retry, uint16_t seq_ctl, int tid = kNonQosTid) {
+    if (tid < 0 || tid >= kSlots) tid = kNonQosTid;
+    const bool dup = retry && seen_[tid] && last_[tid] == seq_ctl;
+    if (!dup) {
+      seen_[tid] = true;
+      last_[tid] = seq_ctl;
+    }
+    return dup;
+  }
+  void reset() {
+    for (int i = 0; i < kSlots; ++i) {
+      seen_[i] = false;
+      last_[i] = 0;
+    }
+  }
+
+private:
+  bool seen_[kSlots] = {};
+  uint16_t last_[kSlots] = {};
+};
+
 /* A monotonic 12-bit sequence counter. One per transmitter address; a station
  * needs exactly one for everything it sends.
  *

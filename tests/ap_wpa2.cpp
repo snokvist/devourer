@@ -622,6 +622,9 @@ static HarnessCrypto g_crypto;
 // Data-plane visibility. The one thing the on-air runs could not answer was
 // whether encrypted frames were arriving at all, because nothing counted them.
 static std::atomic<uint64_t> g_enc_rx{0}, g_mic_fail{0}, g_replayed{0};
+/* Retransmissions a lost ACK caused, dropped before decrypt (802.11
+ * duplicate detection) - so `replays rejected` stays a count of replays. */
+static std::atomic<uint64_t> g_dup_drop{0};
 /* THE RECEIVE PATH, counted at the door. Every frame the device hands us, and
  * every 802.11 data frame addressed to this BSS BEFORE any filter, with each
  * exit that used to be silent named. The encrypted counter above only sees
@@ -1092,6 +1095,18 @@ static void on_rx(const Packet& p) {
       int len = (int)mlen;
       if (len < hlen + 8 + 8) { g_rx_data_short.fetch_add(1); return; }
       const uint8_t* d = p.Data.data();
+      {
+        const bool fa = (fc1 & (devourer::sta::kFcToDs | devourer::sta::kFcFromDs)) ==
+                        (devourer::sta::kFcToDs | devourer::sta::kFcFromDs);
+        const int dtid = devourer::sta::is_qos_data(fc0)
+                             ? (d[fa ? 30 : 24] & 0x0f)
+                             : devourer::sta::DupDetector::kNonQosTid;
+        const uint16_t sc = (uint16_t)(d[22] | (d[23] << 8));
+        if (sender->rx_dup.is_duplicate((fc1 & devourer::sta::kFcRetry) != 0, sc, dtid)) {
+          g_dup_drop.fetch_add(1);
+          return;
+        }
+      }
       // The header length is passed explicitly, so a QoS frame's AAD includes
       // its TID as 802.11-2016 12.5.3.3.3 requires. This is a deliberate
       // CORRECTNESS change, not byte-identity: the previous code folded the
@@ -1794,13 +1809,14 @@ int main(int argc, char** argv) {
           (unsigned long long)g_rx_malformed.load());
   fprintf(stderr,
           "  data plane: encrypted frames received=%llu, MIC failures=%llu, "
-          "replays rejected=%llu, queued=%llu, frames sent=%llu, "
+          "replays rejected=%llu, duplicates dropped=%llu, queued=%llu, frames sent=%llu, "
           "queue dropped=%llu, send failed=%llu, backoffs=%llu,"
           " refused after the TX circuit opened=%llu,"
           " beacon refreshes=%llu (failed %llu, retries %llu)\n",
           (unsigned long long)g_enc_rx.load(),
           (unsigned long long)g_mic_fail.load(),
           (unsigned long long)g_replayed.load(),
+          (unsigned long long)g_dup_drop.load(),
           (unsigned long long)g_q_in.load(),
           (unsigned long long)g_sent.load(),
           (unsigned long long)g_q_drop.load(),

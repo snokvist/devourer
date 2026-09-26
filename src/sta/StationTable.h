@@ -68,6 +68,7 @@ struct Station {
 
   uint64_t tx_pn;           /* one per station; see invariant 1 */
   CcmpReplay rx_replay;     /* per-TID receive window */
+  DupDetector rx_dup;       /* per-TID retransmission cache, before decrypt */
 
   int hs_tries;             /* four-way retransmissions so far */
   double hs_tx_ms;          /* when the last (re)transmission went out */

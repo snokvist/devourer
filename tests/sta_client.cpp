@@ -155,6 +155,11 @@ devourer::sta::SeqCounter g_data_seq;
  * problem, it is a keystream-reuse problem. */
 uint64_t g_tx_pn = 1;
 devourer::sta::CcmpReplay g_rx_replay;       /* pairwise, per TID */
+/* 802.11 duplicate detection for the AP's unicast frames: a retransmission a
+ * lost ACK caused is dropped before decrypt and counted as a duplicate, not a
+ * replay. Group frames are never retried and would clobber the cache. */
+devourer::sta::DupDetector g_rx_dup;
+std::atomic<uint64_t> g_dup_drop{0};
 devourer::sta::CcmpReplay g_group_replay;    /* the GTK's own PN space */
 /* WHICH KEYS THIS PN STATE BELONGS TO. Generations rather than copies of the
  * key: the supplicant already holds both, and a harness keeping its own copy
@@ -279,11 +284,12 @@ struct ProfilingCrypto : devourer::test::OpenSslCryptoOps {
 /* THE ONE the whole harness uses. */
 ProfilingCrypto g_crypto;
 
-/* DEVOURER_STA_ACK=1: unicast frames request an ACK, so the MT7612U's
- * hardware retries until the AP answers (15 deep). Unset/0 keeps every frame
- * NOACK - what every recorded figure was measured with, and the reason this
- * station's uplink never retransmitted anything. Group-addressed frames stay
- * NOACK either way: nobody ACKs them. */
+/* Unicast frames request an ACK by default, so the MT7612U's hardware
+ * retries until the AP answers (15 deep) - what any station does. Until
+ * 2026-09-26 every frame went NOACK (the stream builder's default) and this
+ * station's uplink never retransmitted anything. DEVOURER_STA_ACK=0 restores
+ * that, to reproduce the older single-shot figures. Group-addressed frames
+ * stay NOACK either way: nobody ACKs them. */
 std::vector<uint8_t> g_rt_ack;
 
 void enqueue(std::vector<uint8_t> mpdu) {
@@ -351,6 +357,7 @@ void note_keys() {
     g_ptk_gen_seen = sup.ptk_generation();
     g_tx_pn = 1;
     g_rx_replay.reset();
+    g_rx_dup.reset();
     g_ptk_installs.fetch_add(1);
   }
   if (sup.gtk_valid() && sup.gtk_len() == 16 &&
@@ -460,6 +467,13 @@ void rx_frame(const uint8_t* mpdu, size_t len, int8_t rssi, uint32_t now) {
   const int tid = devourer::sta::is_qos_data(fc0)
                       ? (mpdu[24] & 0x0f)
                       : devourer::sta::CcmpReplay::kNonQosTid;
+
+  if (!(mpdu[4] & 0x01) &&
+      g_rx_dup.is_duplicate((fc1 & devourer::sta::kFcRetry) != 0,
+                            (uint16_t)(mpdu[22] | (mpdu[23] << 8)), tid)) {
+    g_dup_drop.fetch_add(1);
+    return;
+  }
 
   if (!(fc1 & devourer::sta::kFcProtected)) {
     /* An unprotected data frame on a WPA2 link is not ours to forward: the
@@ -913,12 +927,13 @@ void report() {
   std::fprintf(stderr,
                "  data plane: encrypted rx=%llu (group=%llu), plaintext rx="
                "%llu, MIC failures=%llu, replays rejected=%llu,"
-               " no key for it=%llu\n",
+               " duplicates dropped=%llu, no key for it=%llu\n",
                (unsigned long long)g_enc_rx.load(),
                (unsigned long long)g_group_rx.load(),
                (unsigned long long)g_plain_rx.load(),
                (unsigned long long)g_mic_fail.load(),
                (unsigned long long)g_replays.load(),
+               (unsigned long long)g_dup_drop.load(),
                (unsigned long long)g_no_key.load());
   std::fprintf(stderr,
                "  refused before the host: fragmented=%llu, A-MSDU=%llu,"
@@ -1032,7 +1047,7 @@ int main(int argc, char** argv) {
   const char* rate_s = std::getenv("DEVOURER_TX_RATE");
   if (!rate_s || !*rate_s) rate_s = "6M";
   g_rt = devourer::build_stream_radiotap(devourer::parse_tx_mode_str(rate_s));
-  if (const char* a = std::getenv("DEVOURER_STA_ACK"); a && *a && std::strcmp(a, "0") != 0)
+  if (const char* a = std::getenv("DEVOURER_STA_ACK"); !a || !*a || std::strcmp(a, "0") != 0)
     g_rt_ack = devourer::build_stream_radiotap(devourer::parse_tx_mode_str(rate_s),
                                                /*no_ack=*/false);
   std::fprintf(stderr, "  TX rate: %s, unicast %s\n", rate_s,

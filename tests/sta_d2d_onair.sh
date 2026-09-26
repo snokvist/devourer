@@ -133,16 +133,21 @@ ARQ="${ARQ:-0}"
 # FPV link, where FEC carries reliability - so without this every downlink
 # frame airs exactly once and a frame the station misses stays lost. The
 # station needs nothing for it: the MT7612U ACKs its own address. Unset keeps
-# the library default. Measured: AP_RETRY=7 took downlink loss from 1.3-2.3%
-# to 0.00% on every rung to 30 Mbit/s at ch36.
-AP_RETRY="${AP_RETRY:-}"
+# the library default. Measured at ch36, MCS7, one downlink ladder each:
+# AP_RETRY=7, 5 and 3 all held loss at 0.00% to 30 Mbit/s (3: one datagram in
+# ~115k, at 20 Mbit/s), against 1.3-2.3% with no retries. DEFAULT 3 since
+# 2026-09-26 - an AP retries, and 3 is the cheapest in airtime that measured
+# clean. AP_RETRY=0 reproduces the older single-shot figures; empty leaves
+# the library default (also 0).
+AP_RETRY="${AP_RETRY-3}"
 # STA_ACK=1 is the uplink's half: the station's unicast frames request an ACK
 # (DEVOURER_STA_ACK), so its MT7612U retries until the AP answers (15 deep).
-# Unset keeps every frame NOACK, the stream builder's default and what every
-# earlier figure was measured with - an uplink with no retransmission at all.
-# Measured: a 6M 2 Mbit/s uplink at ch36 went from ~1% loss to 0.00% (5386 of
-# 5386 frames decrypted), with the retries visible on air.
-STA_ACK="${STA_ACK:-}"
+# DEFAULT ON since 2026-09-26 - a station ACKs. STA_ACK=0 sends every frame
+# NOACK, the stream builder's default and what every earlier figure was
+# measured with - an uplink with no retransmission at all. Measured: a 6M
+# 2 Mbit/s uplink at ch36 went from ~1% loss to 0.00% (5386 of 5386 frames
+# decrypted), with the retries visible on air.
+STA_ACK="${STA_ACK-1}"
 # The AP's beacon interval, in TU. 25 is what every figure in this branch was
 # measured under and stays the default; 100 is what a normal AP uses. It is a
 # knob because the beacon rides the same chip as the data queue and "does the
@@ -465,7 +470,7 @@ sta_up() {   # $1 = channel, $2 = seconds, $3.. = extra env
   local chan="$1" secs="$2"; shift 2
   rm -f "$OUT/sta.log"
   env DEVOURER_TX_RATE="$TX_RATE" \
-      ${STA_ACK:+DEVOURER_STA_ACK="$STA_ACK"} \
+      DEVOURER_STA_ACK="${STA_ACK:-0}" \
       DEVOURER_VID=0x0e8d DEVOURER_PID=0x7612 \
       DEVOURER_USB_BUS="${STA_SYSFS%%-*}" DEVOURER_USB_PORT="${STA_SYSFS#*-}" \
       DEVOURER_CHANNEL="$chan" DEVOURER_TX_WITH_RX=thread \

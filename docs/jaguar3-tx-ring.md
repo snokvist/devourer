@@ -355,6 +355,25 @@ retransmission. What it establishes:
 | MCS7, 1-20 Mbit/s up / 1-30 down | **0.00% on every rung** | **0.00%** on every rung but the first (6.64% at 1 Mbit/s, not reproduced in two later runs of that rung) |
 | 6M, 0.5-4 Mbit/s | **0.00%** | **0.00%** |
 
+**How many AP retries** (asked on review: 7 is a lot). Downlink-only
+ladders, MCS7, ch36, `STA_ACK=1`, one run each: `AP_RETRY=3` 0.00% on every
+rung to 30 Mbit/s except 0.01% (about one datagram in ~115k) at 20 Mbit/s;
+`AP_RETRY=5` 0.00% everywhere; 7, 0.00% (above). **The harness now defaults
+to `AP_RETRY=3` and `STA_ACK=1`** (2026-09-26) - the cheapest limit that
+measured clean, on a strong, quiet link; a weaker one may want 5. `=0`
+reproduces the older single-shot figures. With both on, `all` reads 21/21
+with every ping cell 20/20 (the flaky `wpa2`-at-6M cell included, one run),
+and a 4-minute bidirectional soak 0.00% both ways (one downlink chunk
+0.01%).
+
+**Duplicate detection** came with it. With both ends retrying, a lost ACK
+delivers a frame twice, and the second copy reached the CCMP replay check -
+the `wpa2` cell's `replays=0` ledger check failed on it (2 on the AP). Both
+ends now run 802.11 duplicate detection (Retry bit + Sequence Control per
+TID, `sta::DupDetector`, before decrypt), counted as `duplicates dropped`;
+in that soak 257 at the station and 13 at the AP, with `replays rejected`
+back to 0 at both.
+
 So the 6M-vs-MCS7 difference (item 5) was never a property of the rate: it
 was single-shot loss, larger for longer frames, and it disappears once
 either end can retry. The 30 Mbit/s uplink rung still loses ~24% - the

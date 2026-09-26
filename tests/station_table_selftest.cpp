@@ -413,6 +413,74 @@ void test_forward_decision() {
         "...and hands back no destination to act on");
 }
 
+/* 802.11 duplicate detection (sta::DupDetector). With both ends retrying,
+ * a lost ACK delivers the same frame twice; the second copy must be dropped
+ * as a duplicate, not reach the replay window and be counted as a replay.
+ * Each case is one way the cache could be wrong. */
+void test_duplicate_detection() {
+  using devourer::sta::DupDetector;
+  const uint16_t sc10 = 10 << 4, sc11 = 11 << 4;
+  {
+    DupDetector d;
+    check(!d.is_duplicate(false, sc10), "the first frame is never a duplicate");
+    check(d.is_duplicate(true, sc10),
+          "a retry of the same Sequence Control IS a duplicate");
+    check(d.is_duplicate(true, sc10),
+          "...and so is a second retry of it");
+  }
+  {
+    DupDetector d;
+    d.is_duplicate(false, sc10);
+    check(!d.is_duplicate(false, sc10),
+          "the same Sequence Control WITHOUT Retry is not a duplicate "
+          "(the standard requires the Retry bit)");
+  }
+  {
+    DupDetector d;
+    d.is_duplicate(false, sc10);
+    check(!d.is_duplicate(true, sc11),
+          "a retry of a DIFFERENT frame (its original was lost) is processed");
+    check(d.is_duplicate(true, sc11),
+          "...and becomes the frame its own retries are compared with");
+  }
+  {
+    DupDetector d;
+    d.is_duplicate(false, sc10, 0);
+    check(!d.is_duplicate(true, sc10, 5),
+          "per TID: the same number on another TID is not a duplicate");
+    check(d.is_duplicate(true, sc10, 0), "...while TID 0 still remembers it");
+  }
+  {
+    DupDetector d;
+    d.is_duplicate(false, (uint16_t)(sc10 | 1));
+    check(!d.is_duplicate(true, (uint16_t)(sc10 | 2)),
+          "the fragment number is part of the match");
+  }
+  {
+    DupDetector d;
+    d.is_duplicate(false, sc10, 99);
+    check(d.is_duplicate(true, sc10, DupDetector::kNonQosTid),
+          "an out-of-range TID folds into the non-QoS slot, not out of bounds");
+  }
+  {
+    DupDetector d;
+    d.is_duplicate(false, sc10);
+    d.reset();
+    check(!d.is_duplicate(true, sc10),
+          "reset forgets: after a rejoin the first frame is processed");
+  }
+  {
+    devourer::sta::StationTable t;
+    const uint8_t a[6] = {0x02, 1, 2, 3, 4, 5};
+    devourer::sta::Station* st = t.add(a);
+    st->rx_dup.is_duplicate(false, sc10);
+    t.remove(a);
+    st = t.add(a);
+    check(st && !st->rx_dup.is_duplicate(true, sc10),
+          "a re-added station starts with an empty duplicate cache");
+  }
+}
+
 } // namespace
 
 int main() {
@@ -427,6 +495,7 @@ int main() {
   test_churn_does_not_exhaust_the_table();
   test_keyed_accepts_wait_msg4();
   test_forward_decision();
+  test_duplicate_detection();
 
   if (failures) {
     std::fprintf(stderr, "station_table_selftest: %d failure(s)\n", failures);
