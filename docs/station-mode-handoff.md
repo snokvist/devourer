@@ -405,11 +405,13 @@ because it was measured, not because it is understood.
 11. ~~**Soaks with the defaults.**~~ **CLOSED 2026-09-26** for the 8812CU:
     30 min, 5/5, up 0.00% every chunk, down <= 0.02%, 643k frames each way,
     replays 0 (one run). The 8812BU is item 12's run.
-12. **The 8812BU AP's resident memory grew 532 kB in 15 min** (the 8812CU:
-    16 kB in 30, and 12 kB in 30 with the defaults, flat when sampled every
-    30 s). One run; leak vs warm-up not separated. A 30-min 8812BU soak with
-    RSS sampled every 30 s would say (the external sampler used for the
-    8812CU: the harness itself reads RSS only at start and end).
+12. ~~**The 8812BU AP's resident memory grew 532 kB in 15 min**~~ **ANSWERED
+    2026-09-26: warm-up, not a leak.** A 30-min 8812BU-AP soak with the
+    defaults, RSS sampled every 30 s by an external sampler: 11516 -> 12008 kB
+    inside the first minute, then 12012 kB flat for all 61 samples. The soak
+    itself: 5/5, up 0.00% every chunk, down 0.00-0.06%, 643k frames each way,
+    one association, replays 0; three TX-DMA watchdog reads failed and were
+    skipped (the known Jaguar2 USB-read flakiness, guarded). One run.
 13. ~~**The station's send ceiling is ~22.7 Mbit/s**~~ **ANSWERED
     2026-09-26: the MT7612U send path, not the CCMP.** Same AP (8812CU),
     same session, uplink ladder 20-50 Mbit/s, one run each: the MT7612U
@@ -423,9 +425,9 @@ because it was measured, not because it is understood.
     endpoint map is the 3-bulk-OUT table). Needs hardware.
 15. **Small, recorded, not chased:** Jaguar2's `rx.frame` `seq` is always 0;
     the MT7612U decoded ~half of an 8822E's 2.4 GHz beacons against the quirk
-    entry that says no receiver does; the local branch `xp/j3-general-info`
-    (the byte-exact GENERAL_INFO port) - push to the fork as a record or
-    delete.
+    entry that says no receiver does; the branch `xp/j3-general-info` (the
+    byte-exact GENERAL_INFO port) - DECIDED 2026-09-26: pushed to the fork
+    as a record (`fork/xp/j3-general-info`, 12dd4e7), not for merge.
 
 16. **12 station MIC failures = 12 AP send failures** in the unarmed Phase 6
     control (8812BU station, 8812CU AP, 4x retry load): possibly frames aired
