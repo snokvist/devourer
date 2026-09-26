@@ -59,7 +59,7 @@ that tree up; nothing here depends on it any more.
 | 2 — the `IRadio` seam | **Implemented.** Seam + caps flag + MT7612U implementation + five bring-up gates + a headless selftest. R5 and R6 both measured; `station_mode_ok` is **true** for MT7612U. `docs/mt7612u-station-identity.md` — read its retraction section before quoting any number. The R6 table was re-taken 2026-09-20 under the corrected single-variable harness and holds. |
 | 3 — pure station logic | **DONE 2026-09-21.** BSS table, association state machine, EAPOL/4-way supplicant, all headless. Both acceptance negatives present and load-bearing. Pinned against a captured hostapd/wpa_supplicant four-way. |
 | 4 — the harness | **DONE 2026-09-21.** `tests/sta_client.cpp` (+ its `.inc`, ctest `sta_client_headless`) and `tests/mt7612u_sta_onair.sh`. **16/16 on ch6** against hostapd on an RTL8812AU; `bench` 2/2 separately. No backend branch anywhere in it, which is the phase's acceptance property. |
-| 5 — validation | **Validated; close-out review done (Round 6, three reviewers, all findings resolved); open items remain.** Independent witness (Phase 4); devourer-to-devourer + 5 GHz, `tests/sta_d2d_onair.sh`. Throughput at ch36, MCS7, one ladder per AP: ~20 Mbit/s up at 0.2-0.4% loss and ~30 down at 0.8-1.3% (8812CU, 8812EU, 8812BU). Bidirectional soak, ch36, 4+4 Mbit/s: 8812CU 30 min and 8812BU 15 min, both 5/5 - but the FIRST 8812BU soak died at minute 9 (an unguarded register read, fixed), downlink loss ran ~3% throughout without retries, and the 8812BU AP's RSS grew 532 kB in 15 min (not separated from warm-up). Still failing their gates, both at 2.4 GHz: the 8812BU as AP on ch6 and the 8812AU uplink. **Retransmission is now ON by default at both ends and is what closes the loss:** `AP_RETRY=7` (downlink) and `STA_ACK=1` (uplink - the station had sent every frame NOACK, so it never retried). Defaults `AP_RETRY=3`, `STA_ACK=1`; `all` 21/21 and a 4-min soak lossless with them. An "ACKed-but-undelivered" AP defect recorded in Round 6 was that NOACK misread, and is retracted (`docs/jaguar3-tx-ring.md` items 3, 5, 6). |
+| 5 — validation | **DONE 2026-09-26 on 5 GHz; two 2.4 GHz gates open.** Close-out review done (Round 6 + its addendum; every finding resolved). The d2d link now runs with retransmission at both ends by default - `AP_RETRY=3` (Realtek descriptor retry limit), `STA_ACK=1` (the station had sent every frame NOACK and never retried), `STA_RETRY=5` (MT7612U MAC retry limit) - plus 802.11 duplicate detection at both ends. With them, ch36 MCS7: 0.00% loss both ways to 20 up / 30 down Mbit/s; 6M 0.00%; `all` 21/21 (every ping cell 20/20, the old flaky 6M/ch6 cell included); a 4-min bidirectional soak 0.00% with `replays rejected` 0. The 30-min soak (8812CU) and 15-min soak (8812BU) ran BEFORE the defaults and passed 5/5 with ~3% downlink loss; not yet re-run with them. OPEN at 2.4 GHz, measured before retries existed: the 8812BU as AP on ch6 and the 8812AU uplink - re-run both. The Jaguar3 AP TX wedge (REG_CR PROTOCOL_EN at the LLT init) is fixed on 8822C/8822E and the same defect on Jaguar2 (8822B): `docs/jaguar3-tx-ring.md`. |
 | 6 — the Realtek arm | Not started. |
 
 ## What exists now
@@ -362,10 +362,12 @@ because it was measured, not because it is understood.
    review round - the claim that one existed was false when it was written -
    and the rotation has never met a **real** retune, which on this part takes
    48-526 ms.
-6. **No duplicate filter on the station's receive path.** A retried frame the
-   MAC delivers twice is handed to the host twice. The CCMP replay window
-   catches it on a protected link, which is every link this project ships;
-   an open link has nothing. Not observed causing trouble, and not defended.
+6. ~~**No duplicate filter on the station's receive path.**~~ **CLOSED
+   2026-09-26**: both ends now run 802.11 duplicate detection before decrypt
+   (`sta::DupDetector`, Retry bit + Sequence Control per TID; unicast only at
+   the station), so it covers open links too. It became necessary, not
+   theoretical, once both ends retried: a lost ACK had the copy counted as a
+   replay and the `wpa2` cell's ledger check failed on it.
 7. **No 802.11w**, unchanged, and now with an on-air consequence: the
    `reconnect` cell stops the AP rather than sending a deauth, partly because
    an unauthenticated deauth is exactly what this station cannot tell from a
@@ -393,6 +395,29 @@ because it was measured, not because it is understood.
    0.00%. (An "ACKed-but-undelivered at the AP" reading of the zero witness
    retries was that NOACK, and is retracted.) Table:
    `docs/jaguar3-tx-ring.md` items 5 and 6.
+
+10. **The 2.4 GHz gates, re-measured with retries.** The 8812BU-as-AP ch6
+    `thru` and the 8812AU uplink failed before `AP_RETRY`/`STA_ACK`/
+    `STA_RETRY` existed; single-shot loss on a busy channel is exactly what
+    those remove. Re-run both before calling them adapter problems.
+11. **Soaks with the defaults.** The 30-min (8812CU) and 15-min (8812BU)
+    bidirectional soaks predate the retransmission defaults. One 30-min run
+    with them closes Phase 5 cleanly.
+12. **The 8812BU AP's resident memory grew 532 kB in 15 min** (the 8812CU:
+    16 kB in 30). One run; leak vs warm-up not separated. A 30-min soak with
+    RSS sampled per chunk would say.
+13. **The station's send ceiling is ~22.7 Mbit/s** (the 30 Mbit/s uplink rung
+    loses ~24% in every arm: the station's own queue drops). Not the air;
+    the MT7612U send path or `sta_client`'s software CCMP. Unmeasured which.
+14. **Untested silicon** sharing today's fixes: the 8821C (USB) and the PCIe
+    8821CE (Jaguar2 `MAC_TRX_ENABLE`), the 8814AU (Jaguar1 auto-LLT - not
+    covered by the manual-LLT argument), and 2/4-bulk-OUT Jaguar3 parts (the
+    endpoint map is the 3-bulk-OUT table). Needs hardware.
+15. **Small, recorded, not chased:** Jaguar2's `rx.frame` `seq` is always 0;
+    the MT7612U decoded ~half of an 8822E's 2.4 GHz beacons against the quirk
+    entry that says no receiver does; the local branch `xp/j3-general-info`
+    (the byte-exact GENERAL_INFO port) - push to the fork as a record or
+    delete.
 
 ## The rule this work runs under
 
