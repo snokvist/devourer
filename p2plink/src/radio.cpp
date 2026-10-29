@@ -496,7 +496,17 @@ bool Adapter::retune(uint8_t channel, uint8_t bw_mhz, bool ht40_plus, std::strin
     // send_packet inside the backend (RtlJaguar3Device.h, FastRetune note).
     std::lock_guard<std::mutex> lk(im.tx_mu);
     if (!im.up || im.stopped) return false;
-    im.dev->SetMonitorChannel(make_channel(channel, bw_mhz, ht40_plus));
+    const SelectedChannel want = make_channel(channel, bw_mhz, ht40_plus);
+    im.dev->SetMonitorChannel(want);
+    // SetMonitorChannel is void and some backends (MT7612U) log and return
+    // on a refused width or a failed set; read back what the radio holds.
+    const SelectedChannel got = im.dev->GetSelectedChannel();
+    if (got.Channel != want.Channel || got.ChannelWidth != want.ChannelWidth) {
+      if (err)
+        *err = "radio holds ch " + std::to_string(unsigned(got.Channel)) + " width " +
+               std::to_string(int(got.ChannelWidth)) + " after SetMonitorChannel";
+      return false;
+    }
     im.cur_channel = channel;
     im.cur_bw = bw_mhz;
     im.cur_ht40_plus = ht40_plus;

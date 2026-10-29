@@ -780,10 +780,16 @@ int run(const Opts& o) {
         const uint8_t tb = sh.tune_bw.load();
         bool want20 = fixed ? kLadder[fixed_rung].bw_mhz == 20 : ctl.wants_tune_20mhz(t);
         if (tb == 40 && want20) {
+          // Narrow the TX thread BEFORE the radio: a frame whose rung it
+          // picked while tune_bw still read 40 would otherwise wait on the TX
+          // mutex through the retune and then air a 40 MHz frame on a 20 MHz
+          // tune. 20 MHz frames on a 40 MHz tune are fine, so the opposite
+          // order (20 -> 40, below) publishes after.
+          sh.tune_bw = 20;
           if (ad->retune(uint8_t(o.channel), 20, o.ht40_plus, &err)) {
-            sh.tune_bw = 20;
             devourer::Ev(ev, "p2p.tune").t().f("bw", 20);
           } else {
+            sh.tune_bw = 40;
             logger->warn("retune to 20 MHz failed: {}", err);
           }
         } else if (tb == 20 && kLadder[phy].bw_mhz == 40) {
