@@ -24,7 +24,8 @@ namespace p2p {
 struct Rung {
   uint8_t bw_mhz;          // 20 or 40 (per-frame radiotap on the drone)
   uint8_t mcs;             // HT single-stream MCS
-  uint32_t phy_kbps;       // nominal PHY rate at this bw/MCS (LGI)
+  uint32_t phy_kbps;       // nominal HT PHY rate at this bw/MCS, LGI (40 MHz carries
+                           // 108 data subcarriers, not 2 x 52: 27/54/108, not 26/52/104)
   uint8_t fec_k;           // source symbols per video block
   uint8_t fec_n;           // total symbols per video block
   uint16_t duty_permille;  // airtime cap the video budget is derived from
@@ -37,9 +38,9 @@ inline constexpr std::array<Rung, 7> kLadder = {{
     Rung{20, 1, 13000, 8, 12, 600, -89, 1400},   // R1
     Rung{20, 2, 19500, 8, 12, 600, -87, 1400},   // R2
     Rung{20, 3, 26000, 8, 11, 600, -84, 1400},   // R3
-    Rung{40, 1, 26000, 8, 11, 550, -86, 1400},   // R4
-    Rung{40, 3, 52000, 8, 10, 500, -81, 1400},   // R5
-    Rung{40, 5, 104000, 8, 10, 450, -74, 1400},  // R6
+    Rung{40, 1, 27000, 8, 11, 550, -86, 1400},   // R4
+    Rung{40, 3, 54000, 8, 10, 500, -81, 1400},   // R5
+    Rung{40, 5, 108000, 8, 10, 450, -74, 1400},  // R6
 }};
 inline constexpr uint8_t kFloorRung = 0;
 inline constexpr uint8_t kTopRung = 6;
@@ -164,15 +165,15 @@ class LinkController {
 
   // The rung the drone should air video REPAIR symbols at so the ground's
   // reports carry r+1 PER for the next promote decision; nullopt = air repair
-  // at the current rung. Open in TRACK on a settled, unlocked, strictly faster
-  // next rung from promote_sample_lead_ms before the dwell ends. A lost repair
+  // at the current rung. Open in TRACK on a settled, unlocked next rung that
+  // needs more signal (needs_evidence) from promote_sample_lead_ms before the dwell ends. A lost repair
   // costs nothing while the block's sources arrive (DESIGN.md "Promotion
   // evidence").
   std::optional<uint8_t> sample_rung(uint64_t now_ms) const {
     if (state_ != State::Track || state_age_ms(now_ms) >= cfg_.report_timeout_ms) return std::nullopt;
     if (rung_ >= kTopRung || !converged()) return std::nullopt;
     const uint8_t next = uint8_t(rung_ + 1);
-    if (kLadder[next].phy_kbps <= kLadder[rung_].phy_kbps || locked_[next] > now_ms) return std::nullopt;
+    if (!needs_evidence(rung_, next) || locked_[next] > now_ms) return std::nullopt;
     const uint32_t lead = std::min(cfg_.promote_sample_lead_ms, cfg_.promote_dwell_ms);
     if (now_ms < last_change_ms_ || now_ms - last_change_ms_ + lead < cfg_.promote_dwell_ms) return std::nullopt;
     return next;
@@ -327,13 +328,19 @@ class LinkController {
     }
   }
 
+  // A step needs r+1 PER evidence when the next rung needs more signal than
+  // this one (a higher rssi_floor_dbm). R3 -> R4 (20 MHz MCS3 -> 40 MHz MCS1,
+  // floor -84 -> -86 dBm) does not: the lower MCS outweighs the 3 dB spread
+  // over 40 MHz, and its r+1 frames could not air on a 20 MHz tune anyway.
+  static bool needs_evidence(uint8_t cur, uint8_t next) {
+    return kLadder[next].rssi_floor_dbm > kLadder[cur].rssi_floor_dbm;
+  }
+
   // Probe-rung PER <= 2 x current-rung PER, from this report's counters.
-  // No frames at the probe rung is no evidence, which vetoes. A step that is
-  // not faster on air (R3 -> R4: same 26 Mb/s, 20 -> 40 MHz) needs none — it
-  // promotes on loss + rssi + dwell alone (and its r+1 frames could not air
-  // on a 20 MHz tune anyway).
+  // No frames at the probe rung is no evidence, which vetoes. A step that
+  // needs no evidence promotes on loss + rssi + dwell alone.
   static bool probe_evidence_ok(const LinkReport& r, uint8_t cur, uint8_t next) {
-    if (kLadder[next].phy_kbps <= kLadder[cur].phy_kbps) return true;
+    if (!needs_evidence(cur, next)) return true;
     const uint64_t p_tot = uint64_t(r.probe_rung_ok) + r.probe_rung_lost;
     const uint64_t c_tot = uint64_t(r.cur_rung_ok) + r.cur_rung_lost;
     if (p_tot == 0) return false;

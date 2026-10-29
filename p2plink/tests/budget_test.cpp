@@ -25,16 +25,16 @@ static void test_airtime() {
   std::printf("      R0 1400 B: %u us (data %u)  R6 1400 B: %u us (data %u)  overhead %u\n", a0, a0 - ovh, a6, a6 - ovh, ovh);
   check(a0 - ovh >= 1740 && a0 - ovh <= 1790, "R0 1400 B data time ~1.76 ms (1428 B MPDU at 6.5 Mb/s)");
   check(a6 - ovh >= 100 && a6 - ovh <= 120, "R6 1400 B data time ~0.11 ms");
-  check(a0 == 1850 && a6 == 198, "exact: R0 1850 us, R6 198 us");
+  check(a0 == 1850 && a6 == 194, "exact: R0 1850 us, R6 194 us");
   check((a0 - ovh) % 4 == 0 && (a6 - ovh) % 4 == 0, "data time is whole 4 us symbols");
   check(frame_airtime_us(kLadder[0], 0) == ovh + 40, "0 B body: 28 B hdr+FCS -> 40 us + overhead");
   check(frame_airtime_us(kLadder[1], 1400) < a0 && frame_airtime_us(kLadder[5], 1400) > a6, "monotonic in PHY rate");
-  check(frame_airtime_us(kLadder[3], 1400) == frame_airtime_us(kLadder[4], 1400), "R3/R4 same PHY -> same airtime");
+  check(frame_airtime_us(kLadder[4], 1400) < frame_airtime_us(kLadder[3], 1400), "R4 (HT40 MCS1, 27 Mb/s) shorter than R3 (HT20 MCS3, 26)");
   check(video_item_airtime_us(kLadder[0], 1000) == a0 * 2, "1-symbol block at R0 = 12/8 -> 2 frames (ceil)");
   check(video_item_airtime_us(kLadder[0], 8 * 1382) == a0 * 12, "8-symbol block at R0 -> 12 frames");
   check(single_item_airtime_us(kLadder[6], 1382) == a6, "IP packet filling a frame = one frame");
   check(single_item_airtime_us(kLadder[6], 1383) == 2 * a6, "IP packet one byte over spans two frames");
-  check(video_budget_kbps(kLadder[0], 0) == 2522 && video_budget_kbps(kLadder[6], 0) == 36316, "video_budget_kbps R0 2522, R6 36316");
+  check(video_budget_kbps(kLadder[0], 0) == 2522 && video_budget_kbps(kLadder[6], 0) == 37713, "video_budget_kbps R0 2522, R6 37713");
   check(video_budget_kbps(kLadder[0], 300) == 2222 && video_budget_kbps(kLadder[0], 5000) == 0, "control reserve subtracts, floors at 0");
 }
 
@@ -208,7 +208,7 @@ static void test_duty() {
   std::puts("-- tx duty over the window");
   TxScheduler s;
   const Rung& r = kLadder[6];
-  const uint32_t a = single_item_airtime_us(r, 1382);  // 198 us
+  const uint32_t a = single_item_airtime_us(r, 1382);  // 194 us
   for (uint32_t i = 0; i < 10; i++) s.on_sent(item(TxClass::Control, i, 1382), r, 1000);
   std::printf("      10 x %u us in 100 ms -> %u permille\n", a, s.tx_duty_permille(1000));
   check(s.tx_duty_permille(1000) == 10 * a / 100, "duty = sum us / window ms");

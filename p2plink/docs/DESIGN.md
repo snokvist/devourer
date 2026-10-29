@@ -25,9 +25,9 @@ wide-RX penalty). Frame MPDU 1400 B (one IP packet per frame; MT7612U RX cap
 ## Ladder (rung = {frame bw, MCS, FEC k/n, duty cap}); LDPC always
 ```
 rung bw  MCS PHY(Mb/s) k/n   duty  notes
- R6  40  5   104       8/10  0.45
- R5  40  3   52        8/10  0.50
- R4  40  1   26        8/11  0.55
+ R6  40  5   108       8/10  0.45
+ R5  40  3   54        8/10  0.50
+ R4  40  1   27        8/11  0.55
  R3  20  3   26        8/11  0.60  drone retunes its own tune to 20 MHz after >=3 s at <=R3
  R2  20  2   19.5      8/12  0.60  (drops the wide-TX IGI floor = recovers uplink RX sens.)
  R1  20  1   13        8/12  0.60
@@ -57,10 +57,11 @@ TRACK (rep_age < 500 ms)
   AND rung not locked → r+1; bitrate lags 0.5 s; never skip rungs.
 - promotion evidence: the probe-rung PER comes from video REPAIR symbols the
   drone airs at r+1 from 1 s before the dwell ends (TRACK, settled, r+1
-  unlocked and strictly faster). A lost repair costs nothing while the block's
+  unlocked and needing more signal, i.e. a higher rssi floor). A lost repair costs nothing while the block's
   sources arrive. Every symbol's flags carry the repair rung, so the ground
-  charges each lost symbol to the rung it aired at. A step that is not faster
-  on air (R3 → R4: 26 = 26 Mb/s, 20 → 40 MHz) needs no r+1 evidence.
+  charges each lost symbol to the rung it aired at. A step to a rung with a
+  lower rssi floor (R3 → R4: −84 → −86 dBm, 20 MHz MCS3 → 40 MHz MCS1) needs no
+  r+1 evidence.
   (C5 on hardware: with the probe at the current rung and nothing else at
   r+1, promotion could never fire.)
 BLIND (rep_age >= 500 ms)
@@ -116,7 +117,7 @@ calibration, narrowband, 2.4 GHz, A-MPDU.
   n = k + max(1, ceil(k·(n_r−k_r)/k_r)) ≤ 192. A frame above 128·S (≈176 KB) is dropped whole and counted
   (`dropped_video_frames`) with one warning; never truncated or split.
 - Tune vs rung: while the drone is tuned to 20 MHz and the controller's PHY rung is a 40 MHz one (the
-  promote edge), frames air at R3 (same 26 Mb/s, 20 MHz) until the 100 ms tick retunes to 40 MHz.
+  promote edge), frames air at R3 (26 Mb/s vs R4's 27, 20 MHz) until the 100 ms tick retunes to 40 MHz.
 - Tun MTU 1380 on both ends (1400 − 18 header − 2 packed-length prefix); ground IP is group-DA only.
 - Rx-only ears have no bring-up completion signal (`Init` is bring-up + blocking worker); the glue waits a
   bounded 6 s for an early exception, then treats the ear as up and reports later worker death via `rx_failed()`.
