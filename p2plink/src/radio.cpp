@@ -371,6 +371,11 @@ bool Adapter::bring_up(std::string* err) {
     try {
       std::lock_guard<std::mutex> lk(im.tx_mu);
       im.dev->InitWrite(make_channel(im.cfg.channel, im.cfg.bw_mhz, im.cfg.ht40_plus));
+      if (im.cfg.txpwr_offset_qdb) {
+        const int applied = im.dev->SetTxPowerOffsetQdb(*im.cfg.txpwr_offset_qdb);
+        im.logger->info("p2p ear {}: TX power offset {} qdB requested, {} qdB applied", unsigned(im.ear),
+                        *im.cfg.txpwr_offset_qdb, applied);
+      }
     } catch (const std::exception& e) {
       if (err) *err = std::string("InitWrite: ") + e.what();
       return false;

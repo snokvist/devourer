@@ -74,8 +74,10 @@ re-plug (VBUS) before blaming the code.
 **Near-field saturation.** Free-space loss is ~28 dB at 10 cm, ~57 dB at 3 m;
 25 mW (+14 dBm) at 10 cm puts −14 dBm into the receiver — squarely in
 compression. The tell is **EVM, not SNR** (SNR sat flat at 18 dB across a whole
-sweep while EVM reversed at the knee). On the 8812EU use `DEVOURER_TX_PWR` /
-the offset knob, a 30–40 dB SMA attenuator, or distance; never add power to a
+sweep while EVM reversed at the knee). On the 8812EU use `--txpwr-offset-qdb N`
+(both apps; quarter dB vs the calibrated table — the library reads no
+environment, so `DEVOURER_TX_PWR` is inert here), a 30–40 dB SMA attenuator,
+or distance; never add power to a
 link that reads SATURATED (`docs/bench-testing-near-field.md`). MT7612U ears
 report no EVM and an RSSI-minus-noise "SNR" that is zeroed on quiet channels, so
 judge saturation on the 8812EU ear.
@@ -101,12 +103,14 @@ p2p_tx  --adapter VID:PID[@BUS-PORT] --channel N --bw 20|40 (40) --offset +|- (+
         --net-id N --peer-mac XX:.. (REQUIRED, = p2p_rx's ack_target_mac)
         --ring NAME --tun NAME --tun-addr CIDR --bitrate-cmd 'cmd with %u kbps'
         --control-reserve-kbps N (300) --start-rung N (2) --fixed-rung N
-        --no-tune20 --probe-ms N (100) --wide-igi-floor 0xNN --mt7612u-fw DIR
+        --no-tune20 --probe-ms N (100) --wide-igi-floor 0xNN
+        --txpwr-offset-qdb N --mt7612u-fw DIR
         --stats-shm NAME (/p2plink.tx) --no-ndjson --log-level L
 p2p_rx  --adapter SPEC (repeatable; ear index = order) --ack-target IDX (0)
         --uplink IDX|none (0) --channel --bw --offset --net-id
         --out-udp HOST:PORT --out-shm NAME --tun NAME --tun-addr CIDR
-        --report-hz N (10) --report-mcs N (0) --mt7612u-fw DIR
+        --report-hz N (10) --report-mcs N (0) --txpwr-offset-qdb N (uplink)
+        --mt7612u-fw DIR
         --stats-shm NAME (/p2plink.rx) --no-ndjson --log-level
 p2p_feed --ring NAME --synthetic --fps N --kbps N --idr-every N --enhance-ratio F
          | --file X.h265 [--loop] [--fps N]

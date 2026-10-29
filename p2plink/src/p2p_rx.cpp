@@ -66,6 +66,7 @@ struct Opts {
   std::string tun, tun_addr;
   int report_hz = 10;
   int report_mcs = 0;
+  std::optional<int> txpwr_offset_qdb;
   std::optional<std::string> mt7612u_fw;
   std::string stats_shm = "/p2plink.rx";
   bool ndjson = true;
@@ -85,6 +86,7 @@ void usage(const char* argv0) {
       "  --tun NAME --tun-addr CIDR   IP tunnel (ground IP is group-addressed in v1)\n"
       "  --report-hz N           LinkReport rate (default 10)\n"
       "  --report-mcs N          report HT MCS at 20 MHz LDPC (default 0)\n"
+      "  --txpwr-offset-qdb N    uplink TX power offset, quarter dB (-40 = -10 dB)\n"
       "  --mt7612u-fw DIR        MT7612U firmware directory\n"
       "  --stats-shm NAME        (default /p2plink.rx)\n"
       "  --no-ndjson             no p2p.stats lines on stdout\n"
@@ -166,6 +168,7 @@ int run(const Opts& o) {
     rc.tx_report = false;
     rc.ack_responder = int(i) == o.ack_target;
     rc.mt7612u_fw_dir = o.mt7612u_fw;
+    if (rc.duplex) rc.txpwr_offset_qdb = o.txpwr_offset_qdb;
     rc.log_level = o.log_level;
     auto ad = Adapter::open(spec, rc, uint8_t(i), net_id, logger, &err);
     if (!ad) {
@@ -434,7 +437,7 @@ int run(const Opts& o) {
 int main(int argc, char** argv) {
   Opts o;
   enum { kAdapter = 1000, kAck, kUplink, kChannel, kBw, kOffset, kNetId, kUdp, kShm, kTun, kTunAddr, kHz, kMcs,
-         kMtFw, kStatsShm, kNoNdjson, kLog, kHelp };
+         kTxPwr, kMtFw, kStatsShm, kNoNdjson, kLog, kHelp };
   static const option longopts[] = {
       {"adapter", required_argument, nullptr, kAdapter},  {"ack-target", required_argument, nullptr, kAck},
       {"uplink", required_argument, nullptr, kUplink},    {"channel", required_argument, nullptr, kChannel},
@@ -443,7 +446,7 @@ int main(int argc, char** argv) {
       {"out-shm", required_argument, nullptr, kShm},      {"tun", required_argument, nullptr, kTun},
       {"tun-addr", required_argument, nullptr, kTunAddr}, {"report-hz", required_argument, nullptr, kHz},
       {"report-mcs", required_argument, nullptr, kMcs},   {"mt7612u-fw", required_argument, nullptr, kMtFw},
-      {"stats-shm", required_argument, nullptr, kStatsShm}, {"no-ndjson", no_argument, nullptr, kNoNdjson},
+      {"txpwr-offset-qdb", required_argument, nullptr, kTxPwr}, {"stats-shm", required_argument, nullptr, kStatsShm}, {"no-ndjson", no_argument, nullptr, kNoNdjson},
       {"log-level", required_argument, nullptr, kLog},    {"help", no_argument, nullptr, kHelp},
       {nullptr, 0, nullptr, 0}};
   int c;
@@ -462,6 +465,7 @@ int main(int argc, char** argv) {
       case kTunAddr: o.tun_addr = optarg; break;
       case kHz: o.report_hz = std::atoi(optarg); break;
       case kMcs: o.report_mcs = std::atoi(optarg); break;
+      case kTxPwr: o.txpwr_offset_qdb = std::atoi(optarg); break;
       case kMtFw: o.mt7612u_fw = std::string(optarg); break;
       case kStatsShm: o.stats_shm = optarg; break;
       case kNoNdjson: o.ndjson = false; break;

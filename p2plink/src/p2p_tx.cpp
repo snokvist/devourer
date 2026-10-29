@@ -79,6 +79,7 @@ struct Opts {
   bool no_tune20 = false;
   int probe_ms = 100;
   std::optional<uint8_t> wide_igi_floor;
+  std::optional<int> txpwr_offset_qdb;
   std::optional<std::string> mt7612u_fw;
   std::string stats_shm = "/p2plink.tx";
   bool ndjson = true;
@@ -102,6 +103,7 @@ void usage(const char* argv0) {
       "  --no-tune20             never retune the radio itself to 20 MHz\n"
       "  --probe-ms N            probe period (default 100)\n"
       "  --wide-igi-floor 0xNN   Jaguar3 wide-TX IGI floor\n"
+      "  --txpwr-offset-qdb N    TX power offset vs the calibrated table, quarter dB (-40 = -10 dB)\n"
       "  --mt7612u-fw DIR        MT7612U firmware directory\n"
       "  --stats-shm NAME        (default /p2plink.tx)\n"
       "  --no-ndjson             no p2p.stats lines on stdout\n"
@@ -486,6 +488,7 @@ int run(const Opts& o) {
   rc.ack_responder = false;
   rc.mt7612u_fw_dir = o.mt7612u_fw;
   rc.wide_igi_floor = o.wide_igi_floor;
+  rc.txpwr_offset_qdb = o.txpwr_offset_qdb;
   rc.log_level = o.log_level;
 
   std::string err;
@@ -889,7 +892,7 @@ int run(const Opts& o) {
 int main(int argc, char** argv) {
   Opts o;
   enum { kChannel = 1000, kBw, kOffset, kNetId, kPeer, kRing, kTun, kTunAddr, kBitrate, kReserve, kStart, kFixed,
-         kNoTune20, kProbeMs, kIgi, kMtFw, kStatsShm, kNoNdjson, kLog, kAdapter, kHelp };
+         kNoTune20, kProbeMs, kIgi, kTxPwr, kMtFw, kStatsShm, kNoNdjson, kLog, kAdapter, kHelp };
   static const option longopts[] = {
       {"adapter", required_argument, nullptr, kAdapter},   {"channel", required_argument, nullptr, kChannel},
       {"bw", required_argument, nullptr, kBw},             {"offset", required_argument, nullptr, kOffset},
@@ -899,7 +902,8 @@ int main(int argc, char** argv) {
       {"control-reserve-kbps", required_argument, nullptr, kReserve},
       {"start-rung", required_argument, nullptr, kStart},  {"fixed-rung", required_argument, nullptr, kFixed},
       {"no-tune20", no_argument, nullptr, kNoTune20},      {"probe-ms", required_argument, nullptr, kProbeMs},
-      {"wide-igi-floor", required_argument, nullptr, kIgi}, {"mt7612u-fw", required_argument, nullptr, kMtFw},
+      {"wide-igi-floor", required_argument, nullptr, kIgi},
+      {"txpwr-offset-qdb", required_argument, nullptr, kTxPwr}, {"mt7612u-fw", required_argument, nullptr, kMtFw},
       {"stats-shm", required_argument, nullptr, kStatsShm}, {"no-ndjson", no_argument, nullptr, kNoNdjson},
       {"log-level", required_argument, nullptr, kLog},     {"help", no_argument, nullptr, kHelp},
       {nullptr, 0, nullptr, 0}};
@@ -922,6 +926,7 @@ int main(int argc, char** argv) {
       case kNoTune20: o.no_tune20 = true; break;
       case kProbeMs: o.probe_ms = std::atoi(optarg); break;
       case kIgi: o.wide_igi_floor = uint8_t(std::strtoul(optarg, nullptr, 0)); break;
+      case kTxPwr: o.txpwr_offset_qdb = std::atoi(optarg); break;
       case kMtFw: o.mt7612u_fw = std::string(optarg); break;
       case kStatsShm: o.stats_shm = optarg; break;
       case kNoNdjson: o.ndjson = false; break;

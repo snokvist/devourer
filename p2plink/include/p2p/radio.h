@@ -52,6 +52,11 @@ struct RadioCfg {
   bool ack_responder = false;   // SetAckResponder(own MAC) after bring-up (Realtek only)
   std::optional<std::string> mt7612u_fw_dir;
   std::optional<uint8_t> wide_igi_floor;  // DeviceConfig tuning.wide_tx_igi_floor (Jaguar3)
+  // Duplex only: IRadio::SetTxPowerOffsetQdb right after InitWrite, relative
+  // to the efuse-calibrated table (quarter dB; negative = back off). The
+  // library reads no environment, so DEVOURER_TX_PWR does nothing here — this
+  // is the near-field bench's power lever. Not regulatory-clamped.
+  std::optional<int> txpwr_offset_qdb;
   Logger::Level log_level = Logger::Level::Info;
 };
 
