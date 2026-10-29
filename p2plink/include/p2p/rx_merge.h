@@ -90,7 +90,7 @@ struct WindowStats {
   uint8_t adapters = 0;      // ears that delivered this window and are not silent
   uint8_t rung_seen = 0;     // rung with the most accepted symbols this window
   std::array<uint32_t, 8> rung_ok{};    // accepted symbols per rung
-  std::array<uint32_t, 8> rung_lost{};  // missing symbols of retired blocks, at the block's rung
+  std::array<uint32_t, 8> rung_lost{};  // missing symbols of retired blocks, at the rung each aired at
   std::array<uint32_t, 8> ear_rx{};     // frames seen per ear (first copies and duplicates)
 };
 
@@ -163,6 +163,7 @@ class BlockMerger {
       b.k = h.fec_k;
       b.n = h.fec_n;
       b.rung = h.rung;
+      b.rep_rung = repair_rung_of(h);
       b.sym_len = len;
       b.first_ms = now_ms;
       b.last_ms = now_ms;
@@ -187,7 +188,8 @@ class BlockMerger {
     b.flags |= h.flags;
     win_.uniq++;
     total_uniq_++;
-    if (h.rung < kMaxRungs) win_.rung_ok[h.rung]++;
+    const uint8_t air = h.fec_idx < b.k ? b.rung : b.rep_rung;
+    if (air < kMaxRungs) win_.rung_ok[air]++;
     return true;
   }
 
@@ -327,6 +329,7 @@ class BlockMerger {
     int64_t u = 0;
     uint8_t stream = 0, k = 0, n = 0, rung = 0, flags = 0;
     uint8_t n_present = 0, n_src = 0;
+    uint8_t rep_rung = 0;  // rung the repair symbols aired at (flags), else the source rung
     bool emitted = false;
     bool lost = false;  // emitted ok=false: retire as soon as order allows
     size_t sym_len = 0;
@@ -379,10 +382,19 @@ class BlockMerger {
     return now_ms >= since_ms + cfg_.gap_dwell_ms;
   }
 
+  // Missing symbols are charged to the rung each aired at: sources at the
+  // block's rung, repairs at its repair rung — so r+1 PER evidence counts the
+  // repair symbols the drone sampled one rung up, not the block's own rung.
   void account_retire(const Block& b) {
-    uint32_t lost = uint32_t(b.n) - b.n_present;
+    const uint32_t lost = uint32_t(b.n) - b.n_present;
+    const uint32_t lost_src = uint32_t(b.k) - b.n_src;
     win_.lost += lost;
-    if (b.rung < kMaxRungs) win_.rung_lost[b.rung] += lost;
+    if (b.rung < kMaxRungs) win_.rung_lost[b.rung] += lost_src;
+    if (b.rep_rung < kMaxRungs) win_.rung_lost[b.rep_rung] += lost - lost_src;
+  }
+  static uint8_t repair_rung_of(const P2pHeader& h) {
+    return (h.flags & kFlagRepairRungValid) ? uint8_t((h.flags & kFlagRepairRungMask) >> kFlagRepairRungShift)
+                                            : h.rung;
   }
 
   RsCodec& codec(uint8_t k, uint8_t n) {

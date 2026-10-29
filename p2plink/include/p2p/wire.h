@@ -45,13 +45,24 @@ enum Flags : uint8_t {
   kFlagIdr = 0x02,
   kFlagLastInBlock = 0x04,
   kFlagPacked = 0x08,   // IpData: payload is [u16 len][pkt]... list
+  // Video: the rung the block's REPAIR symbols aired at, in bits 4..6, valid
+  // when 0x80 is set (every symbol of the block carries it). P2pHeader::rung
+  // stays the block's source rung; the drone airs repair one rung up to give
+  // the ground r+1 PER evidence for promotion (DESIGN.md "Promotion evidence").
+  kFlagRepairRungMask = 0x70,
+  kFlagRepairRungValid = 0x80,
 };
+inline constexpr uint8_t kFlagRepairRungShift = 4;
+inline uint8_t with_repair_rung(uint8_t flags, uint8_t rung) {
+  return uint8_t((flags & ~(kFlagRepairRungMask | kFlagRepairRungValid)) | kFlagRepairRungValid |
+                 ((rung << kFlagRepairRungShift) & kFlagRepairRungMask));
+}
 
 struct P2pHeader {
   uint8_t type = 0;      // Type
   uint8_t flags = 0;     // Flags
   uint8_t net_id = 0;
-  uint8_t rung = 0;      // ladder rung this frame was sent at (ground scores PER per rung)
+  uint8_t rung = 0;      // ladder rung (video: the block's SOURCE rung; repair may differ, see flags)
   uint8_t fec_k = 1;     // block source symbol count (1 for non-video)
   uint8_t fec_n = 1;     // block total symbols
   uint8_t fec_idx = 0;   // symbol index 0..n-1 (>= k is repair)

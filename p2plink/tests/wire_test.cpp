@@ -22,6 +22,12 @@ int main() {
   CHECK(d->fec_k == 8 && d->fec_n == 12 && d->fec_idx == 10 && d->stream == 1);
   CHECK(d->seq == 0xdeadbeef && d->block_id == 65535 && d->payload_len == 100);
   CHECK(d->session == 0xa5 && f[11] == 0xa5);
+  {
+    const uint8_t fl = with_repair_rung(kFlagIdr | kFlagLastInBlock, 6);
+    CHECK((fl & kFlagRepairRungValid) && ((fl & kFlagRepairRungMask) >> kFlagRepairRungShift) == 6);
+    CHECK((fl & (kFlagIdr | kFlagLastInBlock)) == (kFlagIdr | kFlagLastInBlock));
+    CHECK(((with_repair_rung(fl, 2) & kFlagRepairRungMask) >> kFlagRepairRungShift) == 2);  // replaces, not ORs
+  }
   f[0] ^= 1; CHECK(!decode_header(f.data(), f.size())); f[0] ^= 1;
   CHECK(!decode_header(f.data(), kHdrLen - 1));
   h.fec_idx = 12; encode_header(h, f.data()); CHECK(!decode_header(f.data(), f.size()));  // idx >= n

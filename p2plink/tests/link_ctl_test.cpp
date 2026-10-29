@@ -403,6 +403,36 @@ static void test_da_machine() {
   check(lc.state() == State::Floor || lc.state() == State::Blind, "controller descended (Blind/Floor)");
 }
 
+static void test_sample_rung() {
+  std::puts("-- (7b) promotion evidence: sample_rung window, equal-PHY step needs none");
+  // R2 -> R3 is faster (19.5 -> 26 Mb/s): sampling opens 1 s before the 5 s dwell ends.
+  LinkController lc(LinkCfg{}, 0);
+  uint32_t ep = 0, uniq = 0;
+  for (uint64_t t = 0; t <= 4000; t += 100) {
+    lc.on_report(rep(++ep, uniq += 100, 0, -60, 50, 0, 100, 0), t);
+    lc.tick(t);
+    if (t == 3900) check(!lc.sample_rung(t).has_value(), "R2, 3900: dwell - lead not reached, no sampling", t);
+    if (t == 4000) check(lc.sample_rung(t) == std::optional<uint8_t>(3), "R2, 4000: sample repairs at R3", t);
+  }
+  check(!lc.sample_rung(4600).has_value(), "R2: report 600 ms old (Blind due) -> no sampling", 4600);
+  // R3 -> R4 is not faster (26 = 26 Mb/s, 20 -> 40 MHz): no sampling, and it
+  // promotes with zero frames at the probe rung.
+  LinkCfg c3;
+  c3.start_rung = 3;
+  LinkController l3(c3, 0);
+  ep = 0;
+  uniq = 0;
+  bool sampled = false;
+  for (uint64_t t = 0; t <= 5000; t += 100) {
+    l3.on_report(rep(++ep, uniq += 100, 0, -60, /*pok=*/0, 0, 100, 0), t);
+    l3.tick(t);
+    sampled |= l3.sample_rung(t).has_value();
+  }
+  check(!sampled, "R3: equal-PHY next rung, never sampled");
+  check(l3.rung_phy() == 4, "R3 -> R4 promoted with no probe-rung frames (equal PHY)", 5000);
+  // ...while R2 -> R3 still vetoes without evidence (run_promote above covers it).
+}
+
 int main() {
   test_blind_descent();
   test_hold();
@@ -411,6 +441,7 @@ int main() {
   test_acute();
   test_persistent_and_lock();
   test_promote();
+  test_sample_rung();
   test_local();
   test_tune20();
   test_da_machine();

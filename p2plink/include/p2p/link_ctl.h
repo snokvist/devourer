@@ -60,6 +60,9 @@ struct LinkCfg {
   uint32_t promote_reports = 10;         // consecutive fresh good reports needed
   uint16_t promote_loss_permille = 20;   // "good" report: loss below this
   int8_t promote_rssi_margin_db = 6;     // rssi_best >= floor(r+1) + margin
+  // sample_rung() opens this long before the promote dwell ends, so the
+  // reports that decide the promote already carry r+1 PER evidence.
+  uint32_t promote_sample_lead_ms = 1000;
   uint16_t acute_loss_permille = 200;    // acute demote to floor at/above this ...
   uint32_t acute_min_uniq = 32;          // ... when the window carried >= this many symbols
   uint16_t persistent_loss_permille = 45;// leaky score +1 per report at/above this, -1 below
@@ -154,9 +157,25 @@ class LinkController {
       const uint8_t next = uint8_t(rung_ + 1);
       const bool rssi_ok =
           int(r.rssi_best) >= int(kLadder[next].rssi_floor_dbm) + int(cfg_.promote_rssi_margin_db);
-      if (rssi_ok && probe_evidence_ok(r) && locked_[next] <= now_ms)
+      if (rssi_ok && probe_evidence_ok(r, rung_, next) && locked_[next] <= now_ms)
         commit(next, /*budget_leads=*/false, now_ms);
     }
+  }
+
+  // The rung the drone should air video REPAIR symbols at so the ground's
+  // reports carry r+1 PER for the next promote decision; nullopt = air repair
+  // at the current rung. Open in TRACK on a settled, unlocked, strictly faster
+  // next rung from promote_sample_lead_ms before the dwell ends. A lost repair
+  // costs nothing while the block's sources arrive (DESIGN.md "Promotion
+  // evidence").
+  std::optional<uint8_t> sample_rung(uint64_t now_ms) const {
+    if (state_ != State::Track || state_age_ms(now_ms) >= cfg_.report_timeout_ms) return std::nullopt;
+    if (rung_ >= kTopRung || !converged()) return std::nullopt;
+    const uint8_t next = uint8_t(rung_ + 1);
+    if (kLadder[next].phy_kbps <= kLadder[rung_].phy_kbps || locked_[next] > now_ms) return std::nullopt;
+    const uint32_t lead = std::min(cfg_.promote_sample_lead_ms, cfg_.promote_dwell_ms);
+    if (now_ms < last_change_ms_ || now_ms - last_change_ms_ + lead < cfg_.promote_dwell_ms) return std::nullopt;
+    return next;
   }
 
   // tx.report of a PROBE frame: ok = delivered (state 0), !ok = retry-pinned.
@@ -309,8 +328,12 @@ class LinkController {
   }
 
   // Probe-rung PER <= 2 x current-rung PER, from this report's counters.
-  // No frames at the probe rung is no evidence, which vetoes.
-  static bool probe_evidence_ok(const LinkReport& r) {
+  // No frames at the probe rung is no evidence, which vetoes. A step that is
+  // not faster on air (R3 -> R4: same 26 Mb/s, 20 -> 40 MHz) needs none — it
+  // promotes on loss + rssi + dwell alone (and its r+1 frames could not air
+  // on a 20 MHz tune anyway).
+  static bool probe_evidence_ok(const LinkReport& r, uint8_t cur, uint8_t next) {
+    if (kLadder[next].phy_kbps <= kLadder[cur].phy_kbps) return true;
     const uint64_t p_tot = uint64_t(r.probe_rung_ok) + r.probe_rung_lost;
     const uint64_t c_tot = uint64_t(r.cur_rung_ok) + r.cur_rung_lost;
     if (p_tot == 0) return false;

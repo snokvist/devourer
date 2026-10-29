@@ -427,6 +427,33 @@ int main() {
     check(!r.accept(5, 0, 7, 0x22), "(g) ... once");
   }
 
+  // ---- (g2) repair symbols aired one rung up --------------------------------
+  {
+    std::printf("-- (g2) per-rung accounting follows the rung each symbol aired at\n");
+    BlockMerger m;
+    Sink s;
+    TestBlock b = make_block(rs, 600, 11188, 3, 50);   // sources at R3
+    TestBlock c = make_block(rs, 601, 11188, 3, 51);
+    auto feed_rep = [&](const TestBlock& tb, uint8_t idx, uint64_t t) {
+      P2pHeader h = tb.hdr(idx);
+      h.flags = with_repair_rung(h.flags, 4);           // repairs at R4
+      m.on_symbol(0, h, tb.syms[idx].data(), tb.sym_len, -50, t);
+    };
+    for (uint8_t i = 0; i < b.n; i++)
+      if (i != 9 && i != 10) feed_rep(b, i, 0);       // two R4 repairs lost
+    for (uint8_t i = 0; i < c.n; i++)
+      if (i != 2) feed_rep(c, i, 1);                  // one R3 source lost (FEC covers it)
+    m.poll(1, s.fn);
+    feed_rep(make_block(rs, 602, 11188, 3, 52), 0, 2);  // closes 601 under rule (1)
+    m.poll(2, s.fn);
+    WindowStats w = m.take_window(3);
+    CHECK_EQ(w.rung_lost[4], 2u, "(g2) the two lost repairs charged to R4");
+    CHECK_EQ(w.rung_lost[3], 1u, "(g2) the lost source charged to R3");
+    CHECK_EQ(w.rung_ok[4], 2u + 4u, "(g2) R4 ok = 2 of block 600's repairs + all 4 of 601's");
+    CHECK_EQ(w.rung_ok[3], 8u + 7u + 1u, "(g2) R3 ok = sources (8 + 7 + 602's first)");
+    CHECK_EQ(int(w.rung_seen), 3, "(g2) rung_seen stays the source rung");
+  }
+
   // ---- (h) make_report round trip -----------------------------------------
   {
     std::printf("-- (h) make_report\n");

@@ -255,6 +255,9 @@ struct Shared {
   // Published by the main loop, read at dequeue by the TX thread.
   std::atomic<uint8_t> rung_phy{2};
   std::atomic<uint8_t> tune_bw{40};
+  // LinkController::sample_rung: video repair symbols air here (255 = at the
+  // block's own rung) so the ground's reports carry r+1 PER for promotion.
+  std::atomic<uint8_t> sample_rung{255};
   std::atomic<bool> ucast_ctl{false}, ucast_inter{false}, ucast_bulk{false};
   std::atomic<int> probe_ms{100};
 
@@ -379,10 +382,18 @@ class TxThread {
 
     const uint16_t bid = s_.block_id.fetch_add(1, std::memory_order_relaxed);
     const devourer::TxMode m = rung_mode(r);
+    // Repair symbols one rung up while the controller samples for a promote;
+    // never a 40 MHz repair on a 20 MHz tune, never other than rung + 1.
+    uint8_t rep_rung = rung;
+    const uint8_t sr = s_.sample_rung.load(std::memory_order_relaxed);
+    if (sr == rung + 1 && !(kLadder[sr].bw_mhz == 40 && s_.tune_bw.load(std::memory_order_relaxed) == 20))
+      rep_rung = sr;
+    const devourer::TxMode m_rep = rep_rung == rung ? m : rung_mode(kLadder[rep_rung]);
     for (uint8_t idx = 0; idx < nn; idx++) {
       P2pHeader h;
       h.type = uint8_t(idx < kk ? Type::VideoData : Type::VideoRepair);
-      h.flags = uint8_t((item.flags & (kFlagEnhance | kFlagIdr)) | (idx + 1 == nn ? kFlagLastInBlock : 0));
+      h.flags = with_repair_rung(uint8_t((item.flags & (kFlagEnhance | kFlagIdr)) | (idx + 1 == nn ? kFlagLastInBlock : 0)),
+                                 rep_rung);
       h.net_id = s_.net_id;
       h.rung = rung;
       h.fec_k = kk;
@@ -391,7 +402,7 @@ class TxThread {
       h.stream = item.stream;
       h.seq = s_.sym_seq.fetch_add(1, std::memory_order_relaxed);
       h.block_id = bid;
-      send(m, s_.group, h, block_.data() + idx * S, S, TagSlot::Other, h.seq);
+      send(idx < kk ? m : m_rep, s_.group, h, block_.data() + idx * S, S, TagSlot::Other, h.seq);
       if (s_.stop.load(std::memory_order_relaxed)) return;
     }
     s_.video_blocks.fetch_add(1, std::memory_order_relaxed);
@@ -768,6 +779,7 @@ int run(const Opts& o) {
       const uint8_t phy = fixed ? fixed_rung : ctl.rung_phy();
       const uint8_t budget = fixed ? fixed_rung : ctl.rung_budget();
       sh.rung_phy.store(phy);
+      sh.sample_rung.store(fixed ? uint8_t(255) : ctl.sample_rung(t).value_or(uint8_t(255)));
       sh.ucast_ctl = da.allow_unicast(0, ctl.ack8());
       sh.ucast_inter = da.allow_unicast(1, ctl.ack8());
       sh.ucast_bulk = da.allow_unicast(2, ctl.ack8());

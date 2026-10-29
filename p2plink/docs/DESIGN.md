@@ -55,6 +55,14 @@ TRACK (rep_age < 500 ms)
 - promote: >= 10 consecutive fresh reports AND loss < 20‰ AND rssi_best >=
   rung_floor_dbm(r+1) + 6 AND probe-rung PER <= 2× current PER AND dwell >= 5 s
   AND rung not locked → r+1; bitrate lags 0.5 s; never skip rungs.
+- promotion evidence: the probe-rung PER comes from video REPAIR symbols the
+  drone airs at r+1 from 1 s before the dwell ends (TRACK, settled, r+1
+  unlocked and strictly faster). A lost repair costs nothing while the block's
+  sources arrive. Every symbol's flags carry the repair rung, so the ground
+  charges each lost symbol to the rung it aired at. A step that is not faster
+  on air (R3 → R4: 26 = 26 Mb/s, 20 → 40 MHz) needs no r+1 evidence.
+  (C5 on hardware: with the probe at the current rung and nothing else at
+  r+1, promotion could never fire.)
 BLIND (rep_age >= 500 ms)
 - t0: budget+FEC := max(r−2, floor); t0+500 ms: MCS/frame := r−2; then every
   500 ms r := max(r−2, floor). Floor from R6 in ~2.5 s.
