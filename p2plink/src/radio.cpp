@@ -111,6 +111,7 @@ bool parse_adapter_spec(const std::string& s, AdapterSpec* out) {
     auto dash = topo.find('-');
     std::string bus = dash == std::string::npos ? topo : topo.substr(0, dash);
     if (bus.empty()) return false;
+    if (bus.size() > 3) return false;  // libusb bus numbers are 8-bit; std::stoi would throw past int
     for (char c : bus)
       if (c < '0' || c > '9') return false;
     a.bus = std::stoi(bus);
@@ -171,6 +172,7 @@ struct Adapter::Impl {
   uint8_t cur_channel = 0, cur_bw = 20;
   bool cur_ht40_plus = true;
   bool up = false;
+  bool ack_armed = false;  // SetAckResponder succeeded: ClearAckResponder before Stop
   std::atomic<bool> stopped{false};  // read under tx_mu by send/retune; set by stop()
 
   void on_packet(const Packet& p);
@@ -431,6 +433,7 @@ bool Adapter::bring_up(std::string* err) {
         if (err) *err = "SetAckResponder(own MAC) refused";
         return false;
       }
+      im.ack_armed = true;
       im.logger->info("p2p ear {}: hardware ACK responder armed on own MAC", unsigned(im.ear));
     }
   }
@@ -565,6 +568,9 @@ void Adapter::stop() {
   if (im.dev && im.up) {
     try {
       std::lock_guard<std::mutex> lk(im.tx_mu);
+      // The arm's mirror (IRadio::SetAckResponder): not every backend's Stop()
+      // de-inits the MAC (Jaguar2), and the port identity would outlive us.
+      if (im.ack_armed) im.dev->ClearAckResponder();
       im.dev->Stop();
     } catch (const std::exception& e) {
       im.logger->warn("p2p ear {}: Stop(): {}", unsigned(im.ear), e.what());

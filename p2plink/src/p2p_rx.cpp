@@ -317,7 +317,8 @@ int run(const Opts& o) {
           case Type::IpData:
             if (!dedup.accept(f.hdr.type, f.hdr.stream, f.hdr.seq, f.hdr.session)) break;
             for_each_packed(f.payload.data(), f.payload.size(), [&](const uint8_t* p, size_t l) {
-              if (have_tun && tun.write_packet(p, l)) {
+              if (!have_tun) return;  // a spectator never attempted the write: not a drop
+              if (tun.write_packet(p, l)) {
                 ip_rx++;
                 if (ip_rx_window < 0xffff) ip_rx_window++;
               } else {
