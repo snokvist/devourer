@@ -49,15 +49,26 @@ inline size_t frame_payload_capacity(const Rung& r) {
   return r.frame_bytes > kHdrLen ? size_t(r.frame_bytes - kHdrLen) : size_t(1);
 }
 
+// Repair symbols for a k-source video block at this rung: the rung's ratio,
+// ceil(k x (n_r - k_r) / k_r), floored at kMinRepair so a small frame is not
+// one loss from death (a 1..4-symbol block at R5/R6 would otherwise carry a
+// single repair; waybeam-link's min_r = 2, same reason). The TX encoder and the
+// airtime charge below both use this, so the scheduler charges what airs.
+inline constexpr size_t kMinRepair = 2;
+inline size_t video_repair_count(const Rung& r, size_t k) {
+  const size_t kr = r.fec_k ? r.fec_k : 1;
+  const size_t ratio = (k * (r.fec_n > r.fec_k ? r.fec_n - r.fec_k : 0) + kr - 1) / kr;
+  return std::max(kMinRepair, ratio);
+}
+
 // Airtime of one video item (one encoder frame -> one FEC block, encoded at
-// DEQUEUE): ceil(payload / capacity) source symbols, each a full
-// frame_bytes frame, times n/k for the repair symbols.
+// DEQUEUE): ceil(payload / capacity) source symbols plus video_repair_count()
+// repairs, each a full frame_bytes frame.
 inline uint32_t video_item_airtime_us(const Rung& r, size_t payload_bytes) {
   const size_t cap = frame_payload_capacity(r);
-  uint64_t syms = (uint64_t(payload_bytes) + cap - 1) / cap;
+  size_t syms = (payload_bytes + cap - 1) / cap;
   if (syms == 0) syms = 1;
-  const uint64_t k = r.fec_k ? r.fec_k : 1;
-  const uint64_t total = (syms * r.fec_n + k - 1) / k;
+  const uint64_t total = syms + video_repair_count(r, syms);
   return uint32_t(uint64_t(frame_airtime_us(r, r.frame_bytes)) * total);
 }
 

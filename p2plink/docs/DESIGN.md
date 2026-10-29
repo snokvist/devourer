@@ -121,7 +121,10 @@ calibration, narrowband, 2.4 GHz, A-MPDU.
 
 ## Implementation notes (v1 as built)
 - Video block sizing: symbol payload S = frame_bytes − 18; k = clamp(ceil((12 + frame_len)/S), 1, 128),
-  n = k + max(1, ceil(k·(n_r−k_r)/k_r)) ≤ 192. A frame above 128·S (≈176 KB) is dropped whole and counted
+  n = k + max(2, ceil(k·(n_r−k_r)/k_r)) ≤ 192 — one block per encoder frame, released as soon as it
+  decodes; the rung's k/n is a ratio, not a block size. The repair floor of 2 (waybeam-link's `min_r`) keeps
+  a small frame from being one loss from death; it costs one frame of airtime on k ≤ 4 blocks at R5/R6
+  (k ≤ 2 at R0–R4) and nothing above. A frame above 128·S (≈176 KB) is dropped whole and counted
   (`dropped_video_frames`) with one warning; never truncated or split.
 - Tune vs rung: while the drone is tuned to 20 MHz and the controller's PHY rung is a 40 MHz one (the
   promote edge), frames air at R3 (26 Mb/s vs R4's 27, 20 MHz) until the 100 ms tick retunes to 40 MHz.

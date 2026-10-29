@@ -367,7 +367,7 @@ class TxThread {
       }
       return;
     }
-    const size_t repair = std::max<size_t>(1, (k * (r.fec_n - r.fec_k) + r.fec_k - 1) / r.fec_k);
+    const size_t repair = video_repair_count(r, k);
     const uint8_t kk = uint8_t(k), nn = uint8_t(k + repair);
 
     block_.assign(nn * S, 0);

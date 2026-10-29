@@ -30,7 +30,10 @@ static void test_airtime() {
   check(frame_airtime_us(kLadder[0], 0) == ovh + 40, "0 B body: 28 B hdr+FCS -> 40 us + overhead");
   check(frame_airtime_us(kLadder[1], 1400) < a0 && frame_airtime_us(kLadder[5], 1400) > a6, "monotonic in PHY rate");
   check(frame_airtime_us(kLadder[4], 1400) < frame_airtime_us(kLadder[3], 1400), "R4 (HT40 MCS1, 27 Mb/s) shorter than R3 (HT20 MCS3, 26)");
-  check(video_item_airtime_us(kLadder[0], 1000) == a0 * 2, "1-symbol block at R0 = 12/8 -> 2 frames (ceil)");
+  check(video_item_airtime_us(kLadder[0], 1000) == a0 * 3, "1-symbol block at R0: ratio gives 1 repair, floor 2 -> 3 frames");
+  check(video_repair_count(kLadder[6], 4) == 2 && video_repair_count(kLadder[6], 12) == 3 &&
+            video_repair_count(kLadder[0], 8) == 4,
+        "repair floor 2 (R6 k=4: 2 not 1); the ratio rules above it (R6 k=12: 3, R0 k=8: 4)");
   check(video_item_airtime_us(kLadder[0], 8 * 1382) == a0 * 12, "8-symbol block at R0 -> 12 frames");
   check(single_item_airtime_us(kLadder[6], 1382) == a6, "IP packet filling a frame = one frame");
   check(single_item_airtime_us(kLadder[6], 1383) == 2 * a6, "IP packet one byte over spans two frames");
@@ -130,57 +133,58 @@ static void test_video_bound() {
   std::puts("-- video queue bound (60 ms airtime, drop newest enhance first, never IDR while non-IDR exists)");
   TxScheduler s;
   const Rung& r = kLadder[0];
-  const uint32_t per_us = video_item_airtime_us(r, 1000);  // 1 source symbol -> 2 frames = 3700 us
-  const size_t fit = 60000 / per_us;                        // 16 whole blocks
+  const uint32_t per_us = video_item_airtime_us(r, 1000);  // 1 source + 2 repair = 3 frames = 5550 us
+  const size_t fit = 60000 / per_us;                        // 10 whole blocks
+  const uint32_t E = uint32_t(fit / 2), Bse = uint32_t(fit) - 1 - E;  // enhance, base (+1 IDR) = fit
   std::printf("      block airtime at R0 %u us, %zu fit under 60 ms\n", per_us, fit);
-  check(fit == 16, "16 one-symbol blocks fit in 60 ms at R0");
+  check(fit == 10, "10 one-symbol blocks fit in 60 ms at R0");
   uint32_t id = 0;
   check(s.enqueue(item(TxClass::Video, id++, 1000, kFlagIdr), r, 0), "IDR accepted");
-  for (int i = 0; i < 7; i++) check(s.enqueue(item(TxClass::Video, id++, 1000, 0), r, 0), "base accepted");
-  for (int i = 0; i < 8; i++) check(s.enqueue(item(TxClass::Video, id++, 1000, kFlagEnhance), r, 0), "enhance accepted");
-  check(s.q_video() == 16 && s.q_video_air_ms(r) == 59, "16 queued, 59 ms");
-  // 17th (enhance, newest) -> over the bound, it is the victim.
-  check(!s.enqueue(item(TxClass::Video, id++, 1000, kFlagEnhance), r, 0), "17th enhance dropped (newest)");
+  for (uint32_t i = 0; i < Bse; i++) check(s.enqueue(item(TxClass::Video, id++, 1000, 0), r, 0), "base accepted");
+  for (uint32_t i = 0; i < E; i++) check(s.enqueue(item(TxClass::Video, id++, 1000, kFlagEnhance), r, 0), "enhance accepted");
+  check(s.q_video() == fit && s.q_video_air_ms(r) == fit * per_us / 1000, "fit queued, fit x 5.55 ms");
+  // One more (enhance, newest) -> over the bound, it is the victim.
+  check(!s.enqueue(item(TxClass::Video, id++, 1000, kFlagEnhance), r, 0), "enhance over the bound dropped (newest)");
   {
     auto d = s.drops();
     check(d.video_frames == 1 && d.video_enhance == 1, "drops: 1 frame, 1 enhance");
   }
   // A base frame over the bound evicts the newest queued enhance instead.
   check(s.enqueue(item(TxClass::Video, 100, 1000, 0), r, 0), "base over bound: accepted");
-  check(s.q_video() == 16 && s.drops().video_enhance == 2, "newest enhance evicted for it");
-  for (uint32_t i = 101; i < 108; i++) s.enqueue(item(TxClass::Video, i, 1000, 0), r, 0);
-  check(s.drops().video_enhance == 9 && s.drops().video_frames == 9, "all 8 queued enhance evicted by base frames");
+  check(s.q_video() == fit && s.drops().video_enhance == 2, "newest enhance evicted for it");
+  for (uint32_t i = 0; i + 1 < E; i++) s.enqueue(item(TxClass::Video, 101 + i, 1000, 0), r, 0);
+  check(s.drops().video_enhance == E + 1 && s.drops().video_frames == E + 1, "every queued enhance evicted by base frames");
   // No enhance left: a new base frame is the newest non-IDR -> dropped itself.
   check(!s.enqueue(item(TxClass::Video, 200, 1000, 0), r, 0), "base over bound, no enhance: newest non-IDR (itself) dropped");
-  check(s.drops().video_frames == 10 && s.drops().video_enhance == 9, "drops 10/9");
-  check(s.q_video() == 16 && s.q_video_air_ms(r) <= 60, "queue within bound");
+  check(s.drops().video_frames == E + 2 && s.drops().video_enhance == E + 1, "drops E+2 / E+1");
+  check(s.q_video() == fit && s.q_video_air_ms(r) <= 60, "queue within bound");
   auto first = s.dequeue(r, 0);
   check(first && (first->flags & kFlagIdr) && first->id == 0, "IDR survived at the head");
   // A new IDR over the bound evicts a non-IDR, never itself while a non-IDR exists.
   check(s.enqueue(item(TxClass::Video, 300, 1000, kFlagIdr), r, 0), "IDR pushed over bound: accepted");
   check(s.enqueue(item(TxClass::Video, 301, 1000, kFlagIdr), r, 0), "second IDR accepted, a base frame goes instead");
-  check(s.drops().video_frames == 11, "one base frame evicted for it");
+  check(s.drops().video_frames == E + 3, "one base frame evicted for it");
   size_t idr = 0, base = 0;
   for (;;) {
     auto it = s.dequeue(r, 0);
     if (!it) break;
     if (it->flags & kFlagIdr) idr++; else base++;
   }
-  check(idr == 2 && base == 14, "drained: 2 IDR + 14 base");
+  check(idr == 2 && base == fit - 2, "drained: 2 IDR + the rest base");
   // All-IDR queue still honours the bound (newest IDR dropped, never the last item).
   TxScheduler s3;
   for (uint32_t i = 0; i < 40; i++) s3.enqueue(item(TxClass::Video, i, 1000, kFlagIdr), r, 0);
-  check(s3.q_video() == 16 && s3.q_video_air_ms(r) <= 60 && s3.drops().video_frames == 24, "all-IDR: bounded at 16, 24 dropped");
+  check(s3.q_video() == fit && s3.q_video_air_ms(r) <= 60 && s3.drops().video_frames == 40 - fit, "all-IDR: bounded at fit, the rest dropped");
   // One oversize frame is kept (bound is a queue bound, not a frame limit).
   TxScheduler s4;
   check(s4.enqueue(item(TxClass::Video, 1, 60000, kFlagIdr), r, 0) && s4.q_video_air_ms(r) > 60, "lone 60 kB IDR kept over the bound");
   // Demote inflates the queue: the bound is re-checked at dequeue.
   TxScheduler s5;
   for (uint32_t i = 0; i < 20; i++) s5.enqueue(item(TxClass::Video, i, 1000, i >= 10 ? kFlagEnhance : 0), kLadder[6], 0);
-  check(s5.q_video() == 20 && s5.q_video_air_ms(kLadder[6]) < 10, "20 blocks at R6 are < 10 ms, all accepted");
-  auto deq = s5.dequeue(r, 0);  // now at R0: 20 x 3.7 ms = 74 ms > 60
-  check(deq.has_value() && deq->id == 0 && s5.q_video() == 15, "dequeue at R0: trimmed to 16 then popped the head");
-  check(s5.drops().video_frames == 4 && s5.drops().video_enhance == 4, "the 4 evicted were the newest enhance");
+  check(s5.q_video() == 20 && s5.q_video_air_ms(kLadder[6]) < 15, "20 blocks at R6 are < 15 ms, all accepted");
+  auto deq = s5.dequeue(r, 0);  // now at R0: 20 x 5.55 ms = 111 ms > 60
+  check(deq.has_value() && deq->id == 0 && s5.q_video() == fit - 1, "dequeue at R0: trimmed to fit then popped the head");
+  check(s5.drops().video_frames == 20 - fit && s5.drops().video_enhance == 20 - fit, "the evicted were the newest enhance");
   check(s5.q_video_air_ms(r) <= 60, "within bound at R0");
   // Control is never dropped by the video policy.
   TxScheduler s6;
@@ -234,8 +238,8 @@ static void test_duty() {
   check(s.tx_duty_permille(1000) == 10 * a / 100, "duty = sum us / window ms");
   check(s.tx_duty_permille(1099) == 10 * a / 100, "still counted at +99 ms");
   check(s.tx_duty_permille(1100) == 0, "out of the window at +100 ms");
-  for (uint32_t i = 0; i < 50; i++) s.on_sent(item(TxClass::Video, i, 1000), kLadder[0], 2000 + i);  // 50 x 3700 us
-  check(s.tx_duty_permille(2049) == 50 * 3700 / 100, "50 R0 blocks: 1850 permille (over-committed is reported, not clamped)");
+  for (uint32_t i = 0; i < 50; i++) s.on_sent(item(TxClass::Video, i, 1000), kLadder[0], 2000 + i);  // 50 x 5550 us
+  check(s.tx_duty_permille(2049) == 50 * 5550 / 100, "50 R0 blocks: 2775 permille (over-committed is reported, not clamped)");
   check(s.tx_duty_permille(2149) == 0, "window moved on");
   check(s.tx_duty_permille(500) == 0, "nothing before the first send");
 }
