@@ -94,7 +94,8 @@ struct StatsSnapshot {
   // radio
   uint8_t channel = 0, bw_mhz = 0, rung = 0, link_state = 0; // link_state: LinkController::State
   uint8_t da_mode = 0, ack8 = 0, adapters = 0, reserved0 = 0;
-  // budget (kbit/s)
+  // budget (kbit/s of payload, by the budget.h airtime model: capacity at the
+  // duty cap before FEC, video budget after FEC + reserve, IP at the interactive share)
   uint32_t est_capacity_kbps = 0, video_budget_kbps = 0, ip_budget_kbps = 0;
   uint32_t tx_duty_permille = 0;
   // queues (airtime ms at the current rung)

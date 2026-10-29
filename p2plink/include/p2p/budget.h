@@ -70,6 +70,33 @@ inline uint32_t single_item_airtime_us(const Rung& r, size_t payload_bytes) {
   return uint32_t(uint64_t(frame_airtime_us(r, r.frame_bytes)) * frames);
 }
 
+// ---- budgets ----------------------------------------------------------------
+//
+// A share of wall-clock airtime, in the SAME model the scheduler charges, so
+// a rung's duty cap and the tx_duty_permille the scheduler reports are one
+// quantity: feeding exactly the budget fills duty_permille of the 100 ms
+// duty window (C7: PHY x duty, which ignores the 86 us PLCP + IFS every frame
+// pays, fed duty 707 permille at R5 against a 500 cap, 814 at R6 against 450).
+
+// Payload kbps that share_permille of airtime carries in full frame_bytes
+// frames at this rung: frames/s = share x 1000 / airtime_us, each carrying
+// frame_payload_capacity bytes.
+inline uint32_t payload_kbps_at_share(const Rung& r, uint32_t share_permille) {
+  const uint64_t air = frame_airtime_us(r, r.frame_bytes);
+  return uint32_t(uint64_t(share_permille) * frame_payload_capacity(r) * 8 / air);
+}
+
+// Video budget(r) = payload at the duty cap x k/n x 0.97 - control reserve,
+// floored at 0. The 0.97 is margin for what the model does not see per
+// block: the last source symbol's padding and n rounded up (a 1-symbol block
+// is 1+1, not 1.25).
+inline uint32_t video_budget_kbps(const Rung& r, uint32_t control_reserve_kbps) {
+  const uint64_t air = frame_airtime_us(r, r.frame_bytes);
+  uint64_t v = uint64_t(r.duty_permille) * frame_payload_capacity(r) * 8 * r.fec_k * 97;
+  v /= air * (r.fec_n ? r.fec_n : 1) * 100;
+  return v > control_reserve_kbps ? uint32_t(v - control_reserve_kbps) : 0;
+}
+
 // ---- scheduler --------------------------------------------------------------
 
 enum class TxClass : uint8_t { Control = 0, IpInteractive = 1, Video = 2, IpBulk = 3 };

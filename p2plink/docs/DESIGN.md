@@ -33,7 +33,14 @@ rung bw  MCS PHY(Mb/s) k/n   duty  notes
  R1  20  1   13        8/12  0.60
  R0  20  0   6.5       8/12  0.60  FLOOR; encoder resolution/fps co-designed for bpp here
 ```
-Video budget(r) = PHY × duty × k/n × 0.97 − control reserve; calibrate per rung.
+Video budget(r) = payload carried by duty × wall-clock airtime in full frames,
+by the scheduler's own airtime model (PLCP 36 µs + data + IFS 50 µs per frame),
+× k/n × 0.97 − control reserve: R0 2.0, R3 8.5, R4 8.1, R5 14.1, R6 19.6 Mb/s.
+The duty cap and the reported `tx_duty_permille` are therefore one quantity, and
+feeding the budget fills ~0.97 of the cap. (C7: PHY × duty ignored the 86 µs
+every frame pays and fed 707‰ at R5 against 500, 814‰ at R6 against 450.)
+The cap is the encoder's average, not a scheduler limit; bursts above it are
+absorbed by the 60 ms video queue bound. Calibrate per rung.
 
 ## Sensors (drone)
 - `ack8`: ok count over the last 8 REPORTED probe tx.reports (state 0 = ok,

@@ -46,12 +46,8 @@ inline constexpr uint8_t kFloorRung = 0;
 inline constexpr uint8_t kTopRung = 6;
 static_assert(kLadder.size() == kTopRung + 1);
 
-// Video budget(r) = PHY x duty x k/n x 0.97 - control reserve, floored at 0.
-inline uint32_t video_budget_kbps(const Rung& r, uint32_t control_reserve_kbps) {
-  uint64_t v = uint64_t(r.phy_kbps) * r.duty_permille * r.fec_k * 97;
-  v /= 1000ull * (r.fec_n ? r.fec_n : 1) * 100;
-  return v > control_reserve_kbps ? uint32_t(v - control_reserve_kbps) : 0;
-}
+// The video budget a rung's duty cap buys is video_budget_kbps() in budget.h,
+// next to the airtime model it is derived from.
 
 struct LinkCfg {
   uint32_t report_timeout_ms = 500;      // TRACK while report_age < this

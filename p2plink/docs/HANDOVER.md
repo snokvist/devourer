@@ -324,7 +324,7 @@ to it, do not shorten the descent.
 - **Not implemented: "no probe ACK for 30 s → duty 0.3".** The drone-side
   rule that would let a saturated MT7612U ground come back up. FLOOR today
   keeps the floor rung's full duty (0.60).
-- **Encoder floor co-design.** R0's budget (~2.2 Mb/s by the PHY model with
+- **Encoder floor co-design.** R0's budget (~2.0 Mb/s by the airtime model with
   the 300 kb/s reserve; the reference link measured 20–40 % below the model)
   needs a resolution/fps profile chosen for bpp at that rate. The link only
   commands bitrate; the profile change is the encoder's.

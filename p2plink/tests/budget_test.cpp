@@ -34,8 +34,28 @@ static void test_airtime() {
   check(video_item_airtime_us(kLadder[0], 8 * 1382) == a0 * 12, "8-symbol block at R0 -> 12 frames");
   check(single_item_airtime_us(kLadder[6], 1382) == a6, "IP packet filling a frame = one frame");
   check(single_item_airtime_us(kLadder[6], 1383) == 2 * a6, "IP packet one byte over spans two frames");
-  check(video_budget_kbps(kLadder[0], 0) == 2522 && video_budget_kbps(kLadder[6], 0) == 37713, "video_budget_kbps R0 2522, R6 37713");
-  check(video_budget_kbps(kLadder[0], 300) == 2222 && video_budget_kbps(kLadder[0], 5000) == 0, "control reserve subtracts, floors at 0");
+  check(video_budget_kbps(kLadder[0], 0) == 2318 && video_budget_kbps(kLadder[5], 0) == 14395 &&
+            video_budget_kbps(kLadder[6], 0) == 19900,
+        "video_budget_kbps R0 2318, R5 14395, R6 19900 (airtime model, not PHY x duty)");
+  check(video_budget_kbps(kLadder[0], 300) == 2018 && video_budget_kbps(kLadder[0], 5000) == 0, "control reserve subtracts, floors at 0");
+  check(payload_kbps_at_share(kLadder[6], 1000) == 1382u * 8 * 1000 / a6, "payload at full airtime = frames/s x 1382 B");
+}
+
+// Feeding exactly the budget, in whole k_r-symbol blocks, charges the duty
+// window with 0.95..1.0 of the rung's duty cap: the budget and the meter are
+// the same airtime model (C7 fed PHY x duty and read 707 permille at R5 against
+// a 500 cap).
+static void test_budget_fills_duty() {
+  std::puts("-- budget fills the duty cap, in the scheduler's own charge");
+  for (size_t i = 0; i < kLadder.size(); i++) {
+    const Rung& r = kLadder[i];
+    const uint64_t block_bytes = uint64_t(r.fec_k) * frame_payload_capacity(r);
+    const double blocks_per_s = video_budget_kbps(r, 0) * 1000.0 / 8 / double(block_bytes);
+    const double duty = blocks_per_s * video_item_airtime_us(r, size_t(block_bytes)) / 1000.0;
+    std::printf("      R%zu budget %u kbps -> duty %.0f permille (cap %u)\n", i, video_budget_kbps(r, 0), duty,
+                unsigned(r.duty_permille));
+    check(duty <= r.duty_permille && duty >= 0.95 * r.duty_permille, "duty within [0.95, 1.0] x cap");
+  }
 }
 
 static void test_priority() {
@@ -228,6 +248,7 @@ int main() {
   test_bulk_starves();
   test_queue_limits();
   test_duty();
+  test_budget_fills_duty();
   std::printf("%s: %d failure(s)\n", g_fail ? "FAILED" : "PASSED", g_fail);
   return g_fail ? 1 : 0;
 }

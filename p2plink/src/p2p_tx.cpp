@@ -850,9 +850,12 @@ int run(const Opts& o) {
         s.ack8 = ctl.ack8();
         s.adapters = have_report ? last_report.adapters : 0;
         const Rung& br = kLadder[budget];
-        s.est_capacity_kbps = uint32_t(uint64_t(br.phy_kbps) * br.duty_permille / 1000);
+        // Same airtime model as the budget and the duty meter: payload at the
+        // duty cap (before FEC), and at the interactive bucket's share, which
+        // the scheduler charges at the PHY rung.
+        s.est_capacity_kbps = payload_kbps_at_share(br, br.duty_permille);
         s.video_budget_kbps = budget_kbps;
-        s.ip_budget_kbps = uint32_t(uint64_t(br.phy_kbps) * 150 / 1000);
+        s.ip_budget_kbps = payload_kbps_at_share(kLadder[phy], SchedCfg{}.interactive_share_permille);
         {
           std::lock_guard<std::mutex> lk(sh.sched_mu);
           s.tx_duty_permille = sh.sched.tx_duty_permille(t);
