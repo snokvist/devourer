@@ -81,12 +81,14 @@ bool StatsPublisher::read(const std::string& shm_name, StatsSnapshot* out) {
 std::string StatsPublisher::to_ndjson(const StatsSnapshot& s) {
   char buf[1024];
   int n = snprintf(buf, sizeof(buf),
-      "{\"ev\":\"p2p.stats\",\"seq\":%u,\"t_ms\":%llu,\"chan\":%u,\"bw\":%u,\"rung\":%u,\"state\":%u,"
-      "\"da_mode\":%u,\"ack8\":%u,\"adapters\":%u,\"cap_kbps\":%u,\"video_kbps\":%u,\"ip_kbps\":%u,"
-      "\"duty_permille\":%u,\"q_video_ms\":%u,\"q_ip_ms\":%u,\"q_ctl\":%u,\"report_age_ms\":%u,"
-      "\"probe_age_ms\":%u,\"retries_centi\":%u,\"rssi_best\":%d,\"rssi_mean\":%d,\"loss_permille\":%u,"
-      "\"fec_fail_permille\":%u,\"fec_k\":%u,\"fec_n\":%u,\"frame_bytes\":%u,\"uniq\":%u,\"diversity\":%u,"
-      "\"drop_video\":%u,\"drop_ip\":%u,\"tx_submitted\":%u,\"tx_failed\":%u,\"tx_timeouts\":%u}",
+      "{\"ev\":\"p2p.stats\",\"seq\":%u,\"t_ms\":%llu,\"channel\":%u,\"bw_mhz\":%u,\"rung\":%u,"
+      "\"link_state\":%u,\"da_mode\":%u,\"ack8\":%u,\"adapters\":%u,\"est_capacity_kbps\":%u,"
+      "\"video_budget_kbps\":%u,\"ip_budget_kbps\":%u,\"tx_duty_permille\":%u,\"q_video_ms\":%u,"
+      "\"q_ip_ms\":%u,\"q_ctl_frames\":%u,\"report_age_ms\":%u,\"probe_age_ms\":%u,"
+      "\"retries_mean_centi\":%u,\"rssi_best\":%d,\"rssi_mean\":%d,\"loss_permille\":%u,"
+      "\"fec_fail_permille\":%u,\"fec_k\":%u,\"fec_n\":%u,\"frame_bytes\":%u,\"uniq\":%u,"
+      "\"diversity\":%u,\"dropped_video_frames\":%u,\"dropped_ip_pkts\":%u,\"tx_submitted\":%u,"
+      "\"tx_failed\":%u,\"tx_timeouts\":%u}",
       s.seq, static_cast<unsigned long long>(s.t_ms), s.channel, s.bw_mhz, s.rung, s.link_state, s.da_mode,
       s.ack8, s.adapters, s.est_capacity_kbps, s.video_budget_kbps, s.ip_budget_kbps, s.tx_duty_permille,
       s.q_video_ms, s.q_ip_ms, s.q_ctl_frames, s.report_age_ms, s.probe_age_ms, s.retries_mean_centi,
