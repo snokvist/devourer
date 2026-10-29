@@ -677,7 +677,13 @@ Two side results:
   would be equal).
 - **The model's 50 µs IFS is an upper bound on this unit**: mean idle per
   frame at saturation 49 µs (R3), 53 (R4), 38 (R5), 30 (R6), so the model
-  overcharges R5/R6 frames by 4–12 % (reads 1 040–1 120‰ at 100 % airtime)
+  overcharges R5/R6 frames by 4–12 % (reads 1 040–1 120‰ at 100 % airtime).
+  Correction (later): those meter readings also charged every oversize video
+  item, dropped unsent — ~1/s in these runs (116 in 115 s) — so part of the
+  excess is that bug, fixed in the commit that adds this note; not re-measured
+  on the bench drone. On the camera drone at R6 saturation (472 oversize drops
+  in 60 s) the meter read 1 068‰ before and 551‰ after, against 554‰ for the
+  frames actually aired (`near-r6sat-1` / `-2`)
   and the caps there are slightly conservative. The constant stays.
 
 Witness note: the 8812BU witness (`build/rxdemo`) logged `rtw_read …

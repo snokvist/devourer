@@ -352,7 +352,9 @@ class TxThread {
     s_.sched.on_sent(it, s_.ladder[rung], now_ms());
   }
 
-  void send_video(const TxItem& item, uint8_t rung) {
+  // False when the item was dropped whole (oversize): nothing aired, so the
+  // caller must not charge its airtime to the duty meter.
+  bool send_video(const TxItem& item, uint8_t rung) {
     const Rung& r = s_.ladder[rung];
     const size_t S = frame_payload_capacity(r);
     // The scheduler item is the ring blob [8 B VencFrameMeta][frame]; the block
@@ -370,7 +372,7 @@ class TxThread {
         s_.lg->warn("video frame of {} B exceeds the block limit k={} x {} B = {} B; dropped (further drops counted only)",
                     item.payload.size(), unsigned(kMaxK), S, kMaxK * S);
       }
-      return;
+      return false;
     }
     const size_t repair = video_repair_count(r, k);
     const uint8_t kk = uint8_t(k), nn = uint8_t(k + repair);
@@ -408,9 +410,10 @@ class TxThread {
       h.seq = s_.sym_seq.fetch_add(1, std::memory_order_relaxed);
       h.block_id = bid;
       send(idx < kk ? m : m_rep, s_.group, h, block_.data() + idx * S, S, TagSlot::Other, h.seq);
-      if (s_.stop.load(std::memory_order_relaxed)) return;
+      if (s_.stop.load(std::memory_order_relaxed)) return true;  // part aired; the meter stops with us
     }
     s_.video_blocks.fetch_add(1, std::memory_order_relaxed);
+    return true;
   }
 
   void send_ip(const TxItem& item, uint8_t rung) {
@@ -451,12 +454,14 @@ class TxThread {
           continue;
         }
       }
+      bool aired = true;
       switch (item->cls) {
-        case TxClass::Video: send_video(*item, rung); break;
+        case TxClass::Video: aired = send_video(*item, rung); break;
         case TxClass::IpInteractive:
         case TxClass::IpBulk:
         case TxClass::Control: send_ip(*item, rung); break;
       }
+      if (!aired) continue;
       std::lock_guard<std::mutex> lk(s_.sched_mu);
       s_.sched.on_sent(*item, s_.ladder[rung], now_ms());
     }
