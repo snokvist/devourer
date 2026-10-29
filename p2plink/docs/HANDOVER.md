@@ -688,29 +688,35 @@ size distribution predicts 5.85 with the floor and 4.89 without it. Ground:
 field; this proves the encoder airs k + 2, not that the floor recovers a
 loss the ratio would not — that needs a lossy link.
 
-### MT7612U ground restart under drone load — found and fixed (3d7c081, devourer core)
+### MT7612U ground restart under drone load — found and fixed (devourer core; upstream PR)
 
 The C5 re-run's 31 s ground restart, chased with `gr_restart.sh` (ground up,
 drone fixed R5 at budget, then the ground SIGTERMed and restarted N times while
-the drone airs; `gr_analyze.py`).
+the drone airs; `gr_analyze.py`). Counts re-done from the runner logs (the
+first write-up and 3d7c081's message miscounted them as 16/32 and 7/10):
 
 | arm | slow restarts (31–34 s, 10–11 MCU timeouts) |
 |---|---|
 | no drone | 0 / 4 |
 | first ground start, before the drone (every arm) | 0 / 9 |
-| restarts under the drone, −40 qdB | 6 / 10 (+ 6 / 6 diag, + 3 / 6 control) |
-| restarts under the drone, −120 qdB | 5 / 10 |
-| first fix attempt (2nd flush in `mt_mac_stop`) | 7 / 10 — did not help |
-| **fix (3d7c081)** | **0 / 21** (0.94–1.26 s) |
+| restarts under the drone, −40 qdB (4 sessions pooled) | 16 / 22 |
+| restarts under the drone, −120 qdB (2 sessions) | 6 / 10 |
+| first fix attempt (2nd flush in `mt_mac_stop`) | 8 / 10 — did not help |
+| EP 4 drain, all revisions | **0 / 31** (0.94–1.26 s; 10 of them on the final code) |
 
-Bimodal, not graded: a restart was either 0.94 s or 31–34 s. The −120 qdB arm
-lowered the ground's level by only 6 dB (−37 → −43 dBm; the 8812EU offset
-floors), so it is not a flight-level arm, and level was not the variable.
-Timestamped logs: every reply of the burst appeared within 7 ms of the RX
-ring's first transfer. Mechanism: `MCU_CAL_RXDCOC` opens the receive path with
-MAC RX off; frames land in EP 4; with EP 4 undrained the chip does not deliver
-the EP 5 replies. The fix drains EP 4 on an MCU reply timeout when no ring
-owns it (the drain logged 7–19 kB at cmd 31 arg 3 in every slow-path case).
-The drone-side "no ACK for 30 s → duty 0.3" rule (§5) is therefore not
-needed for this; it stays unimplemented. Counterparts: one MT7612U unit, one
-channel, near field, one traffic shape.
+Bimodal, not graded. The −120 qdB arm lowered the ground's level by only 6 dB
+(−37 → −43 dBm; the 8812EU offset floors), so level was not the variable.
+Mechanism: during `MCU_CAL_RXDCOC` received data reaches EP 4 with
+`MT_MAC_SYS_CTRL` = 0 (MAC RX off) and the USB RX bulk enable set — a register
+probe and one decoded EP 4 read (a data frame from the drone's MAC) show it —
+and with EP 4 undrained the chip does not deliver the EP 5 replies. The fix
+drains EP 4 once per command on an MCU reply timeout while no RX ring or sync
+drainer owns it (`mt7612u_dev::ep4_owner`). Reviewed by three independent
+agents over two rounds (a use-after-free in the first revision's unlocked
+`d->a->rx_active` read was caught there and is gone). Upstream reproducer
+`tests/mt7612u_busy_bringup.sh` (rxdemo + txdemo, upstream code only): master
+09c2ff3 stalled 6/6 at 20 MHz and 6/6 at HT40 under a zero-gap MCS3 peer; with
+the fix 10/10 and 10/10 at 1.18 s. Detail: `docs/mt7612u.md`, "Bring-up on a
+busy channel". The drone-side "no ACK for 30 s → duty 0.3" rule (§5) is not
+needed for this and stays unimplemented. Counterparts: one MT7612U unit, one
+peer model, one channel, near field.
