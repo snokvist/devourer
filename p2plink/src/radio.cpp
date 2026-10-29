@@ -170,7 +170,7 @@ struct Adapter::Impl {
   uint8_t cur_channel = 0, cur_bw = 20;
   bool cur_ht40_plus = true;
   bool up = false;
-  bool stopped = false;
+  std::atomic<bool> stopped{false};  // read under tx_mu by send/retune; set by stop()
 
   void on_packet(const Packet& p);
   void push(RxFrame&& f);
@@ -517,15 +517,28 @@ bool Adapter::rx_failed(std::string* why) const {
 void Adapter::stop() {
   if (!impl_) return;
   Impl& im = *impl_;
-  if (im.stopped) return;
-  im.stopped = true;
+  if (im.stopped.exchange(true)) return;
   if (im.dev) {
     // Clear the sink first: SetTxReportSink returns only once no earlier sink
     // is executing, so what the application's sink captured may die after.
     im.dev->SetTxReportSink({});
-    im.dev->StopRxLoop();
   }
-  if (im.rx_thread.joinable()) im.rx_thread.join();
+  if (im.rx_thread.joinable()) {
+    // StopRxLoop only sets a flag, and StartRxLoop CLEARS that flag on entry
+    // (restartable; Jaguar3 and MT7612U alike). A stop that lands before the
+    // worker reaches StartRxLoop — an Init still in bring-up, or a thread
+    // just spawned — is wiped and the join would wait forever. Re-assert it
+    // until the worker is seen to exit.
+    std::unique_lock<std::mutex> lk(im.rx_mu);
+    while (!im.rx_exited) {
+      lk.unlock();
+      im.dev->StopRxLoop();
+      lk.lock();
+      im.rx_cv.wait_for(lk, std::chrono::milliseconds(50), [&im] { return im.rx_exited; });
+    }
+    lk.unlock();
+    im.rx_thread.join();
+  }
   if (im.dev && im.up) {
     try {
       std::lock_guard<std::mutex> lk(im.tx_mu);
