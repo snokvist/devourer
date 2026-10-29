@@ -219,8 +219,12 @@ class Actuator {
   std::thread th_;
 };
 
-struct ProbeSlot {
-  bool valid = false;
+// What the frame carrying a given SW_DEFINE tag was. EVERY sent frame writes
+// its slot (before send_packet), so after the 8-bit tag wraps a slot always
+// names the latest frame with that tag: a probe whose report was lost cannot
+// later claim a unicast IP frame's report.
+struct TagSlot {
+  enum Kind : uint8_t { None, Probe, Other } kind = None;
   uint32_t seq = 0;
   uint64_t t_ms = 0;
 };
@@ -249,9 +253,9 @@ struct Shared {
   std::atomic<bool> ucast_ctl{false}, ucast_inter{false}, ucast_bulk{false};
   std::atomic<int> probe_ms{100};
 
-  // tag -> probe seq, written by the TX thread, consumed by the main loop.
+  // tag -> sent frame, written by the TX thread, consumed by the main loop.
   std::mutex probe_mu;
-  ProbeSlot probes[256];
+  TagSlot tags[256];
   std::atomic<uint32_t> probe_seq{0};
   std::atomic<bool> tags_available{true};
 
@@ -292,11 +296,29 @@ class TxThread {
     return r;
   }
 
+  // Records the frame under its report tag before it is handed to the chip
+  // (Adapter::send's hook runs under the TX mutex just before send_packet).
   bool send(const devourer::TxMode& m, const Mac& da, const P2pHeader& h, const uint8_t* p, size_t n,
-            std::optional<uint8_t>* tag) {
-    bool ok = s_.ad->send(m, da, s_.own, h, p, n, tag);
+            TagSlot::Kind kind, uint32_t seq) {
+    std::optional<uint8_t> tag;
+    const Adapter::TagHook hook = [&](std::optional<uint8_t> t) {
+      tag = t;
+      if (!t) return;
+      std::lock_guard<std::mutex> lk(s_.probe_mu);
+      s_.tags[*t] = TagSlot{kind, seq, now_ms()};
+    };
+    bool ok = s_.ad->send(m, da, s_.own, h, p, n, &hook);
     s_.frames_sent.fetch_add(1, std::memory_order_relaxed);
-    if (!ok) s_.frames_failed.fetch_add(1, std::memory_order_relaxed);
+    if (!ok) {
+      s_.frames_failed.fetch_add(1, std::memory_order_relaxed);
+      if (tag) {
+        // Never aired: no report will come for it.
+        std::lock_guard<std::mutex> lk(s_.probe_mu);
+        s_.tags[*tag].kind = TagSlot::None;
+      }
+    }
+    if (kind == TagSlot::Probe && !tag && s_.tags_available.exchange(false))
+      s_.lg->info("this device echoes no TX-report tag: every non-broadcast tx.report is read as a probe result");
     return ok;
   }
 
@@ -311,14 +333,7 @@ class TxThread {
     h.net_id = s_.net_id;
     h.rung = rung;
     h.seq = pr.seq;
-    std::optional<uint8_t> tag;
-    send(rung_mode(kLadder[rung]), s_.peer, h, buf, sizeof buf, &tag);
-    if (tag) {
-      std::lock_guard<std::mutex> lk(s_.probe_mu);
-      s_.probes[*tag] = ProbeSlot{true, pr.seq, now_ms()};
-    } else if (s_.tags_available.exchange(false)) {
-      s_.lg->info("this device echoes no TX-report tag: every non-broadcast tx.report is read as a probe result");
-    }
+    send(rung_mode(kLadder[rung]), s_.peer, h, buf, sizeof buf, TagSlot::Probe, pr.seq);
     TxItem it{TxClass::Control, 0, 0, std::vector<uint8_t>(buf, buf + sizeof buf), now_ms(), 0};
     std::lock_guard<std::mutex> lk(s_.sched_mu);
     s_.sched.on_sent(it, kLadder[rung], now_ms());
@@ -371,7 +386,7 @@ class TxThread {
       h.stream = item.stream;
       h.seq = s_.sym_seq.fetch_add(1, std::memory_order_relaxed);
       h.block_id = bid;
-      send(m, s_.group, h, block_.data() + idx * S, S, nullptr);
+      send(m, s_.group, h, block_.data() + idx * S, S, TagSlot::Other, h.seq);
       if (s_.stop.load(std::memory_order_relaxed)) return;
     }
     s_.video_blocks.fetch_add(1, std::memory_order_relaxed);
@@ -388,7 +403,7 @@ class TxThread {
     h.stream = item.stream;
     h.seq = s_.ip_seq.fetch_add(1, std::memory_order_relaxed);
     send(rung_mode(kLadder[rung]), ucast ? s_.peer : s_.group, h, item.payload.data(), item.payload.size(),
-         nullptr);
+         TagSlot::Other, h.seq);
   }
 
   void run() {
@@ -702,11 +717,9 @@ int run(const Opts& o) {
         bool is_probe = false;
         if (sh.tags_available.load()) {
           std::lock_guard<std::mutex> lk(sh.probe_mu);
-          ProbeSlot& slot = sh.probes[r.tag];
-          if (slot.valid) {
-            is_probe = true;
-            slot.valid = false;
-          }
+          TagSlot& slot = sh.tags[r.tag];
+          is_probe = slot.kind == TagSlot::Probe;
+          slot.kind = TagSlot::None;
         } else {
           is_probe = true;  // no tag echo on this die: every non-bmc report is probe-class
         }

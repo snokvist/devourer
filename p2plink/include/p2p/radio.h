@@ -100,13 +100,16 @@ class Adapter {
 
   // Builds radiotap (build_stream_radiotap(mode, no_ack = group DA)) + 802.11
   // Data header (bssid = link_bssid(net_id)) + P2pHeader + payload and calls
-  // send_packet under the adapter's TX mutex. When the device is an IRtlRadio
-  // with a report tag (HalMAC dies, tx_report on), *tag_out receives the
-  // SW_DEFINE tag this frame will carry so the caller can join its TxReport;
-  // nullopt otherwise. Returns send_packet's result. Never call from the RX
-  // callback path (it is not — the application owns both ends).
+  // send_packet under the adapter's TX mutex. When `on_tag` is given it is
+  // called under that mutex immediately BEFORE send_packet with the SW_DEFINE
+  // tag this frame will carry (IRtlRadio::NextTxReportTag; nullopt when the
+  // die echoes none or tx_report is off), so the caller's tag -> frame record
+  // exists before the TxReport can possibly arrive. The hook must not call
+  // back into this Adapter. Returns send_packet's result. Never call from the
+  // RX callback path (it is not — the application owns both ends).
+  using TagHook = std::function<void(std::optional<uint8_t>)>;
   bool send(const devourer::TxMode& mode, const Mac& da, const Mac& sa, const P2pHeader& h,
-            const uint8_t* payload, size_t len, std::optional<uint8_t>* tag_out);
+            const uint8_t* payload, size_t len, const TagHook* on_tag);
 
   // Forwards to IRadio::SetTxReportSink. The sink runs on the backend's C2H
   // thread (Jaguar3: the coex thread or the RX worker): enqueue only, and set

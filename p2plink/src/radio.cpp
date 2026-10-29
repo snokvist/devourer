@@ -443,7 +443,7 @@ bool Adapter::pop_rx(RxFrame* out, int timeout_ms) {
 int Adapter::rx_fd() const { return impl_->evfd; }
 
 bool Adapter::send(const devourer::TxMode& mode, const Mac& da, const Mac& sa, const P2pHeader& h,
-                   const uint8_t* payload, size_t len, std::optional<uint8_t>* tag_out) {
+                   const uint8_t* payload, size_t len, const TagHook* on_tag) {
   Impl& im = *impl_;
   // NOACK for a group DA (nothing answers; a backend that honours the bit must
   // not wait), ACK-requested for unicast so the hardware retries. Only the
@@ -456,8 +456,8 @@ bool Adapter::send(const devourer::TxMode& mode, const Mac& da, const Mac& sa, c
   if (len) std::memcpy(frame.data() + rt + kDot11HdrLen + kHdrLen, payload, len);
 
   std::lock_guard<std::mutex> lk(im.tx_mu);
-  if (tag_out) *tag_out = im.rtl ? im.rtl->NextTxReportTag() : std::nullopt;
   if (!im.up || im.stopped) return false;
+  if (on_tag && *on_tag) (*on_tag)(im.rtl ? im.rtl->NextTxReportTag() : std::nullopt);
   return im.dev->send_packet(frame.data(), frame.size());
 }
 
