@@ -691,7 +691,11 @@ int run(const Opts& o) {
           last_report = *r;
           have_report = true;
           reports_total++;
-          if (!fixed) ctl.on_report(*r, t);
+          // Fed in --fixed-rung mode too: the rungs are pinned below, but the
+          // report age, TRACK state and therefore the DA machine need them
+          // (first light: without this a pinned drone sat in FLOOR with
+          // report_age MAX and could never reach Ucast).
+          ctl.on_report(*r, t);
           break;
         }
         case Type::IpData:
