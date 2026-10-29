@@ -263,6 +263,33 @@ int main() {
           "(c2) 304 ok=false, 8 lost");
   }
 
+  // ---- (c3) a block longer on air than the dwell ---------------------------
+  // First light: every IDR block (and at R0 most blocks) takes longer than
+  // gap_dwell_ms to air. Rule (3) is a QUIET dwell, so symbols trickling in at
+  // 7 ms spacing for ~80 ms must still complete the block.
+  {
+    std::printf("-- (c3) rule (3) dates from the last symbol, not the first\n");
+    BlockMerger m;
+    Sink s;
+    TestBlock b = make_block(rs, 500, 11188, R, 40);
+    for (uint8_t idx = 0; idx < b.n; idx++) {
+      uint64_t t = 7 * uint64_t(idx);
+      feed(m, 0, b, idx, t);
+      m.poll(t, s.fn);
+      if (idx + 1 < b.k) check(s.out.empty(), "(c3) nothing declared while symbols keep arriving");
+    }
+    CHECK_EQ(s.out.size(), size_t(1), "(c3) block 500 emitted once");
+    check(s.out.size() == 1 && frame_matches(s.out[0], b), "(c3) 500 decoded intact after 7 ms x 8 sources");
+    // ...and a block that goes quiet IS declared, gap_dwell_ms after its last symbol.
+    TestBlock c = make_block(rs, 501, 11188, R, 41);
+    for (uint8_t idx = 0; idx < 5; idx++) feed(m, 0, c, idx, 100 + 7 * idx);  // last at 128
+    m.poll(147, s.fn);
+    CHECK_EQ(s.out.size(), size_t(1), "(c3) 501 held until 20 ms after its last symbol");
+    m.poll(148, s.fn);
+    CHECK_EQ(s.out.size(), size_t(2), "(c3) 501 declared at last + 20 ms");
+    check(s.out.size() == 2 && !s.out[1].ok, "(c3) 501 ok=false");
+  }
+
   // ---- (d) silent ear ----------------------------------------------------
   {
     std::printf("-- (d) silent ear excluded from rule (1) and adapters\n");

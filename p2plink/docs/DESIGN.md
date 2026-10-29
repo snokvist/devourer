@@ -84,7 +84,10 @@ Key (stream, block_id, fec_idx) → first copy wins; later copies count as
 `diversity`. Cursor window: blocks older than cursor−4 are dropped. A block
 decodes when >= k symbols are present (FEC) or all k sources arrive (fast
 path). Gap/finalize rules in order: (1) every non-silent ear has advanced past
-the block, (2) a newer block_id has been seen, (3) 20 ms dwell. An ear with 0
+the block, (2) a newer block_id has been seen, (3) 20 ms with no symbol of the
+block (a quiet dwell dated from its LAST symbol — a block's own airtime exceeds
+20 ms for every IDR and for most blocks at R0; first light lost every IDR block
+when the dwell was dated from the first symbol). An ear with 0
 frames for 200 ms while a sibling delivers is excluded from (1) and from
 `adapters`. Hardware retry copies are dedup'd by the same key (the Retry bit
 and seq12 are informational).

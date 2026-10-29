@@ -12,7 +12,11 @@
 //            cannot complete is emitted ok=false (declared lost) when, in
 //            order: (1) every non-silent ear has delivered a symbol of a NEWER
 //            block, (2) a block_id >= this + window_blocks has been seen,
-//            (3) gap_dwell_ms elapsed since the block's first symbol.
+//            (3) gap_dwell_ms elapsed since the block's LAST symbol (from any
+//            ear) — a quiet block, not an old one: a block's own airtime
+//            (k + repair frames back to back) routinely exceeds the dwell
+//            (an IDR at any rung; most blocks at R0), so dating it from the
+//            first symbol declared blocks lost while they were still arriving.
 //   retire — an emitted block stays in the pending set until the same three
 //            rules say no more copies can come, so its repair symbols that
 //            trail the k-th source still count as `uniq` rather than as loss.
@@ -53,7 +57,7 @@
 namespace p2p {
 
 struct MergeConfig {
-  uint32_t gap_dwell_ms = 20;     // rule (3): declare lost after this much time since the first symbol
+  uint32_t gap_dwell_ms = 20;     // rule (3): declare lost after this long with no symbol of the block
   uint32_t silent_ear_ms = 200;   // anti-phantom: ear idle this long while a sibling delivers
   uint8_t window_blocks = 4;      // rule (2) and the acceptance window behind the newest block
   uint8_t max_ears = 8;           // ear indices >= this are rejected (<= kMaxEars)
@@ -161,6 +165,7 @@ class BlockMerger {
       b.rung = h.rung;
       b.sym_len = len;
       b.first_ms = now_ms;
+      b.last_ms = now_ms;
       b.sym.resize(h.fec_n);
       it = pending_.emplace(u, std::move(b)).first;
     }
@@ -169,6 +174,7 @@ class BlockMerger {
       win_.rejected++;
       return false;
     }
+    b.last_ms = now_ms;  // any copy, duplicate included, means the block is still arriving
     if (b.present[h.fec_idx]) {
       win_.diversity++;
       total_diversity_++;
@@ -205,7 +211,7 @@ class BlockMerger {
       }
       if (decodable(b)) {
         emit_block(b, false, emit);
-      } else if (gap_closed(b.u, b.first_ms, now_ms)) {
+      } else if (gap_closed(b.u, b.last_ms, now_ms)) {
         emit_block(b, true, emit);
       } else {
         break;
@@ -217,7 +223,7 @@ class BlockMerger {
     for (auto it = pending_.begin(); it != pending_.end();) {
       Block& b = it->second;
       if (!b.emitted) break;
-      if (!b.lost && !gap_closed(b.u, b.first_ms, now_ms)) break;
+      if (!b.lost && !gap_closed(b.u, b.last_ms, now_ms)) break;
       account_retire(b);
       retire_next_u_ = b.u + 1;
       it = pending_.erase(it);
@@ -324,7 +330,8 @@ class BlockMerger {
     bool emitted = false;
     bool lost = false;  // emitted ok=false: retire as soon as order allows
     size_t sym_len = 0;
-    uint64_t first_ms = 0;
+    uint64_t first_ms = 0;  // first symbol: dates a gap noticed in front of this block
+    uint64_t last_ms = 0;   // latest symbol (any ear, duplicates too): rule (3) for this block
     std::array<bool, 256> present{};
     std::vector<std::vector<uint8_t>> sym;
   };
@@ -365,11 +372,11 @@ class BlockMerger {
     }
     return any;
   }
-  // Rules (1), (2), (3) in order for block (or missing id) `u` first noticed at `first_ms`.
-  bool gap_closed(int64_t u, uint64_t first_ms, uint64_t now_ms) const {
+  // Rules (1), (2), (3) in order for block (or missing id) `u`, quiet since `since_ms`.
+  bool gap_closed(int64_t u, uint64_t since_ms, uint64_t now_ms) const {
     if (rule_ears_past(u, now_ms)) return true;
     if (highest_u_ - u >= int64_t(cfg_.window_blocks)) return true;
-    return now_ms >= first_ms + cfg_.gap_dwell_ms;
+    return now_ms >= since_ms + cfg_.gap_dwell_ms;
   }
 
   void account_retire(const Block& b) {
