@@ -675,8 +675,15 @@ Two side results:
 
 Witness note: the 8812BU witness (`build/rxdemo`) logged `rtw_read …
 iostream error` in every R4 run and once at R6, and in `sat-r4-1` an uncaught
-`std::ios_base::failure` aborted it. Not a drone or ground number; a devourer
-Jaguar2 robustness issue, queued separately.
+`std::ios_base::failure` aborted it. Not a drone or ground number. Resolved in
+a separate session: the 8812BU STALLs a control request now and then under
+~85 % co-channel busy (LIBUSB_ERROR_PIPE, any address, ~1–6 per 90 s; a
+re-read succeeds), and rxdemo's busy-window poller had no catch. Fix branch
+`jaguar2-read-fail-survive` (devourer, from upstream/master; PR pending). Until
+it lands: a witness rxdemo should come from a tree with those commits, should
+run only `DEVOURER_RX_BUSY_MS` (the thermal / RX-energy pollers are unguarded
+too), and its `rx.busy` must be filtered on `valid` (a failed read then emits
+`valid:false, read_failed:1`) — `cal_analyze.py` already does.
 
 ### Repair floor (86594f5) on air — PASS
 
