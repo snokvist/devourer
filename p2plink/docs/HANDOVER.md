@@ -406,3 +406,116 @@ Also seen: the drone's video queue bound dropped 3 frames in 20 s
 (`q_video_ms` max 55) — the synthetic IDR every second at 3 Mb/s is a burst
 the 60 ms bound clips at R2. Design behaviour, not a link fault, but a real
 encoder's IDR size decides whether it bites.
+
+The review fixes listed in the PR were made after first light; the first-light
+setup was re-run on the fixed tree (`c0-firstlight-3`, 2026-10-29): 436
+symbols/s, 0 failed blocks, `ack8` 8, Ucast at +1.7 s.
+
+Same units, channel, power and feed as first light unless stated; "near
+field" below means ground RSSI −35..−38 dBm with no attenuator, so no cell
+here says anything about range.
+
+### C1 — 8812EU soliciting vs 8812EU responder (A1) — NOT RUN
+
+Needs a second 8812EU as the responder; this bench has one. A1 is half-
+answered by C2 (the 8812EU closes the ACK loop as the soliciting TX against
+an MT7612U responder, below) — the 8812EU-responder half is open.
+
+### C2 — 8812EU → MT7612U ACK target (A2) — PASS (one unit pair, near field)
+
+`c2-run1`, 2026-10-29. Ground `--uplink none` (ACK target only, rx-only
+`Init`), drone `--fixed-rung 2`; ground SIGTERM'd at +30 s for the OFF arm.
+
+| arm | probes reported / sent | coverage | ok | retries histogram | mean |
+|---|---|---|---|---|---|
+| ON (2.0–24.3 s) | 223 / ~223 | 1.00 | 223 (1.00) | {0: 220, 1: 3} | 0.01 |
+| OFF (26.3–54.6 s) | 283 / ~283 | 1.00 | 0 | {3: 283} — all pinned at the limit | 3.00 |
+
+`ack8` 8 → 0 in eight probes (0.8 s) after the kill. Group decode while
+ACKing: 435 symbols/s vs ~436 video frames/s submitted, equal to the
+first-light ground (434/s) — the auto-responder and the monitor filter
+coexist on this MT7612U. Counterpart: one 8812EU, one MT7612U, at −36 dBm
+with ~50 dB of margin; coverage 1.00 is at R2's ~450 frames/s, far below the
+~1.3 k reports/s CCX ceiling that R5/R6 cross (C7 measures it there). The
+MT7612U-only ground is **kept** in v1 (C2's flip does not trigger).
+
+### C3 — 40 MHz-parked ground, 20 and 40 MHz frames (A3, A5) — PASS for the MT7612U ear only
+
+`c3-r3`, `c3-r5`, 2026-10-29, 60 s each, window 8–50 s, ground uplink 0.
+
+| drone | frames on air | ground uniq/s | video frames/s submitted | ratio | failed blocks |
+|---|---|---|---|---|---|
+| `--fixed-rung 3` (tune 20) | MCS3 / 20 MHz | 404.6 | 405.3 | 99.8 % | 0 |
+| `--fixed-rung 5` (tune 40, floor 0x35) | MCS3 / 40 MHz | 368.2 | 369.4 | 99.7 % | 0 |
+
+A5 (MT7612U receives at 40 MHz, incl. 20-in-40 on the primary) holds on this
+unit. Not shown: `adapters == 2` and the 8812EU ear's ratio (no second
+8812EU), so A3 for an 8812EU ear is open. Near field: a width-dependent
+sensitivity cost would not show at this margin.
+
+### C4 — wide_tx_igi_floor edge and uplink cost (A4) — edge: 0 on this unit; cost: NOT RUN
+
+`c4-edge-v00-r{1,2,3}`, 2026-10-29: `--fixed-rung 5 --wide-igi-floor 0`, 20 s
+each. All three starts aired the first 40 MHz frame at once (663–707
+submitted at +1 s, 0 `tx_failed`, 0 timeouts, ground uniq rising within
+~0.5 s of the drone's first frame). By the cell's rule the edge is **0 for
+unit 1-1**. Counterparts, all of which limit it: the starts were soft
+re-inits (card-disable → power-on in a fresh process), not VBUS cold — the
+8812EU sits on an xHCI root port that uhubctl cannot switch; one unit, and
+`src/jaguar3/CLAUDE.md` already records one 8812EU that never stalls and one
+that needs the floor, so this says nothing about the drone's own unit; the
+ground ear saw no foreign 802.11 on ch 100 but the drone's receiver did, so
+"quiet" is not established. Floor 0 had 2–3 failed blocks of ~466 per run
+(one per run is the drone SIGTERM mid-block), against 0 in C3's single R5 run
+at 0x35 — inside the noise at n = 3 vs n = 1, recorded, not a finding.
+
+The cost half (attenuation where ack8 ≈ 6–7, floor on vs off) needs an
+attenuator or distance: the link sits ~50 dB above the edge, and
+`--txpwr-offset-qdb` cannot remove 50 dB. The default stays 0x35 (per-unit
+edge; no design flip). Re-run the edge on the drone's own 8812EU.
+
+### C5 — blind descent and HOLD — STOPPED on two findings (design questions open)
+
+`c5-run1`, 2026-10-29: drone adaptive `--start-rung 5`, ground MT7612U ack
+target + uplink. (a) used the new SIGUSR1 report mute, because restarting
+`p2p_rx` on a one-adapter ground also kills the ACK for ~1 s.
+
+| leg | expected (HANDOVER) | observed (drone clock) | verdict |
+|---|---|---|---|
+| (a) reports muted at 20.00, ACK alive | budget R3 ≤ 500 ms, PHY R3 +500 ms, then HOLD | HOLD at 20.62 with **no step**: R5/R5 kept; DA → Bcast at 20.62 | contradicts HANDOVER; matches the code and `link_ctl_test` ("Probes ACKed all along: Hold at the report timeout, no initial drop") |
+| unmute at 35.00 | TRACK, no snap-back | TRACK at 35.22 at R5; Ucast at 36.22 | PASS |
+| (b) ground SIGTERM at 54.97 | budget R−2 at +500 ms, R−2 per 500 ms, floor ≤ ~2.5 s, ack8 → 0 in 8 probes | Bcast 55.32; budget R3 55.52; then 56.02 / 56.52 / 57.02 steps; FLOOR at 57.02 (+2.05 s); ack8 4 → 0 by 56.02; tune 20 MHz at 59.09 (3.07 s at ≤ R3) | PASS — every step on the 500 ms grid |
+| (c) ground restarted at 64.96 (up 65.90) | first fresh report → TRACK, no snap-back | TRACK at 66.02, R0 kept; Ucast at 67.52 | PASS (needs the session-nonce fix — before it, the restarted ground's epoch 1 was refused as stale) |
+
+**Finding 1 — promotion can never fire.** In 20 s of clean TRACK at R5 the
+drone never went to R6, and after (c) it sat at R0 for the remaining 29 s on
+a −36 dBm link. `LinkController::probe_evidence_ok` requires frames at rung
+r+1 in the ground's report window and vetoes on none, but nothing is ever
+sent at r+1 — DESIGN.md "Sensors" sends the probe at the current rung. So any
+outage parks the link at the floor for the rest of the flight. The unit tests
+pass because they feed synthetic reports with r+1 counters.
+
+**Finding 2 — HOLD entry.** DESIGN.md "BLIND … HOLD exception: ack8 ≥ 6 →
+stop descending" is read two ways: the code holds at the report timeout
+without a step, HANDOVER C5(a) expects one R−2 step first.
+
+Both are design decisions; proposals are on PR #4, no code changed for them yet.
+
+### C6 — DA machine vs a 10 pps IP class, ground unplugged — PASS
+
+`c6-run1`, 2026-10-29: ground in netns with tun 10.99.0.2, drone adaptive
+from R5 with tun 10.99.0.1, `ping -i 0.1` throughout; ground SIGTERM at 24.19,
+restarted at 34.22 (drone clock).
+
+- Bcast at 24.50 (+0.31 s; pass ≤ 1.5 s).
+- `tx_duty_permille` in the 0.6 s after the kill, before any PHY step: 85–296,
+  against 82–287 in the 5 s before (max is the IDR burst both times) — no
+  storm. After that the duty rises with the blind descent to R0 (707 at the
+  floor), which is the rung, not the DA.
+- `dropped_ip_pkts` 0 throughout.
+- Ping: 100 % before the kill, 0 while the ground was gone, 96 % from +3 s
+  after the restore; first reply 0.88 s after the restart (group DA, before
+  TRACK); TRACK at 35.30, Ucast at 36.90 (≥ 1 s of ack8 ≥ 7 after TRACK).
+
+Counterparts: the run stayed at R0 after the restore because of C5 finding 1,
+so Ucast was re-entered at the floor rung only; one run.
