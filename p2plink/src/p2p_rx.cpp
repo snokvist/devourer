@@ -271,6 +271,7 @@ int run(const Opts& o) {
            ip_tx = 0, tun_fail = 0, reports_sent = 0, reports_failed = 0, out_ring_drops = 0;
   uint32_t ip_seq = 0;
   uint8_t last_k = 0, last_n = 0;
+  size_t last_frame_bytes = 0;  // the drone's --frame-bytes, as the last video symbol carried it
   uint64_t tx_failed_prev = 0, tx_timeouts = 0;
 
   auto emit = [&](const DecodedBlock& b) {
@@ -319,6 +320,7 @@ int run(const Opts& o) {
             merger.on_symbol(f.ear, f.hdr, f.payload.data(), f.payload.size(), f.rssi_dbm, t);
             last_k = f.hdr.fec_k;
             last_n = f.hdr.fec_n;
+            last_frame_bytes = kHdrLen + f.payload.size();
             break;
           case Type::IpData:
             if (!dedup.accept(f.hdr.type, f.hdr.stream, f.hdr.seq, f.hdr.session)) break;
@@ -411,8 +413,8 @@ int run(const Opts& o) {
       s.fec_fail_permille = last_rep.fec_fail_permille;
       s.fec_k = last_k;
       s.fec_n = last_n;
-      s.frame_bytes_hi = uint8_t(1400 >> 8);
-      s.frame_bytes_lo = uint8_t(1400 & 0xff);
+      s.frame_bytes_hi = uint8_t(last_frame_bytes >> 8);
+      s.frame_bytes_lo = uint8_t(last_frame_bytes & 0xff);
       s.uniq = uint32_t(merger.total_uniq());
       s.diversity = uint32_t(merger.total_diversity());
       s.dropped_video_frames = uint32_t(blocks_failed);

@@ -19,8 +19,10 @@ retry_limit 3, ack_timeout_us 128, A-MPDU off, rx.pool_exhaust backpressure
 LGI, 5 GHz only, static channel per boot (operator-manual switch only).
 Ground parks at 40 MHz; the drone picks 20/40 PER FRAME in radiotap (the
 receiver decodes a 20 MHz frame on its primary with no retune; measured 0 dB
-wide-RX penalty). Frame MPDU 1400 B (one IP packet per frame; MT7612U RX cap
-3836). No 5/10 MHz anywhere.
+wide-RX penalty). Frame MPDU 1400 B by default (one IP packet per frame;
+MT7612U RX cap 3836); the drone's `--frame-bytes` (200..1400, every rung) sets
+it lower for the C8 sweep — the ground takes the length from the frames, and
+the drone's tun MTU follows it. No 5/10 MHz anywhere.
 
 ## Ladder (rung = {frame bw, MCS, FEC k/n, duty cap}); LDPC always
 ```
@@ -125,7 +127,8 @@ calibration, narrowband, 2.4 GHz, A-MPDU.
   decodes; the rung's k/n is a ratio, not a block size. The repair floor of 2 (waybeam-link's `min_r`) keeps
   a small frame from being one loss from death; it costs one frame of airtime on k ≤ 4 blocks at R5/R6
   (k ≤ 2 at R0–R4) and nothing above. A frame above 128·S (≈176 KB) is dropped whole and counted
-  (`dropped_video_frames`) with one warning; never truncated or split.
+  (`dropped_video_frames`) with one warning; never truncated or split. The ceiling scales with
+  `--frame-bytes`: ≈74 KB at 600 B.
 - Tune vs rung: while the drone is tuned to 20 MHz and the controller's PHY rung is a 40 MHz one (the
   promote edge), frames air at R3 (26 Mb/s vs R4's 27, 20 MHz) until the 100 ms tick retunes to 40 MHz.
 - Tun MTU 1380 on both ends (1400 − 18 header − 2 packed-length prefix); ground IP is group-DA only.

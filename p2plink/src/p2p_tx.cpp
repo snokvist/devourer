@@ -56,8 +56,9 @@ void on_signal(int) { g_stop = 1; }
 // The TX scheduler's maximum source-symbol count per block. n stays <= 192 at
 // the worst 8/12 ratio, under the RS limit of 255 (fec.h).
 constexpr uint8_t kMaxK = 128;
-// One IP packet per frame: capacity minus the 2-byte packed length prefix.
-constexpr int kTunMtu = int(1400 - kHdrLen - 2);
+// --frame-bytes range. The top is the v1 frame (DESIGN.md "Frame MPDU"); the
+// bottom keeps the 18 B header and the 12 B block prefix a small share.
+constexpr int kMinFrameBytes = 200, kMaxFrameBytes = 1400;
 constexpr uint32_t kPackTimerMs = 5;
 constexpr uint32_t kTickMs = 20;
 constexpr uint32_t kControlTickMs = 100;
@@ -78,6 +79,7 @@ struct Opts {
   int fixed_rung = -1;
   bool no_tune20 = false;
   int probe_ms = 100;
+  int frame_bytes = kMaxFrameBytes;
   std::optional<uint8_t> wide_igi_floor;
   std::optional<int> txpwr_offset_qdb;
   std::optional<std::string> mt7612u_fw;
@@ -105,6 +107,7 @@ void usage(const char* argv0) {
       "  --fixed-rung N          bypass the LinkController (bench cells)\n"
       "  --no-tune20             never retune the radio itself to 20 MHz\n"
       "  --probe-ms N            probe period (default 100)\n"
+      "  --frame-bytes N         802.11 body per frame on every rung, 200..1400 (default 1400)\n"
       "  --wide-igi-floor 0xNN   Jaguar3 wide-TX IGI floor\n"
       "  --txpwr-offset-qdb N    TX power offset vs the calibrated table, quarter dB (-40 = -10 dB)\n"
       "  --mt7612u-fw DIR        MT7612U firmware directory\n"
@@ -276,6 +279,8 @@ struct Shared {
   std::atomic<uint32_t> sym_seq{0}, ip_seq{0};
   std::atomic<uint16_t> block_id{0};
   Logger_t lg;
+  // kLadder with --frame-bytes applied; fixed before the TX thread starts.
+  std::array<Rung, kLadder.size()> ladder = kLadder;
 };
 
 class TxThread {
@@ -300,7 +305,7 @@ class TxThread {
   // main loop retunes).
   uint8_t air_rung() const {
     uint8_t r = s_.rung_phy.load(std::memory_order_relaxed);
-    if (s_.tune_bw.load(std::memory_order_relaxed) == 20 && kLadder[r].bw_mhz == 40) r = 3;
+    if (s_.tune_bw.load(std::memory_order_relaxed) == 20 && s_.ladder[r].bw_mhz == 40) r = 3;
     return r;
   }
 
@@ -341,14 +346,14 @@ class TxThread {
     h.net_id = s_.net_id;
     h.rung = rung;
     h.seq = pr.seq;
-    send(rung_mode(kLadder[rung]), s_.peer, h, buf, sizeof buf, TagSlot::Probe, pr.seq);
+    send(rung_mode(s_.ladder[rung]), s_.peer, h, buf, sizeof buf, TagSlot::Probe, pr.seq);
     TxItem it{TxClass::Control, 0, 0, std::vector<uint8_t>(buf, buf + sizeof buf), now_ms(), 0};
     std::lock_guard<std::mutex> lk(s_.sched_mu);
-    s_.sched.on_sent(it, kLadder[rung], now_ms());
+    s_.sched.on_sent(it, s_.ladder[rung], now_ms());
   }
 
   void send_video(const TxItem& item, uint8_t rung) {
-    const Rung& r = kLadder[rung];
+    const Rung& r = s_.ladder[rung];
     const size_t S = frame_payload_capacity(r);
     // The scheduler item is the ring blob [8 B VencFrameMeta][frame]; the block
     // prefix is [u32 frame_len][meta][frame], so the frame is the blob minus
@@ -386,9 +391,9 @@ class TxThread {
     // never a 40 MHz repair on a 20 MHz tune, never other than rung + 1.
     uint8_t rep_rung = rung;
     const uint8_t sr = s_.sample_rung.load(std::memory_order_relaxed);
-    if (sr == rung + 1 && !(kLadder[sr].bw_mhz == 40 && s_.tune_bw.load(std::memory_order_relaxed) == 20))
+    if (sr == rung + 1 && !(s_.ladder[sr].bw_mhz == 40 && s_.tune_bw.load(std::memory_order_relaxed) == 20))
       rep_rung = sr;
-    const devourer::TxMode m_rep = rep_rung == rung ? m : rung_mode(kLadder[rep_rung]);
+    const devourer::TxMode m_rep = rep_rung == rung ? m : rung_mode(s_.ladder[rep_rung]);
     for (uint8_t idx = 0; idx < nn; idx++) {
       P2pHeader h;
       h.type = uint8_t(idx < kk ? Type::VideoData : Type::VideoRepair);
@@ -418,7 +423,7 @@ class TxThread {
     h.rung = rung;
     h.stream = item.stream;
     h.seq = s_.ip_seq.fetch_add(1, std::memory_order_relaxed);
-    send(rung_mode(kLadder[rung]), ucast ? s_.peer : s_.group, h, item.payload.data(), item.payload.size(),
+    send(rung_mode(s_.ladder[rung]), ucast ? s_.peer : s_.group, h, item.payload.data(), item.payload.size(),
          TagSlot::Other, h.seq);
   }
 
@@ -435,7 +440,7 @@ class TxThread {
       std::optional<TxItem> item;
       {
         std::unique_lock<std::mutex> lk(s_.sched_mu);
-        item = s_.sched.dequeue(kLadder[rung], now);
+        item = s_.sched.dequeue(s_.ladder[rung], now);
         if (!item) {
           // Nothing eligible: sleep to the probe or a notification. A queued
           // but bucket-starved interactive item is re-checked in 5 ms.
@@ -453,7 +458,7 @@ class TxThread {
         case TxClass::Control: send_ip(*item, rung); break;
       }
       std::lock_guard<std::mutex> lk(s_.sched_mu);
-      s_.sched.on_sent(*item, kLadder[rung], now_ms());
+      s_.sched.on_sent(*item, s_.ladder[rung], now_ms());
     }
   }
 
@@ -484,6 +489,9 @@ int run(const Opts& o) {
   }
   Shared sh;
   sh.lg = logger;
+  for (Rung& r : sh.ladder) r.frame_bytes = uint16_t(o.frame_bytes);
+  // One IP packet per frame: capacity minus the 2-byte packed length prefix.
+  const int tun_mtu = int(frame_payload_capacity(sh.ladder[0])) - 2;
   if (!parse_mac(o.peer_mac, &sh.peer) || is_group(sh.peer)) {
     logger->error("--peer-mac must be a unicast MAC (the ground's ack_target_mac)");
     return 2;
@@ -542,13 +550,13 @@ int run(const Opts& o) {
   Tun tun;
   bool have_tun = false;
   if (!o.tun.empty()) {
-    if (!tun.open(o.tun, kTunMtu, &err)) {
+    if (!tun.open(o.tun, tun_mtu, &err)) {
       logger->error("tun: {}", err);
     } else {
       have_tun = true;
       if (!o.tun_addr.empty() && !tun.set_ipv4(o.tun_addr, &err)) logger->warn("tun addr: {}", err);
       if (!tun.set_up(true, &err)) logger->warn("tun up: {}", err);
-      logger->info("tun {} up, mtu {}", tun.name(), kTunMtu);
+      logger->info("tun {} up, mtu {}", tun.name(), tun_mtu);
     }
   }
   StatsPublisher pub;
@@ -575,7 +583,8 @@ int run(const Opts& o) {
       .f("bw", o.bw)
       .f("chip", ad->chip_name())
       .f("net_id", o.net_id)
-      .f("fixed_rung", o.fixed_rung);
+      .f("fixed_rung", o.fixed_rung)
+      .f("frame_bytes", o.frame_bytes);
   logger->info("p2p_tx up: {} {} ch {} bw {} peer {}", ad->chip_name(), mac_str(sh.own), o.channel, o.bw,
                mac_str(sh.peer));
 
@@ -601,7 +610,7 @@ int run(const Opts& o) {
 
   auto enqueue = [&](TxItem&& it) {
     std::lock_guard<std::mutex> lk(sh.sched_mu);
-    bool kept = sh.sched.enqueue(std::move(it), kLadder[sh.rung_phy.load()], now_ms());
+    bool kept = sh.sched.enqueue(std::move(it), sh.ladder[sh.rung_phy.load()], now_ms());
     sh.sched_cv.notify_one();
     return kept;
   };
@@ -678,10 +687,10 @@ int run(const Opts& o) {
       for (int i = 0; i < 32; i++) {
         long len = tun.read_packet(pkt, sizeof pkt);
         if (len <= 0) break;
-        if (size_t(len) + 2 > frame_payload_capacity(kLadder[0])) continue;  // over the tun MTU: cannot fit one frame
+        if (size_t(len) + 2 > frame_payload_capacity(sh.ladder[0])) continue;  // over the tun MTU: cannot fit one frame
         uint8_t cls = classify_ip(pkt, size_t(len));
         Packer& pk = packers[cls];
-        const size_t cap = frame_payload_capacity(kLadder[sh.rung_phy.load()]);
+        const size_t cap = frame_payload_capacity(sh.ladder[sh.rung_phy.load()]);
         if (!pk.buf.empty() && pk.buf.size() + 2 + size_t(len) > cap) flush_packer(cls);
         if (pk.buf.empty()) pk.first_ms = t;
         uint8_t lp[2];
@@ -767,7 +776,7 @@ int run(const Opts& o) {
       uint32_t q_air;
       {
         std::lock_guard<std::mutex> lk(sh.sched_mu);
-        q_air = sh.sched.q_video_air_ms(kLadder[sh.rung_phy.load()]);
+        q_air = sh.sched.q_video_air_ms(sh.ladder[sh.rung_phy.load()]);
       }
       if (!fixed) {
         ctl.tick(t);
@@ -790,7 +799,7 @@ int run(const Opts& o) {
       // the TX thread on the TX mutex.
       if (!o.no_tune20 && o.bw == 40) {
         const uint8_t tb = sh.tune_bw.load();
-        bool want20 = fixed ? kLadder[fixed_rung].bw_mhz == 20 : ctl.wants_tune_20mhz(t);
+        bool want20 = fixed ? sh.ladder[fixed_rung].bw_mhz == 20 : ctl.wants_tune_20mhz(t);
         if (tb == 40 && want20) {
           // Narrow the TX thread BEFORE the radio: a frame whose rung it
           // picked while tune_bw still read 40 would otherwise wait on the TX
@@ -804,7 +813,7 @@ int run(const Opts& o) {
             sh.tune_bw = 40;
             logger->warn("retune to 20 MHz failed: {}", err);
           }
-        } else if (tb == 20 && kLadder[phy].bw_mhz == 40) {
+        } else if (tb == 20 && sh.ladder[phy].bw_mhz == 40) {
           if (ad->retune(uint8_t(o.channel), 40, o.ht40_plus, &err)) {
             sh.tune_bw = 40;
             devourer::Ev(ev, "p2p.tune").t().f("bw", 40);
@@ -814,7 +823,7 @@ int run(const Opts& o) {
         }
       }
 
-      const uint32_t budget_kbps = video_budget_kbps(kLadder[budget], o.control_reserve_kbps);
+      const uint32_t budget_kbps = video_budget_kbps(sh.ladder[budget], o.control_reserve_kbps);
       if (phy != last_phy || budget != last_budget || uint8_t(ctl.state()) != last_state) {
         last_phy = phy;
         last_budget = budget;
@@ -849,18 +858,18 @@ int run(const Opts& o) {
         s.da_mode = uint8_t(da.mode());
         s.ack8 = ctl.ack8();
         s.adapters = have_report ? last_report.adapters : 0;
-        const Rung& br = kLadder[budget];
+        const Rung& br = sh.ladder[budget];
         // Same airtime model as the budget and the duty meter: payload at the
         // duty cap (before FEC), and at the interactive bucket's share, which
         // the scheduler charges at the PHY rung.
         s.est_capacity_kbps = payload_kbps_at_share(br, br.duty_permille);
         s.video_budget_kbps = budget_kbps;
-        s.ip_budget_kbps = payload_kbps_at_share(kLadder[phy], SchedCfg{}.interactive_share_permille);
+        s.ip_budget_kbps = payload_kbps_at_share(sh.ladder[phy], SchedCfg{}.interactive_share_permille);
         {
           std::lock_guard<std::mutex> lk(sh.sched_mu);
           s.tx_duty_permille = sh.sched.tx_duty_permille(t);
-          s.q_video_ms = sh.sched.q_video_air_ms(kLadder[phy]);
-          s.q_ip_ms = sh.sched.q_ip_air_ms(kLadder[phy]);
+          s.q_video_ms = sh.sched.q_video_air_ms(sh.ladder[phy]);
+          s.q_ip_ms = sh.sched.q_ip_air_ms(sh.ladder[phy]);
           s.q_ctl_frames = uint32_t(sh.sched.q_control());
           auto d = sh.sched.drops();
           s.dropped_video_frames = d.video_frames + uint32_t(sh.oversize_drops.load());
@@ -924,7 +933,7 @@ int run(const Opts& o) {
 int main(int argc, char** argv) {
   Opts o;
   enum { kChannel = 1000, kBw, kOffset, kNetId, kPeer, kRing, kTun, kTunAddr, kBitrate, kReserve, kStart, kFixed,
-         kNoTune20, kProbeMs, kIgi, kTxPwr, kMtFw, kStatsShm, kNoNdjson, kLog, kAdapter, kHelp };
+         kNoTune20, kProbeMs, kFrameBytes, kIgi, kTxPwr, kMtFw, kStatsShm, kNoNdjson, kLog, kAdapter, kHelp };
   static const option longopts[] = {
       {"adapter", required_argument, nullptr, kAdapter},   {"channel", required_argument, nullptr, kChannel},
       {"bw", required_argument, nullptr, kBw},             {"offset", required_argument, nullptr, kOffset},
@@ -934,6 +943,7 @@ int main(int argc, char** argv) {
       {"control-reserve-kbps", required_argument, nullptr, kReserve},
       {"start-rung", required_argument, nullptr, kStart},  {"fixed-rung", required_argument, nullptr, kFixed},
       {"no-tune20", no_argument, nullptr, kNoTune20},      {"probe-ms", required_argument, nullptr, kProbeMs},
+      {"frame-bytes", required_argument, nullptr, kFrameBytes},
       {"wide-igi-floor", required_argument, nullptr, kIgi},
       {"txpwr-offset-qdb", required_argument, nullptr, kTxPwr}, {"mt7612u-fw", required_argument, nullptr, kMtFw},
       {"stats-shm", required_argument, nullptr, kStatsShm}, {"no-ndjson", no_argument, nullptr, kNoNdjson},
@@ -957,6 +967,7 @@ int main(int argc, char** argv) {
       case kFixed: o.fixed_rung = std::atoi(optarg); break;
       case kNoTune20: o.no_tune20 = true; break;
       case kProbeMs: o.probe_ms = std::atoi(optarg); break;
+      case kFrameBytes: o.frame_bytes = std::atoi(optarg); break;
       case kIgi: o.wide_igi_floor = uint8_t(std::strtoul(optarg, nullptr, 0)); break;
       case kTxPwr: o.txpwr_offset_qdb = std::atoi(optarg); break;
       case kMtFw: o.mt7612u_fw = std::string(optarg); break;
@@ -974,7 +985,8 @@ int main(int argc, char** argv) {
     return 2;
   }
   if ((o.bw != 20 && o.bw != 40) || o.channel < 1 || o.channel > 253 || o.net_id < 0 || o.net_id > 255 ||
-      o.start_rung < 0 || o.start_rung > int(kTopRung) || o.fixed_rung > int(kTopRung) || o.probe_ms < 10) {
+      o.start_rung < 0 || o.start_rung > int(kTopRung) || o.fixed_rung > int(kTopRung) || o.probe_ms < 10 ||
+      o.frame_bytes < kMinFrameBytes || o.frame_bytes > kMaxFrameBytes) {
     std::fprintf(stderr, "bad option value\n");
     usage(argv[0]);
     return 2;

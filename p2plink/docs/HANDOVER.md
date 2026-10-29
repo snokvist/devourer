@@ -103,7 +103,8 @@ p2p_tx  --adapter VID:PID[@BUS-PORT] --channel N --bw 20|40 (40) --offset +|- (+
         --net-id N --peer-mac XX:.. (REQUIRED, = p2p_rx's ack_target_mac)
         --ring NAME --tun NAME --tun-addr CIDR --bitrate-cmd 'cmd with %u kbps'
         --control-reserve-kbps N (300) --start-rung N (2) --fixed-rung N
-        --no-tune20 --probe-ms N (100) --wide-igi-floor 0xNN
+        --no-tune20 --probe-ms N (100) --frame-bytes N (1400; 200..1400)
+        --wide-igi-floor 0xNN
         --txpwr-offset-qdb N --mt7612u-fw DIR
         --stats-shm NAME (/p2plink.tx) --no-ndjson --log-level L (warn)
 p2p_rx  --adapter SPEC (repeatable; ear index = order) --ack-target IDX (0)
@@ -274,12 +275,17 @@ restart before any flight.
 
 Purpose: the review's model says PER at equal BER scales ~linearly with
 length (1500 B 11 % vs 600 B 4.7 % at 1e-5; 70 vs 38 % at 1e-4) and the
-coherence time at 5.5 GHz / 20 m/s (~0.5–1.1 ms) is shorter than a 4.7 ms
-MCS0 frame. Unmeasured on these dies. **v1 fixes the body at 1400 B and has
-no frame-size knob**, so this cell cannot run as designed — log it as the
-first follow-up (§5). Doable now: a walk test at `--fixed-rung 0` recording
-`loss_permille`, `fec_fail_permille` and `rssi_best` per 100 ms — the 1400 B
-baseline the later sweep is compared against.
+coherence time at 5.5 GHz / 20 m/s (~0.5–1.1 ms) is shorter than an R0
+(HT20 MCS0, 6.5 Mb/s) frame: 1850 us on air at 1400 B, 866 us at 600 B, by
+budget.h's airtime model (an earlier draft said 4.7 ms). Unmeasured on these
+dies. Drone `--frame-bytes N` (every rung, 200..1400) is the knob; the ground
+needs none (it takes each block's symbol length from its frames) and reports
+what it receives as `frame_bytes`. Run: `--fixed-rung 0`, the feed at the R0
+budget for that size (`p2p.stats video_budget_kbps`: 2018 kb/s at 1400 B, 1786
+at 600), alternating 1400 / 1000 / 600 B legs over the SAME walk path, and
+compare `loss_permille` and `fec_fail_permille` per 100 ms against `rssi_best`.
+Short frames cost budget (header + preamble paid more often), much more at the
+top: R0 −11 % and R6 −40 % at 600 B.
 
 ### C9 — encoder in the loop
 
@@ -303,8 +309,9 @@ to it, do not shorten the descent.
 
 - **Frame size as a rung.** v1 fixes 1400 B (tun MTU fits one frame, MT7612U
   3836 B RX cap moot). The top rung pays ~20 % of peak for it; the floor would
-  gain from 600–1000 B frames by the PER model above. Needs a knob, C8, then
-  a ladder column.
+  gain from 600–1000 B frames by the PER model above. The knob exists
+  (`--frame-bytes`, one size for every rung); C8 next, then a ladder column if
+  it pays.
 - **Ground unicast IP only via an 8812EU uplink.** An MT7612U uplink is
   broadcast-only (75 fps unicast cliff) and its ACK is not
   backpressure-truthful (64-slot hand-off queue drops newest, so an ACKed frame

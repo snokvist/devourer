@@ -47,17 +47,24 @@ static void test_airtime() {
 // Feeding exactly the budget, in whole k_r-symbol blocks, charges the duty
 // window with 0.95..1.0 of the rung's duty cap: the budget and the meter are
 // the same airtime model (C7 fed PHY x duty and read 707 permille at R5 against
-// a 500 cap).
+// a 500 cap). Holds for every --frame-bytes, since budget and charge read the
+// same Rung::frame_bytes; a shorter frame pays the fixed per-frame overhead
+// more often, so its budget is lower at every rung.
 static void test_budget_fills_duty() {
   std::puts("-- budget fills the duty cap, in the scheduler's own charge");
-  for (size_t i = 0; i < kLadder.size(); i++) {
-    const Rung& r = kLadder[i];
-    const uint64_t block_bytes = uint64_t(r.fec_k) * frame_payload_capacity(r);
-    const double blocks_per_s = video_budget_kbps(r, 0) * 1000.0 / 8 / double(block_bytes);
-    const double duty = blocks_per_s * video_item_airtime_us(r, size_t(block_bytes)) / 1000.0;
-    std::printf("      R%zu budget %u kbps -> duty %.0f permille (cap %u)\n", i, video_budget_kbps(r, 0), duty,
-                unsigned(r.duty_permille));
-    check(duty <= r.duty_permille && duty >= 0.95 * r.duty_permille, "duty within [0.95, 1.0] x cap");
+  for (uint16_t fb : {uint16_t(1400), uint16_t(600), uint16_t(200)}) {
+    for (size_t i = 0; i < kLadder.size(); i++) {
+      Rung r = kLadder[i];
+      r.frame_bytes = fb;
+      const uint64_t block_bytes = uint64_t(r.fec_k) * frame_payload_capacity(r);
+      const double blocks_per_s = video_budget_kbps(r, 0) * 1000.0 / 8 / double(block_bytes);
+      const double duty = blocks_per_s * video_item_airtime_us(r, size_t(block_bytes)) / 1000.0;
+      std::printf("      %u B R%zu budget %u kbps -> duty %.0f permille (cap %u)\n", unsigned(fb), i,
+                  video_budget_kbps(r, 0), duty, unsigned(r.duty_permille));
+      check(duty <= r.duty_permille && duty >= 0.95 * r.duty_permille, "duty within [0.95, 1.0] x cap");
+      check(fb == 1400 || video_budget_kbps(r, 0) < video_budget_kbps(kLadder[i], 0),
+            "a shorter frame buys a lower budget");
+    }
   }
 }
 
