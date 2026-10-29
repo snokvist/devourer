@@ -352,3 +352,57 @@ Two rules, both borrowed and both paid for already:
 
 And the house rule of the tree this lives in: a favourable number goes next to
 its adversarial counterpart, every time.
+
+## Results
+
+Bench host: one Linux x86_64 box, both ends local (ground tun in its own
+netns for IP checks). Logs: `~/dev/snokvist/p2plink-bench/logs/<date>/`
+(outside the repo; `<cell>.{rx,tx}.ndjson|.err|.runner`), produced by
+`run_cell.sh` / `run_ping.sh` beside them. Kernel modules: `8812eu`,
+`rtw88_8822eu`, `mt76x2u` temp-blacklisted (`/etc/modprobe.d/p2plink-bench.conf`),
+`lsmod | grep -E 'rtw88|mt76x2|8812'` empty for every run below.
+
+Units (fixed for every cell):
+
+| role | part | USB | bus path | serial | permanent MAC |
+|---|---|---|---|---|---|
+| drone | RTL8812EU `0bda:a81a` (RTL8822E) | 480M (USB2) | 1-1 | 123456 | 84:fc:14:50:bc:de |
+| ground ear 0 (ack target + uplink) | MT7612U `0e8d:7612` | 5000M | 8-1 | 000000000 | 40:a5:ef:5a:32:f8 |
+
+**Only one 8812EU is on this bench.** C1 (8812EU responder) and the 8812EU
+ear of C3 cannot run until the second unit is available; every cell below is
+the 8812EU → MT7612U pairing. No control adapter and no second receiver
+either, so no delivery figure here is cross-checked by an independent witness.
+
+### First light — 2026-10-29, ch 100 HT40+, drone tuned 20 MHz (R2), no attenuator
+
+Distance not measured (same desk); drone `--txpwr-offset-qdb -40` (−10 dB);
+ground RSSI −31..−47 dBm. Ground `--adapter 0e8d:7612@8-1 --ack-target 0
+--uplink 0 --channel 100 --bw 40 --net-id 7`; drone `--adapter
+0bda:a81a@1-1 --channel 100 --bw 40 --net-id 7 --peer-mac <ack_target>
+--fixed-rung 2 --ring /p2pbench --txpwr-offset-qdb -40`; feed `--synthetic
+--fps 30 --kbps 3000 --idr-every 30`.
+
+Run 1 (`c0-firstlight-1`) exposed two bring-up bugs, fixed before run 2:
+every IDR block declared lost (rule (3) dated from the first symbol —
+26 of 763 blocks, exactly one per second), and a `--fixed-rung` drone never
+fed reports to its controller (report_age MAX, FLOOR, no Ucast).
+
+Run 2 (`c0-firstlight-2`, window 8–28 s) — **PASS** on what this pairing can
+show:
+
+| criterion | result | adversarial counterpart |
+|---|---|---|
+| `uniq` rising | 434 symbols/s vs 436 video frames/s submitted (~99.5 %); 760 blocks decoded, 0 failed | single ear, near field; 25 of 760 blocks (3.3 %) needed FEC and 100 ms loss windows reached 33 ‰ at −37 dBm — not a clean link, and the MT7612U reports no EVM, so front-end saturation cannot be excluded |
+| `diversity ≈ uniq × (ears−1)` | n/a (one ear) | untested |
+| `fec_fail_permille 0` | 0 throughout | — |
+| `ack8 == 8`, retries < 0.5 | ack8 8 throughout, `retries_mean_centi` 0; probes 250/250 ok, 250/250 reported (coverage 1.00) | ON arm only — the OFF shape (no responder) is not yet measured; this is A2 (8812EU → MT7612U), one unit each |
+| `report_age_ms < 200` | 19–21 ms, TRACK throughout | reports are group-DA from an MT7612U at MCS0/20 — no retry, so a loss is silent |
+| `p2p.da` Ucast | Ucast at +1.5 s, stays | — |
+| `tx_timeouts 0` | 0; `tx_failed` 0 | 25 s run; the 20 ms stall is C7's question |
+| ping through the tun | drone→ground 39/40, avg 13.8 ms, max 62 ms; ground→drone 19/20, avg 7.8 ms (`c0-ping-1`) | one loss each way, unexplained; ground→drone IP is group-DA (no retry); RTT max reflects IP queued behind video |
+
+Also seen: the drone's video queue bound dropped 3 frames in 20 s
+(`q_video_ms` max 55) — the synthetic IDR every second at 3 Mb/s is a burst
+the 60 ms bound clips at R2. Design behaviour, not a link fault, but a real
+encoder's IDR size decides whether it bites.
