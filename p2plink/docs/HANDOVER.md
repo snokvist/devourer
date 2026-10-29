@@ -720,3 +720,36 @@ the fix 10/10 and 10/10 at 1.18 s. Detail: `docs/mt7612u.md`, "Bring-up on a
 busy channel". The drone-side "no ACK for 30 s → duty 0.3" rule (§5) is not
 needed for this and stays unimplemented. Counterparts: one MT7612U unit, one
 peer model, one channel, near field.
+
+### C8 — frame length vs PER (A6) — NOT RUN as designed; static 1400 B baseline recorded
+
+No frame-size knob in v1 and no moving platform on this bench (§5 follow-up
+stands). Recorded instead: `c8-static-r0`, 3 min, drone `--fixed-rung 0`,
+1400 B frames, feed at the R0 budget (2018 kb/s, 30 fps), near field, static.
+Over 161 s of steady state: `fec_fail_permille` 0 in every 100 ms row, 0
+failed blocks, 303 unique symbols/s; `loss_permille` p50 0, p99 41, max 80
+(non-zero in 128 of 1609 rows, all recovered by FEC); `rssi_best` −34 dBm;
+drone duty p50 462‰ (cap 600), `q_video` ≤ 20 ms, 0 video drops.
+Counterparts: static and near field, so this is the reference a walk test
+and a frame-size sweep compare against, not a motion result.
+
+### C9 — encoder in the loop — PARTIAL (no encoder; ordering only)
+
+The waybeam encoder is not on this bench. `c9p-run1` (`c9p.sh`): adaptive
+from R0 with the synthetic feed and `--bitrate-cmd` pointed at a logger
+(`echo %u $(date) >> c9p-run1.bitrate`), ground killed at +50 / +110 s and
+restarted at +60 / +120 s; three climbs, two blind descents.
+- Every budget step reached the actuator in the same tick (22 invocations);
+  on each demote the budget step and its bitrate command came 500 ms before
+  the PHY step (e.g. budget R4 + command 50.29–50.30 s, PHY R4 50.80 s); on
+  each promote the PHY led and the budget + command followed 500 ms later.
+- Ground restarts came up in < 1 s (TRACK 0.8 s after each restart), with the
+  MT7612U fix in the build.
+- **Note:** R3 → R4 lowers the budget 8529 → 8111 kb/s (−4.9 %, R4's lower duty
+  cap), under the actuator's 5 % change threshold, so that re-target is never
+  sent and the encoder runs ~5 % over R4's budget until the next step. Harmless
+  at this size; it disappears if R4's cap is raised to R3's or the threshold is
+  exempted for a budget DROP.
+Not measured: an encoder's real re-target latency, `q_video` and ground
+`fec_fail` through a loss-driven demote (needs attenuation), Enhance-only
+drops. C9's pass criteria stay open.
