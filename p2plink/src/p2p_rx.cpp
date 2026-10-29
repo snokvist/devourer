@@ -48,6 +48,12 @@ namespace {
 
 volatile sig_atomic_t g_stop = 0;
 void on_signal(int) { g_stop = 1; }
+// Bench hook (HANDOVER C5(a) "kill the uplink but keep the ACK"): SIGUSR1
+// toggles LinkReport transmission while the adapter, and so its hardware ACK,
+// stays up. A process restart cannot do this when one adapter is both the ACK
+// target and the uplink: the ACK disappears for the whole bring-up.
+volatile sig_atomic_t g_mute_reports = 0;
+void on_usr1(int) { g_mute_reports = !g_mute_reports; }
 
 constexpr int kTunMtu = int(1400 - kHdrLen - 2);
 constexpr uint32_t kTickMs = 10;
@@ -368,7 +374,7 @@ int run(const Opts& o) {
       last_rep = merger.make_report(++epoch, t, probe_rung, rung_seen, ip_rx_window);
       rung_seen = last_rep.rung_seen;
       ip_rx_window = 0;
-      if (uplink) {
+      if (uplink && !g_mute_reports) {
         uint8_t buf[kLinkReportLen];
         encode_report(last_rep, buf);
         P2pHeader h;
@@ -379,6 +385,12 @@ int run(const Opts& o) {
         if (uplink->send(report_mode, group, uplink->mac(), h, buf, sizeof buf, nullptr)) reports_sent++;
         else reports_failed++;
       }
+    }
+
+    static int muted_logged = -1;
+    if (int(g_mute_reports) != muted_logged) {
+      muted_logged = int(g_mute_reports);
+      if (muted_logged || stats_seq) devourer::Ev(ev, "p2p.uplink_mute").t().f("muted", muted_logged);
     }
 
     // --- stats -------------------------------------------------------------------
@@ -504,6 +516,9 @@ int main(int argc, char** argv) {
   sa.sa_handler = on_signal;
   sigaction(SIGINT, &sa, nullptr);
   sigaction(SIGTERM, &sa, nullptr);
+  struct sigaction su{};
+  su.sa_handler = on_usr1;
+  sigaction(SIGUSR1, &su, nullptr);
   signal(SIGPIPE, SIG_IGN);
   return run(o);
 }
