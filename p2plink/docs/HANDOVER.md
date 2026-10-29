@@ -795,11 +795,31 @@ not VBUS cold), ch 100 carries ~10 foreign frames/s at the ground (light, not
 silent — the devourer doc's 36(+) "light" row still wedged one CU), one more
 unit. The floor cost (C4's second half) still needs attenuation.
 
-**C9 with the real encoder — prepared, not run.** The camera's venc writes
-1280×720@100 fps H.265 at 5754 kb/s into `/dev/shm/venc_frame` (the frame
-ring p2plink mirrors) and takes `GET /api/v1/live/set?video0.bitrate=N`
-(volatile); `c9cam.sh` + `cam/{c9tx,brcmd}.sh` would run p2p_tx on that ring
-with `--bitrate-cmd` driving it, log each command on the camera's monotonic
-clock, force a descent + climb by killing/restarting the ground, and restore
-venc's bitrate. Blocked pending explicit approval to re-target the camera's
-encoder.
+**C9 — encoder in the loop — PASS on what this bench can drive.** `c9-cam-run1`
+(`c9cam.sh`, `cam/{c9tx,brcmd}.sh`): the camera's own venc (1280×720@100 fps
+H.265, frame ring `/dev/shm/venc_frame`) feeding p2p_tx, adaptive from R4,
+`--bitrate-cmd` re-targeting venc through `/api/v1/live/set?video0.bitrate=N`
+(volatile) and logging each command on the camera's monotonic clock; MT7612U
+ground killed at +40 s and restarted at +55 s; venc restored to 5754 kb/s
+after.
+- Ordering: every budget step reached venc in the same tick (11 commands);
+  each demote's budget step + command led its PHY step by 500 ms (R6→R4→R2→R0
+  at 39.86 / 40.37 / 40.87, FLOOR 41.38); promotes the other way round.
+- **Encoder re-target latency ≤ ~0.5 s**: the drone's frame rate (the
+  encoder's output through the ring) reached each new level within the first
+  0.5 s bin after the command, up and down — e.g. 14 095 → 19 600 kb/s: 1712 →
+  2222 frames/s in the first 0.5 s, 2436 at 3–5 s; the 19 600 → 8 875 → 6 064
+  → 2018 descent fell 2315 → 1194 (first 0.5 s) → ~450 frames/s within 1.5 s.
+  So the 500 ms bitrate lead is adequate for this encoder at this resolution
+  (bound, not a precise latency: 100 ms stats, 0.5 s bins).
+- `q_video_ms` max 9 (bound 60), 0 video drops, 0 `tx_failed`, duty p50 493‰.
+- Ground: 0 `fec_fail` rows on the first ground; the restarted ground's 2
+  failed blocks were the first block it joined mid-way and the last block cut
+  by the drone stopping — none mid-run.
+- R3 → R4 now raises the budget 8529 → 8875 (+4.1 %, the R4 cap change), under
+  the actuator's 5 % threshold, so that one re-target is not sent and the
+  encoder runs ~4 % under R4's budget — the harmless direction.
+Not tested: "fec_fail back to 0 within 1 s after each demote" — the demotes
+here were blind (ground killed), not loss-driven; that half needs attenuation.
+Counterparts: one encoder config, near field (−45 dBm at the MT7612U ear),
+one run.
