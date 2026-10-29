@@ -747,9 +747,59 @@ restarted at +60 / +120 s; three climbs, two blind descents.
   MT7612U fix in the build.
 - **Note:** R3 → R4 lowers the budget 8529 → 8111 kb/s (−4.9 %, R4's lower duty
   cap), under the actuator's 5 % change threshold, so that re-target is never
-  sent and the encoder runs ~5 % over R4's budget until the next step. Harmless
-  at this size; it disappears if R4's cap is raised to R3's or the threshold is
-  exempted for a budget DROP.
+  sent and the encoder runs ~5 % over R4's budget until the next step. Fixed
+  after this run by raising R4's cap to R3's 0.60 (R4 → R3 adds only ~4 %
+  airtime, so it needs none of the demote headroom the 40 MHz rungs above
+  keep): R4's budget is now 8.9 Mb/s, above R3's 8.5.
 Not measured: an encoder's real re-target latency, `q_video` and ground
 `fec_fail` through a loss-driven demote (needs attenuation), Enhance-only
 drops. C9's pass criteria stay open.
+
+### Second 8812EU: the ssc338q camera as drone (2026-10-29 evening)
+
+Rig: drone = the ssc338q camera (192.168.2.232; its RTL8812EU `0bda:a81a`,
+MAC 98:03:cf:cf:a4:28, USB 2), `p2p_tx`/`p2p_feed` cross-built for armv7
+(OpenIPC gnueabihf 13.3, only the 8822E backend, waybeam-link's static
+libusb; 1.6 MB stripped) and run from `/tmp` with the camera's waybeam-hub
+stopped; ground = the bench host. `cam_cell.sh` / `cam_hub.sh` in
+p2plink-bench. Ch 100 HT40+; the camera reads −23 dBm at the ground at
+`--txpwr-offset-qdb -40` and −31..−32 dBm at −100 (it floors there), so every
+cell below is near field and hot.
+
+**C1 — 8812EU soliciting vs 8812EU responder (A1) — PASS.** `c1-cam-run1`:
+ground = bench 8812EU 1-1 only (ack target), drone R2 60 s, ground SIGTERMed
+at +40 s. ON: `ack8` 8 throughout, `retries_mean_centi` 0–2, report coverage
+1.00 (300 of 300 probes reported), Ucast. OFF: `ack8` 0 throughout, 203 of 203
+probe reports `ok=false` pinned at retries 3, Bcast. Counterpart: −23 dBm.
+
+**C3 — 40 MHz-parked ground, both ears (A3, A5) — PASS.** `c3-cam-r3` /
+`c3-cam-r5`: ground ears 8812EU 1-1 (ack target) + MT7612U 8-1, drone R3
+(20 MHz MCS3) then R5 (40 MHz MCS3), 60 s each, −100 qdB.
+
+| | drone sent | 8812EU ear | MT7612U ear | failed blocks | adapters |
+|---|---|---|---|---|---|
+| R3 (20 MHz) | 24 939 | 99.4 % | 99.9 % | 1 of 1 802 | 2 throughout |
+| R5 (40 MHz) | 22 832 | 99.5 % | 99.9 % | 0 of 1 806 | 2 throughout |
+
+Per-ear counts are the ground's `p2p.exit` `earN_rx − earN_foreign` against
+the drone's frames sent (the ground's window is slightly wider). `diversity`
+is ~99 % of `uniq`: almost every symbol arrived on both ears. Counterpart:
+−31 dBm, one unit pair, no EVM on either ear.
+
+**C4 edge — camera unit: 0.** `c4-cam-<floor>-<n>`: MT7612U-only ground, drone
+R5 with `--wide-igi-floor` 0x35/0x30/0x2c/0x28/0x24/0x20/0x00, three starts
+each: all 21 starts aired at once (766–907 frames in the first 2 s, 0
+failed, ~5 550 symbols decoded per 15 s). So both units on this bench clear
+with the floor off. Counterparts: soft starts (process restart + USB reset,
+not VBUS cold), ch 100 carries ~10 foreign frames/s at the ground (light, not
+silent — the devourer doc's 36(+) "light" row still wedged one CU), one more
+unit. The floor cost (C4's second half) still needs attenuation.
+
+**C9 with the real encoder — prepared, not run.** The camera's venc writes
+1280×720@100 fps H.265 at 5754 kb/s into `/dev/shm/venc_frame` (the frame
+ring p2plink mirrors) and takes `GET /api/v1/live/set?video0.bitrate=N`
+(volatile); `c9cam.sh` + `cam/{c9tx,brcmd}.sh` would run p2p_tx on that ring
+with `--bitrate-cmd` driving it, log each command on the camera's monotonic
+clock, force a descent + climb by killing/restarting the ground, and restore
+venc's bitrate. Blocked pending explicit approval to re-target the camera's
+encoder.
