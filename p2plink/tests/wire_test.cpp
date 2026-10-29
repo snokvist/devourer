@@ -13,6 +13,7 @@ int main() {
   P2pHeader h;
   h.type = uint8_t(Type::VideoRepair); h.flags = kFlagLastInBlock | kFlagIdr; h.net_id = 7; h.rung = 3;
   h.fec_k = 8; h.fec_n = 12; h.fec_idx = 10; h.stream = 1; h.seq = 0xdeadbeef; h.block_id = 65535;
+  h.session = 0xa5;
   std::vector<uint8_t> f(kHdrLen + 100, 0xaa);
   encode_header(h, f.data());
   auto d = decode_header(f.data(), f.size());
@@ -20,6 +21,7 @@ int main() {
   CHECK(d->type == h.type && d->flags == h.flags && d->net_id == 7 && d->rung == 3);
   CHECK(d->fec_k == 8 && d->fec_n == 12 && d->fec_idx == 10 && d->stream == 1);
   CHECK(d->seq == 0xdeadbeef && d->block_id == 65535 && d->payload_len == 100);
+  CHECK(d->session == 0xa5 && f[11] == 0xa5);
   f[0] ^= 1; CHECK(!decode_header(f.data(), f.size())); f[0] ^= 1;
   CHECK(!decode_header(f.data(), kHdrLen - 1));
   h.fec_idx = 12; encode_header(h, f.data()); CHECK(!decode_header(f.data(), f.size()));  // idx >= n

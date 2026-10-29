@@ -581,6 +581,7 @@ int run(const Opts& o) {
   uint8_t last_phy = 255, last_budget = 255, last_state = 255, last_da = 255;
   LinkReport last_report;
   bool have_report = false;
+  uint8_t report_session = 0;
   uint64_t last_probe_rx_ms = 0;
   uint64_t retries_sum = 0, retries_n = 0, probes_ok = 0, probes_pinned = 0, reports_total = 0;
   uint32_t stats_seq = 0;
@@ -691,6 +692,9 @@ int run(const Opts& o) {
         case Type::LinkReport: {
           auto r = decode_report(f.payload.data(), f.payload.size());
           if (!r) break;
+          // A new ground session restarted its epoch at 0: accept it as fresh.
+          if (have_report && f.hdr.session != report_session) ctl.on_peer_restart();
+          report_session = f.hdr.session;
           last_report = *r;
           have_report = true;
           reports_total++;
@@ -702,7 +706,7 @@ int run(const Opts& o) {
           break;
         }
         case Type::IpData:
-          if (!dedup.accept(f.hdr.type, f.hdr.stream, f.hdr.seq)) break;
+          if (!dedup.accept(f.hdr.type, f.hdr.stream, f.hdr.seq, f.hdr.session)) break;
           if (have_tun)
             for_each_packed(f.payload.data(), f.payload.size(), [&](const uint8_t* p, size_t l) {
               if (tun.write_packet(p, l)) ip_rx_pkts++;

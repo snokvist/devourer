@@ -418,6 +418,13 @@ int main() {
     check(f.accept(4, 0, 0xffffffffu), "(g) seq 2^32-1 accepted");
     check(f.accept(4, 0, 0), "(g) seq wraps to 0");
     check(!f.accept(4, 0, 0xffffffffu), "(g) 2^32-1 now a repeat");
+    // peer restart: same seqs from a new session are first sights
+    SeqDedup r;
+    for (uint32_t s = 0; s <= 300; s++) r.accept(5, 0, s, 0x11);
+    check(!r.accept(5, 0, 7, 0x11), "(g) old session: seq 7 is a repeat");
+    check(r.accept(5, 0, 0, 0x22), "(g) restarted peer (new session): seq 0 accepted");
+    check(r.accept(5, 0, 7, 0x22), "(g) ... and seq 7 too");
+    check(!r.accept(5, 0, 7, 0x22), "(g) ... once");
   }
 
   // ---- (h) make_report round trip -----------------------------------------

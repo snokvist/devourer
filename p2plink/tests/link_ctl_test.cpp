@@ -156,6 +156,22 @@ static void test_exit_to_track() {
   lw.on_report(rep(0xFFFFFFF0u, 0, 0), 0);
   lw.on_report(rep(0x00000005u, 100, 0), 100);
   check(lw.report_age_ms(100) == 0, "epoch wrap 0xFFFFFFF0 -> 5 counts as fresh");
+  // Ground restart: its epoch began again at 1 (on_peer_restart from the session change).
+  LinkController lr(LinkCfg{}, 0);
+  for (uint32_t e = 1; e <= 50; e++) lr.on_report(rep(e, e * 100, 0), e * 100);
+  lr.on_report(rep(1, 0, 0), 5100);
+  check(lr.report_age_ms(5100) == 100, "restart without notice: epoch 1 < 50 refused as stale");
+  lr.on_peer_restart();
+  lr.on_report(rep(1, 0, 0), 5200);
+  check(lr.report_age_ms(5200) == 0 && lr.state() == State::Track, "on_peer_restart: epoch 1 accepted, Track");
+  lr.on_report(rep(2, 100, 0), 5300);
+  check(lr.report_age_ms(5300) == 0, "... and the new session continues");
+  // uniq backwards on a forward epoch carries no acute evidence (no underflow).
+  LinkController lu(LinkCfg{}, 0);
+  for (uint32_t e = 1; e <= 10; e++) lu.on_report(rep(e, 100000 + e * 100, 0), e * 100);
+  const uint8_t before = lu.rung_budget();
+  lu.on_report(rep(11, 50, 900), 1100);  // 90 % loss, uniq went from 101000 to 50
+  check(lu.rung_budget() == before, "uniq backwards: no acute floor from an underflowed delta");
 }
 
 static void test_acute() {

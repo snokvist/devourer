@@ -96,6 +96,12 @@ class LinkController {
 
   // ---- inputs -------------------------------------------------------------
 
+  // The ground restarted (its session nonce changed): its epoch and uniq
+  // counters began again, so the next report is accepted as the first one
+  // instead of being refused as stale until the new epoch overtakes the old.
+  // Changes nothing else: state, rungs and report age move only on the report.
+  void on_peer_restart() { has_report_ = false; }
+
   // A LinkReport counts only when its epoch is new: strictly greater than the
   // last one modulo 2^32 (so a counter wrap is not a 4-billion-report gap).
   // Any fresh report leaves BLIND/HOLD/FLOOR for TRACK without snapping the
@@ -104,8 +110,10 @@ class LinkController {
     advance(now_ms);
     if (has_report_ && int32_t(r.epoch - last_epoch_) <= 0) return;
     // uniq is cumulative; the first report has no previous one to difference
-    // against and carries no acute evidence.
-    const uint32_t uniq_delta = has_report_ ? r.uniq - last_uniq_ : 0;
+    // against and carries no acute evidence, and neither does one whose uniq
+    // went BACKWARDS (a restarted ground whose epoch overtook the old one
+    // before on_peer_restart could be called) — never an unsigned underflow.
+    const uint32_t uniq_delta = (has_report_ && r.uniq >= last_uniq_) ? r.uniq - last_uniq_ : 0;
     has_report_ = true;
     last_epoch_ = r.epoch;
     last_uniq_ = r.uniq;

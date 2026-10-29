@@ -56,6 +56,11 @@ struct P2pHeader {
   uint8_t fec_n = 1;     // block total symbols
   uint8_t fec_idx = 0;   // symbol index 0..n-1 (>= k is repair)
   uint8_t stream = 0;    // video stream id / IP class (0 ctl,1 interactive,2 bulk)
+  // Sender session nonce (header byte 11, formerly reserved = 0): random
+  // 1..255 per sender process, so a receiver can tell a restarted peer whose
+  // counters (seq, LinkReport epoch) began again at 0 from a stale or
+  // duplicate copy. 0 = sender carries none (treated as one fixed session).
+  uint8_t session = 0;
   uint32_t seq = 0;      // per-type monotonic counter (symbols for video)
   uint16_t block_id = 0; // video block (one encoder frame)
   uint16_t payload_len = 0;
@@ -79,7 +84,7 @@ inline void encode_header(const P2pHeader& h, uint8_t out[kHdrLen]) {
   out[8] = h.fec_n;
   out[9] = h.fec_idx;
   out[10] = h.stream;
-  out[11] = 0;  // reserved
+  out[11] = h.session;
   put_le32(out + 12, h.seq);
   put_le16(out + 16, h.block_id);
   // payload_len is not carried: decode_header() derives it from the MPDU
@@ -98,6 +103,7 @@ inline std::optional<P2pHeader> decode_header(const uint8_t* p, size_t len) {
   h.fec_n = p[8];
   h.fec_idx = p[9];
   h.stream = p[10];
+  h.session = p[11];
   h.seq = get_le32(p + 12);
   h.block_id = get_le16(p + 16);
   h.payload_len = uint16_t(len - kHdrLen);

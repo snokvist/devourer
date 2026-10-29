@@ -466,16 +466,20 @@ class BlockMerger {
 // Cross-ear duplicate suppression for the per-type seq counters (IpData,
 // Probe, LinkReport): a 4096-wide bitmap per (type, stream). The first sight
 // of a seq is accepted; a seq more than 2048 ahead of the newest resets the
-// window (forward-jump resync); one more than 4096 behind is refused.
+// window (forward-jump resync); one more than 4096 behind is refused. A
+// change of the sender's session nonce (P2pHeader::session) restarts the
+// window: a restarted peer's counters begin again at 0, and without this its
+// first 4096 seqs would collide with (or fall behind) the old session's.
 class SeqDedup {
  public:
   static constexpr uint32_t kWindow = 4096;
   static constexpr uint32_t kJump = 2048;
 
-  bool accept(uint8_t type, uint8_t stream, uint32_t seq) {
+  bool accept(uint8_t type, uint8_t stream, uint32_t seq, uint8_t session = 0) {
     Win& w = wins_[uint16_t((uint16_t(type) << 8) | stream)];
-    if (!w.init) {
+    if (!w.init || w.session != session) {
       w.init = true;
+      w.session = session;
       w.newest = seq;
       w.bits.fill(0);
       set(w, seq);
@@ -502,6 +506,7 @@ class SeqDedup {
  private:
   struct Win {
     bool init = false;
+    uint8_t session = 0;
     uint32_t newest = 0;
     std::array<uint64_t, kWindow / 64> bits{};
   };

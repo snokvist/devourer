@@ -315,7 +315,7 @@ int run(const Opts& o) {
             last_n = f.hdr.fec_n;
             break;
           case Type::IpData:
-            if (!dedup.accept(f.hdr.type, f.hdr.stream, f.hdr.seq)) break;
+            if (!dedup.accept(f.hdr.type, f.hdr.stream, f.hdr.seq, f.hdr.session)) break;
             for_each_packed(f.payload.data(), f.payload.size(), [&](const uint8_t* p, size_t l) {
               if (have_tun && tun.write_packet(p, l)) {
                 ip_rx++;
@@ -326,7 +326,7 @@ int run(const Opts& o) {
             });
             break;
           case Type::Probe:
-            if (!dedup.accept(f.hdr.type, f.hdr.stream, f.hdr.seq)) break;
+            if (!dedup.accept(f.hdr.type, f.hdr.stream, f.hdr.seq, f.hdr.session)) break;
             if (probes++ == 0)
               logger->info("first probe from {} at rung {} rssi {} dBm (ear {})", mac_str(f.sa), f.hdr.rung,
                            int(f.rssi_dbm), f.ear);

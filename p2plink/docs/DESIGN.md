@@ -110,3 +110,8 @@ calibration, narrowband, 2.4 GHz, A-MPDU.
 - Rx-only ears have no bring-up completion signal (`Init` is bring-up + blocking worker); the glue waits a
   bounded 6 s for an early exception, then treats the ear as up and reports later worker death via `rx_failed()`.
 - One local (queue/timeout) demote per 500 ms, so the airtime inflation a demote causes cannot cascade.
+- Peer restart: header byte 11 (formerly reserved 0) carries a per-sender session nonce, random 1..255
+  per adapter open. Seq dedup windows restart when it changes, and the drone treats a LinkReport from a
+  new ground session as the first report (`LinkController::on_peer_restart`) instead of refusing it as
+  stale until the new epoch overtakes the old one. A forward epoch whose cumulative uniq went backwards
+  carries no acute-loss evidence.

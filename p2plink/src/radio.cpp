@@ -145,6 +145,7 @@ struct Adapter::Impl {
   RadioCfg cfg;
   AdapterSpec spec;
   uint8_t ear = 0, net_id = 0;
+  uint8_t nonce = 0;  // P2pHeader::session stamped on every frame this adapter sends
   Mac bssid{};
   Mac own_mac{};
   bool mac_valid = false;
@@ -199,6 +200,10 @@ std::unique_ptr<Adapter> Adapter::open(const AdapterSpec& spec, const RadioCfg& 
   im.ear = ear_index;
   im.net_id = net_id;
   im.bssid = link_bssid(net_id);
+  {
+    std::random_device rd;
+    do im.nonce = uint8_t(rd()); while (im.nonce == 0);
+  }
   im.cur_channel = cfg.channel;
   im.cur_bw = cfg.bw_mhz;
   im.cur_ht40_plus = cfg.ht40_plus;
@@ -457,7 +462,9 @@ bool Adapter::send(const devourer::TxMode& mode, const Mac& da, const Mac& sa, c
   const size_t rt = frame.size();
   frame.resize(rt + kDot11HdrLen + kHdrLen + len);
   encode_dot11(da, sa, im.bssid, frame.data() + rt);
-  encode_header(h, frame.data() + rt + kDot11HdrLen);
+  P2pHeader hs = h;
+  hs.session = im.nonce;
+  encode_header(hs, frame.data() + rt + kDot11HdrLen);
   if (len) std::memcpy(frame.data() + rt + kDot11HdrLen + kHdrLen, payload, len);
 
   std::lock_guard<std::mutex> lk(im.tx_mu);
@@ -474,6 +481,7 @@ Mac Adapter::mac() const { return impl_->own_mac; }
 bool Adapter::is_realtek() const { return impl_->rtl != nullptr; }
 const char* Adapter::chip_name() const { return impl_->chip.c_str(); }
 uint8_t Adapter::ear_index() const { return impl_->ear; }
+uint8_t Adapter::session() const { return impl_->nonce; }
 uint8_t Adapter::channel() const { return impl_->cur_channel; }
 uint8_t Adapter::bw_mhz() const { return impl_->cur_bw; }
 

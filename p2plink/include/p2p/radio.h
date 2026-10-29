@@ -110,7 +110,8 @@ class Adapter {
   // tag this frame will carry (IRtlRadio::NextTxReportTag; nullopt when the
   // die echoes none or tx_report is off), so the caller's tag -> frame record
   // exists before the TxReport can possibly arrive. The hook must not call
-  // back into this Adapter. Returns send_packet's result. Never call from the
+  // back into this Adapter. `h.session` is overwritten with this adapter's
+  // session nonce (random 1..255, drawn at open). Returns send_packet's result. Never call from the
   // RX callback path (it is not — the application owns both ends).
   using TagHook = std::function<void(std::optional<uint8_t>)>;
   bool send(const devourer::TxMode& mode, const Mac& da, const Mac& sa, const P2pHeader& h,
@@ -128,6 +129,7 @@ class Adapter {
   bool is_realtek() const;
   const char* chip_name() const;
   uint8_t ear_index() const;
+  uint8_t session() const;
 
   // Full SetMonitorChannel (not FastRetune: the width changes). Serialised
   // with send() on the TX mutex, so a frame in flight completes first and no
