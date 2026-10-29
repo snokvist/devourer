@@ -96,3 +96,14 @@ StatsSnapshot (report.h) published every 100 ms to a POSIX shm object
 ## Out of scope for v1
 Encryption, channel migration protocol, cache/repair, multi-receiver authority,
 calibration, narrowband, 2.4 GHz, A-MPDU.
+
+## Implementation notes (v1 as built)
+- Video block sizing: symbol payload S = frame_bytes − 18; k = clamp(ceil((12 + frame_len)/S), 1, 128),
+  n = k + max(1, ceil(k·(n_r−k_r)/k_r)) ≤ 192. A frame above 128·S (≈176 KB) is dropped whole and counted
+  (`dropped_video_frames`) with one warning; never truncated or split.
+- Tune vs rung: while the drone is tuned to 20 MHz and the controller's PHY rung is a 40 MHz one (the
+  promote edge), frames air at R3 (same 26 Mb/s, 20 MHz) until the 100 ms tick retunes to 40 MHz.
+- Tun MTU 1380 on both ends (1400 − 18 header − 2 packed-length prefix); ground IP is group-DA only.
+- Rx-only ears have no bring-up completion signal (`Init` is bring-up + blocking worker); the glue waits a
+  bounded 6 s for an early exception, then treats the ear as up and reports later worker death via `rx_failed()`.
+- One local (queue/timeout) demote per 500 ms, so the airtime inflation a demote causes cannot cascade.

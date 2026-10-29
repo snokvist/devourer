@@ -39,15 +39,21 @@ add_executable(p2p_tx src/p2p_tx.cpp)
 target_link_libraries(p2p_tx PRIVATE p2p_io)
 add_executable(p2p_rx src/p2p_rx.cpp)
 target_link_libraries(p2p_rx PRIVATE p2p_io)
+add_executable(p2p_feed src/p2p_feed.cpp)
+target_link_libraries(p2p_feed PRIVATE p2p_io)
 
 enable_testing()
 foreach(t wire fec merge link_ctl budget)
   add_executable(${t}_test tests/${t}_test.cpp)
   target_link_libraries(${t}_test PRIVATE p2p_core)
   add_test(NAME ${t} COMMAND ${t}_test)
+  set_tests_properties(${t} PROPERTIES LABELS p2p)
 endforeach()
 # Device-free but Linux-only (shm/futex/eventfd): links the io layer without a radio.
 add_executable(frame_shm_test tests/frame_shm_test.cpp src/frame_shm.cpp)
 target_include_directories(frame_shm_test PRIVATE include)
 target_link_libraries(frame_shm_test PRIVATE Threads::Threads rt)
 add_test(NAME frame_shm COMMAND frame_shm_test)
+set_tests_properties(frame_shm PROPERTIES LABELS p2p)
+# `ctest -L p2p`: the devourer subtree is EXCLUDE_FROM_ALL, so its own
+# selftests are registered but never built here and would read "Not Run".

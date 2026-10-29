@@ -8,7 +8,7 @@ inline and the design evaluation this tree was planned from
 
 ## 1. Status
 
-**Implemented and headless-tested** (`ctest --test-dir build-p2p`, six suites):
+**Implemented and headless-tested** (`ctest --test-dir build-p2p -L p2p`, six suites):
 `wire` (header/dot11 codec), `fec` (RS codec vs the zfec construction, block
 symbol sizing), `merge` (N-ear BlockMerger: first-copy-wins, gap rules,
 anti-phantom, restart resync, SeqDedup), `link_ctl` (ladder, TRACK/BLIND/HOLD/

@@ -57,7 +57,7 @@ From the devourer checkout root (this tree is a subdirectory of it):
 ```sh
 cmake -S p2plink -B build-p2p -DCMAKE_BUILD_TYPE=Release [-DP2P_WITH_MT7612U=ON]
 cmake --build build-p2p -j
-ctest --test-dir build-p2p          # wire fec merge link_ctl budget frame_shm
+ctest --test-dir build-p2p -L p2p  # wire fec merge link_ctl budget frame_shm
 ```
 
 `P2P_WITH_MT7612U` (default ON) needs `mt7662_rom_patch.bin` + `mt7662.bin` at

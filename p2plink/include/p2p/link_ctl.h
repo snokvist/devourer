@@ -220,8 +220,8 @@ class LinkController {
   // continuously at rung_phy <= 3 (drops the wide-RX IGI floor); false the
   // moment rung_phy >= 4.
   bool wants_tune_20mhz(uint64_t now_ms) const {
-    return le3_since_.has_value() && now_ms >= *le3_since_ &&
-           now_ms - *le3_since_ >= cfg_.tune20_after_ms;
+    return le3_since_ != kNever && now_ms >= le3_since_ &&
+           now_ms - le3_since_ >= cfg_.tune20_after_ms;
   }
 
   struct Debug {
@@ -244,9 +244,9 @@ class LinkController {
   void set_phy(uint8_t r, uint64_t now_ms) {
     phy_ = r;
     if (r <= 3) {
-      if (!le3_since_) le3_since_ = now_ms;
+      if (le3_since_ == kNever) le3_since_ = now_ms;
     } else {
-      le3_since_.reset();
+      le3_since_ = kNever;
     }
   }
 
@@ -255,8 +255,8 @@ class LinkController {
   // step: the newest decision owns both trajectories.
   void commit(uint8_t r, bool budget_leads, uint64_t now_ms) {
     rung_ = r;
-    pend_phy_.reset();
-    pend_budget_.reset();
+    pend_phy_ = kNoPend;
+    pend_budget_ = kNoPend;
     if (budget_leads) {
       budget_ = r;
       if (phy_ != r) {
@@ -278,8 +278,8 @@ class LinkController {
 
   void commit_both(uint8_t r, uint64_t now_ms) {
     rung_ = r;
-    pend_phy_.reset();
-    pend_budget_.reset();
+    pend_phy_ = kNoPend;
+    pend_budget_ = kNoPend;
     budget_ = r;
     set_phy(r, now_ms);
     last_change_ms_ = now_ms;
@@ -287,16 +287,16 @@ class LinkController {
     score_ = 0;
   }
 
-  bool converged() const { return !pend_phy_ && !pend_budget_ && phy_ == rung_ && budget_ == rung_; }
+  bool converged() const { return pend_phy_ == kNoPend && pend_budget_ == kNoPend && phy_ == rung_ && budget_ == rung_; }
 
   void apply_pending(uint64_t now_ms) {
-    if (pend_phy_ && now_ms >= pend_phy_due_) {
-      set_phy(*pend_phy_, now_ms);
-      pend_phy_.reset();
+    if (pend_phy_ != kNoPend && now_ms >= pend_phy_due_) {
+      set_phy(pend_phy_, now_ms);
+      pend_phy_ = kNoPend;
     }
-    if (pend_budget_ && now_ms >= pend_budget_due_) {
-      budget_ = *pend_budget_;
-      pend_budget_.reset();
+    if (pend_budget_ != kNoPend && now_ms >= pend_budget_due_) {
+      budget_ = pend_budget_;
+      pend_budget_ = kNoPend;
     }
   }
 
@@ -360,7 +360,7 @@ class LinkController {
   // FLOOR = a report-less state that has fully reached rung 0.
   void settle_floor() {
     if (state_ != State::Track && rung_ == kFloorRung && phy_ == kFloorRung && budget_ == kFloorRung &&
-        !pend_phy_ && !pend_budget_)
+        pend_phy_ == kNoPend && pend_budget_ == kNoPend)
       state_ = State::Floor;
   }
 
@@ -369,7 +369,11 @@ class LinkController {
   uint8_t rung_;     // committed rung both outputs converge to
   uint8_t phy_;
   uint8_t budget_;
-  std::optional<uint8_t> pend_phy_, pend_budget_;
+  // Pending rung steps. Plain sentinels rather than std::optional: GCC's
+  // -O3 inliner reports a spurious -Wmaybe-uninitialized on the optional's
+  // engaged flag when the controller is a local in the caller.
+  static constexpr uint8_t kNoPend = 0xff;
+  uint8_t pend_phy_ = kNoPend, pend_budget_ = kNoPend;
   uint64_t pend_phy_due_ = 0, pend_budget_due_ = 0;
 
   bool has_report_ = false;
@@ -390,7 +394,8 @@ class LinkController {
   uint64_t last_probe_ms_ = 0;
 
   uint64_t blind_next_ms_ = 0;
-  std::optional<uint64_t> le3_since_;
+  static constexpr uint64_t kNever = UINT64_MAX;  // sentinel, see kNoPend
+  uint64_t le3_since_ = kNever;
 };
 
 // DA policy for the IP and control classes (video is ALWAYS group DA).
@@ -445,11 +450,11 @@ class DaMachine {
       const bool cond = st_ == LinkController::State::Track && ack8_ >= cfg_.to_ucast_ack_min &&
                         pinned_ < cfg_.pinned_trip;
       if (!cond) {
-        cond_since_.reset();
+        cond_since_ = kNever;
         return;
       }
-      if (!cond_since_) cond_since_ = now_ms;
-      if (now_ms - *cond_since_ >= cfg_.to_ucast_hold_ms && dwell_ok) flip(Mode::Ucast, now_ms);
+      if (cond_since_ == kNever) cond_since_ = now_ms;
+      if (now_ms - cond_since_ >= cfg_.to_ucast_hold_ms && dwell_ok) flip(Mode::Ucast, now_ms);
     } else {
       const bool cond = st_ != LinkController::State::Track || pinned_ >= cfg_.pinned_trip ||
                         ack8_ <= cfg_.to_bcast_ack_max;
@@ -460,14 +465,15 @@ class DaMachine {
     mode_ = m;
     mode_since_ms_ = now_ms;
     flipped_ = true;
-    cond_since_.reset();
+    cond_since_ = kNever;
   }
 
   Cfg cfg_;
   Mode mode_ = Mode::Bcast;
   bool flipped_ = false;
   uint64_t mode_since_ms_ = 0;
-  std::optional<uint64_t> cond_since_;
+  static constexpr uint64_t kNever = UINT64_MAX;
+  uint64_t cond_since_ = kNever;
   int pinned_ = 0;
   uint8_t ack8_ = 0, known_ = 0;
   LinkController::State st_ = LinkController::State::Blind;

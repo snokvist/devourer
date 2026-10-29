@@ -327,7 +327,11 @@ class TxThread {
   void send_video(const TxItem& item, uint8_t rung) {
     const Rung& r = kLadder[rung];
     const size_t S = frame_payload_capacity(r);
-    const size_t total = kBlockPrefixLen + item.payload.size();
+    // The scheduler item is the ring blob [8 B VencFrameMeta][frame]; the block
+    // prefix is [u32 frame_len][meta][frame], so the frame is the blob minus
+    // its meta and the prefix adds 4 bytes to the blob.
+    const size_t frame_len = item.payload.size() > shm::kMetaSize ? item.payload.size() - shm::kMetaSize : 0;
+    const size_t total = kBlockPrefixLen + frame_len;
     size_t k = (total + S - 1) / S;
     if (k == 0) k = 1;
     if (k > kMaxK) {
@@ -344,14 +348,9 @@ class TxThread {
     const uint8_t kk = uint8_t(k), nn = uint8_t(k + repair);
 
     block_.assign(nn * S, 0);
-    put_le32(block_.data(), uint32_t(item.payload.size()));
-    // Block prefix: [u32 frame_len][8 B VencFrameMeta][frame][pad]. The
-    // scheduler item carries the whole ring blob (meta first), so the meta
-    // bytes are the blob's first 8 and the frame follows.
-    std::memcpy(block_.data() + 4, item.payload.data(), std::min<size_t>(8, item.payload.size()));
-    if (item.payload.size() > shm::kMetaSize)
-      std::memcpy(block_.data() + kBlockPrefixLen, item.payload.data() + shm::kMetaSize,
-                  item.payload.size() - shm::kMetaSize);
+    put_le32(block_.data(), uint32_t(frame_len));
+    std::memcpy(block_.data() + 4, item.payload.data(), std::min<size_t>(shm::kMetaSize, item.payload.size()));
+    if (frame_len) std::memcpy(block_.data() + kBlockPrefixLen, item.payload.data() + shm::kMetaSize, frame_len);
     std::vector<const uint8_t*> src(kk);
     std::vector<uint8_t*> rep(repair);
     for (size_t i = 0; i < kk; i++) src[i] = block_.data() + i * S;
@@ -646,7 +645,7 @@ int run(const Opts& o) {
       for (int i = 0; i < 32; i++) {
         long len = tun.read_packet(pkt, sizeof pkt);
         if (len <= 0) break;
-        if (size_t(len) + 2 > kHdrLen + 0 + frame_payload_capacity(kLadder[0])) continue;  // over MTU
+        if (size_t(len) + 2 > frame_payload_capacity(kLadder[0])) continue;  // over the tun MTU: cannot fit one frame
         uint8_t cls = classify_ip(pkt, size_t(len));
         Packer& pk = packers[cls];
         const size_t cap = frame_payload_capacity(kLadder[sh.rung_phy.load()]);
@@ -714,8 +713,9 @@ int run(const Opts& o) {
         if (!is_probe) continue;
         const bool ok = r.state == 0;
         ok ? probes_ok++ : probes_pinned++;
-        if (!fixed) ctl.on_probe_result(ok, t);
-        else ctl.on_probe_result(ok, t);  // the ack8 window still drives the DA machine
+        // Fed in --fixed-rung mode too: the ack8 window still drives the DA
+        // machine and the stats even when the rungs are pinned.
+        ctl.on_probe_result(ok, t);
         da.on_probe_result(ok, t);
       }
     }
