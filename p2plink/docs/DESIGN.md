@@ -67,8 +67,11 @@ BLIND (rep_age >= 500 ms)
 - t0: budget+FEC := max(r−2, floor); t0+500 ms: MCS/frame := r−2; then every
   500 ms r := max(r−2, floor). Floor from R6 in ~2.5 s.
 - HOLD exception: ack8 >= 6 → stop descending (ground hears us; its reports
-  don't reach us). Never promote in HOLD. ack8 <= 2 or no reported probe for
-  1 s → keep descending.
+  don't reach us). Evaluated before the t0 step, so with the probes ACKed at
+  the report timeout BLIND goes straight to HOLD at r — no initial r−2 (C5(a)
+  confirmed on hardware; descending does nothing for a lost reverse path).
+  Never promote in HOLD. ack8 <= 2 or no reported probe for 1 s → keep
+  descending.
 - exit: first fresh report → TRACK (no snap-back).
 FLOOR: as BLIND at r = floor. Stays. (No rescue rung in v1.)
 Promotion asymmetry: demote within 0.5 s, promote only after 5 s dwell + evidence.

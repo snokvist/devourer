@@ -216,9 +216,11 @@ Purpose: the failsafe timing (R−2 per 500 ms, floor from R6 in ~2.5 s) and
 the ACK-alive HOLD exception. Drone adaptive (`--start-rung 5`, no
 `--fixed-rung`), ground 8812EU ack_target + uplink, near field.
 (a) Kill the uplink but keep the ACK: restart `p2p_rx` with `--uplink none`
-(the ACK target stays). Expect within 500 ms a `p2p.rung` budget step to R3,
-then a PHY step to R3 500 ms later, then **HOLD** (link_state HOLD, rung
-stays) because `ack8 ≥ 6`. No further descent while probes are ACKed.
+(the ACK target stays) — or, on a one-adapter ground, SIGUSR1 to `p2p_rx`
+(mutes reports, keeps the adapter and its ACK up). Expect **HOLD** at the
+report timeout (~500 ms) with the rung unchanged — no initial R−2 step: the
+probes are ACKed, so the forward link is fine (DESIGN.md, decided after C5).
+No descent while probes are ACKed.
 (b) Unplug the ACK/uplink adapter (or kill `p2p_rx`): expect budget R−2 at
 +500 ms, PHY +500 ms, further R−2 steps every 500 ms, floor (R0) within
 ~2.5 s of the last report; `ack8` falls to 0 within 8 probes.
