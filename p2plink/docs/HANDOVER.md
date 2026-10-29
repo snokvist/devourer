@@ -521,3 +521,46 @@ restarted at 34.22 (drone clock).
 
 Counterparts: the run stayed at R0 after the restore because of C5 finding 1,
 so Ucast was re-entered at the floor rung only; one run.
+
+### C7 — 20 ms-stall soak (A7) — PASS (one unit pair, near field)
+
+`c7-r5` 10:46–11:16 and `c7-r6` 11:16–11:46, 2026-10-29, ch 100 HT40+, drone
+8812EU 1-1 at `--txpwr-offset-qdb -40`, ground MT7612U 8-1, no attenuator.
+`run_cell.sh` with `--fixed-rung 5` / `6`, feed `--synthetic` at the budget
+then in force (19 876 kb/s at 120 fps; 36 017 kb/s at 240 fps), bmc
+`tx.report` lines filtered out of the log. Logs:
+`p2plink-bench/logs/20261029/c7-r{5,6}.*`; analysis `c7_analyze.py`.
+
+| | R5 | R6 |
+|---|---|---|
+| longest flat `tx_submitted` (pass < 2 s) | 0 ms | 0 ms |
+| frames/s | 2 379 | 4 325 |
+| `tx_failed` / `tx_timeouts` | 0 / 0 | 0 / 0 |
+| `q_video_ms` max (bound 60) | 7 | 12 |
+| `dropped_video_frames` | 15 | 11 |
+| stats cadence p50 / max | 100 / 108 ms | 100 / 100 ms |
+| clean exit (`p2p.exit`) | yes | yes |
+| ground failed blocks | 53 of ~215 k | 167 of ~431 k |
+| probe report coverage (ok rate) | 0.88 (1.000) | 0.76, worst minute 0.67 (0.998) |
+| `tx_duty_permille` p50 / max (cap) | 707 / 1107 (500) | 822 / 1125 (450) |
+
+Counterparts:
+- The `q_video` maximum is the strongest stall evidence here: at 70–80 %
+  model duty, a TX stall of ~10 ms or more would have queued that much
+  airtime, so neither leg had one in 30 min. That is at the budget's load,
+  not at saturation, and on one unit.
+- Report coverage falls with frame rate (0.88 at 2.4 k/s, 0.76 at 4.3 k/s):
+  the CCX report path does not keep up, so `ack8` sees fewer probes at R6. A
+  missing report is UNKNOWN, not a failure; the review's deferred CCX
+  saturation item.
+- The duty overran its cap on both legs: the budget formula ignored the
+  86 µs per-frame overhead. Fixed in c8d8408 (budget from the airtime
+  model); this run used the old budget, so it soaked ~1.6x and ~2.5x the
+  load the new budgets feed.
+- An 8812BU witness (`witness.sh`, rxdemo `rx.busy`, passive) read 61 % busy
+  airtime during R6 at 4 308 frames/s, against 62–64 % predicted from
+  frames/s × (PLCP + data): the model's on-air part agrees; its 50 µs IFS
+  share is idle time a busy meter cannot see.
+- Feed ring-full drops (647 / 1 324) are all before the drone attached or
+  after it stopped.
+- The "without `no_cancel_multipkt`" arm was not run (the knob is hard-wired).
