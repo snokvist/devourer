@@ -402,16 +402,20 @@ class LinkController {
 // honour). IP-bulk is unicast only at ack8 == 8. The probe is the sensor, so
 // the machine is independent of the IP traffic rate: with no IP at all it
 // still flips to BCAST two probes after the peer vanishes.
+// Namespace-scope (not nested) so its default member initializers can serve
+// as the constructor's default argument on GCC; DaMachine::Cfg aliases it.
+struct DaCfg {
+  uint8_t to_ucast_ack_min = 7;
+  uint32_t to_ucast_hold_ms = 1000;
+  uint8_t to_bcast_ack_max = 5;
+  int pinned_trip = 2;
+  uint32_t min_dwell_ms = 1000;
+};
+
 class DaMachine {
  public:
   enum class Mode : uint8_t { Bcast = 0, Ucast = 1 };
-  struct Cfg {
-    uint8_t to_ucast_ack_min = 7;
-    uint32_t to_ucast_hold_ms = 1000;
-    uint8_t to_bcast_ack_max = 5;
-    int pinned_trip = 2;
-    uint32_t min_dwell_ms = 1000;
-  };
+  using Cfg = DaCfg;
 
   explicit DaMachine(Cfg cfg = {}) : cfg_(cfg) {}
 

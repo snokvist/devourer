@@ -165,8 +165,9 @@ static void test_acute() {
   for (uint64_t t = 0; t <= 500; t += 100) { lc.on_report(rep(++ep, uniq += 100, 0), t); lc.tick(t); }
   lc.on_report(rep(++ep, uniq += 100, 300), 600);
   check(lc.state() == State::Track && lc.rung_budget() == 0 && lc.rung_phy() == 2, "600: budget floor now, phy R2", 600);
-  for (uint64_t t = 700; t <= 1000; t += 100) lc.tick(t);
-  check(lc.rung_phy() == 2, "1000: phy still R2 (lead not elapsed)", 1000);
+  for (uint64_t t = 700; t <= 1000; t += 100) { lc.on_report(rep(++ep, uniq += 100, 0), t); lc.tick(t); }
+  check(lc.rung_phy() == 2 && lc.rung_budget() == 0, "1000: phy still R2 (lead not elapsed), budget floor", 1000);
+  lc.on_report(rep(++ep, uniq += 100, 0), 1100);
   lc.tick(1100);
   check(lc.rung_phy() == 0 && lc.rung_budget() == 0 && lc.state() == State::Track, "1100: phy floor, Track", 1100);
 
@@ -187,8 +188,8 @@ static void test_persistent_and_lock() {
   lc.on_report(rep(++ep, uniq += 100, 60), t);  // t = 400, 5th
   check(lc.rung_budget() == 1 && lc.rung_phy() == 2 && lc.debug().persistent_score == 0, "5th: budget R1 now, phy R2, score reset", t);
   check(lc.debug().rung_locked_until[2] == 400 + 30000, "rung 2 locked until 30400");
-  for (t += 100; t <= 900; t += 100) lc.tick(t);
-  check(lc.rung_phy() == 1, "900: phy R1", 900);
+  for (t += 100; t <= 900; t += 100) { lc.on_report(rep(++ep, uniq += 100, 0, -60), t); lc.tick(t); }
+  check(lc.rung_phy() == 1 && lc.rung_budget() == 1 && lc.state() == State::Track, "900: phy R1 (lead elapsed), Track", 900);
   // Perfect reports with every promote condition met except the lock.
   bool promoted_early = false;
   for (t = 1000; t < 30400; t += 100) {
@@ -199,8 +200,8 @@ static void test_persistent_and_lock() {
   check(!promoted_early && lc.rung_phy() == 1 && lc.rung_budget() == 1, "no promote into locked R2 before 30400", 30300);
   lc.on_report(rep(++ep, uniq += 100, 0, -60), 30400);
   check(lc.rung_phy() == 2 && lc.rung_budget() == 1, "30400: lock expired -> phy R2, budget lags", 30400);
-  lc.tick(30900);
-  check(lc.rung_budget() == 2, "30900: budget R2", 30900);
+  for (t = 30500; t <= 30900; t += 100) { lc.on_report(rep(++ep, uniq += 100, 0, -60), t); lc.tick(t); }
+  check(lc.rung_budget() == 2 && lc.rung_phy() == 2, "30900: budget R2 (lag elapsed)", 30900);
   // Clean reports leak the score down.
   LinkController ld(LinkCfg{}, 0);
   ep = 0; uniq = 0;
@@ -253,16 +254,32 @@ static void test_promote() {
 static void test_local() {
   std::puts("-- (8) local q_air / tx_timeout -> immediate demote");
   LinkController lc(LinkCfg{}, 0);
-  lc.on_local(60, false, 100);
+  uint32_t ep = 0, uniq = 0;
+  // Reports (no promote evidence) keep the controller in TRACK throughout.
+  auto local = [&](uint32_t q_air, bool to, uint64_t t) {
+    lc.on_report(rep(++ep, uniq += 100, 0, -60, 0, 0), t);
+    lc.on_local(q_air, to, t);
+  };
+  local(60, false, 100);
   check(lc.rung_phy() == 2, "q_air 60 (not >60): no demote", 100);
-  lc.on_local(70, false, 100);
+  local(70, false, 100);
   check(lc.rung_phy() == 1 && lc.rung_budget() == 1 && lc.state() == State::Track, "q_air 70: R1/R1 at once", 100);
-  lc.on_local(0, true, 200);
+  local(0, true, 200);
   check(lc.rung_phy() == 1, "tx_timeout 100 ms later: within gap, no second demote", 200);
-  lc.on_local(0, true, 600);
+  local(0, false, 300);
+  local(0, false, 400);
+  local(0, false, 500);
+  local(0, true, 600);
   check(lc.rung_phy() == 0 && lc.rung_budget() == 0, "tx_timeout at 600: R0/R0", 600);
-  lc.on_local(500, true, 1200);
-  check(lc.rung_phy() == 0 && lc.state() == State::Track, "at floor: stays R0, Track (reports grace)", 1200);
+  for (uint64_t t = 700; t <= 1200; t += 100) local(t == 1200 ? 500 : 0, t == 1200, t);
+  check(lc.rung_phy() == 0 && lc.state() == State::Track, "at floor: stays R0, Track", 1200);
+  // Local demote works in BLIND too, and the blind cadence continues.
+  uint32_t e2, u2;
+  LinkController lb = warm_r6(e2, u2);
+  lb.tick(B + 500);
+  check(lb.state() == State::Blind && lb.rung_budget() == 4 && lb.rung_phy() == 6, "pre: Blind budget R4 phy R6", B + 500);
+  lb.on_local(0, true, B + 600);
+  check(lb.rung_phy() == 3 && lb.rung_budget() == 3 && lb.state() == State::Blind, "local in Blind: both R3 now", B + 600);
 }
 
 static void test_tune20() {
