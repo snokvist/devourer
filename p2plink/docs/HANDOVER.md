@@ -564,3 +564,153 @@ Counterparts:
 - Feed ring-full drops (647 / 1 324) are all before the drone attached or
   after it stopped.
 - The "without `no_cancel_multipkt`" arm was not run (the knob is hard-wired).
+
+### C5 re-run — promotion (13db3fc + 435c414) and 20↔40 retunes — PASS (one unit pair, near field)
+
+`c5p-run1`, 2026-10-29 12:05, drone adaptive from `--start-rung 0`,
+`--txpwr-offset-qdb -40`, feed 3 Mb/s at 30 fps; ground SIGTERM at +60 s and
++150 s, restarted at +70 s and +160 s. `c5p.sh`, `c5p_analyze.py`.
+
+- Climb R0 → R6 three times in one session, one rung per promote dwell
+  (5.12 / 10.14 / 16.18 / 21.23 / 26.26 / 31.34 s on the first climb), the
+  budget step 0.5 s after each PHY step. Finding 1 above is closed.
+- Each R3 → R4 promote retuned the drone 20 → 40 MHz in the same tick
+  (21.23, 95.68, 211.41 s) and 40 MHz frames continued without a gap: per-100 ms
+  `tx_submitted` 25–49 around every retune (the ~100 rows are the 1 Hz IDR), no
+  zero-frame 100 ms row in the whole 240 s, 0 failed, 0 timeouts. This is the
+  "IGI clamp when the floor drops / first wide frame after a retune" path that
+  `docs/experiments/8822c-ht40-tx-stall.md` lists as never exercised on air.
+- Each ground kill: Bcast +0.3 s, budget R4 +0.5 s, then the 500 ms grid to
+  FLOOR in 1.7 s, tune 20 MHz 2.6 s after FLOOR.
+
+Counterparts: one session, one unit, near field, a fixed 3 Mb/s feed (above
+the R0 budget, so duty sat at 480–760‰ at the floor). Ground restart 2 came
+up in 0.9 s; restart 3 took **31 s** — 11 MT7612U `mcu command timed out`
+during bring-up under the drone's load (the known gap in §5); measured
+separately below.
+
+### Budget on hardware (c8d8408) — R5 PASS, R6 5 % over in the model
+
+`bud-r5` / `bud-r6`, 2 min each, fixed rung, feed exactly the new budget
+(14 095 kb/s at 120 fps; 19 600 kb/s at 240 fps), 8812BU witness running.
+
+| | R5 (cap 500‰) | R6 (cap 450‰) |
+|---|---|---|
+| model `tx_duty_permille` p50 | 495 | 472 |
+| witness busy (signal on air) | 43 % (frames/s × on-air: 42.8) | 38 % (35.7) |
+| `q_video` max / video drops | 0 ms / 0 | 0 ms / 0 |
+| ground failed blocks | 8 | 0 |
+
+C7 fed the old budgets and read 707 / 822‰. R6 stays 5 % over in the model
+because block padding at 240 fps (a 10.2 kB frame is 7.4 symbols → 8 + 2) is
+more than the 0.97 margin covers; at 120 fps it is. The saturation runs below
+put the model ~12 % over the real per-frame cost at R6, so the real share is
+~420‰. A frame-rate-aware margin is a possible follow-up, not done.
+
+### 8812EU HT40 TX at saturation (libc0607/rtl88x2eu-20230815#7)
+
+The issue: a kernel-driver 8812EU injecting HT40 under load periodically stops
+draining (the wait sits between URB submit and completion), RX sees bursts of
+loss, and peak rate varies between bring-ups. Bench: fixed rung, feed far
+above airtime (R3/R4 30 Mb/s, R5 60, R6 100), 60–120 s per bring-up,
+`sat40.sh` / `pwr40.sh` / `rep40.sh`, `cal_analyze.py`.
+
+| arm | power | bring-ups | sagging | frames/s (steady) |
+|---|---|---|---|---|
+| R3 (20 MHz MCS3, 26 Mb/s) | −40 qdB | 3 | 0 | 1 890 |
+| R4 (40 MHz MCS1, 27 Mb/s — the issue's setting) | −40 qdB | 3 | 0 | 1 950 |
+| R5 (40 MHz MCS3) | −40 qdB | 3 | 0 | 3 500 |
+| R6 (40 MHz MCS5) | −40 qdB | 3 | 0 | 5 750 |
+| R4 | −20 qdB | 2 | 0 | 1 950 |
+| R6 | −20 qdB | 8 | **3** | 5 750 |
+
+"Sagging" = 100 ms rows below half the median; clean runs never fell below
+0.97 × median. In the three sagging runs (`pwr-r6-2`, `rep-r6-3`, `rep-r6-4`)
+the rate fell to 64–500 per 100 ms in episodes of seconds, recurring through
+the session (`rep-r6-4` lost ~11 s of 115 s of airtime); the ground's `uniq`
+fell in step with loss ≤ 29‰, so the frames were not sent rather than lost;
+0 `tx_failed`, 0 `tx_timeouts`. Not retries: video is group-DA (never
+ACKed), and the 13 unicast probe reports inside the `pwr-r6-2` sag show 0
+retries. Not the witness: `rep40.sh` ran without it.
+
+Counterparts: near field (50 cm, ground −29..−33 dBm at −20 qdB), so higher
+power and proximity are not separable here; one unit; at saturation only —
+C7 (budget load, −40 qdB, 1 h) and the budget runs saw no sag. The 3/8 vs 0/3
+power split is too few runs to call.
+
+**Isolation — not devourer's HT40 TX path.** The same air shape from
+devourer's own `txdemo` (MCS5/40 LDPC, ~1400 B, zero gap, −20 qdB, ch 100,
+no ground on the air), fresh bring-up per run, 500 k frames each
+(`txmat.sh`, `txmat2.sh`):
+
+| arm | bring-ups | sagging |
+|---|---|---|
+| txdemo, 40 MHz tune | 6 | 0 |
+| txdemo, CCA gates off (`DEVOURER_CCA_GATES=1,1`) | 6 | 0 |
+| txdemo, 40-in-80 tune | 6 | 0 |
+| txdemo + `DEVOURER_TX_REPORT=1` (a CCX report per frame) | 5 | 0 |
+| txdemo + TX report + `DEVOURER_TX_WITH_RX=thread` | 5 | 0 |
+| p2p_tx R6 −20 qdB, **no ground on the air** | 4 | 0 |
+| p2p_tx R6 −20 qdB, ground up (above) | 8 | 3 |
+
+The libc0607 stall is TX-only; 28 ground-less bring-ups never showed it, so
+devourer's 8812EU does not reproduce it in this shape. The sag needs the
+MT7612U ground 50 cm away (0/4 without it is weak on its own: at 3/8 that is
+15 % likely by chance; with the 0/28 it is consistent). Which interaction —
+the drone's DIG/EDCCA reacting to the ground's −30 dBm frames, or something
+on the ground side — is not separable without an attenuator. **Re-check at
+real separation** (the ssc338q airframe) before acting on it; the next
+discriminator here would be a p2p_tx CCA-off arm with the ground up. txdemo's
+`tx.stats` carries no time field — `stamp.py` stamps lines for round 2; round
+1 is judged by run duration (107–108 s for every run; a 4 s sag adds 4 s).
+
+Two side results:
+- **The HT40 rate correction holds on air**: R4 / R3 frames/s = 1.032 at
+  saturation, PHY 27 / 26 = 1.038 (with 26/26, as the ladder had, they
+  would be equal).
+- **The model's 50 µs IFS is an upper bound on this unit**: mean idle per
+  frame at saturation 49 µs (R3), 53 (R4), 38 (R5), 30 (R6), so the model
+  overcharges R5/R6 frames by 4–12 % (reads 1 040–1 120‰ at 100 % airtime)
+  and the caps there are slightly conservative. The constant stays.
+
+Witness note: the 8812BU witness (`build/rxdemo`) logged `rtw_read …
+iostream error` in every R4 run and once at R6, and in `sat-r4-1` an uncaught
+`std::ios_base::failure` aborted it. Not a drone or ground number; a devourer
+Jaguar2 robustness issue, queued separately.
+
+### Repair floor (86594f5) on air — PASS
+
+`floor-r5`, 60 s, R5 fixed, feed 1 Mb/s at 30 fps (P-frames ~2.6–4.9 kB, so
+k = 2..4, where the ratio alone gives 1 repair). Drone: 9 969 frames for
+1 664 blocks + 550 probes = **5.66 symbols per video block**; the feed's own
+size distribution predicts 5.85 with the floor and 4.89 without it. Ground:
+1 failed block in 60 s, 0 `tx_failed`. Counterparts: one 60 s run, near
+field; this proves the encoder airs k + 2, not that the floor recovers a
+loss the ratio would not — that needs a lossy link.
+
+### MT7612U ground restart under drone load — found and fixed (3d7c081, devourer core)
+
+The C5 re-run's 31 s ground restart, chased with `gr_restart.sh` (ground up,
+drone fixed R5 at budget, then the ground SIGTERMed and restarted N times while
+the drone airs; `gr_analyze.py`).
+
+| arm | slow restarts (31–34 s, 10–11 MCU timeouts) |
+|---|---|
+| no drone | 0 / 4 |
+| first ground start, before the drone (every arm) | 0 / 9 |
+| restarts under the drone, −40 qdB | 6 / 10 (+ 6 / 6 diag, + 3 / 6 control) |
+| restarts under the drone, −120 qdB | 5 / 10 |
+| first fix attempt (2nd flush in `mt_mac_stop`) | 7 / 10 — did not help |
+| **fix (3d7c081)** | **0 / 21** (0.94–1.26 s) |
+
+Bimodal, not graded: a restart was either 0.94 s or 31–34 s. The −120 qdB arm
+lowered the ground's level by only 6 dB (−37 → −43 dBm; the 8812EU offset
+floors), so it is not a flight-level arm, and level was not the variable.
+Timestamped logs: every reply of the burst appeared within 7 ms of the RX
+ring's first transfer. Mechanism: `MCU_CAL_RXDCOC` opens the receive path with
+MAC RX off; frames land in EP 4; with EP 4 undrained the chip does not deliver
+the EP 5 replies. The fix drains EP 4 on an MCU reply timeout when no ring
+owns it (the drain logged 7–19 kB at cmd 31 arg 3 in every slow-path case).
+The drone-side "no ACK for 30 s → duty 0.3" rule (§5) is therefore not
+needed for this; it stays unimplemented. Counterparts: one MT7612U unit, one
+channel, near field, one traffic shape.
