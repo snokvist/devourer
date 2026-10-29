@@ -262,6 +262,7 @@ int run(const Opts& o) {
            ip_tx = 0, tun_fail = 0, reports_sent = 0, reports_failed = 0, out_ring_drops = 0;
   uint32_t ip_seq = 0;
   uint8_t last_k = 0, last_n = 0;
+  uint64_t tx_failed_prev = 0, tx_timeouts = 0;
 
   auto emit = [&](const DecodedBlock& b) {
     if (!b.ok) {
@@ -284,7 +285,10 @@ int run(const Opts& o) {
     pfd.clear();
     for (auto& e : ears) pfd.push_back({e->rx_fd(), POLLIN, 0});
     pfd.push_back({tfd, POLLIN, 0});
-    if (have_tun) pfd.push_back({tun.fd(), POLLIN, 0});
+    // The tun is read only when there is an uplink to send it on; polling an
+    // fd that is never drained would spin this loop at 100 % CPU.
+    const bool poll_tun = have_tun && uplink;
+    if (poll_tun) pfd.push_back({tun.fd(), POLLIN, 0});
     int pr = poll(pfd.data(), nfds_t(pfd.size()), int(kTickMs));
     if (pr < 0 && errno != EINTR) {
       logger->error("poll: {}", std::strerror(errno));
@@ -332,7 +336,7 @@ int run(const Opts& o) {
     merger.poll(t, emit);
 
     // --- ground tun -> IpData, group DA, one packet per frame ------------------
-    if (have_tun && uplink && (pfd.back().revents & POLLIN)) {
+    if (poll_tun && (pfd.back().revents & POLLIN)) {
       uint8_t pkt[2048];
       for (int i = 0; i < 32; i++) {
         long len = tun.read_packet(pkt, sizeof pkt);
@@ -401,7 +405,11 @@ int run(const Opts& o) {
         auto ts = uplink->tx_stats();
         s.tx_submitted = uint32_t(ts.submitted);
         s.tx_failed = uint32_t(ts.failed);
-        s.tx_timeouts = ts.last_was_timeout ? 1 : 0;
+        // Same accounting as the drone: failures that landed while the last
+        // failure was a bulk-OUT timeout (chip FIFO full).
+        if (ts.failed > tx_failed_prev && ts.last_was_timeout) tx_timeouts += ts.failed - tx_failed_prev;
+        tx_failed_prev = ts.failed;
+        s.tx_timeouts = uint32_t(tx_timeouts);
       }
       pub.publish(s);
       for (auto& e : ears) {
