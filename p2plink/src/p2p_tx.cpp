@@ -83,7 +83,10 @@ struct Opts {
   std::optional<std::string> mt7612u_fw;
   std::string stats_shm = "/p2plink.tx";
   bool ndjson = true;
-  Logger::Level log_level = Logger::Level::Info;
+  // Default warn: devourer logs every successful bulk-OUT at info (one stderr
+  // line + flush per frame), a measurable CPU cost at video frame rates.
+  // Everything p2plink itself reports at info is also in the NDJSON events.
+  Logger::Level log_level = Logger::Level::Warn;
 };
 
 void usage(const char* argv0) {
@@ -107,7 +110,7 @@ void usage(const char* argv0) {
       "  --mt7612u-fw DIR        MT7612U firmware directory\n"
       "  --stats-shm NAME        (default /p2plink.tx)\n"
       "  --no-ndjson             no p2p.stats lines on stdout\n"
-      "  --log-level trace|debug|info|warn|error\n",
+      "  --log-level trace|debug|info|warn|error  (default warn)\n",
       argv0);
 }
 

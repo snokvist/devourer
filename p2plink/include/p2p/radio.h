@@ -57,7 +57,7 @@ struct RadioCfg {
   // library reads no environment, so DEVOURER_TX_PWR does nothing here — this
   // is the near-field bench's power lever. Not regulatory-clamped.
   std::optional<int> txpwr_offset_qdb;
-  Logger::Level log_level = Logger::Level::Info;
+  Logger::Level log_level = Logger::Level::Warn;
 };
 
 // One received p2plink frame, already filtered to this link (bssid ==

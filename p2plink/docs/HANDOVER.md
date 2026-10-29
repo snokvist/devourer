@@ -105,13 +105,13 @@ p2p_tx  --adapter VID:PID[@BUS-PORT] --channel N --bw 20|40 (40) --offset +|- (+
         --control-reserve-kbps N (300) --start-rung N (2) --fixed-rung N
         --no-tune20 --probe-ms N (100) --wide-igi-floor 0xNN
         --txpwr-offset-qdb N --mt7612u-fw DIR
-        --stats-shm NAME (/p2plink.tx) --no-ndjson --log-level L
+        --stats-shm NAME (/p2plink.tx) --no-ndjson --log-level L (warn)
 p2p_rx  --adapter SPEC (repeatable; ear index = order) --ack-target IDX (0)
         --uplink IDX|none (0) --channel --bw --offset --net-id
         --out-udp HOST:PORT --out-shm NAME --tun NAME --tun-addr CIDR
         --report-hz N (10) --report-mcs N (0) --txpwr-offset-qdb N (uplink)
         --mt7612u-fw DIR
-        --stats-shm NAME (/p2plink.rx) --no-ndjson --log-level
+        --stats-shm NAME (/p2plink.rx) --no-ndjson --log-level L (warn)
 p2p_feed --ring NAME --synthetic --fps N --kbps N --idr-every N --enhance-ratio F
          | --file X.h265 [--loop] [--fps N]
 ```
