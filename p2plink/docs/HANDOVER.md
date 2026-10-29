@@ -753,6 +753,27 @@ drone duty p50 462‰ (cap 600), `q_video` ≤ 20 ms, 0 video drops.
 Counterparts: static and near field, so this is the reference a walk test
 and a frame-size sweep compare against, not a motion result.
 
+**C8 walk 1 (2026-10-29 evening) — VOID; found a ground bug instead.**
+`walk-c8`: camera drone untethered (supervisor `cam/walk/sup.sh`, control by
+ssh over the p2plink tun — 10.99.0.1, which held through every leg restart and
+MTU change), R0, −100 qdB, 1700 kb/s, 18 legs cycling 1400 / 1000 / 600 B,
+each a fresh p2p_tx under ONE running ground. The ground decoded leg 1 and
+then nothing more (`uniq` 4 960 in 500 s) while both ears received ~120 000
+frames each and the drone aired ~560 blocks every leg. Cause: BlockMerger
+recognised a sender restart only when the block_id fell more than 1 024 behind
+its cursor, so each new leg's ids (from 0) were "late" for ~563 blocks — the
+whole leg. Every earlier cell restarted the ground with the drone, and C5/C6
+restarted only the ground, so a drone restart under a live ground had never
+been exercised. In flight that is any p2p_tx restart mid-link: up to 1 024
+blocks (~34 s at 30 fps) of video discarded. Fixed in the commit that adds
+this note (rebase on the session nonce; ear positions forgotten on a rebase;
+merge_test (f2), which fails on the old merger and without the ear reset).
+Hardware check `walk-restartfix`: three drone restarts under one ground, each
+leg decoded from its first symbol (263 / 359 / 586 sym/s at 1400 / 1000 / 600
+B, 0 failed blocks, −35 dBm). Side observation: one of those 3 bring-ups (0 of
+the walk's 18) re-enumerated the 8812EU at the USB reset and took ~13 s.
+The walk has to be repeated.
+
 ### C9 — encoder in the loop — PARTIAL (no encoder; ordering only)
 
 The waybeam encoder is not on this bench. `c9p-run1` (`c9p.sh`): adaptive

@@ -33,9 +33,15 @@
 // not emitted ahead of a copy a slow ear may still bring, and the frame
 // consumer sees the block_id gap.
 //
-// Restart: a block_id more than kResyncBlocks behind the retire cursor is a
-// sender restart, not a late copy — the pending set is flushed (emitted or
-// declared lost on the next poll) and the cursors rebase on the new id.
+// Restart: a change of the sender's session nonce (P2pHeader::session, random
+// per p2p_tx process) is a sender restart — the pending set is flushed
+// (emitted or declared lost on the next poll), the cursors rebase on the new
+// id and every ear's position is forgotten (an old-session position would
+// close the new session's gaps early). A copy still arriving from the session
+// just replaced is late, not a second restart. Without a nonce (session 0), a
+// block_id more than kResyncBlocks behind the retire cursor is the restart
+// instead — which leaves a sender that restarts within that many blocks of its
+// old count discarded as late until it catches up.
 //
 // One BlockMerger serves one block_id sequence (one video stream); `stream`
 // is part of the key only in that a symbol whose stream differs from the
@@ -133,14 +139,20 @@ class BlockMerger {
 
     if (!have_cursor_) {
       have_cursor_ = true;
+      session_ = h.session;
       highest_u_ = emit_next_u_ = retire_next_u_ = int64_t(h.block_id);
     }
     int64_t u = unwrap(h.block_id);
-    if (u < retire_next_u_ - kResyncBlocks) {
-      // Sender restart: flush what is pending, rebase on the new id.
-      for (auto& kv : pending_) stale_.push_back(std::move(kv.second));
-      pending_.clear();
-      highest_u_ = emit_next_u_ = retire_next_u_ = u;
+    if (h.session != session_) {
+      if (int16_t(h.session) == prev_session_) {
+        win_.late++;  // a straggler of the sender just replaced
+        return false;
+      }
+      prev_session_ = session_;
+      session_ = h.session;
+      rebase(u);
+    } else if (u < retire_next_u_ - kResyncBlocks) {
+      rebase(u);
     }
     if (!e.has_highest || u > e.highest_u) {
       e.has_highest = true;
@@ -349,6 +361,15 @@ class BlockMerger {
     std::array<uint32_t, 8> rung_lost{};
   };
 
+  // Sender restart: flush what is pending, rebase on the new id, forget where
+  // each ear was.
+  void rebase(int64_t u) {
+    for (auto& kv : pending_) stale_.push_back(std::move(kv.second));
+    pending_.clear();
+    highest_u_ = emit_next_u_ = retire_next_u_ = u;
+    for (Ear& e : ears_) e.has_highest = false;
+  }
+
   static int16_t bdiff(uint16_t a, uint16_t b) { return int16_t(uint16_t(a - b)); }
   int64_t unwrap(uint16_t id) const { return highest_u_ + bdiff(id, uint16_t(highest_u_)); }
 
@@ -466,6 +487,8 @@ class BlockMerger {
   std::vector<Block> stale_;
   std::map<uint16_t, RsCodec> codecs_;
   bool have_cursor_ = false;
+  uint8_t session_ = 0;        // the sender's nonce the cursors belong to
+  int16_t prev_session_ = -1;  // the nonce it replaced (-1 = none yet): its stragglers are late
   int64_t highest_u_ = 0;      // newest block seen (unwrapped)
   int64_t emit_next_u_ = 0;    // lowest block not yet emitted
   int64_t retire_next_u_ = 0;  // lowest block not yet retired

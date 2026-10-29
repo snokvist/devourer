@@ -30,6 +30,7 @@ static void check_eq(const A& a, const B& b, const char* what) {  // operands ev
 struct TestBlock {
   uint16_t id = 0;
   uint8_t k = 0, n = 0, rung = 0, stream = 0;
+  uint8_t session = 0;  // the sender's nonce (P2pHeader::session)
   size_t sym_len = 0;
   std::vector<uint8_t> frame;
   std::array<uint8_t, 8> meta{};
@@ -46,6 +47,7 @@ struct TestBlock {
     h.stream = stream;
     h.seq = uint32_t(id) * n + idx;
     h.block_id = id;
+    h.session = session;
     h.payload_len = uint16_t(sym_len);
     return h;
   }
@@ -388,6 +390,41 @@ int main() {
     check(!feed(m, 0, blocks[0], 3, 4), "(f) 65534 is late after the wrap");
     CHECK_EQ(m.pending_blocks(), size_t(1), "(f) only block 1 pending");
     CHECK_EQ(m.take_window(4).late, 1u, "(f) late 1");
+  }
+
+  // ---- (f2) sender restart: a new session nonce, ids from 0 again ----------
+  // The C8 walk shape: p2p_tx restarted every leg under a running ground, so
+  // block ids fell back to 0 well inside kResyncBlocks of the old count — the
+  // id rule alone discarded every new block as late.
+  {
+    std::printf("-- (f2) sender restart (new session)\n");
+    BlockMerger m;
+    Sink s;
+    auto blk = [&](uint8_t session, uint16_t id) {
+      TestBlock b = make_block(rs, id, 900 + id % 5, R, uint32_t(session) * 1000 + id);
+      b.session = session;
+      return b;
+    };
+    for (uint16_t id = 0; id < 30; id++) feed_all(m, blk(0x11, id), id, {{}, {}});
+    m.poll(30, s.fn);
+    CHECK_EQ(s.out.size(), size_t(30), "(f2) first session: 30 blocks");
+    std::vector<TestBlock> nb;
+    for (uint16_t id = 0; id < 4; id++) nb.push_back(blk(0x22, id));
+    // The new session's blocks 0 and 2 on ear 0 only; 1 not yet heard. Ear 1's
+    // old-session position (29) must not close the gap at 1 under rule (1).
+    check(feed(m, 0, nb[0], 0, 31), "(f2) new session's block 0 accepted (not late)");
+    for (uint8_t idx = 1; idx < nb[0].n; idx++) feed(m, 0, nb[0], idx, 31);
+    for (uint8_t idx = 0; idx < nb[2].n; idx++) feed(m, 0, nb[2], idx, 31);
+    m.poll(31, s.fn);
+    CHECK_EQ(s.out.size(), size_t(31), "(f2) new block 0 out; gap at 1 held (ear 1 not heard this session)");
+    check(!feed(m, 1, blk(0x11, 29), 0, 32), "(f2) a straggler of the old session is late");
+    feed_all(m, nb[1], 32, {{}, {}});
+    feed_all(m, nb[3], 32, {{}, {}});
+    m.poll(32, s.fn);
+    CHECK_EQ(s.out.size(), size_t(34), "(f2) new blocks 1..3 emitted");
+    bool ok = s.out.size() == 34;
+    for (size_t i = 0; ok && i < 4; i++) ok &= frame_matches(s.out[30 + i], nb[i]);
+    check(ok, "(f2) new session decoded whole and in order");
   }
 
   // ---- (g) SeqDedup -------------------------------------------------------
