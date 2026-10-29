@@ -239,10 +239,11 @@ std::unique_ptr<Adapter> Adapter::open(const AdapterSpec& spec, const RadioCfg& 
 
   // Lock + claim before reset (src/UsbOpen.h). BUSY = another process owns
   // the adapter; the handle is adopted either way so the unwind closes it.
+  // The reopen variant (rxdemo's path): a reset that re-enumerates the device
+  // replaces `handle` in place instead of leaving it stale.
   std::shared_ptr<devourer::UsbDeviceLock> lock;
-  const int iface = devourer::find_wifi_interface(handle);
-  rc = devourer::claim_interface_then_reset(handle, iface, logger, /*do_reset=*/true, lock);
-  im.session.adopt_handle(handle, iface);
+  rc = devourer::claim_interface_reset_reopen(ctx, handle, logger, /*do_reset=*/true, lock);
+  im.session.adopt_handle(handle, devourer::find_wifi_interface(handle));
   if (rc != 0) {
     return fail(rc == LIBUSB_ERROR_BUSY ? "adapter in use by another process"
                                         : std::string("claim/reset failed: ") + libusb_error_name(rc));
