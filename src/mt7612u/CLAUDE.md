@@ -26,10 +26,18 @@ Two facts that measurement added. First, the reading **requires a running
 receiver**: with RX down the idle timer still advances, so busy+idle is
 non-zero and the ratio is a perfectly plausible 0% — a fabricated zero that a
 channel ranker reads as "emptiest". `GetChannelBusy` and `ArmChannelBusy` both
-refuse unless `_rx_active`. Second, bring-up does not reliably complete while
-the channel is already saturated (the arm then never becomes available, and the
-MCU times out), so in a two-adapter test bring this one up BEFORE the
-interferer.
+refuse unless `_rx_active`. Second, bring-up on a busy channel used to take
+~31 s instead of ~1 s about half the time, and the cause was not the MCU. The
+RXDCOC calibration (`CMD_CALIBRATION_OP`, `MCU_CAL_RXDCOC`) opens the receive
+path with MAC RX still off, so frames on the channel land in EP 4. Nothing reads
+EP 4 before the RX ring starts, and while data is parked there the chip does not
+deliver the MCU's EP 5 replies either. That calibration and every command after
+it timed out at 3 s, and all the replies appeared within 7 ms of the ring's
+first RX transfer. `mcu_wait_resp()` now drains EP 4 on its first 300 ms
+timeout whenever no ring owns it. Measured under a peer airing ~1.7 k
+frames/s: 16 of 16 restarts under 1.3 s (7–19 kB drained per bring-up), against
+16 slow out of 32 before. The same path covers a channel set with no RX ring,
+since RXDCOC runs on every channel set.
 
 `ArmChannelBusy` here resets the timers and the interval mark through
 `mt7612u_ch_time_arm` — NOT `mt7612u_link_stats_start`, which would also clear

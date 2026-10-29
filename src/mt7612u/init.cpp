@@ -255,15 +255,18 @@ static void wcid_and_key_clear(struct mt7612u_dev *d)
  * pool is the leading suspect for the chip wedging after repeated TX cycles
  * (see BRINGUP-RESULTS.md). Cheap insurance either way.
  */
-void mt_rx_flush(struct mt7612u_dev *d)
+size_t mt_rx_flush(struct mt7612u_dev *d)
 {
 	uint8_t buf[4096];
+	size_t total = 0;
 	int n;
 
 	for (int i = 0; i < 64; i++) {
 		if (mt_bulk(d, MT_EP_IN_PKT_RX, buf, sizeof buf, &n, 10) || n == 0)
 			break;
+		total += (size_t)n;
 	}
+	return total;
 }
 
 /* The value every station cell measured; the named bits must spell it. */
