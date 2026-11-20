@@ -1,5 +1,6 @@
 #include "RtlJaguar2Device.h"
 #include "PktBufWindow.h"
+#include "AcTxQueue.h"
 
 #include <algorithm>
 #include <climits>
@@ -908,6 +909,9 @@ void RtlJaguar2Device::InitWrite(SelectedChannel channel) {
       !SetAckResponder(*_cfg.rx.ack_responder)) /* DEVOURER_ACK_RESPONDER */
     throw std::runtime_error(
         "Jaguar2: configured ACK responder could not be armed");
+  /* DEVOURER_TX_BE_FAST_RETRY / _AC_LIFETIME_US: after MAC init, before a
+   * configured A-MPDU mode and the debug replay. */
+  devourer::apply_ac_tx_queue(_device, _cfg.tx);
   if (_cfg.tx.ampdu)
     SetAmpduMode(*_cfg.tx.ampdu); /* DEVOURER_TX_AMPDU_MODE */
   apply_replay_wseq();
@@ -1878,6 +1882,11 @@ size_t RtlJaguar2Device::build_tx_block(const uint8_t *packet, size_t length,
    * has the measurement). Same checksummed span as the retry limit. */
   if (_cfg.tx.retry_fallback == devourer::RetryFallback::Off)
     SET_TX_DESC_DISDATAFB_8822B(out, 1);
+  /* DEVOURER_TX_DATA_BE: DATA frames ride BE (QSEL 0), still on the first
+   * endpoint like every Jaguar2 frame; a SetAmpduMode TID or
+   * DEVOURER_TX_QSEL below wins. Checksummed span. */
+  if (_cfg.tx.data_on_be && frame_len >= 1 && ((dot11[0] >> 2) & 0x3) == 0x2)
+    SET_TX_DESC_QSEL_8822B(out, 0);
   jaguar2::cal_txdesc_chksum_8822b(out);
   const devourer::AmpduMode am = _ampdu; /* one lock-free load */
   if (am.enabled || _cfg.debug.tx_qsel || _cfg.debug.tx_ampdu_max) {

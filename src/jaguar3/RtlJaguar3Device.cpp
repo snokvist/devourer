@@ -1,5 +1,6 @@
 #include "RtlJaguar3Device.h"
 #include "TxQueueMap.h"
+#include "AcTxQueue.h"
 #include "PktBufWindow.h"
 #include "InitTimer.h"
 
@@ -1201,6 +1202,9 @@ void RtlJaguar3Device::InitWrite(SelectedChannel channel) {
    * adapter's transfer counter, so anything emitted after it would count
    * that thread's register and H2C traffic as bring-up. */
   timer.total();
+  /* DEVOURER_TX_BE_FAST_RETRY / _AC_LIFETIME_US: after init_edca_cfg and
+   * before the coex thread shares the register path. */
+  devourer::apply_ac_tx_queue(_device, _cfg.tx);
   if (_cfg.tuning.j3_runtime_thread)
     _coex_thread = std::thread([this] { coex_runtime_loop(); });
   else

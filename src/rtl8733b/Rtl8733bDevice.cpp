@@ -11,6 +11,7 @@
 #include <utility>
 #include <vector>
 
+#include "AcTxQueue.h"
 #include "AckResponder.h" /* hardware ACK responder recipe */
 #include "RateDefinitions.h"
 #include "RadiotapPeek.h" /* send_packets batch pre-parse */
@@ -249,6 +250,9 @@ void Rtl8733bDevice::InitWrite(SelectedChannel channel) {
       throw std::runtime_error("RTL8733B monitor RX configuration failed");
     _tx_ready = true;
     _tx_submits = 0;
+    /* DEVOURER_TX_BE_FAST_RETRY / _AC_LIFETIME_US, after init_edca and
+     * before the A-MPDU mode captures the EDCA word it later restores. */
+    devourer::apply_ac_tx_queue(_device, _cfg.tx);
     /* DEVOURER_TX_AMPDU_MODE: MAC init rewrote the pacing registers, so a
      * recorded mode is re-applied on every TX bring-up. */
     if (_cfg.tx.ampdu && !_ampdu.enabled)
@@ -1050,6 +1054,10 @@ size_t Rtl8733bDevice::build_tx_block(const uint8_t *packet, size_t length,
   cfg.short_gi = short_gi;
   cfg.ldpc = ldpc;
   cfg.bmc = bmc;
+  /* DEVOURER_TX_DATA_BE: DATA frames ride BE; build_tx_block's ep_for_qsel
+   * then picks the BE queue's endpoint. */
+  if (_cfg.tx.data_on_be && ((dot11[0] >> 2) & 0x3) == 0x2)
+    cfg.qsel = 0;
   if (_ampdu.enabled) {
     cfg.qsel = static_cast<uint8_t>(_ampdu.tid & 0x07);
     cfg.agg_en = true;

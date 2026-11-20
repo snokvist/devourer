@@ -1808,6 +1808,12 @@ target_link_libraries(TxQueueSelftest PRIVATE devourer)
 target_include_directories(TxQueueSelftest PRIVATE src)
 add_test(NAME txqueue_map COMMAND TxQueueSelftest)
 
+# Headless guard for the AC-queue register arithmetic (src/AcTxQueue.h) behind
+# DeviceConfig::Tx::be_fast_retry / ac_lifetime_us.
+add_executable(AcTxQueueSelftest tests/ac_tx_queue_selftest.cpp)
+target_include_directories(AcTxQueueSelftest PRIVATE src)
+add_test(NAME ac_tx_queue COMMAND AcTxQueueSelftest)
+
 # Headless guard for the beamforming-report decoder (src/BfReportDecode.h) — the
 # LSB-first Givens-angle unpacking + per-tone variance behind sense. It
 # decodes a real captured VHT MU report and checks the angles against an offline
