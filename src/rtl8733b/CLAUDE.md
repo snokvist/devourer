@@ -528,8 +528,8 @@ same witness reads `paggr` 1.00), at ~305 fps.
   frame's 17 airings took 95.8 ms (≈3 ms apart, then ≈8 ms once the window
   had doubled), against 8.4 ms on MGMT, which re-airs back to back. Outside
   A-MPDU, `DeviceConfig::Tx::data_on_be` + `be_fast_retry` (+
-  `ac_lifetime_us`) is the product path; the measurement and its
-  counterpart sit at those fields.
+  `ac_lifetime_us`) is the product path (9.2 ms chains); the measurements
+  and their counterparts sit at those fields.
 
 Delivered distinct payload counters per second at the RTL8812EU witness,
 ch36, 1000 B QoS-Data, no-ack (`0/16/7/1/0x20`), ~9 s cells:

@@ -145,6 +145,14 @@ Jaguar1 (shared `PhyTableLoader`).
   so 20 vs 40 MHz and airtime are not separated. The vendor's 0x4E0 write
   after an always-on-section access (`usbctrl_vendorreq`, rtw88
   `rtw_usb_reg_sec`) is not ported and was not tested as a cause.
+- **BE retries back off; MGMT's do not.** Power-on REG_EDCA_BE_PARAM reads
+  `0x0000a42b`: TXOP limit already 0 (the backend never writes BE), CW
+  15..1023. With the peer not ACKing (RTL8812BU, MCS4, retry 16) a BE
+  frame's 17 airings took 63.8 ms against 8.4 ms on MGMT, all from the
+  window doubling. `DeviceConfig::Tx::be_fast_retry` pins CWmax to CWmin
+  (9.2 ms); `data_on_be` is what puts DATA on BE here, routed to the LOW
+  endpoint so QSEL and endpoint agree. The SetAmpduMode TID path keeps
+  every frame on the first endpoint as before.
 
 ## TX power
 
