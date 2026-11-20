@@ -304,6 +304,50 @@ struct DeviceConfig {
      * retries re-air at the descriptor rate. See the RetryFallback enum for
      * why there is no floor form. */
     RetryFallback retry_fallback = RetryFallback::Default;
+    /* env: DEVOURER_TX_DATA_BE=1 — RTL8733B and Jaguar2: DATA frames
+     * (802.11 type 2) ride the BE queue (descriptor QSEL 0) instead of
+     * MGMT (0x12); management and control frames keep MGMT. The RTL8733B
+     * also sends them on the BE queue's bulk-OUT endpoint (ep_for_qsel);
+     * Jaguar2 keeps every frame on its first endpoint, as its A-MPDU mode
+     * already does. Jaguar3 has no knob to need: it puts DATA on BE whenever
+     * the adapter has three bulk-OUT endpoints (jaguar3/TxQueueMap.h).
+     * What it is for: ac_lifetime_us ages the AC queues only, never MGMT.
+     * What it costs on the vendor EDCA: BE holds a TXOP (3.0 ms on the
+     * RTL8733B and Jaguar3) and doubles its contention window per retry, so
+     * a frame whose ACKs fail took 95.8 ms (RTL8733BU) and 63.8 ms
+     * (RTL8812BU) over 17 airings, against 8.4 ms on MGMT, which retries
+     * back to back (peer not ACKing, retry 16, MCS4, one unit each) — pair
+     * it with be_fast_retry. A SetAmpduMode TID or DEVOURER_TX_QSEL still
+     * wins. Default off: descriptors byte-identical. */
+    bool data_on_be = false;
+    /* env: DEVOURER_TX_BE_FAST_RETRY=1 — RTL8733B, Jaguar2, Jaguar3: at TX
+     * bring-up, clear the BE queue's EDCA TXOP limit and pull its CWmax
+     * down to its CWmin (REG_EDCA_BE_PARAM 0x0508, src/AcTxQueue.h), so
+     * retries on BE re-air the way MGMT's do. Measured, same setup as
+     * data_on_be: the 17-airing chain fell to 9.3 ms (RTL8733BU) and 9.4 ms
+     * (RTL8812BU), every copy at the descriptor rate; TXOP 0 alone left
+     * 64 ms (the window still doubles to 1023 slots), and CWmax alone, under
+     * the 3 ms TXOP, only about halved it. Healthy-link cost, ACKing peer at
+     * 500 fps: +0.2 ms p50 against MGMT. The counterpart: BE gives up
+     * exponential backoff, as MGMT already has, so against other stations'
+     * traffic it contends harder than stock BE does. Jaguar3 adapters with
+     * three endpoints already send DATA on BE, so this changes their retry
+     * timing with no queue change; unmeasured there. */
+    bool be_fast_retry = false;
+    /* env: DEVOURER_TX_AC_LIFETIME_US — RTL8733B, Jaguar2, Jaguar3: the MAC
+     * drops a frame from an AC queue (VO/VI/BE/BK) once it has been queued
+     * this long, mid retry chain included (REG_LIFETIME_EN 0x0426 bits 0..3,
+     * REG_PKT_LIFE_TIME 0x04C0; 256 us units, rounded up, max ~16.8 s).
+     * 0 = off, the default: no register touched. MGMT is never aged — see
+     * data_on_be. Measured with data_on_be + be_fast_retry at 30000, a peer
+     * that hears but never ACKs, 500 fps for 10 s: about 4800 frames
+     * delivered at p99 30-31 ms on an RTL8733BU and an RTL8812BU, against
+     * 1081 at 147 ms on the RTL8733BU's MGMT queue, where the same setting
+     * changed nothing. The counterpart: a frame a slow-to-ACK peer would
+     * still have taken is dropped as well, and the drop is reported nowhere
+     * (the RTL8733B's LIFE_DROP_NUM, 0x04EC[31:16], read 0 while frames
+     * expired) — count delivery at the receiver. */
+    unsigned ac_lifetime_us = 0;
     /* env: DEVOURER_TX_USB_AGG — USB TX aggregation: max frames packed into
      * one bulk-OUT URB by send_packets (0 = off, the default: send_packets
      * degrades to a per-frame loop and every TX path is byte-identical to
