@@ -1176,6 +1176,10 @@ void RtlJaguar3Device::InitWrite(SelectedChannel channel) {
       _cfg.tx.ack_timeout_us > 255   ? 255
       : _cfg.tx.ack_timeout_us < 1 ? 1
                                      : _cfg.tx.ack_timeout_us));
+  /* DEVOURER_TX_BE_FAST_RETRY / _AC_LIFETIME_US: after init_edca_cfg, before
+   * the debug replay (which keeps the last word) and the coex thread. */
+  if (!devourer::apply_ac_tx_queue(_device, _cfg.tx))
+    throw std::runtime_error("Jaguar3: AC-queue options could not be set");
   apply_replay_wseq(); /* DEVOURER_REPLAY_WSEQ golden-init replay (debug) */
   if (_cfg.debug.bb_dump) {
     /* Full MAC+BB dump (0x000..0x4ffc — MAC plane, then BB incl. the RF
@@ -1200,9 +1204,6 @@ void RtlJaguar3Device::InitWrite(SelectedChannel channel) {
    * adapter's transfer counter, so anything emitted after it would count
    * that thread's register and H2C traffic as bring-up. */
   timer.total();
-  /* DEVOURER_TX_BE_FAST_RETRY / _AC_LIFETIME_US: after init_edca_cfg and
-   * before the coex thread shares the register path. */
-  devourer::apply_ac_tx_queue(_device, _cfg.tx);
   if (_cfg.tuning.j3_runtime_thread)
     _coex_thread = std::thread([this] { coex_runtime_loop(); });
   else

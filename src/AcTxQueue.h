@@ -4,14 +4,23 @@
 #include <algorithm>
 #include <cstdint>
 
+#include "DeviceConfig.h"
+#include "RtlAdapter.h"
+
 namespace devourer {
 
 /* The access-category (AC) queue registers behind DeviceConfig::Tx::
  * data_on_be / be_fast_retry / ac_lifetime_us. The addresses and field
  * layouts are the halmac 88xx ones, identical on the RTL8733B, Jaguar2
  * (8822B/8821C) and Jaguar3 (8822C/8822E), the three backends that apply
- * them. Pure arithmetic plus one generic apply, so the headless selftest
- * (tests/ac_tx_queue_selftest.cpp) pins the bits without a device. */
+ * them. Pure arithmetic plus the apply, pinned headless against a fake
+ * transport by tests/ac_tx_queue_selftest.cpp. */
+
+/* True for an 802.11 DATA frame (Frame Control type bits = 2), given the
+ * first Frame Control byte: the frames data_on_be moves. Same predicate as
+ * jaguar3::dot11_is_data, kept here so the RTL8733B and Jaguar2 backends
+ * need no other generation's header. */
+constexpr bool dot11_is_data(uint8_t fc0) { return ((fc0 >> 2) & 0x3) == 0x2; }
 
 inline constexpr uint16_t kRegEdcaBeParam = 0x0508;
 /* REG_LIFETIME_EN: bits 0..3 enable the packet lifetime of the VO, VI, BE
@@ -44,27 +53,25 @@ constexpr uint32_t pkt_life_time_reg(unsigned us) {
   return (units << 16) | units;
 }
 
-/* Programs the AC-queue options of `tx` (a DeviceConfig::Tx) through a
- * register accessor with RtlAdapter's rtw_read<T>/rtw_write<T> members
- * (spelled out with `template`: the rtw_read8/... macros cannot be used on a
- * dependent type). Called once per TX bring-up, after the backend's EDCA
- * init and before a configured SetAmpduMode is re-applied, so the A-MPDU
- * mode saves and restores the value set here. Neither option set: no
- * register access. */
-template <class Dev, class TxCfg>
-void apply_ac_tx_queue(Dev &dev, const TxCfg &tx) {
+/* Programs be_fast_retry and ac_lifetime_us. Called once per TX bring-up,
+ * after the backend's EDCA init and before a configured SetAmpduMode is
+ * re-applied (the A-MPDU mode then saves and restores the value set here)
+ * and before the debug register replay (which keeps the last word). Neither
+ * option set: no register access. Returns false if a register write failed;
+ * the backends then fail the bring-up, as for a configured ACK responder. */
+inline bool apply_ac_tx_queue(RtlAdapter &dev, const DeviceConfig::Tx &tx) {
+  bool ok = true;
   if (tx.be_fast_retry)
-    dev.template rtw_write<uint32_t>(
-        kRegEdcaBeParam,
-        edca_fast_retry(dev.template rtw_read<uint32_t>(kRegEdcaBeParam)));
+    ok &= dev.rtw_write32(kRegEdcaBeParam,
+                          edca_fast_retry(dev.rtw_read32(kRegEdcaBeParam)));
   if (tx.ac_lifetime_us > 0) {
-    dev.template rtw_write<uint32_t>(kRegPktLifeTime,
-                                     pkt_life_time_reg(tx.ac_lifetime_us));
-    dev.template rtw_write<uint8_t>(
-        kRegLifetimeEn,
-        static_cast<uint8_t>(dev.template rtw_read<uint8_t>(kRegLifetimeEn) |
-                             kLifetimeEnAc));
+    ok &= dev.rtw_write32(kRegPktLifeTime,
+                          pkt_life_time_reg(tx.ac_lifetime_us));
+    ok &= dev.rtw_write8(kRegLifetimeEn,
+                         static_cast<uint8_t>(dev.rtw_read8(kRegLifetimeEn) |
+                                              kLifetimeEnAc));
   }
+  return ok;
 }
 
 } // namespace devourer

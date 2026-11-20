@@ -5,14 +5,20 @@
  *     applies it;
  *   - pkt_life_time_reg: 256 us units rounded up, both halves equal,
  *     clamped to the 16-bit field;
- *   - apply_ac_tx_queue against a fake register file: nothing touched with
- *     both options off, and REG_LIFETIME_EN's other bits preserved.
+ *   - apply_ac_tx_queue through an RtlAdapter on a fake transport (the
+ *     ack_responder_selftest shape): nothing touched with both options off,
+ *     REG_LIFETIME_EN's other bits preserved, a failed write reported;
+ *   - dot11_is_data on the Frame Control type bits.
  * Prints the failing case and exits nonzero. */
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <map>
+#include <memory>
+#include <stdexcept>
 
 #include "AcTxQueue.h"
+#include "RtlAdapter.h"
 
 static int g_fail = 0;
 
@@ -26,22 +32,52 @@ static int g_fail = 0;
     }                                                                          \
   } while (0)
 
-/* RtlAdapter's accessor shape: rtw_read<T> / rtw_write<T>. */
-struct FakeRegs {
-  std::map<uint16_t, uint32_t> r;
-  int writes = 0;
-  template <typename T> T rtw_read(uint16_t a) { return static_cast<T>(r[a]); }
-  template <typename T> bool rtw_write(uint16_t a, T v) {
-    r[a] = v;
-    ++writes;
+namespace {
+
+/* A byte-addressed register file, as in tests/ack_responder_selftest.cpp. */
+class FakeRegs final : public devourer::ITransport {
+public:
+  std::map<uint16_t, uint8_t> mem;
+  bool fail_writes = false;
+  bool fail_writes_after_store = false;
+  bool throw_writes = false;
+  int write_calls = 0;
+
+  bool is_usb() const override { return true; }
+  uint8_t read8(uint16_t a) override { return mem.count(a) ? mem[a] : 0; }
+  uint16_t read16(uint16_t a) override {
+    return static_cast<uint16_t>(read8(a) | (read8(a + 1) << 8));
+  }
+  uint32_t read32(uint16_t a) override {
+    return static_cast<uint32_t>(read16(a)) |
+           (static_cast<uint32_t>(read16(a + 2)) << 16);
+  }
+  bool write8(uint16_t a, uint8_t v) override {
+    ++write_calls;
+    if (throw_writes) throw std::runtime_error("injected write failure");
+    if (fail_writes) return false;
+    mem[a] = v;
+    if (fail_writes_after_store) return false;
     return true;
   }
+  bool write16(uint16_t a, uint16_t v) override {
+    return write8(a, static_cast<uint8_t>(v)) &&
+           write8(a + 1, static_cast<uint8_t>(v >> 8));
+  }
+  bool write32(uint16_t a, uint32_t v) override {
+    return write16(a, static_cast<uint16_t>(v)) &&
+           write16(a + 2, static_cast<uint16_t>(v >> 16));
+  }
+  bool write_bytes(uint16_t, const uint8_t *, size_t) override { return true; }
+  bool tx_async(uint8_t, uint8_t *, size_t, unsigned) override { return true; }
+  int tx_sync(uint8_t, uint8_t *, size_t len, int) override {
+    return static_cast<int>(len);
+  }
+  void rx_loop(int, int, const std::function<void(const uint8_t *, int)> &,
+               const std::function<bool()> &) override {}
 };
 
-struct Tx {
-  bool be_fast_retry = false;
-  unsigned ac_lifetime_us = 0;
-};
+} // namespace
 
 static void test_edca() {
   using devourer::edca_fast_retry;
@@ -77,29 +113,61 @@ static void test_lifetime() {
 }
 
 static void test_apply() {
-  FakeRegs d;
-  d.r[devourer::kRegEdcaBeParam] = 0x005ea42bu;
-  d.r[devourer::kRegLifetimeEn] = 0x30; /* bits 4, 5 belong to others */
-  Tx off;
-  devourer::apply_ac_tx_queue(d, off);
-  CHECK(d.writes == 0, "both off: %d register writes", d.writes);
+  auto logger = std::make_shared<Logger>();
+  {
+    auto regs = std::make_shared<FakeRegs>();
+    RtlAdapter dev(regs, logger);
+    devourer::DeviceConfig::Tx off;
+    CHECK(devourer::apply_ac_tx_queue(dev, off), "both off: reported failure");
+    CHECK(regs->write_calls == 0, "both off: %d register writes",
+          regs->write_calls);
+  }
+  {
+    auto regs = std::make_shared<FakeRegs>();
+    RtlAdapter dev(regs, logger);
+    regs->write32(devourer::kRegEdcaBeParam, 0x005ea42bu);
+    regs->write8(devourer::kRegLifetimeEn, 0x30); /* bits 4, 5: others' */
+    devourer::DeviceConfig::Tx on;
+    on.be_fast_retry = true;
+    on.ac_lifetime_us = 60000;
+    CHECK(devourer::apply_ac_tx_queue(dev, on), "on: reported failure");
+    CHECK(regs->read32(devourer::kRegEdcaBeParam) == 0x0000442bu, "BE 0x%08x",
+          regs->read32(devourer::kRegEdcaBeParam));
+    CHECK(regs->read8(devourer::kRegLifetimeEn) == 0x3f, "LIFETIME_EN 0x%02x",
+          regs->read8(devourer::kRegLifetimeEn));
+    CHECK(regs->read32(devourer::kRegPktLifeTime) == 0x00eb00ebu,
+          "PKT_LIFE_TIME 0x%08x", regs->read32(devourer::kRegPktLifeTime));
+    /* Lifetime alone leaves the EDCA word alone. */
+    regs->write32(devourer::kRegEdcaBeParam, 0x005ea42bu);
+    devourer::DeviceConfig::Tx lt;
+    lt.ac_lifetime_us = 1000;
+    CHECK(devourer::apply_ac_tx_queue(dev, lt), "lifetime: reported failure");
+    CHECK(regs->read32(devourer::kRegEdcaBeParam) == 0x005ea42bu,
+          "lifetime alone moved BE to 0x%08x",
+          regs->read32(devourer::kRegEdcaBeParam));
+  }
+  {
+    auto regs = std::make_shared<FakeRegs>();
+    RtlAdapter dev(regs, logger);
+    regs->fail_writes = true;
+    devourer::DeviceConfig::Tx on;
+    on.be_fast_retry = true;
+    CHECK(!devourer::apply_ac_tx_queue(dev, on), "failed write not reported");
+  }
+}
 
-  Tx on;
-  on.be_fast_retry = true;
-  on.ac_lifetime_us = 60000;
-  devourer::apply_ac_tx_queue(d, on);
-  CHECK(d.r[devourer::kRegEdcaBeParam] == 0x0000442bu, "BE 0x%08x",
-        d.r[devourer::kRegEdcaBeParam]);
-  CHECK(d.r[devourer::kRegLifetimeEn] == 0x3f, "LIFETIME_EN 0x%02x",
-        d.r[devourer::kRegLifetimeEn]);
-  CHECK(d.r[devourer::kRegPktLifeTime] == 0x00eb00ebu, "PKT_LIFE_TIME 0x%08x",
-        d.r[devourer::kRegPktLifeTime]);
+static void test_is_data() {
+  CHECK(devourer::dot11_is_data(0x08), "Data");
+  CHECK(devourer::dot11_is_data(0x88), "QoS Data");
+  CHECK(!devourer::dot11_is_data(0x80), "Beacon is management");
+  CHECK(!devourer::dot11_is_data(0xd4), "ACK is control");
 }
 
 int main() {
   test_edca();
   test_lifetime();
   test_apply();
+  test_is_data();
   if (g_fail) {
     std::printf("ac_tx_queue_selftest: %d failure(s)\n", g_fail);
     return 1;
