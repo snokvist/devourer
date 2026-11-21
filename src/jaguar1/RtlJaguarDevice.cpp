@@ -138,23 +138,7 @@ void RtlJaguarDevice::InitWrite(SelectedChannel channel) {
           "Jaguar1: configured ACK responder could not be armed");
     configured_arm_generation = _active_ack_arm_generation;
   }
-  /* DEVOURER_TX_BE_FAST_RETRY / _AC_LIFETIME_US: the 8812A has the halmac
-   * register layout here (vendor hal_com_reg.h REG_LIFETIME_CTRL 0x0426,
-   * REG_PKT_VO_VI/BE_BK_LIFE_TIME 0x04C0/0x04C2 in 256 us units,
-   * REG_EDCA_BE_PARAM 0x0508). */
-  {
-    /* be_fast_retry is not applied here: on the 8812A, clearing the BE TXOP
-     * (0x005EA42B -> 0x0000442B) cut saturated MCS2 throughput to 3.5-10.1
-     * Mbit/s against 11.3-13.6 without it (8812AU -> MT7612U, near field,
-     * 7-10 s runs), and the lifetime alone holds the bound: a peer that
-     * never ACKs saw a delivered age max of 68.9 ms at 68000 us, 68.7 ms
-     * with fast retry. */
-    devourer::DeviceConfig::Tx tx = _cfg.tx;
-    tx.be_fast_retry = false;
-    std::lock_guard<std::recursive_mutex> lock(_port0_mu);
-    if (!devourer::apply_ac_tx_queue(_device, tx))
-      throw std::runtime_error("Jaguar1: AC-queue options could not be set");
-  }
+  apply_ac_tx_queue_knobs();
 
   /* Carrier-sense default: EDCCA + primary CCA enabled unless
    * DEVOURER_DIS_CCA. Always applied — the enable path is what programs
@@ -878,20 +862,43 @@ bool RtlJaguarDevice::send_packet(const uint8_t *packet, size_t length) {
   return _device.send_packet_ep(tx_ep_for(usb_frame.data()), usb_frame.data(), usb_frame.size());
 }
 
+/* DEVOURER_TX_DATA_BE / _AC_LIFETIME_US: the 8812A has the halmac register
+ * addresses here (vendor hal_com_reg.h REG_LIFETIME_CTRL 0x0426,
+ * REG_PKT_VO_VI/BE_BK_LIFE_TIME 0x04C0/0x04C2, REG_EDCA_BE_PARAM 0x0508).
+ * The lifetime unit is 256 us, as measured: a peer that never ACKs saw a
+ * delivered age max of 21.0 ms at 20000 us and 70.1 ms at 68000 us (the
+ * vendor header's HAL92C_MSDU_LIFE_TIME_UNIT says 128, which would give
+ * half). be_fast_retry is not applied: clearing the BE TXOP (0x005EA42B ->
+ * 0x0000442B) cut saturated MCS2 throughput to 3.5-10.1 Mbit/s against
+ * 11.3-13.6 without it (8812AU -> MT7612U, near field), and the lifetime
+ * alone holds the bound (68.7 ms with fast retry, 68.9 ms without). */
+void RtlJaguarDevice::apply_ac_tx_queue_knobs() {
+  devourer::DeviceConfig::Tx tx = _cfg.tx;
+  if (tx.be_fast_retry)
+    _logger->warn("Jaguar1: tx.be_fast_retry is not applied on this chip "
+                  "(it halves saturated throughput; the lifetime holds the bound)");
+  tx.be_fast_retry = false;
+  std::lock_guard<std::recursive_mutex> lock(_port0_mu);
+  if (!devourer::apply_ac_tx_queue(_device, tx))
+    throw std::runtime_error("Jaguar1: AC-queue options could not be set");
+}
+
 /* DEVOURER_TX_DATA_BE: the endpoint of the descriptor's queue, as
  * _InitNormalChipThreeOutEpPriority_8812AUsb maps it (BE/BK -> LOW, VI ->
  * NORMAL, the rest -> HIGH) and the vendor three_out_pipe orders the pipes
- * (HIGH, NORMAL, LOW). With fewer than three endpoints there is no LOW
- * endpoint: the first one, as before. */
+ * (HIGH, NORMAL, LOW). With two endpoints, the vendor two_out_pipe puts
+ * BE/BK on the second and the rest on the first. One endpoint: the first,
+ * as before. */
 uint8_t RtlJaguarDevice::tx_ep_for(const uint8_t *txdesc) const {
-  if (!_cfg.tx.data_on_be || _device.bulk_out_ep_count() < 3)
+  const unsigned n = _device.bulk_out_ep_count();
+  if (!_cfg.tx.data_on_be || n < 2)
     return _device.first_bulk_out_ep();
   switch (txdesc[0x05] & 0x1f) { /* QSEL: dword1 [12:8], SET_TX_DESC_QUEUE_SEL_8812 */
-  case 0: case 1: case 2: case 3:
-    return _device.nth_bulk_out_ep(2);
-  case 4: case 5: case 6: case 7:
-    return _device.nth_bulk_out_ep(1);
-  default:
+  case 0: case 1: case 2: case 3: /* BE, BK: LOW (3 EPs) or the second pipe (2 EPs) */
+    return _device.nth_bulk_out_ep(n >= 3 ? 2 : 1);
+  case 4: case 5: /* VI: NORMAL with 3 EPs */
+    return n >= 3 ? _device.nth_bulk_out_ep(1) : _device.first_bulk_out_ep();
+  default: /* VO, MGT, HIGH: the first pipe */
     return _device.first_bulk_out_ep();
   }
 }
@@ -1762,23 +1769,7 @@ void RtlJaguarDevice::Init(Action_ParsedRadioPacket packetProcessor,
     }
     configured_arm_generation = _active_ack_arm_generation;
   }
-  /* DEVOURER_TX_BE_FAST_RETRY / _AC_LIFETIME_US: the 8812A has the halmac
-   * register layout here (vendor hal_com_reg.h REG_LIFETIME_CTRL 0x0426,
-   * REG_PKT_VO_VI/BE_BK_LIFE_TIME 0x04C0/0x04C2 in 256 us units,
-   * REG_EDCA_BE_PARAM 0x0508). */
-  {
-    /* be_fast_retry is not applied here: on the 8812A, clearing the BE TXOP
-     * (0x005EA42B -> 0x0000442B) cut saturated MCS2 throughput to 3.5-10.1
-     * Mbit/s against 11.3-13.6 without it (8812AU -> MT7612U, near field,
-     * 7-10 s runs), and the lifetime alone holds the bound: a peer that
-     * never ACKs saw a delivered age max of 68.9 ms at 68000 us, 68.7 ms
-     * with fast retry. */
-    devourer::DeviceConfig::Tx tx = _cfg.tx;
-    tx.be_fast_retry = false;
-    std::lock_guard<std::recursive_mutex> lock(_port0_mu);
-    if (!devourer::apply_ac_tx_queue(_device, tx))
-      throw std::runtime_error("Jaguar1: AC-queue options could not be set");
-  }
+  apply_ac_tx_queue_knobs();
 
   /* Carrier-sense default: EDCCA + primary CCA enabled unless
    * DEVOURER_DIS_CCA. Always applied — the enable path is what programs

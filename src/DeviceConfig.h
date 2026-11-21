@@ -129,13 +129,15 @@ struct DeviceConfig {
     /* env: DEVOURER_RX_DROP_CTRL — RXFLTMAP1 = 0: control frames (ACK, RTS,
      * CTS, BlockAck, ...) stop at the MAC. The MAC still acts on the ACKs for
      * its own frames; host readers of control frames get none. A beamformee
-     * arm re-opens subtypes 4-5. Jaguar1, Jaguar2, Jaguar3 and the RTL8733B;
-     * silently inert elsewhere. */
+     * arm re-opens subtypes 4-5. Jaguar1 also clears RCR_ACF (BlockAck/BAR
+     * may still pass there, see jaguar1/RadioManagementModule.cpp). Jaguar1,
+     * Jaguar2, Jaguar3 and the RTL8733B; silently inert elsewhere. */
     bool drop_ctrl = false;
     /* env: DEVOURER_RX_OWN_ADDR_ONLY — RCR AAP off, APM|AM|AB on: only unicast
      * to the address in MACID (0x0610), plus group frames. The RTL8733B
-     * bring-up programs its EFUSE address there; Jaguar2/3 bring-up does not,
-     * so arm an identity first (SetAckResponder, a station or beacon arm).
+     * and Jaguar1 bring-ups program their EFUSE address there; Jaguar2/3
+     * bring-up does not, so arm an identity first (SetAckResponder, a station
+     * or beacon arm). Jaguar1 also clears RCR_ADF.
      * Jaguar1, Jaguar2, Jaguar3 and the RTL8733B; silently inert elsewhere. */
     bool own_addr_only = false;
     /* env: DEVOURER_TX_WITH_RX — Jaguar3 only: keep the RX filters open and
