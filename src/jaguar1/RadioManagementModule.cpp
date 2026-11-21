@@ -1,4 +1,5 @@
 #include "RadioManagementModule.h"
+#include "RxFilter.h"
 #include "Hal8812PhyReg.h"
 #include "Hal8812a_TxPwrTrack.h" /* kTxScalingTableJaguar — fast swing lever */
 #include "InitTimer.h"
@@ -18,7 +19,7 @@ RadioManagementModule::RadioManagementModule(
     RtlAdapter device, std::shared_ptr<EepromManager> eepromManager,
     Logger_t logger, const devourer::DeviceConfig &cfg)
     : _device{device}, _tuning{cfg.tuning},
-      _keep_corrupted{cfg.rx.keep_corrupted},
+      _keep_corrupted{cfg.rx.keep_corrupted}, _rx{cfg.rx},
       _dump_canary{cfg.debug.dump_canary}, _eepromManager{eepromManager},
       _logger{logger},
       _pwrTrk{device, eepromManager, this, logger},
@@ -171,12 +172,19 @@ void RadioManagementModule::hw_var_set_monitor() {
     rcr_bits |= RCR_ACRC32 | RCR_AICV;
   }
 
+  /* DEVOURER_RX_OWN_ADDR_ONLY: AAP off, so unicast must match REG_MACID
+   * (the ACK responder's address). */
+  rcr_bits = devourer::monitor_rcr(rcr_bits, _rx);
   // rtw_hal_get_hwreg(adapterState, HW_VAR_RCR, pHalData.rcr_backup);
   hw_var_rcr_config(rcr_bits);
 
   /* Receive all data frames */
   uint16_t value_rxfltmap2 = 0xFFFF;
   _device.rtw_write16(REG_RXFLTMAP2, value_rxfltmap2);
+  /* DEVOURER_RX_DROP_CTRL: no control subtype reaches the host (the MAC
+   * still acts on the ACKs for its own frames). */
+  if (_rx.drop_ctrl)
+    _device.rtw_write16(REG_RXFLTMAP1, devourer::monitor_ctrl_map(_rx));
 }
 
 /* A 2.4 GHz HT40 pair must stay inside channels 1-13: HT40+ needs a primary
@@ -1631,6 +1639,8 @@ void RadioManagementModule::init_hw_mlme_ext(SelectedChannel pmlmeext) {
 }
 
 void RadioManagementModule::Set_HW_VAR_ENABLE_RX_BAR(bool val) {
+  if (_rx.drop_ctrl) /* DEVOURER_RX_DROP_CTRL: BAR stays dropped with the rest */
+    return;
   if (val) {
     /* enable RX BAR */
     uint32_t val16 = _device.rtw_read16(REG_RXFLTMAP1);

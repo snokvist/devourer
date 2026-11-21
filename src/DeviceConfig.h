@@ -129,14 +129,14 @@ struct DeviceConfig {
     /* env: DEVOURER_RX_DROP_CTRL — RXFLTMAP1 = 0: control frames (ACK, RTS,
      * CTS, BlockAck, ...) stop at the MAC. The MAC still acts on the ACKs for
      * its own frames; host readers of control frames get none. A beamformee
-     * arm re-opens subtypes 4-5. Jaguar2, Jaguar3 and the RTL8733B; silently
-     * inert elsewhere. */
+     * arm re-opens subtypes 4-5. Jaguar1, Jaguar2, Jaguar3 and the RTL8733B;
+     * silently inert elsewhere. */
     bool drop_ctrl = false;
     /* env: DEVOURER_RX_OWN_ADDR_ONLY — RCR AAP off, APM|AM|AB on: only unicast
      * to the address in MACID (0x0610), plus group frames. The RTL8733B
      * bring-up programs its EFUSE address there; Jaguar2/3 bring-up does not,
      * so arm an identity first (SetAckResponder, a station or beacon arm).
-     * Jaguar2, Jaguar3 and the RTL8733B; silently inert elsewhere. */
+     * Jaguar1, Jaguar2, Jaguar3 and the RTL8733B; silently inert elsewhere. */
     bool own_addr_only = false;
     /* env: DEVOURER_TX_WITH_RX — Jaguar3 only: keep the RX filters open and
      * enable the RX path during a TX (InitWrite) bring-up so StartRxLoop can
@@ -305,12 +305,12 @@ struct DeviceConfig {
      * why there is no floor form. */
     RetryFallback retry_fallback = RetryFallback::Default;
     /* The three AC-queue knobs below (src/AcTxQueue.h) are honoured by the
-     * RTL8733B, Jaguar2 and Jaguar3 backends; Jaguar1, Kestrel and the
+     * RTL8733B, Jaguar1, Jaguar2 and Jaguar3 backends; Kestrel and the
      * MT7612U ignore them. All default off: descriptors and registers
      * byte-identical. Measured on one RTL8733BU and one RTL8812BU, 500 fps
      * of 1400 B at MCS4, retry 16, 10 s runs, near field; Jaguar3
      * unmeasured. */
-    /* env: DEVOURER_TX_DATA_BE=1 — RTL8733B and Jaguar2: DATA frames
+    /* env: DEVOURER_TX_DATA_BE=1 — RTL8733B, Jaguar1 and Jaguar2: DATA frames
      * (802.11 type 2) ride the BE queue (descriptor QSEL 0) and its LOW
      * bulk-OUT endpoint, instead of MGMT (0x12, HIGH); management and
      * control frames keep MGMT, and a USB-aggregated URB never mixes the two.

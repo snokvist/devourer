@@ -12,8 +12,9 @@ namespace devourer {
 /* The access-category (AC) queue registers behind DeviceConfig::Tx::
  * data_on_be / be_fast_retry / ac_lifetime_us. The addresses and field
  * layouts are the halmac 88xx ones, identical on the RTL8733B, Jaguar2
- * (8822B/8821C) and Jaguar3 (8822C/8822E), the three backends that apply
- * them. Pure arithmetic plus the apply, pinned headless against a fake
+ * (8822B/8821C) and Jaguar3 (8822C/8822E), and on Jaguar1 (8812A: vendor
+ * hal_com_reg.h REG_LIFETIME_CTRL, REG_PKT_*_LIFE_TIME, 256 us units), the
+ * backends that apply them. Pure arithmetic plus the apply, pinned headless against a fake
  * transport by tests/ac_tx_queue_selftest.cpp. */
 
 /* True for an 802.11 DATA frame (Frame Control type bits = 2), given the
