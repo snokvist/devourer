@@ -172,12 +172,14 @@ void RadioManagementModule::hw_var_set_monitor() {
     rcr_bits |= RCR_ACRC32 | RCR_AICV;
   }
 
-  /* DEVOURER_RX_OWN_ADDR_ONLY: AAP off, so unicast must match REG_MACID
-   * (the ACK responder's address). */
+  /* DEVOURER_RX_OWN_ADDR_ONLY: AAP off, so unicast must match REG_MACID:
+   * the EFUSE address from bring-up, or the ACK responder's once armed. */
   rcr_bits = devourer::monitor_rcr(rcr_bits, _rx);
   /* DEVOURER_RX_DROP_CTRL: on the 8812A, RCR_ACF passes every control frame
    * up whatever RXFLTMAP1 says (bench: 200 ACKs/s reached the host with the
-   * map cleared), so it goes too. */
+   * map cleared), so it goes too. The vendor header puts BlockAck, BAR and
+   * PS-Poll under RCR_ADF instead, so those may still pass unless
+   * own_addr_only is also set (not measured: the bench counted ACKs). */
   if (_rx.drop_ctrl)
     rcr_bits &= ~RCR_ACF;
   /* DEVOURER_RX_OWN_ADDR_ONLY: RCR_ADF likewise passes every data frame up
