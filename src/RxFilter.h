@@ -1,5 +1,5 @@
 /* Register values for DeviceConfig::Rx::drop_ctrl / own_addr_only, shared by
- * the Jaguar2, Jaguar3 and RTL8733B monitor RX setups (RCR bits as
+ * the Jaguar1, Jaguar2, Jaguar3 and RTL8733B monitor RX setups (RCR bits as
  * hal/hal_com_reg.h RCR_AAP..RCR_AB). */
 #pragma once
 #include <cstdint>
