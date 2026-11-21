@@ -305,8 +305,9 @@ struct DeviceConfig {
      * why there is no floor form. */
     RetryFallback retry_fallback = RetryFallback::Default;
     /* The three AC-queue knobs below (src/AcTxQueue.h) are honoured by the
-     * RTL8733B, Jaguar1, Jaguar2 and Jaguar3 backends; Kestrel and the
-     * MT7612U ignore them. All default off: descriptors and registers
+     * RTL8733B, Jaguar1, Jaguar2 and Jaguar3 backends (Jaguar1 except
+     * be_fast_retry, which cost it saturated throughput: see
+     * RtlJaguarDevice.cpp); Kestrel and the MT7612U ignore them. All default off: descriptors and registers
      * byte-identical. Measured on one RTL8733BU and one RTL8812BU, 500 fps
      * of 1400 B at MCS4, retry 16, 10 s runs, near field; Jaguar3
      * unmeasured. */

@@ -143,8 +143,16 @@ void RtlJaguarDevice::InitWrite(SelectedChannel channel) {
    * REG_PKT_VO_VI/BE_BK_LIFE_TIME 0x04C0/0x04C2 in 256 us units,
    * REG_EDCA_BE_PARAM 0x0508). */
   {
+    /* be_fast_retry is not applied here: on the 8812A, clearing the BE TXOP
+     * (0x005EA42B -> 0x0000442B) cut saturated MCS2 throughput to 3.5-10.1
+     * Mbit/s against 11.3-13.6 without it (8812AU -> MT7612U, near field,
+     * 7-10 s runs), and the lifetime alone holds the bound: a peer that
+     * never ACKs saw a delivered age max of 68.9 ms at 68000 us, 68.7 ms
+     * with fast retry. */
+    devourer::DeviceConfig::Tx tx = _cfg.tx;
+    tx.be_fast_retry = false;
     std::lock_guard<std::recursive_mutex> lock(_port0_mu);
-    if (!devourer::apply_ac_tx_queue(_device, _cfg.tx))
+    if (!devourer::apply_ac_tx_queue(_device, tx))
       throw std::runtime_error("Jaguar1: AC-queue options could not be set");
   }
 
@@ -1584,7 +1592,11 @@ size_t RtlJaguarDevice::build_tx_block(const uint8_t *packet, size_t length,
     rate_id = 9;
   }
 
-  SET_TX_DESC_BMC_8812(usb_frame, 1);
+  /* BMC follows addr1's group bit. The firmware echoes it in the CCX TX
+   * report (TxReport::bmc), so a constant 1 made every unicast report read
+   * as a group frame. The MAC takes the ACK decision from addr1 either way. */
+  SET_TX_DESC_BMC_8812(usb_frame,
+                       real_packet_length >= 10 && (packet[radiotap_length + 4] & 0x01) ? 1 : 0);
   SET_TX_DESC_RATE_ID_8812(usb_frame, static_cast<uint8_t>(rate_id));
 
   /* DEVOURER_TX_DATA_BE: DATA frames ride BE (QSEL 0), where
@@ -1755,8 +1767,16 @@ void RtlJaguarDevice::Init(Action_ParsedRadioPacket packetProcessor,
    * REG_PKT_VO_VI/BE_BK_LIFE_TIME 0x04C0/0x04C2 in 256 us units,
    * REG_EDCA_BE_PARAM 0x0508). */
   {
+    /* be_fast_retry is not applied here: on the 8812A, clearing the BE TXOP
+     * (0x005EA42B -> 0x0000442B) cut saturated MCS2 throughput to 3.5-10.1
+     * Mbit/s against 11.3-13.6 without it (8812AU -> MT7612U, near field,
+     * 7-10 s runs), and the lifetime alone holds the bound: a peer that
+     * never ACKs saw a delivered age max of 68.9 ms at 68000 us, 68.7 ms
+     * with fast retry. */
+    devourer::DeviceConfig::Tx tx = _cfg.tx;
+    tx.be_fast_retry = false;
     std::lock_guard<std::recursive_mutex> lock(_port0_mu);
-    if (!devourer::apply_ac_tx_queue(_device, _cfg.tx))
+    if (!devourer::apply_ac_tx_queue(_device, tx))
       throw std::runtime_error("Jaguar1: AC-queue options could not be set");
   }
 

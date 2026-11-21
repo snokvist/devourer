@@ -175,6 +175,16 @@ void RadioManagementModule::hw_var_set_monitor() {
   /* DEVOURER_RX_OWN_ADDR_ONLY: AAP off, so unicast must match REG_MACID
    * (the ACK responder's address). */
   rcr_bits = devourer::monitor_rcr(rcr_bits, _rx);
+  /* DEVOURER_RX_DROP_CTRL: on the 8812A, RCR_ACF passes every control frame
+   * up whatever RXFLTMAP1 says (bench: 200 ACKs/s reached the host with the
+   * map cleared), so it goes too. */
+  if (_rx.drop_ctrl)
+    rcr_bits &= ~RCR_ACF;
+  /* DEVOURER_RX_OWN_ADDR_ONLY: RCR_ADF likewise passes every data frame up
+   * whatever the address match says, so it goes too (RXFLTMAP2 still
+   * admits every data subtype). */
+  if (_rx.own_addr_only)
+    rcr_bits &= ~RCR_ADF;
   // rtw_hal_get_hwreg(adapterState, HW_VAR_RCR, pHalData.rcr_backup);
   hw_var_rcr_config(rcr_bits);
 
